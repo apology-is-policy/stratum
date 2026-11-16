@@ -1934,17 +1934,15 @@ stm_status stm_sync_promote_policy_collect(stm_sync *s,
  * The cb resolves each `paddr` against `sync`'s extent index via
  * `stm_extent_lookup_by_paddr`:
  *
- *   - paddr matches a live extent's base → AEAD-decrypt the entire
- *     ciphertext+tag at that paddr (using the same nonce + AD shape as
- *     `stm_sync_write_extent`) and return STM_SCRUB_VERIFY_OK on
- *     success or STM_SCRUB_VERIFY_UNREPAIRABLE on AEAD-tag failure /
- *     bdev I/O error / transient resource shortfall. Replica
- *     reconstruction is not yet implemented — bptr.tla's full
- *     replica-walk + rewrite protocol awaits the replica-aware
- *     allocator and extent record extension. Until then, AEAD-tag
- *     failure means "no surviving redundancy" and the block is
- *     reported UNREPAIRABLE (matching bptr.tla's
- *     `NoOriginalOKMeansUnrepairable` corner).
+ *   - paddr is a live extent's first replica -> read every replica
+ *     and AEAD-verify each (the nonce and AD shape of
+ *     `stm_sync_write_extent`). All verify: STM_SCRUB_VERIFY_OK. Some
+ *     fail and one verifies: each that failed is rewritten from it and
+ *     read back, STM_SCRUB_VERIFY_REPAIRED. None verifies, or a
+ *     rewrite fails: STM_SCRUB_VERIFY_UNREPAIRABLE (bptr.tla's
+ *     `NoOriginalOKMeansUnrepairable` and `WriteVerifyMandatory`).
+ *     The extent's other replicas answer OK; its first one carries
+ *     the verdict.
  *
  *   - paddr does NOT match a live extent (mid-extent block, metadata
  *     tree node, bootstrap block, scrub durable region, etc.) →
@@ -1969,30 +1967,23 @@ stm_status stm_sync_promote_policy_collect(stm_sync *s,
  * `blocks_unrepairable` as a "investigate, don't auto-replace"
  * threshold.
  *
- * Concurrency (R37 P2-2): the cb does NOT acquire `sync->lock`. It
- * borrows `extent_idx`, `pool_uuid`, `metadata_key`, and `pool` as
- * immutable post-create state, plus `extent_idx`'s internal mutex
- * for the lookup. Concurrent `stm_sync_write_extent` /
- * `stm_sync_commit` activity during a `stm_scrub_step` call is
- * therefore permitted by the lock graph but is NOT race-free at
- * the data plane: a `(rec.paddr, rec.gen)` pair returned by the
- * lookup can become stale across a commit-promote-PENDING-then-
- * reuse boundary, with the cb's subsequent `stm_bdev_read`
- * observing the new ciphertext while attempting decrypt under
- * the old gen → false-positive UNREPAIRABLE. Callers MUST EITHER:
- * (a) quiesce all `stm_sync_write_extent` / `stm_sync_commit`
- * activity for the duration of every `stm_scrub_step` call, OR
- * (b) run scrub on a snapshot-mounted view that does not share
- * paddrs with live writes. Multi-writer harnesses without one
- * of these provisions can produce intermittent UNREPAIRABLE
- * phantoms uncorrelated with on-disk corruption.
- * With more than one replica a stale record can cost more than a
- * false report: where one replica's old block still holds the old
- * bytes and another's has been given out again, the old bytes
- * verify, the other replica is taken for damaged, and the repair
- * writes the old ciphertext over a block that now belongs to
- * another extent, reads it back, and reports REPAIRED. Nothing in
- * the cb looks the record up again before it rewrites.
+ * Concurrency: scrub may run beside writes and commits. The cb looks
+ * twice. The first look takes the record by value under the extent
+ * index's own lock and reads with no lock held; by then the extent
+ * may have been written again and its blocks given to another extent
+ * by two commits, so it answers only "every replica verified". Any
+ * other result is judged again under `sync->lock`, by the record the
+ * extent has at the copy's (dataset, ino, offset): no block can be
+ * given out while that lock is held (a commit sweeps freed blocks,
+ * and an unwritten reservation is given back, only under it), so the
+ * replicas read and any rewrite are that record's. An extent no
+ * longer there, or no longer starting at this block, answers OK: its
+ * blocks are not this extent's now, and its new version answers at
+ * its own first block. The second look's device reads and rewrites
+ * hold writers and commits for their time, once per extent the first
+ * look found wanting, per pass. A missing key answers OK at either
+ * look: a key pruned once nothing live used it, or a locked dataset,
+ * leaves nothing to verify, which is not damage.
  *
  * Lifetime contract: `sync` is borrowed (the cb's ctx) and MUST
  * outlive `sc`. Callers MUST close scrub BEFORE closing sync (per

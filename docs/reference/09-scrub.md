@@ -657,13 +657,10 @@ Deferred (γ-scope / future):
   `stm_sync_scrub_install_production_cb`. With no cb installed
   scrub falls back to α (raw read, no csum). Production callers
   should install the production cb after `stm_scrub_create`.
-- **P7-5 single-replica corner**: the production cb maps to the
-  bptr.tla corner where the extent has only one replica. AEAD-tag
-  failure → `UNREPAIRABLE` (no rewrite path until extent records
-  carry replica lists). Mirror-pool deployments will see the same
-  block reported `UNREPAIRABLE` per scrub even when a healthy
-  replica exists on another device — the full replica walk is the
-  next chunk.
+- ~~**P7-5 single-replica corner**~~. **CLOSED by P7-6**: the
+  production cb walks every replica of an extent and rewrites each
+  that fails from one that verifies; only an extent with no replica
+  that verifies is `UNREPAIRABLE`.
 - **R37 P2-1 transient-error overload**: the P7-5 production cb
   charges every non-OK outcome to `STM_SCRUB_VERIFY_UNREPAIRABLE` —
   including transient `malloc` failures, `bdev_read` STM_EIO,
@@ -675,15 +672,23 @@ Deferred (γ-scope / future):
   give operators a clean signal. Until then treat
   `blocks_unrepairable` as an "investigate, don't auto-replace"
   threshold.
-- **R37 P2-2 concurrency**: the P7-5 production cb does NOT take
-  `sync->lock`; it borrows extent_idx's mutex briefly during
-  lookup but does NOT serialize against concurrent
-  `stm_sync_write_extent` / `stm_sync_commit`. A
-  commit-promote-PENDING-then-reuse window between the lookup and
-  the cb's `bdev_read` can cause false-positive `UNREPAIRABLE`.
-  Callers MUST quiesce all `stm_sync_write_extent` / `stm_sync_commit`
-  for the duration of every `stm_scrub_step`, OR run scrub on a
-  snapshot-mounted view.
+- ~~**R37 P2-2 concurrency**~~. **CLOSED by T0.87**: scrub may run
+  beside writes and commits. A record taken with no lock can be
+  stale: its extent written again and its blocks given to another
+  extent by two commits. A repair from such a record wrote the old
+  ciphertext over the other extent's block and reported REPAIRED,
+  and a verdict from it could call whole data `UNREPAIRABLE`. The
+  cb's first look, unlocked, now answers only "every replica
+  verified"; anything else is judged again under `sync->lock` by the
+  record the extent has then, where no block can be given out, and
+  any rewrite is made there. An extent gone or moved answers OK.
+  Tests: `scrub_repair_outlives_its_records_block`,
+  `scrub_stale_record_is_not_called_lost`,
+  `scrub_deleted_extent_is_not_repaired`,
+  `scrub_moved_extent_answers_at_its_own_base`,
+  `scrub_repair_seam_fires_outside_the_lock` (test_scrub) and
+  `corvus_scrub_second_look_after_logout_reports_nothing`
+  (test_corvus_mount).
 - **FAULTED-device blocks are skipped silently**. Status_get
   gives no indication that coverage was degraded. Operators
   monitoring "scrub finished without errors" may misread the

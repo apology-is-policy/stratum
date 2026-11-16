@@ -1985,6 +1985,288 @@ STM_TEST(scrub_p7_6_read_path_falls_back_to_healthy_replica) {
 }
 
 /* ========================================================================= */
+/* T0.87: a repair from a record that went stale                             */
+/* ========================================================================= */
+
+/* The callback takes its record by value and reads the replicas with no
+ * lock held. In that window the extent is written again, so its blocks
+ * are freed; two commits make them free to take; and other files are
+ * written until one of them takes the extent's block on device 1. With
+ * `pin_dev0` the old block on device 0 is reserved first, so nothing
+ * takes it and it still holds the extent's old bytes, which verify; the
+ * block on device 1 holds another file's, which do not. A repair from
+ * the stale record writes the old ciphertext over the other file's
+ * replica. Without the pin both old blocks are taken and no replica
+ * verifies, which says nothing about the extent as it now is. The
+ * extent may instead be deleted (truncated away), or written again and
+ * its new version damaged, which its own base answers for. */
+#define SRB_LEN    4096u
+#define SRB_TRIES  64u
+
+typedef enum {
+    SRB_MOVED,           /* written again */
+    SRB_MOVED_DAMAGED,   /* written again, its new replica 1 damaged */
+    SRB_GONE,            /* truncated away */
+} srb_mode;
+
+typedef struct {
+    mirror2_extent_fx *fx;
+    srb_mode   mode;
+    bool       pin_dev0;
+    int        fired;
+    uint64_t   old_p0, old_p1;     /* the stale record's blocks */
+    uint64_t   new_p0;             /* where the extent is once written again */
+    uint64_t   old_len_blocks;     /* the length of the old block on device 0 */
+    uint64_t   pinned;             /* the reservation over old_p0; 0: none */
+    uint64_t   taker1_ino;         /* whose extent took old_p1; 0: nobody's */
+    uint64_t   taker0_ino;         /* whose extent took old_p0; 0: nobody's */
+    uint64_t   taker1_p0;          /* that extent's block on device 0 */
+    uint8_t    taker1_disk[2 * SRB_LEN];  /* its replica 1, as it wrote it */
+    stm_status st;                 /* the first step of the hook that failed */
+} srb_ctx;
+
+static void srb_fill(uint8_t *b, uint64_t ino, uint32_t ver)
+{
+    for (size_t i = 0; i < SRB_LEN; i++)
+        b[i] = (uint8_t)((ino * 31u + ver * 7u + i) & 0xFFu);
+}
+
+static bool srb_is(const uint8_t *b, uint64_t ino, uint32_t ver)
+{
+    for (size_t i = 0; i < SRB_LEN; i++)
+        if (b[i] != (uint8_t)((ino * 31u + ver * 7u + i) & 0xFFu)) return false;
+    return true;
+}
+
+static void srb_pread(const char *path, uint64_t paddr, uint8_t *out, size_t n)
+{
+    int fd = open(path, O_RDONLY);
+    STM_ASSERT(fd >= 0);
+    ssize_t got = pread(fd, out, n,
+                        (off_t)(stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE));
+    STM_ASSERT_EQ((size_t)got, n);
+    STM_ASSERT_EQ(close(fd), 0);
+}
+
+static void srb_hook(void *arg)
+{
+    srb_ctx *h = arg;
+    if (h->fired++) return;
+    stm_sync *s = h->fx->s;
+    stm_extent_index *eidx = stm_sync_extent_index(s);
+    uint8_t w[SRB_LEN];
+    stm_extent_record e;
+
+    uint32_t refs = 0;
+    h->st = stm_alloc_lookup(h->fx->a0, h->old_p0, &h->old_len_blocks, &refs);
+
+    if (h->mode == SRB_GONE) {
+        /* The extent goes: its record leaves the tree. */
+        bool changed = false;
+        if (h->st == STM_OK) h->st = stm_sync_truncate(s, 1u, 1u, 0u, &changed);
+        if (h->st == STM_OK && !changed) h->st = STM_EINVAL;
+    } else {
+        /* The extent again: the record in the tree now names new blocks. */
+        srb_fill(w, 1u, 1u);
+        if (h->st == STM_OK)
+            h->st = stm_sync_write_extent(s, 1u, 1u, 0u, w, SRB_LEN);
+        if (h->st == STM_OK) h->st = stm_extent_lookup_at(eidx, 1u, 1u, 0u, &e);
+        if (h->st == STM_OK) h->new_p0 = e.paddrs[0];
+        if (h->st == STM_OK && h->mode == SRB_MOVED_DAMAGED)
+            corrupt_replica_on_disk(h->fx->paths[1], e.paddrs[1]);
+    }
+    /* A block freed at a write's generation is swept by the second commit
+     * after it (rc2_read_outlives_its_records_block says why). */
+    if (h->st == STM_OK) h->st = stm_sync_commit(s);
+    if (h->st == STM_OK) h->st = stm_sync_commit(s);
+
+    if (h->st == STM_OK && h->pin_dev0) {
+        h->st = stm_alloc_reserve(h->fx->a0, h->old_len_blocks, h->old_p0,
+                                  &h->pinned);
+        if (h->st == STM_OK && h->pinned != h->old_p0) h->st = STM_EINVAL;
+    }
+
+    /* Other files' extents, until the old blocks are theirs. */
+    for (uint64_t ino = 2u; h->st == STM_OK && ino < 2u + SRB_TRIES &&
+                            (h->taker1_ino == 0u ||
+                             (!h->pin_dev0 && h->taker0_ino == 0u)); ino++) {
+        srb_fill(w, ino, 0u);
+        h->st = stm_sync_write_extent(s, 1u, ino, 0u, w, SRB_LEN);
+        if (h->st == STM_OK) h->st = stm_extent_lookup_at(eidx, 1u, ino, 0u, &e);
+        if (h->st != STM_OK) break;
+        if (e.paddrs[1] == h->old_p1) {
+            h->taker1_ino = ino;
+            h->taker1_p0  = e.paddrs[0];
+        }
+        if (e.paddrs[0] == h->old_p0) h->taker0_ino = ino;
+    }
+    if (h->st == STM_OK && h->taker1_ino != 0u)
+        srb_pread(h->fx->paths[1], h->old_p1, h->taker1_disk,
+                  sizeof h->taker1_disk);
+}
+
+static void scrub_stale_record_case(const char *tag, srb_mode mode,
+                                    bool pin_dev0)
+{
+    mirror2_extent_fx fx;
+    mirror2_extent_setup(&fx, tag);
+    STM_ASSERT_OK(stm_sync_commit(fx.s));
+    stm_sync_dcache_drain_for_test(fx.s);
+
+    srb_ctx h;
+    memset(&h, 0, sizeof h);
+    h.fx = &fx;
+    h.mode = mode;
+    h.pin_dev0 = pin_dev0;
+    h.st = STM_EINVAL;
+    h.old_p0 = fx.extent_rec.paddrs[0];
+    h.old_p1 = fx.extent_rec.paddrs[1];
+    STM_ASSERT_EQ(stm_paddr_device(h.old_p0), (uint16_t)0);
+    STM_ASSERT_EQ(stm_paddr_device(h.old_p1), (uint16_t)1);
+
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(fx.s, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(fx.s, sc));
+    stm_sync_set_scrub_verify_hook_for_test(fx.s, srb_hook, &h);
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    /* Step to the end of the step that met the extent: a step scans one
+     * allocated range, and the other files' extents are later ones, so
+     * nothing has looked at the other file's replica since. */
+    stm_scrub_status st;
+    for (int i = 0; i < 4096 && h.fired == 0; i++) {
+        STM_ASSERT_OK(stm_scrub_step(sc));
+        STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+    }
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    stm_test_info("scrub stale record (%s): old blocks %llu/%llu, the extent "
+                  "now at %llu, device 1's block taken by file %llu, device "
+                  "0's by %llu; after its step repaired %llu, unrepairable "
+                  "%llu",
+                  tag, (unsigned long long)h.old_p0,
+                  (unsigned long long)h.old_p1, (unsigned long long)h.new_p0,
+                  (unsigned long long)h.taker1_ino,
+                  (unsigned long long)h.taker0_ino,
+                  (unsigned long long)st.blocks_repaired,
+                  (unsigned long long)st.blocks_unrepairable);
+
+    /* The premise, or what follows proves nothing: the callback was in
+     * the window; the extent moved; device 1's old block is another
+     * file's; and device 0's is pinned, still holding the old bytes, or
+     * another file's too. */
+    STM_ASSERT_EQ(h.fired, 1);
+    STM_ASSERT_OK(h.st);
+    STM_ASSERT(h.new_p0 != h.old_p0);
+    STM_ASSERT(h.taker1_ino != 0u);
+    if (pin_dev0) STM_ASSERT_EQ(h.pinned, h.old_p0);
+    else          STM_ASSERT(h.taker0_ino != 0u);
+
+    /* Nothing was repaired and nothing called lost: the record the
+     * callback read by was not the extent's by then. And the other
+     * file's replica on device 1 is as it wrote it. */
+    STM_ASSERT_EQ(st.blocks_repaired, 0u);
+    STM_ASSERT_EQ(st.blocks_unrepairable, 0u);
+    uint8_t now_disk[2 * SRB_LEN];
+    srb_pread(fx.paths[1], h.old_p1, now_disk, sizeof now_disk);
+    STM_ASSERT(memcmp(now_disk, h.taker1_disk, sizeof now_disk) == 0);
+
+    /* The rest of the pass finds nothing to do either, but the damaged
+     * new version, at its own base. */
+    run_scrub_done(sc);
+    stm_sync_set_scrub_verify_hook_for_test(fx.s, NULL, NULL);
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    STM_ASSERT_EQ(st.blocks_repaired, mode == SRB_MOVED_DAMAGED ? 1u : 0u);
+    STM_ASSERT_EQ(st.blocks_unrepairable, 0u);
+    srb_pread(fx.paths[1], h.old_p1, now_disk, sizeof now_disk);
+    STM_ASSERT(memcmp(now_disk, h.taker1_disk, sizeof now_disk) == 0);
+
+    /* ... and reads whole from it alone, its device-0 replica damaged.
+     * The extent reads as written in the window. */
+    corrupt_replica_on_disk(fx.paths[0], h.taker1_p0);
+    stm_sync_dcache_drain_for_test(fx.s);
+    uint8_t out[SRB_LEN];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_sync_read_extent(fx.s, 1u, h.taker1_ino, 0u, out,
+                                         sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)SRB_LEN);
+    STM_ASSERT(srb_is(out, h.taker1_ino, 0u));
+    if (mode != SRB_GONE) {
+        got = 0;
+        STM_ASSERT_OK(stm_sync_read_extent(fx.s, 1u, 1u, 0u, out, sizeof out,
+                                             &got));
+        STM_ASSERT_EQ(got, (size_t)SRB_LEN);
+        STM_ASSERT(srb_is(out, 1u, 1u));
+    }
+
+    if (h.pinned != 0u) STM_ASSERT_OK(stm_alloc_unreserve(fx.a0, h.pinned));
+    stm_scrub_close(sc);
+    mirror2_extent_teardown(&fx);
+}
+
+STM_TEST(scrub_repair_outlives_its_records_block) {
+    scrub_stale_record_case("stale_one", SRB_MOVED, true);
+}
+
+STM_TEST(scrub_stale_record_is_not_called_lost) {
+    scrub_stale_record_case("stale_both", SRB_MOVED, false);
+}
+
+STM_TEST(scrub_deleted_extent_is_not_repaired) {
+    scrub_stale_record_case("stale_gone", SRB_GONE, true);
+}
+
+STM_TEST(scrub_moved_extent_answers_at_its_own_base) {
+    scrub_stale_record_case("stale_dmg", SRB_MOVED_DAMAGED, true);
+}
+
+/* A real repair is still made, and the seam fires once, in the unlocked
+ * pass: its hook takes s->lock (a commit), which the second look holds. */
+typedef struct { stm_sync *s; int fired; stm_status st; } srb_count_ctx;
+
+static void srb_count_hook(void *arg)
+{
+    srb_count_ctx *c = arg;
+    c->fired++;
+    stm_status r = stm_sync_commit(c->s);
+    if (c->st == STM_OK) c->st = r;
+}
+
+STM_TEST(scrub_repair_seam_fires_outside_the_lock) {
+    mirror2_extent_fx fx;
+    mirror2_extent_setup(&fx, "seam_once");
+    corrupt_replica_on_disk(fx.paths[1], fx.extent_rec.paddrs[1]);
+
+    srb_count_ctx c = { fx.s, 0, STM_OK };
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(fx.s, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(fx.s, sc));
+    stm_sync_set_scrub_verify_hook_for_test(fx.s, srb_count_hook, &c);
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    run_scrub_done(sc);
+    stm_sync_set_scrub_verify_hook_for_test(fx.s, NULL, NULL);
+
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    STM_ASSERT_EQ(c.fired, 1);
+    STM_ASSERT_OK(c.st);
+    STM_ASSERT_EQ(st.blocks_repaired, 1u);
+    STM_ASSERT_EQ(st.blocks_unrepairable, 0u);
+
+    /* The repaired replica alone reads the extent. */
+    corrupt_replica_on_disk(fx.paths[0], fx.extent_rec.paddrs[0]);
+    stm_sync_dcache_drain_for_test(fx.s);
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_sync_read_extent(fx.s, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    for (size_t i = 0; i < sizeof out; i++)
+        STM_ASSERT_EQ((int)out[i], (int)(i & 0xFF));
+
+    stm_scrub_close(sc);
+    mirror2_extent_teardown(&fx);
+}
+
+/* ========================================================================= */
 /* P7-CAS-15: sticky completion-signal bit.                                   */
 /* ========================================================================= */
 

@@ -135,6 +135,21 @@ void stm_sync_set_read_prefetch_hook_for_test(stm_sync *s,
                                                  void *ctx);
 
 /*
+ * Scrub's stale-record seam: invoked by the production verify
+ * callback (stm_sync_scrub_install_production_cb) after it has taken
+ * its extent record by value and resolved the record's key, and
+ * before it reads a replica. The caller holds the scrub's lock and
+ * the pool's shared lock, not s->lock, so a hook may overwrite the
+ * extent, commit and write other files: the window in which the
+ * record's blocks can be given out again. It does NOT fire on the
+ * callback's second look, which is made under s->lock. Pass
+ * hook=NULL to clear.
+ */
+void stm_sync_set_scrub_verify_hook_for_test(stm_sync *s,
+                                                void (*hook)(void *ctx),
+                                                void *ctx);
+
+/*
  * RC-6 (#35) read-window seam, the [insert, publish] twin of the
  * prepopulate hook: invoked by the HOT-extent fetch between the
  * PROVISIONAL dcache insert and its commit-or-kill publish

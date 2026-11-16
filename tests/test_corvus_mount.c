@@ -40,11 +40,15 @@
 #include <stratum/dataset.h>
 #include <stratum/keyfile.h>
 #include <stratum/keyschema.h>
+#include <stratum/extent.h>
 #include <stratum/pool.h>
+#include <stratum/scrub.h>
+#include <stratum/super.h>
 #include <stratum/sync.h>
 #include <stratum/sync_testing.h>
 #include <stratum/types.h>
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -1310,4 +1314,108 @@ STM_TEST(corvus_logout_flushes_dirty_home_before_key_eviction) {
     STM_ASSERT_OK(stm_fs_unmount(fs));
     fake_corvus_stop(&fc);
     unlink(g_tmp_path); unlink(key_path);
+}
+
+/* ===================================================================== */
+/* T0.87: scrub's second look meets a dataset whose key was evicted      */
+/* ===================================================================== */
+/* A damaged extent of a user's dataset: scrub's first look resolves its */
+/* key and fails on the bytes, so the second look, under s->lock, judges */
+/* the record again. A logout between the two evicts the key: the second */
+/* look can verify nothing, and that is not damage it may report. The    */
+/* control run, no logout, reports the damage.                           */
+
+typedef struct {
+    stm_sync *s;
+    uint64_t  ds;
+    bool      evict;
+    int       fired;
+    stm_status st;
+} scrub_evict_ctx;
+
+static void scrub_evict_hook(void *arg)
+{
+    scrub_evict_ctx *c = arg;
+    if (c->fired++) return;
+    c->st = c->evict ? stm_sync_evict_dek(c->s, c->ds) : STM_OK;
+}
+
+static void scrub_evict_case(const char *tag, bool evict)
+{
+    make_tmp(tag);
+    build_pool_with_corvus_slot();
+    uint8_t canned_dek[32];
+    for (int i = 0; i < 32; i++) canned_dek[i] = (uint8_t)(0x70 + i);
+    fake_corvus fc;
+    fake_corvus_start(&fc, tag, STM_CORVUS_STATUS_OK, canned_dek);
+
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_pool *pool2 = make_test_pool(d);
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
+    stm_corvus_mount_cfg cc = {
+        .socket_path   = fc.sock_path,
+        .session_token = TEST_TOKEN,
+        .n_retries     = 0,
+    };
+    static const char ev_path[] = "users/scrubev";
+    uint64_t ds_ev = rc3_evict_fixture(s2, &cc, tag, ev_path,
+                                         sizeof ev_path - 1);
+    uint8_t buf[4096];
+    for (size_t j = 0; j < sizeof buf; j++) buf[j] = (uint8_t)(0x3C ^ j);
+    STM_ASSERT_OK(stm_sync_write_extent(s2, ds_ev, 1u, 0u, buf, sizeof buf));
+    STM_ASSERT_OK(stm_sync_commit(s2));
+
+    stm_extent_record e;
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(s2), ds_ev, 1u,
+                                         0u, &e));
+    STM_ASSERT_EQ((int)e.n_replicas, 1);
+    int fd = open(g_tmp_path, O_WRONLY);
+    STM_ASSERT(fd >= 0);
+    uint8_t junk[4096];
+    memset(junk, 0xEE, sizeof junk);
+    STM_ASSERT_EQ((size_t)pwrite(fd, junk, sizeof junk,
+                                 (off_t)(stm_paddr_offset(e.paddrs[0]) *
+                                         (uint64_t)STM_UB_SIZE)),
+                  sizeof junk);
+    STM_ASSERT_EQ(close(fd), 0);
+
+    scrub_evict_ctx c = { s2, ds_ev, evict, 0, STM_EINVAL };
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(s2, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(s2, sc));
+    stm_sync_set_scrub_verify_hook_for_test(s2, scrub_evict_hook, &c);
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    stm_scrub_status st;
+    for (int i = 0; i < 4096; i++) {
+        STM_ASSERT_OK(stm_scrub_step(sc));
+        STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+    }
+    stm_sync_set_scrub_verify_hook_for_test(s2, NULL, NULL);
+    STM_ASSERT_EQ((int)st.state, (int)STM_SCRUB_STATE_COMPLETED);
+
+    /* The premise: the first look met the extent, with its key. */
+    STM_ASSERT_EQ(c.fired, 1);
+    STM_ASSERT_OK(c.st);
+    STM_ASSERT_EQ(st.blocks_repaired, 0u);
+    STM_ASSERT_EQ(st.blocks_unrepairable, evict ? 0u : 1u);
+
+    stm_scrub_close(sc);
+    stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool2);
+    stm_bdev_close(d);
+    fake_corvus_stop(&fc);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(corvus_scrub_damage_reported_while_unlocked) {
+    scrub_evict_case("scrubctl", false);
+}
+
+STM_TEST(corvus_scrub_second_look_after_logout_reports_nothing) {
+    scrub_evict_case("scrubev", true);
 }
