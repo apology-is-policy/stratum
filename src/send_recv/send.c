@@ -286,6 +286,10 @@ stm_status stm_send_init(stm_sync *sync,
     if (!sync || !out_handle) return STM_EINVAL;
     if (dataset_id == 0) return STM_EINVAL;
     *out_handle = NULL;
+    /* As ZFS refuses a non-raw send of a dataset whose key is not loaded.
+     * An extent's key would refuse below, but a locked dataset may hold no
+     * HOT extent, and its COLD chunks open under the pool's key. */
+    if (stm_sync_dataset_locked(sync, dataset_id)) return STM_ELOCKED;
 
     /* Resolve gen range from snapshot ids. */
     uint64_t gen_min_excl = 0;

@@ -490,8 +490,9 @@ typedef struct ctl_session {
  *
  * An `orphan` is a lease whose conn died while the evict failed: the key is
  * still in RAM and no conn owns it. It stays in the table so the key stays
- * accounted for; every lease operation retries its evict, and a live lease
- * for the same dataset (its user back) takes it over. */
+ * accounted for; every lease operation retries its evict, and an install
+ * for the same dataset (its user back) takes it over. So a dataset has at
+ * most one orphan, and only while no live lease holds it. */
 typedef struct {
     bool                   active;
     bool                   orphan;
@@ -693,6 +694,12 @@ static stm_status ctl_dek_install(stm_ctl_conn *cn, uint64_t dataset_id,
         c->dek_leases[free_slot].active     = true;
         c->dek_leases[free_slot].dataset_id = dataset_id;
         c->dek_leases[free_slot].owner      = cn;
+        /* The new lease accounts for the key: the dataset's orphan waits
+         * on nothing any more. */
+        for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++)
+            if (c->dek_leases[i].active && c->dek_leases[i].orphan &&
+                c->dek_leases[i].dataset_id == dataset_id)
+                c->dek_leases[i] = (ctl_dek_lease){0};
     }
     pthread_mutex_unlock(&c->dek_mu);
     return rc;
@@ -4525,8 +4532,13 @@ void stm_ctl_destroy(stm_ctl *c)
     pthread_mutex_destroy(&c->worker_mu);
     pthread_mutex_destroy(&c->event_mu);
     /* TLY-A5b: worker_count==0 (waited above) means every conn was
-     * destroyed, so every DEK lease was already auto-evicted -- the
-     * table is empty here. Just release the lock. */
+     * destroyed and released its leases. Orphans may remain (a disconnect
+     * whose evict failed): retry them once more. One that still fails is
+     * dropped with its key in RAM until the fs unmounts, whose close wipes
+     * every DEK. */
+    pthread_mutex_lock(&c->dek_mu);
+    ctl_dek_reap_orphans(c);
+    pthread_mutex_unlock(&c->dek_mu);
     pthread_mutex_destroy(&c->dek_mu);
     free(c);
 }

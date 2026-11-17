@@ -250,3 +250,15 @@ set_tests_properties(test_ctl        PROPERTIES TIMEOUT 180)
 # and 147 s on Linux and been cut off at 180 s there, and on macOS it
 # has never finished in 180 s.
 set_tests_properties(test_fs_frag   PROPERTIES TIMEOUT 600)
+
+# The ctl DEK lease table's mutation-checked model: it compiles the lease
+# functions out of src/ctl/synfs.c against a shim and runs them clean and
+# under each mutant, each of which must fail.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME test_dek_leases
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/../tools/test-dek-leases.py)
+else()
+    message(WARNING "python3 not found: test_dek_leases is not registered")
+endif()

@@ -1280,8 +1280,9 @@ static stm_status h_attach(stm_9p_server *s,
          * LOCKED dataset (a user-sealed home whose user is logged out) is
          * refused here, STM_ELOCKED: the third access gate. Its records open
          * with the pool's key, so a stat alone would answer; the fs refuses
-         * every op on it as well, so a fid attached before the logout gets
-         * ELOCKED too. The lookup + the check + the stat are separate steps
+         * every op on it as well, and an xattr fid's read asks again, so a
+         * fid attached before the logout gets ELOCKED too (EACCES on the
+         * wire). The lookup + the check + the stat are separate steps
          * (not one critical section); a concurrent destroy of child_ds in the
          * window only makes the stat fail -> clean attach abort. Dataset ids are
          * monotonic + never reused, so the resolved child_ds can never alias a
@@ -2388,6 +2389,11 @@ static stm_status h_read(stm_9p_server *s,
         if (f->is_xattr_create)
             return reply_rlerror(resp, resp_cap, resp_len, tag,
                                   STM_9P_ECODE_EINVAL);
+        /* The value was read at Txattrwalk; its dataset may have locked
+         * since (its user logged out). */
+        if (stm_fs_dataset_locked(s->fs, f->dataset_id))
+            return reply_rlerror(resp, resp_cap, resp_len, tag,
+                                  STM_9P_ECODE_EACCES);
         uint32_t max_payload = iounit_for_msize(s->msize);
         if (count > max_payload) count = max_payload;
         if (resp_cap < STM_9P_HDR_SIZE + 4u + count) {

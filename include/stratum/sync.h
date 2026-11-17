@@ -1020,9 +1020,9 @@ stm_status stm_sync_get_dek(const stm_sync *s,
                               uint8_t out_dek[32]);
 
 /*
- * Number of DEKs currently held in the in-RAM map (across all
- * datasets + key_ids). Tests use this to confirm rotations add and
- * sweeps remove the expected counts.
+ * Number of slots in the in-RAM DEK map (across all datasets +
+ * key_ids), a LOCKED dataset's keyless slot included. Tests use this
+ * to confirm rotations add and sweeps remove the expected counts.
  */
 size_t stm_sync_dek_count(const stm_sync *s);
 
@@ -1335,8 +1335,10 @@ stm_status stm_sync_scrub_step_with_cas_gc(stm_sync *s, stm_scrub *sc,
  * stm_sync_add_dataset_key on a non-root dataset) get STM_ENOENT
  * from write_extent. A CURRENT key the keyschema has and the RAM map
  * lacks (a locked dataset, until its DEK is installed) answers
- * STM_ELOCKED, from write_extent and the read paths alike; a read of a
- * record whose RETIRED key the mount could not unwrap, STM_ECORRUPT.
+ * STM_ELOCKED, from write_extent and the read paths alike: the live and
+ * the snapshot read refuse a locked dataset whole, a COLD extent and a
+ * hole included. A read of a record whose RETIRED key the mount could
+ * not unwrap answers STM_ECORRUPT.
  *
  * An index change that fails part way (a record the extent overlaps
  * not deleted, or a replaced block's drop failing) wedges the handle

@@ -10418,8 +10418,9 @@ stm_status stm_fs_evict_dek(stm_fs *fs, uint64_t dataset_id)
      * EX excludes writers through drain + removal, and the buffered insert
      * refuses a locked dataset, so no range of it can follow. Only its own
      * ranges: another dataset's unflushable range must not keep this key in
-     * RAM. A drain failure keeps the key and returns the error, for the
-     * caller to retry; no new lock order or commit protocol. */
+     * RAM (short of the ENOSPC reclaim, which drains every dataset once). A
+     * drain failure keeps the key and returns the error, for the caller to
+     * retry; no new lock order or commit protocol. */
     stm_status s = fs_flush_dataset_locked(fs, dataset_id);
     if (s == STM_OK) s = stm_sync_evict_dek(fs->sync, dataset_id);
     pthread_rwlock_unlock(&fs->global);

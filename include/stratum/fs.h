@@ -2022,8 +2022,11 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
  * the token and live-key equality; CORVUS-only; RAM-only (no commit).
  * stm_fs_evict_dek drains the dataset's own buffered writes under EX
  * before taking the DEK out of RAM, returning the dataset to LOCKED. A
- * drain failure keeps the key and propagates the error; another dataset's
- * buffered writes play no part. This operation is not a commit barrier.
+ * drain failure keeps the key and propagates the error. Another dataset's
+ * buffered writes play no part, except that a drain refused for space
+ * (STM_ENOSPC) reclaims by draining every dataset once before its retry,
+ * and a failure there wedges the fs. This operation is not a commit
+ * barrier.
  * The /ctl/ install-dek / evict-dek verbs (src/ctl/synfs.c) are the
  * production drivers.
  *
@@ -2033,7 +2036,10 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
  * reflink and copy_file_range with it on either side. What still works
  * is what needs nothing inside it: the dataset ops (lookup by name,
  * snapshot, rollback, properties), unlock and lock release, and
- * stm_fs_unlink_anon. stm_fs_dataset_locked asks whether a dataset is
+ * stm_fs_unlink_anon. stm_fs_migrate_to_cold refuses every user-sealed
+ * dataset (STM_ENOTSUPPORTED); stm_fs_promote_to_hot of a locked one
+ * fails STM_ELOCKED at its write, after decrypting the chunk into a
+ * buffer it wipes. stm_fs_dataset_locked asks whether a dataset is
  * LOCKED; lock-free, it takes a short EBR pin, so the caller holds none.
  */
 STM_MUST_USE

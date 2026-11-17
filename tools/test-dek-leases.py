@@ -11,7 +11,7 @@ def function(signature):
   elif s[end]=='}': n-=1
   end+=1
  return s[start:end]
-body='\n'.join(function(x) for x in ('static stm_status ctl_dek_install(', 'static bool ctl_dek_other_lease(', 'static stm_status ctl_dek_evict('))
+body='\n'.join(function(x) for x in ('static bool ctl_dek_other_lease(', 'static void ctl_dek_reap_orphans(', 'static stm_status ctl_dek_install(', 'static stm_status ctl_dek_evict('))
 a=s.index('    pthread_mutex_lock(&ctl->dek_mu);',s.index('void stm_ctl_conn_destroy('));b=s.index('    pthread_mutex_unlock(&ctl->dek_mu);',a)+len('    pthread_mutex_unlock(&ctl->dek_mu);')
 body+='\nstatic void drop(stm_ctl_conn *cn) { stm_ctl *ctl=cn->ctl;\n'+s[a:b]+'\n}\n'
 shim=r'''
@@ -24,7 +24,7 @@ typedef int stm_status;
 enum { STM_OK, STM_EINVAL, STM_EACCES, STM_ENOSPC };
 #define STM_CTL_DEK_LEASE_MAX 64
 typedef struct stm_ctl_conn stm_ctl_conn;
-typedef struct {bool active; uint64_t dataset_id; const stm_ctl_conn *owner;} ctl_dek_lease;
+typedef struct {bool active; bool orphan; stm_status orphan_rc; uint64_t dataset_id; const stm_ctl_conn *owner;} ctl_dek_lease;
 typedef struct {bool corvus_socket_set; const char *corvus_socket_path;
  uint32_t corvus_connect_timeout_ms,corvus_io_timeout_ms,corvus_n_retries;
  pthread_mutex_t dek_mu; void *fs; ctl_dek_lease dek_leases[64];} stm_ctl;
@@ -70,14 +70,37 @@ int main(void) {
  drop(&owners[63]);assert(evictions==4);
  assert(ctl_dek_install(&a,2,&tok)==STM_OK);
  drop(&a);assert(evictions==5);
+ /* A disconnect whose evict fails leaves an orphan, retried at once and by
+  * every later lease operation; an evict-dek answers the orphan's error. */
+ stm_ctl_conn u={&c};
+ assert(ctl_dek_install(&u,3,&tok)==STM_OK);
+ eviction_result=STM_EINVAL; int e0=evictions;
+ drop(&u); assert(evictions==e0+2);
+ assert(ctl_dek_evict(&foreign,3)==STM_EINVAL && evictions==e0+3);
+ /* Each login takes the orphan over: far more failed logouts than the
+  * table holds leave it one orphan. */
+ for(int i=0;i<70;i++){stm_ctl_conn w={&c};
+  assert(ctl_dek_install(&w,3,&tok)==STM_OK); drop(&w);}
+ /* The drain heals: the next lease operation clears the orphan, and the
+  * whole table is free again. */
+ eviction_result=STM_OK;
+ assert(ctl_dek_evict(&foreign,3)==STM_OK);
+ for(int i=0;i<64;i++)assert(ctl_dek_install(&owners[i],4,&tok)==STM_OK);
+ int e1=evictions;
+ for(int i=0;i<64;i++)drop(&owners[i]);
+ assert(evictions==e1+1);
  pthread_mutex_destroy(&c.dek_mu);
 }
 '''
 mutants={
  'foreign-idempotence':('c->dek_leases[i].dataset_id == dataset_id &&\n            c->dek_leases[i].owner == cn','c->dek_leases[i].dataset_id == dataset_id'),
- 'evict-survivor':('ctl_dek_other_lease(c, i) ? STM_OK :','false ? STM_OK :'),
+ 'evict-survivor':('ctl_dek_other_lease(c, i) ? STM_OK :\n            stm_fs_evict_dek(c->fs, dataset_id);','false ? STM_OK :\n            stm_fs_evict_dek(c->fs, dataset_id);'),
  'drop-survivor':('ctl->fs && !ctl_dek_other_lease(ctl, i)','ctl->fs'),
  'skip-new-proof':('stm_status rc = stm_fs_install_dek(c->fs, dataset_id, &cfg);','stm_status rc = (void)cfg, STM_OK;'),
+ 'drop-failed-lease':('        if (rc == STM_OK) {\n            *l = (ctl_dek_lease){0};','        if (1) {\n            *l = (ctl_dek_lease){0};'),
+ 'no-orphan-retry':('    if (!c->fs) return;\n    for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {\n        ctl_dek_lease *l','    if (1) return;\n    for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {\n        ctl_dek_lease *l'),
+ 'no-install-takeover':('            if (c->dek_leases[i].active && c->dek_leases[i].orphan &&\n                c->dek_leases[i].dataset_id == dataset_id)','            if (0)'),
+ 'evict-hides-orphan':('            orphan_rc = c->dek_leases[i].orphan_rc;','            (void)orphan_rc;'),
 }
 # The proof-skipping mutant keeps the call syntactically available but unreachable.
 mutants['skip-new-proof']=(mutants['skip-new-proof'][0], 'stm_status rc = false ? stm_fs_install_dek(c->fs, dataset_id, &cfg) : STM_OK;')

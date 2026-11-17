@@ -843,7 +843,7 @@ STM_TEST(corvus_keyslot_refuses_control_byte_path) {
 /* RC-3 evict-dek race windows (docs/rc-design.md "RC-3"). The three-    */
 /* phase write and the RC-2 unlocked read fetch both open a window       */
 /* between "DEK resolved/copied" and "plaintext cached" that             */
-/* stm_sync_evict_dek (slot remove -> dcache drain, one s->lock hold)    */
+/* stm_sync_evict_dek (slot replace -> dcache drain, one s->lock hold)   */
 /* can land inside. The populate gates must keep the cleartext out of    */
 /* the cache — the CF-5a F1 contract — while the WRITE still indexes     */
 /* its record (durable, decryptable-on-reinstall) and the in-flight      */
@@ -1005,6 +1005,11 @@ STM_TEST(corvus_rc3_read_evict_window) {
     stm_status rrs = stm_sync_read_extent(s2, ds_ev, 1u, 0u,
                                              r2, sizeof r2, &rg2);
     STM_ASSERT(rrs != STM_OK);
+    /* A read of a locked dataset now refuses before the cache, so look in
+     * the cache itself: the populate did not survive the logout. */
+    size_t cached = 1;
+    stm_sync_dcache_stats(s2, NULL, NULL, &cached);
+    STM_ASSERT_EQ(cached, 0u);
 
     stm_sync_close(s2);
     stm_alloc_close(a2);
@@ -1123,6 +1128,11 @@ STM_TEST(corvus_rc6_read_evict_third_party) {
     size_t  rg2 = 0;
     STM_ASSERT(stm_sync_read_extent(s2, ds_ev, 1u, 0u,
                                        r2, sizeof r2, &rg2) != STM_OK);
+    /* A read of a locked dataset now refuses before the cache, so look in
+     * the cache itself: the populate did not survive the logout. */
+    size_t cached = 1;
+    stm_sync_dcache_stats(s2, NULL, NULL, &cached);
+    STM_ASSERT_EQ(cached, 0u);
 
     stm_sync_close(s2);
     stm_alloc_close(a2);
@@ -2057,6 +2067,66 @@ STM_TEST(corvus_sealed_home_never_moves_to_the_cold_tier) {
 /* A pool-keyed dataset under a home would hold that user's tree outside the
  * seal. Refused, made directly or as a clone, logged in or out; nothing is
  * minted. Under the sibling, both are made. */
+/* A pool written before the cold tier refused sealed data may hold a home's
+ * file there, under the pool's key; the seam builds one. Locked, no path
+ * serves it: the live read, the snapshot read, a send. The sibling's cold
+ * file, one variable away, answers each; logged in, the home's reads. */
+STM_TEST(corvus_legacy_cold_file_of_a_locked_home_is_served_by_no_path) {
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "sealleg")) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    seal_tree *ts[2] = {&sp.home, &sp.sib};
+    stm_sync_set_cas_admits_sealed_for_test(sync, true);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(sp.fs, sp.home.ds, sp.home.big));
+    stm_sync_set_cas_admits_sealed_for_test(sync, false);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(sp.fs, sp.sib.ds, sp.sib.big));
+    for (int i = 0; i < 2; i++)
+        STM_ASSERT_EQ(seal_extent_kind(sp.fs, ts[i]->ds, ts[i]->big),
+                      STM_EXTENT_KIND_COLD);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    STM_ASSERT_OK(stm_fs_evict_dek(sp.fs, sp.home.ds));    /* logout */
+
+    uint8_t want[4096], got[4096];
+    memset(want, 0x5a, sizeof want);
+    for (int i = 0; i < 2; i++) {
+        bool locked = (i == 0);
+        seal_tree *t = ts[i];
+        stm_dataset_entry de;
+        STM_ASSERT_OK(stm_dataset_lookup(stm_sync_dataset_index(sync), t->ds,
+                                         &de));
+        size_t n = 0;
+        memset(got, 0, sizeof got);
+        stm_status r1 = stm_sync_read_extent(sync, t->ds, t->big, 0, got,
+                                             sizeof got, &n);
+        stm_status r2 = stm_sync_read_extent_at_snap(
+            sync, t->ds, de.di_tree_root, de.di_root_gen, de.di_root_csum,
+            t->big, 0, got, sizeof got, &n);
+        stm_send_handle *sh = NULL;
+        stm_status r3 = stm_send_init(sync, t->ds, 0, 0, &sh);
+        if (sh) stm_send_close(sh);
+        if (locked) {
+            STM_ASSERT_ERR(r1, STM_ELOCKED);
+            STM_ASSERT_ERR(r2, STM_ELOCKED);
+            STM_ASSERT_ERR(r3, STM_ELOCKED);
+            STM_ASSERT(sh == NULL);
+            STM_ASSERT(memcmp(got, want, sizeof got) != 0);
+        } else {
+            STM_ASSERT_OK(r1);
+            STM_ASSERT_OK(r2);
+            STM_ASSERT_OK(r3);
+            STM_ASSERT(memcmp(got, want, sizeof got) == 0);
+        }
+    }
+
+    STM_ASSERT_OK(stm_fs_install_dek(sp.fs, sp.home.ds, &sp.cc));
+    size_t n = 0;
+    memset(got, 0, sizeof got);
+    STM_ASSERT_OK(stm_sync_read_extent(sync, sp.home.ds, sp.home.big, 0, got,
+                                       sizeof got, &n));
+    STM_ASSERT(memcmp(got, want, sizeof got) == 0);
+    seal_pool_close(&sp);
+}
+
 STM_TEST(corvus_pool_keyed_child_of_a_sealed_home_is_refused) {
     seal_pool sp;
     if (!seal_pool_open(&sp, "sealkid")) return;
@@ -2206,4 +2276,132 @@ STM_TEST(corvus_9p_attach_of_a_locked_home_is_refused) {
     STM_ASSERT_EQ(seal_p9_getattr(back, &ec), STM_9P_RGETATTR);
     stm_9p_server_destroy(back);
     seal_pool_close(&sp);
+}
+
+/* Tread `fid` from offset 0. The reply type; in *val the count (RREAD) or
+ * the ecode (RLERROR). */
+static uint8_t seal_p9_tread(stm_9p_server *sv, uint32_t fid, uint16_t tag,
+                             uint8_t *resp, uint32_t cap, uint32_t *val)
+{
+    uint8_t req[64];
+    uint32_t rlen = 0;
+    uint8_t *p = req + 7;
+    seal_p9_pack_u32(p, fid); p += 4;
+    memset(p, 0, 8); p += 8;
+    seal_p9_pack_u32(p, 64u); p += 4;
+    uint32_t sz = seal_p9_finish(req, p, STM_9P_TREAD, tag);
+    STM_ASSERT_OK(stm_9p_server_handle(sv, req, sz, resp, cap, &rlen));
+    *val = seal_p9_load_u32(resp + 7);
+    return resp[4];
+}
+
+/* An xattr fid holds the value read at its Txattrwalk. Its read asks the
+ * gate again: after the logout EACCES, not the value it holds; the same fid,
+ * before the logout and after the login, answers. */
+STM_TEST(corvus_9p_xattr_fid_read_after_logout_is_refused) {
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "sealxat")) return;
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(sp.fs, 1, 0755, 0, 0, &r));
+    uint32_t ec = 0;
+    stm_9p_server *sv = seal_p9_server(sp.fs);
+    STM_ASSERT_EQ(seal_p9_attach(sv, "ds:home", &ec), STM_9P_RATTACH);
+    uint8_t req[256], resp[512];
+    uint32_t rlen = 0;
+    uint8_t *p = req + 7;
+    seal_p9_pack_u32(p, 100u); p += 4;
+    seal_p9_pack_u32(p, 101u); p += 4;
+    seal_p9_pack_u16(p, 1); p += 2;
+    seal_p9_pack_u16(p, 5); p += 2;
+    memcpy(p, "small", 5); p += 5;
+    uint32_t sz = seal_p9_finish(req, p, STM_9P_TWALK, 3);
+    STM_ASSERT_OK(stm_9p_server_handle(sv, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    p = req + 7;
+    seal_p9_pack_u32(p, 101u); p += 4;
+    seal_p9_pack_u32(p, 102u); p += 4;
+    seal_p9_pack_u16(p, 6); p += 2;
+    memcpy(p, "user.k", 6); p += 6;
+    sz = seal_p9_finish(req, p, STM_9P_TXATTRWALK, 4);
+    STM_ASSERT_OK(stm_9p_server_handle(sv, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RXATTRWALK);
+
+    uint32_t v = 0;
+    STM_ASSERT_EQ(seal_p9_tread(sv, 102u, 5, resp, sizeof resp, &v),
+                  STM_9P_RREAD);
+    STM_ASSERT_EQ(v, 2u);
+    STM_ASSERT(memcmp(resp + 11, "xv", 2) == 0);
+    STM_ASSERT_OK(stm_fs_evict_dek(sp.fs, sp.home.ds));     /* logout */
+    STM_ASSERT_EQ(seal_p9_tread(sv, 102u, 6, resp, sizeof resp, &v),
+                  STM_9P_RLERROR);
+    STM_ASSERT_EQ(v, STM_9P_ECODE_EACCES);
+    STM_ASSERT_OK(stm_fs_install_dek(sp.fs, sp.home.ds, &sp.cc));
+    STM_ASSERT_EQ(seal_p9_tread(sv, 102u, 7, resp, sizeof resp, &v),
+                  STM_9P_RREAD);
+    STM_ASSERT_EQ(v, 2u);
+    stm_9p_server_destroy(sv);
+    seal_pool_close(&sp);
+}
+
+/* A snapshot read racing a logout: its lock check passes, and the logout
+ * lands before its fetch resolves the key. The lock-free key lookup passes
+ * over the locked slot, so the read answers STM_ELOCKED, not a tag
+ * mismatch from decrypting with the slot's empty key. */
+STM_TEST(corvus_snapshot_read_racing_logout_answers_locked) {
+    make_tmp("rc3snap");
+    build_pool_with_corvus_slot();
+    uint8_t canned_dek[32];
+    for (int i = 0; i < 32; i++) canned_dek[i] = (uint8_t)(0x70 + i);
+    fake_corvus fc;
+    fake_corvus_start(&fc, "rc3snap", STM_CORVUS_STATUS_OK, canned_dek);
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_pool *pool2 = make_test_pool(d);
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
+    stm_corvus_mount_cfg cc = {
+        .socket_path   = fc.sock_path,
+        .session_token = TEST_TOKEN,
+        .n_retries     = 0,
+    };
+    static const char ev_path[] = "users/rc3snap";
+    uint64_t ds_ev = rc3_evict_fixture(s2, &cc, "rc3snap", ev_path,
+                                       sizeof ev_path - 1);
+    uint8_t buf[4096];
+    for (size_t j = 0; j < sizeof buf; j++) buf[j] = (uint8_t)(0x3c ^ j);
+    STM_ASSERT_OK(stm_sync_write_extent(s2, ds_ev, 1u, 0u, buf, sizeof buf));
+    STM_ASSERT_OK(stm_sync_commit(s2));
+    stm_dataset_entry de;
+    STM_ASSERT_OK(stm_dataset_lookup(stm_sync_dataset_index(s2), ds_ev, &de));
+    stm_sync_dcache_drain_for_test(s2);
+
+    /* The control, one variable away: no logout, the read answers. */
+    uint8_t rout[4096] = {0};
+    size_t rgot = 0;
+    STM_ASSERT_OK(stm_sync_read_extent_at_snap(s2, ds_ev, de.di_tree_root,
+                                               de.di_root_gen, de.di_root_csum,
+                                               1u, 0u, rout, sizeof rout,
+                                               &rgot));
+    STM_ASSERT_MEM_EQ(rout, buf, sizeof buf);
+    stm_sync_dcache_drain_for_test(s2);
+
+    rc3_evict_hook_ctx hc = { .s = s2, .ds = ds_ev };
+    stm_sync_set_read_prefetch_hook_for_test(s2, rc3_evict_hook, &hc);
+    memset(rout, 0, sizeof rout);
+    stm_status r = stm_sync_read_extent_at_snap(s2, ds_ev, de.di_tree_root,
+                                                de.di_root_gen,
+                                                de.di_root_csum, 1u, 0u,
+                                                rout, sizeof rout, &rgot);
+    stm_sync_set_read_prefetch_hook_for_test(s2, NULL, NULL);
+    STM_ASSERT_EQ(hc.fired, 1);
+    STM_ASSERT_ERR(r, STM_ELOCKED);
+    STM_ASSERT(memcmp(rout, buf, sizeof buf) != 0);
+
+    stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool2);
+    stm_bdev_close(d);
+    fake_corvus_stop(&fc);
+    unlink(g_tmp_path);
 }

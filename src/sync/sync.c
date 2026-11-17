@@ -583,6 +583,7 @@ struct stm_sync {
     void             *write_phase2_test_ctx;
     void            (*read_prefetch_test_hook)(void *ctx);
     void             *read_prefetch_test_ctx;
+    bool              cas_admits_sealed_for_test;
     void            (*read_prepopulate_test_hook)(void *ctx);
     void             *read_prepopulate_test_ctx;
     void            (*read_postinsert_test_hook)(void *ctx);
@@ -835,10 +836,11 @@ static bool sync_dek_lookup_copy_pinned(stm_sync *s,
 }
 
 /* Existence probe for the populate-vs-evict gate (RC-3): is
- * (dataset_id, key_id) present in the published DEK map? A slot's
+ * (dataset_id, key_id) present in the published DEK map? A keyed slot's
  * presence is exactly backing-path readability for a HOT extent
- * stamped with that key (stm_sync_evict_dek removes the slot; the
- * fetch path's DEK resolve then refuses), so gating a dcache populate
+ * stamped with that key (stm_sync_evict_dek replaces it with a keyless
+ * locked slot, which this probe passes over; the fetch path's DEK
+ * resolve then refuses), so gating a dcache populate
  * on it keeps the cache consistent with the DEK denial. Lock-free
  * callers pass their EBR handle (a SHORT own pin covers the walk —
  * enter-at-outermost holds: the populate sites run pinless); locked
@@ -5313,6 +5315,9 @@ static stm_status sync_refuse_cas_for_sealed_locked(const stm_sync *s,
     bool sealed = false;
     stm_status rc = sync_dataset_user_sealed_locked(s, dataset_id, &sealed);
     if (rc != STM_OK) return rc;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (s->cas_admits_sealed_for_test) return STM_OK;
+#endif
     return sealed ? STM_ENOTSUPPORTED : STM_OK;
 }
 
@@ -6103,6 +6108,14 @@ void stm_sync_set_read_prefetch_hook_for_test(stm_sync *s,
     pthread_mutex_lock(&s->lock);
     s->read_prefetch_test_hook = hook;
     s->read_prefetch_test_ctx  = ctx;
+    pthread_mutex_unlock(&s->lock);
+}
+
+void stm_sync_set_cas_admits_sealed_for_test(stm_sync *s, bool on)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    s->cas_admits_sealed_for_test = on;
     pthread_mutex_unlock(&s->lock);
 }
 
@@ -6982,7 +6995,7 @@ static stm_status sync_write_index_commit_locked(stm_sync *s,
      * different bytes. */
     {
         /* Populate-vs-evict gate (RC-3): on the concurrent path,
-         * stm_sync_evict_dek (slot remove -> dcache_drain, one s->lock
+         * stm_sync_evict_dek (slot replace -> dcache_drain, one s->lock
          * hold) can run during the unlocked Phase 2; this epilogue
          * holds s->lock, so a simple pre-gate is fully serialized with
          * the evict — slot alive means any evict is either entirely
@@ -6994,7 +7007,7 @@ static stm_status sync_write_index_commit_locked(stm_sync *s,
          * logout). The locked compound path always sees the slot
          * alive (its caller's s->lock spans resolve to here).
          * Visible at birth (RC-6): the held s->lock excludes the
-         * WHOLE evict (slot remove -> drain, one s->lock hold), so
+         * WHOLE evict (slot replace -> drain, one s->lock hold), so
          * this pre-gate is atomic with the insert -- the provisional
          * dance is the unlocked fetch path's tool. */
         if (sync_dek_find(s, dataset_id, res->enc_key_id) != NULL) {
@@ -8203,6 +8216,11 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     if (len == 0) { *out_read = 0; return STM_OK; }
     if ((off % STM_UB_SIZE) != 0) return STM_EINVAL;
+    /* A HOT extent of a locked dataset refuses at its key, but a COLD one
+     * decrypts under the pool's key (a pool written before the cold tier
+     * refused sealed data may hold some), and the cache would serve it:
+     * refuse the dataset whole, before either. Callers hold no pin. */
+    if (stm_sync_dataset_locked(s, dataset_id)) return STM_ELOCKED;
 
     *out_read = 0;
 
@@ -8377,6 +8395,8 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     if (len == 0) { *out_read = 0; return STM_OK; }
     if ((off % STM_UB_SIZE) != 0) return STM_EINVAL;
+    /* As the live read: a locked dataset's frozen view is refused whole. */
+    if (stm_sync_dataset_locked(s, dataset_id)) return STM_ELOCKED;
 
     *out_read = 0;
 

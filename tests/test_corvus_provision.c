@@ -879,4 +879,55 @@ STM_TEST(ctl_disconnect_whose_evict_fails_keeps_the_lease_for_retry) {
     (void)unlink(g_tmp_path);
 }
 
+/* A user whose logout keeps failing leaves one orphan for the dataset, not
+ * one per login: each login's lease takes the orphan over. More cycles than
+ * the lease table holds all install. Once the drain heals, destroying the
+ * ctl retries the orphan, and the key leaves RAM. */
+STM_TEST(ctl_failed_logouts_leave_one_orphan_per_dataset) {
+    make_tmp("orphone");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    char token_path[256];
+    write_token_file(token_path, sizeof token_path, "orphone");
+    fake_corvus fc;
+    fake_corvus_start(&fc, "orphone", STM_CORVUS_STATUS_OK);
+    stm_fs *fs = provision_and_remount_locked(&fc, "orphone", token_path);
+    if (!fs) { fake_corvus_stop(&fc); return; }
+    stm_ctl *ctl = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &ctl));
+    STM_ASSERT_OK(stm_ctl_set_system_uid(ctl, SYS_UID));
+    STM_ASSERT_OK(stm_ctl_set_corvus_socket(ctl, fc.sock_path, 0, 0, 0));
+    uint64_t root = stm_ctl_root(ctl);
+    const stm_lp9_vops *v = stm_ctl_vops();
+    int cycles_ok = 0;
+    for (int k = 0; k < 70; k++) {           /* the table holds 64 */
+        stm_ctl_conn *c = NULL;
+        STM_ASSERT_OK(stm_ctl_conn_create(ctl, SYS_UID, SYS_GID, &c));
+        stm_status rc = ctl_drive_install(v, c, root, 2u, TEST_TOKEN,
+                                          STM_CORVUS_TOKEN_LEN, 1u);
+        if (rc != STM_OK) { stm_ctl_conn_destroy(c); break; }
+        if (k == 0) {
+            uint64_t ino = 0;
+            STM_ASSERT_OK(stm_fs_create_file(fs, 2u, 1, (const uint8_t *)"g", 1,
+                                             0600, 1000, 1000, &ino));
+            uint8_t b[4096];
+            memset(b, 0xB0, sizeof b);
+            STM_ASSERT_OK(stm_fs_write(fs, 2u, ino, 0, b, sizeof b));
+            stm_fs_fail_drains_for_test(fs, STM_EIO);
+        }
+        stm_ctl_conn_destroy(c);     /* logout by disconnect; evict fails */
+        STM_ASSERT(!stm_fs_dataset_locked(fs, 2u));
+        cycles_ok++;
+    }
+    STM_ASSERT_EQ(cycles_ok, 70);
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    STM_ASSERT(!stm_fs_dataset_locked(fs, 2u));
+    stm_ctl_destroy(ctl);
+    STM_ASSERT(stm_fs_dataset_locked(fs, 2u));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fake_corvus_stop(&fc);
+    (void)unlink(token_path);
+    (void)unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("corvus_provision")

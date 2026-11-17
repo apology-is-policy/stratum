@@ -135,6 +135,13 @@ void stm_sync_set_read_prefetch_hook_for_test(stm_sync *s,
                                                  void *ctx);
 
 /*
+ * on=true lets the cold tier take a user-sealed dataset's data, which a
+ * pool written before it refused may hold, so a test can build one.
+ * on=false restores the refusal.
+ */
+void stm_sync_set_cas_admits_sealed_for_test(stm_sync *s, bool on);
+
+/*
  * Scrub's stale-record seam: invoked by the production verify
  * callback (stm_sync_scrub_install_production_cb) after it has taken
  * its extent record by value and resolved the record's key, and
