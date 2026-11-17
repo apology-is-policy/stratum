@@ -159,6 +159,14 @@ void stm_sync_set_evict_published_hook_for_test(stm_sync *s,
                                                 void *ctx);
 
 /*
+ * on=true sends stm_sync_read_extent and stm_sync_read_extent_at_snap
+ * down their serial locked paths (otherwise taken only when the thread
+ * has no EBR handle or the lock-free lookup keeps meeting a seal), so a
+ * test can reach them. on=false restores the lock-free path.
+ */
+void stm_sync_force_locked_read_for_test(stm_sync *s, bool on);
+
+/*
  * Scrub's stale-record seam: invoked by the production verify
  * callback (stm_sync_scrub_install_production_cb) after it has taken
  * its extent record by value and resolved the record's key, and

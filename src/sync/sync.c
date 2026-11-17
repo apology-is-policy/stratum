@@ -600,6 +600,7 @@ struct stm_sync {
     bool              cold_chunks_uncapped_for_test;
     void            (*evict_published_test_hook)(void *ctx);
     void             *evict_published_test_ctx;
+    _Atomic bool      force_locked_read_for_test;
     void            (*read_prepopulate_test_hook)(void *ctx);
     void             *read_prepopulate_test_ctx;
     void            (*read_postinsert_test_hook)(void *ctx);
@@ -6225,6 +6226,12 @@ void stm_sync_set_evict_published_hook_for_test(stm_sync *s,
     pthread_mutex_unlock(&s->lock);
 }
 
+void stm_sync_force_locked_read_for_test(stm_sync *s, bool on)
+{
+    if (!s) return;
+    atomic_store(&s->force_locked_read_for_test, on);
+}
+
 void stm_sync_set_cas_admits_sealed_for_test(stm_sync *s, bool on)
 {
     if (!s) return;
@@ -7840,19 +7847,30 @@ static void dcache_account(stm_sync *s, bool hit) {
 #endif
 }
 
+/* The bytes of [off, off + len) a hole holds: up to `next`, the start of
+ * the extent after it (UINT64_MAX when none), so a read that starts in a
+ * hole never answers zeros over that extent's bytes. */
+static size_t sync_hole_span(uint64_t off, size_t len, uint64_t next)
+{
+    if (next <= off) return len;
+    uint64_t gap = next - off;
+    return gap < (uint64_t)len ? (size_t)gap : len;
+}
+
 static stm_status stm_sync_read_extent_locked(stm_sync *s,
                                                  uint64_t dataset_id, uint64_t ino,
                                                  uint64_t off, void *buf,
                                                  size_t len, size_t *out_read,
                                                  bool count_for_promotion) {
     stm_extent_record rec;
-    stm_status ls = stm_extent_lookup_at(s->extent_idx, dataset_id, ino, off, &rec);
+    uint64_t hole_end = UINT64_MAX;
+    stm_status ls = stm_extent_lookup_or_next(s->extent_idx, dataset_id, ino,
+                                              off, &rec, &hole_end);
     if (ls == STM_ENOENT) {
-        /* Hole — return zeros. Caller asked for `len` bytes; we fill
-         * the buffer with zeros and report the count. Spans the entire
-         * `len` since the MVP only handles single-extent reads. */
-        memset(buf, 0, len);
-        *out_read = len;
+        /* A hole: zeros up to the next extent. */
+        size_t zn = sync_hole_span(off, len, hole_end);
+        memset(buf, 0, zn);
+        *out_read = zn;
         return STM_OK;
     }
     if (ls != STM_OK) return ls;
@@ -8384,6 +8402,9 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
      * below — also the honest wait-measurement point (the concurrent
      * path reports zero lock wait by construction). */
     stm_ebr_thread *ebr = stm_ebr_thread_current();
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (atomic_load(&s->force_locked_read_for_test)) ebr = NULL;
+#endif
     if (ebr && s->extent_idx) {
         if (atomic_load_explicit(&s->wedged, memory_order_relaxed))
             return STM_EWEDGED;
@@ -8394,10 +8415,11 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             uint64_t slice_off = 0;
             size_t   slice_len = 0;
             bool     hit = false;
+            uint64_t hole_end = UINT64_MAX;
 
             stm_ebr_enter(ebr);
-            stm_status ls = stm_extent_lookup_at_concurrent(
-                    s->extent_idx, ebr, dataset_id, ino, off, &rec);
+            stm_status ls = stm_extent_lookup_or_next_concurrent(
+                    s->extent_idx, ebr, dataset_id, ino, off, &rec, &hole_end);
             if (ls == STM_OK) {
                 ls = sync_slice_bounds(&rec, off, len,
                                          &slice_off, &slice_len);
@@ -8413,9 +8435,11 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                 continue;                      /* fresh pin per attempt */
             }
             if (ls == STM_ENOENT) {
-                /* Hole — return zeros (the locked path's contract). */
-                memset(buf, 0, len);
-                *out_read = len;
+                /* A hole: zeros up to the next extent (the locked path's
+                 * contract). */
+                size_t hn = sync_hole_span(off, len, hole_end);
+                memset(buf, 0, hn);
+                *out_read = hn;
                 return STM_OK;
             }
             if (ls != STM_OK) return ls;
@@ -8494,15 +8518,16 @@ static stm_status stm_sync_read_extent_at_snap_locked(stm_sync *s,
                                                         void *buf, size_t len,
                                                         size_t *out_read) {
     stm_extent_record rec;
-    stm_status ls = stm_extent_index_lookup_at_root(s->extent_idx, dataset_id,
-                                                       root_paddr, root_gen,
-                                                       root_csum,
-                                                       ino, off, &rec);
+    uint64_t hole_end = UINT64_MAX;
+    stm_status ls = stm_extent_index_lookup_or_next_at_root(
+            s->extent_idx, dataset_id, root_paddr, root_gen, root_csum,
+            ino, off, &rec, &hole_end);
     if (ls == STM_ENOENT) {
-        /* Hole in the frozen tree — zero-fill the slice. Mirrors the
-         * live read path's hole-as-zeros contract. */
-        memset(buf, 0, len);
-        *out_read = len;
+        /* A hole in the frozen tree: zeros up to its next extent, as the
+         * live read. */
+        size_t sz = sync_hole_span(off, len, hole_end);
+        memset(buf, 0, sz);
+        *out_read = sz;
         return STM_OK;
     }
     if (ls != STM_OK) return ls;
@@ -8537,21 +8562,23 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
      * fetch is the shared unlocked body. No promote bump (frozen view;
      * the pre-RC contract). The !ebr fallback keeps the locked body. */
     stm_ebr_thread *ebr = stm_ebr_thread_current();
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (atomic_load(&s->force_locked_read_for_test)) ebr = NULL;
+#endif
     if (ebr && s->extent_idx) {
         if (atomic_load_explicit(&s->wedged, memory_order_relaxed))
             return STM_EWEDGED;
 
         stm_extent_record rec;
-        stm_status ls = stm_extent_index_lookup_at_root(s->extent_idx,
-                                                          dataset_id,
-                                                          root_paddr, root_gen,
-                                                          root_csum,
-                                                          ino, off, &rec);
+        uint64_t hole_end = UINT64_MAX;
+        stm_status ls = stm_extent_index_lookup_or_next_at_root(
+                s->extent_idx, dataset_id, root_paddr, root_gen, root_csum,
+                ino, off, &rec, &hole_end);
         if (ls == STM_ENOENT) {
-            /* Hole in the frozen tree — zero-fill the slice. Mirrors
-             * the live read path's hole-as-zeros contract. */
-            memset(buf, 0, len);
-            *out_read = len;
+            /* A hole in the frozen tree: zeros up to its next extent. */
+            size_t fz = sync_hole_span(off, len, hole_end);
+            memset(buf, 0, fz);
+            *out_read = fz;
             return STM_OK;
         }
         if (ls != STM_OK) return ls;

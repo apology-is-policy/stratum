@@ -54,10 +54,17 @@ Dispatch on `si_data_kind`:
 - **EXTENT**: clamp by `si_size` (the combined-buffer write path zero-pads to the
   next 4 KiB, so the extent layer holds bytes past logical EOF — the clamp keeps
   `read(2)`'s "up to EOF" contract). Then probe `stm_dirty_buffer_has_ino`:
-  - **no buffered data → the non-buffered path.** One `fs_read_extent_aligned_locked`
-    (single covering extent), clamp `*out_read` to `si_size - off`, return. It
-    returns the SHORT first-extent slice; the caller loops to read the next
-    extent. **Correct** because the caller honours the short count.
+  - **no buffered data -> the non-buffered path.** `fs_read_extents_locked` over
+    `[off, min(off + len, si_size))`: a piece per extent or hole until the range
+    is filled, each one `stm_sync_read_extent` (through
+    `fs_read_extent_aligned_locked`, so a piece starting mid-block reads its
+    aligned span; the first piece is cut below that helper's recordsize cap). It
+    returns the whole range; it is short only when an error stops it after the
+    first piece (read(2)'s prefix; the next call reports the error).
+    *Before T0.96 this was ONE `fs_read_extent_aligned_locked`: short at an
+    extent's end, and a read that started in a hole answered zeros over the
+    extent after it, with a full count (the sync read zero-filled all of len at
+    a hole). A caller's loop cannot repair a full count.*
   - **buffered data present → the buffered path.** Fill the whole effective range
     across every committed extent (`fs_read_span_filled_locked`), then overlay
     the dirty buffer's newer bytes (`stm_dirty_buffer_overlay`;
@@ -68,10 +75,12 @@ Dispatch on `si_data_kind`:
 
 `fs_read_extent_aligned_locked` is **single-extent**: it satisfies a non-aligned
 read offset by reading the block-aligned covering span via one
-`stm_sync_read_extent` and copying the slice. `stm_sync_read_extent` stops at the
-first covering extent's end (and at a hole it zero-fills the *entire* requested
-len). So it returns a short count at an extent boundary — fine for the
-non-buffered path (the caller loops), **wrong for the buffered path**, which
+`stm_sync_read_extent` and copying the slice. `stm_sync_read_extent` answers one
+extent's bytes (to its end) or one hole's zeros (to the next extent's start,
+`stm_extent_lookup_or_next`; all of len past the last extent; since T0.96, before
+which a hole zero-filled the *entire* requested len). So it returns a short count
+at an extent boundary -- `fs_read_extents_locked` loops over it -- and was
+**wrong for the buffered path**, which
 returns the full `effective_len` (to surface a buffer-only tail via overlay) and
 so defeats the caller's loop. Before Area B, a buffered read spanning ≥ 2
 committed extents whose gap was not in the dirty buffer left the **2nd+ extent
@@ -100,13 +109,19 @@ is dropped — the `memcpy` fully fills `buf`). A `4 * recordsize` scratch cap
 | `fs_io_write_read_roundtrip` | basic write→read |
 | `fs_io_*` (write tests) | also exercise reads back across the boundaries they write |
 | `fs_io_buffered_read_spans_two_extents` | F2 — a read over two committed extents with a disjoint buffered range returns both (not zeros for the 2nd). Non-vacuous (single-extent → the 2nd half reads zeros) |
+| `fs_read_from_a_hole_stops_its_zeros_at_the_next_extent` | T0.96: reads from a leading hole, across an interior hole, from mid-block and over extents whose key order is not their offset order answer the data after the hole and the whole range; live and on a snapshot, each down the lock-free and the locked sync path |
+| `sync_read_extent_answers_one_hole_or_one_extent` | T0.96: the primitive at a hole answers zeros to the next extent's start (the least, not the first scanned), at an extent its bytes to its end, past the last extent all of len |
+| `fs_read_answers_its_prefix_when_a_later_extent_fails` | T0.96: a later extent damaged on disk: the read answers the first extent and the hole, short; a read of the damaged extent fails |
+| `fs_read_of_a_record_size_from_mid_block` | T0.96: the first piece of a mid-block read is cut below the aligned helper's cap, so a recordsize read at 2048 answers whole |
 
 ## Error paths
 
 - `STM_ECORRUPT` — INLINE `si_data_len` exceeds the inline cap.
-- `STM_ERANGE` — the (non-aligned) read scratch span exceeds the recordsize cap
-  (single-extent path) / `4 * recordsize` (multi-extent path) — defensive,
-  unreachable via 9P (iounit-clamped).
+- `STM_ERANGE` -- the buffered path's scratch span exceeds `4 * recordsize` --
+  defensive, unreachable via 9P (iounit-clamped). The non-buffered path cuts its
+  pieces below the aligned helper's recordsize cap, so it does not answer it.
+- Any sync-layer error after the first piece: the read answers the bytes before
+  it instead (STM_OK, short).
 - `STM_ENOMEM` — scratch alloc.
 - `STM_EWEDGED` — from the sync layer.
 
@@ -127,9 +142,16 @@ No P0/P1/P2 open on the read path after F2.
 
 ## Known caveats / footguns
 
-- The non-buffered path returns a **short** count at an extent boundary by design;
-  callers MUST loop. The buffered path returns the full `effective_len` (the fill
-  is multi-extent). The asymmetry is intentional and now coherent.
+- Both paths return the whole range (to EOF); the non-buffered one is short only
+  after an error part way (T0.96; it was short at every extent boundary before,
+  and wrong after a hole).
+- A snapshot file's read (the `.snaps` view) takes the same piece loop over the
+  frozen tree (`fs_read_extents_locked` with the snapshot entry); before T0.96 it
+  made one `stm_sync_read_extent_at_snap` call, with the same hole defect, and
+  answered `STM_EINVAL` at an offset not a multiple of 4 KiB.
+- A hole the write side's RMW or the buffered fill crosses is still stepped a
+  block at a time (`fs_rmw_read_span_locked`, one extent lookup per block): the
+  same content, a cost in lookups on a large hole.
 - Read-after-write within an un-flushed window is served by the overlay, not the
   extents; a crash before `stm_sync_commit` loses both the buffer and the
   in-memory `si_size` bump (neither happened on disk).

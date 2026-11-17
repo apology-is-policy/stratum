@@ -2277,6 +2277,20 @@ static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
     return ws;
 }
 
+/* One read piece from the live tree or, given snap, from that snapshot's
+ * frozen tree. */
+static stm_status fs_sync_read_piece(stm_fs *fs, const stm_snapshot_entry *snap,
+                                     uint64_t ds, uint64_t ino, uint64_t off,
+                                     void *buf, size_t len, size_t *out_read)
+{
+    if (snap)
+        return stm_sync_read_extent_at_snap(fs->sync, ds,
+                                            snap->tree_root_paddr,
+                                            snap->root_gen, snap->root_csum,
+                                            ino, off, buf, len, out_read);
+    return stm_sync_read_extent(fs->sync, ds, ino, off, buf, len, out_read);
+}
+
 /* Read-side counterpart to fs_write_extent_aligned_locked: the extent layer
  * requires the read offset to be 4 KiB-aligned (stm_sync_read_extent rejects
  * (off % STM_UB_SIZE != 0) with STM_EINVAL). A client reading at a non-aligned
@@ -2287,6 +2301,7 @@ static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
  * the number of real bytes copied in *out_read (the caller clamps to EOF).
  * Caller holds fs->lock. */
 static stm_status fs_read_extent_aligned_locked(stm_fs *fs,
+                                                     const stm_snapshot_entry *snap,
                                                      uint64_t ds, uint64_t ino,
                                                      uint64_t off,
                                                      void *buf, size_t len,
@@ -2296,7 +2311,7 @@ static stm_status fs_read_extent_aligned_locked(stm_fs *fs,
     if (len == 0u) return STM_OK;
     const uint64_t BLK = 4096u;
     if (off % BLK == 0u) {
-        return stm_sync_read_extent(fs->sync, ds, ino, off, buf, len, out_read);
+        return fs_sync_read_piece(fs, snap, ds, ino, off, buf, len, out_read);
     }
     uint64_t aligned_off = off & ~(BLK - 1u);
     uint64_t end_off     = off + (uint64_t)len;
@@ -2312,8 +2327,8 @@ static stm_status fs_read_extent_aligned_locked(stm_fs *fs,
     uint8_t *scratch = (uint8_t *)calloc(1, (size_t)aligned_len);
     if (!scratch) return STM_ENOMEM;
     size_t got = 0;
-    stm_status rs = stm_sync_read_extent(fs->sync, ds, ino, aligned_off,
-                                               scratch, (size_t)aligned_len, &got);
+    stm_status rs = fs_sync_read_piece(fs, snap, ds, ino, aligned_off,
+                                       scratch, (size_t)aligned_len, &got);
     if (rs != STM_OK && rs != STM_ENOENT) { free(scratch); return rs; }
     uint64_t skip   = off - aligned_off;
     size_t   avail  = (got > skip) ? (size_t)(got - skip) : 0u;
@@ -2321,6 +2336,42 @@ static stm_status fs_read_extent_aligned_locked(stm_fs *fs,
     if (copy_n > 0u) memcpy(buf, scratch + skip, copy_n);
     free(scratch);
     if (out_read) *out_read = copy_n;
+    return STM_OK;
+}
+
+/* Read [off, off + want) of a file's committed extents into buf, a piece
+ * per extent or hole (stm_sync_read_extent answers one at a time), until
+ * want is filled. A piece starting mid-block goes through the aligned
+ * helper, so the first is bounded below its recordsize cap. An error after
+ * the first piece answers the bytes read so far, as read(2) does. snap NULL
+ * reads the live tree, else that snapshot's. Caller holds fs->lock. */
+static stm_status fs_read_extents_locked(stm_fs *fs,
+                                         const stm_snapshot_entry *snap,
+                                         uint64_t ds, uint64_t ino,
+                                         uint64_t off, uint8_t *buf,
+                                         size_t want, size_t *out_read)
+{
+    const uint64_t BLK = 4096u;
+    size_t done = 0;
+    while (done < want) {
+        uint64_t at = off + (uint64_t)done;
+        size_t n = want - done;
+        size_t cap = (size_t)(STM_FS_RECORDSIZE_MAX - (at % BLK));
+        if (n > cap) n = cap;
+        size_t got = 0;
+        stm_status rs = fs_read_extent_aligned_locked(fs, snap, ds, ino, at,
+                                                      buf + done, n, &got);
+        if (rs != STM_OK) {
+            if (done == 0u) {
+                if (out_read) *out_read = 0;
+                return rs;
+            }
+            break;
+        }
+        if (got == 0u) break;
+        done += (got < n) ? got : n;
+    }
+    if (out_read) *out_read = done;
     return STM_OK;
 }
 
@@ -2972,15 +3023,10 @@ static stm_status fs_read_regular_locked(stm_fs *fs,
         size_t resident =
             stm_dirty_buffer_inode_bytes(fs->dirty_buffer, ds, ino);
         if (resident == 0) {
-            stm_status rs = fs_read_extent_aligned_locked(fs, ds, ino, off,
-                                                              buf, len, out_read);
-            if (rs == STM_OK && out_read) {
-                uint64_t logical_avail = cur_size - off;
-                if ((uint64_t)*out_read > logical_avail) {
-                    *out_read = (size_t)logical_avail;
-                }
-            }
-            return rs;
+            uint64_t avail = cur_size - off;
+            size_t want = ((uint64_t)len < avail) ? len : (size_t)avail;
+            return fs_read_extents_locked(fs, NULL, ds, ino, off,
+                                          (uint8_t *)buf, want, out_read);
         }
         /* Buffered path: zero-fill the effective range so holes +
          * buffer-only ranges read as zeros (POSIX hole semantics),
@@ -3339,23 +3385,13 @@ static stm_status fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             return STM_OK;
         }
         if (iv.si_data_kind == STM_DATA_EXTENT) {
-            /* Single-extent snap read: like the live NON-buffered path, this
-             * returns a SHORT got at an extent boundary and RELIES on the
-             * caller's re-read loop (h_read re-Treads at off+got). A future
-             * non-looping snap consumer would lose a 2nd+ extent (the F2 trap
-             * class); add a multi-extent fill here if one ever appears. */
-            size_t got = 0;
-            stm_status rs = stm_sync_read_extent_at_snap(
-                    fs->sync, dataset_id,
-                    e.tree_root_paddr, e.root_gen, e.root_csum,
-                    frozen_ino, off, buf, len, &got);
-            if (rs == STM_OK) {
-                uint64_t logical_avail = cur_size - off;
-                if ((uint64_t)got > logical_avail) {
-                    got = (size_t)logical_avail;
-                }
-                if (out_read) *out_read = got;
-            }
+            /* The live read's piece loop, over the frozen tree. */
+            uint64_t avail = cur_size - off;
+            size_t want = ((uint64_t)len < avail) ? len : (size_t)avail;
+            stm_status rs = fs_read_extents_locked(fs, &e, dataset_id,
+                                                   frozen_ino, off,
+                                                   (uint8_t *)buf, want,
+                                                   out_read);
             pthread_rwlock_unlock(&fs->global);
             return rs;
         }

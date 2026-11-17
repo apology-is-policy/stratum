@@ -39,6 +39,7 @@
 #include <stratum/stratumd.h>     /* TLY-A1 R137 P2-1: parse_pool_serial_hex */
 #include <stratum/sync.h>
 #include <stratum/sync_testing.h>
+#include <stratum/super.h>
 #include <stratum/types.h>
 #include <stratum/xattr.h>
 
@@ -11408,3 +11409,229 @@ STM_TEST(fs_cf4c_loop_freedom_genuinely_full) {
 }
 
 STM_TEST_MAIN("fs")
+
+/* ========================================================================= */
+/* A read that starts in a hole answers zeros only up to the next extent.   */
+/* ========================================================================= */
+
+/* Three sparse files in dataset 1: f holds 'B' at 8192 only; g 'A' at 0 and
+ * 'C' at 8192; h 'D' at 8192 and 'E' at 65536 (the extent key stores off
+ * little-endian, so the scan meets 65536 first: the hole ends at the least
+ * start past it, not the first one seen). */
+static void rh_make(stm_fs *fs, uint64_t *f, uint64_t *g, uint64_t *h)
+{
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"f", 1, 0644u, 0, 0, f));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"g", 1, 0644u, 0, 0, g));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"h", 1, 0644u, 0, 0, h));
+    uint8_t b[4096];
+    memset(b, 'B', sizeof b); STM_ASSERT_OK(stm_fs_write(fs, 1, *f, 8192, b, sizeof b));
+    memset(b, 'A', sizeof b); STM_ASSERT_OK(stm_fs_write(fs, 1, *g, 0, b, sizeof b));
+    memset(b, 'C', sizeof b); STM_ASSERT_OK(stm_fs_write(fs, 1, *g, 8192, b, sizeof b));
+    memset(b, 'D', sizeof b); STM_ASSERT_OK(stm_fs_write(fs, 1, *h, 8192, b, sizeof b));
+    memset(b, 'E', sizeof b); STM_ASSERT_OK(stm_fs_write(fs, 1, *h, 65536, b, sizeof b));
+    STM_ASSERT_OK(stm_fs_commit(fs));   /* the dirty buffer drained: the unbuffered read */
+}
+
+static bool rh_is(const uint8_t *b, size_t from, size_t to, uint8_t v)
+{
+    for (size_t i = from; i < to; i++)
+        if (b[i] != v) return false;
+    return true;
+}
+
+static uint8_t rh_buf[69632];
+
+/* Read [off, off + len) of ino and expect `got`; the buffer starts 0x11. */
+static void rh_read(stm_fs *fs, uint64_t ino, uint64_t off, size_t len, size_t want)
+{
+    memset(rh_buf, 0x11, sizeof rh_buf);
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, ino, off, rh_buf, len, &got));
+    STM_ASSERT_EQ(got, want);
+}
+
+static void rh_check(stm_fs *fs, uint64_t f, uint64_t g, uint64_t h)
+{
+    rh_read(fs, f, 8192, 4096, 4096);             /* control: the data is there */
+    STM_ASSERT(rh_is(rh_buf, 0, 4096, 'B'));
+    rh_read(fs, f, 0, 12288, 12288);              /* a leading hole */
+    STM_ASSERT(rh_is(rh_buf, 0, 8192, 0));
+    STM_ASSERT(rh_is(rh_buf, 8192, 12288, 'B'));
+    rh_read(fs, g, 0, 12288, 12288);              /* no short read at an extent's end */
+    STM_ASSERT(rh_is(rh_buf, 0, 4096, 'A'));
+    STM_ASSERT(rh_is(rh_buf, 4096, 8192, 0));
+    STM_ASSERT(rh_is(rh_buf, 8192, 12288, 'C'));
+    rh_read(fs, g, 4096, 8192, 8192);             /* an interior hole */
+    STM_ASSERT(rh_is(rh_buf, 0, 4096, 0));
+    STM_ASSERT(rh_is(rh_buf, 4096, 8192, 'C'));
+    rh_read(fs, g, 2048, 10240, 10240);           /* mid-block start */
+    STM_ASSERT(rh_is(rh_buf, 0, 2048, 'A'));
+    STM_ASSERT(rh_is(rh_buf, 2048, 6144, 0));
+    STM_ASSERT(rh_is(rh_buf, 6144, 10240, 'C'));
+    rh_read(fs, h, 0, 69632, 69632);              /* the least start, not the first seen */
+    STM_ASSERT(rh_is(rh_buf, 0, 8192, 0));
+    STM_ASSERT(rh_is(rh_buf, 8192, 12288, 'D'));
+    STM_ASSERT(rh_is(rh_buf, 12288, 65536, 0));
+    STM_ASSERT(rh_is(rh_buf, 65536, 69632, 'E'));
+    rh_read(fs, h, 65536, 8192, 4096);            /* EOF ends it */
+    STM_ASSERT(rh_is(rh_buf, 0, 4096, 'E'));
+}
+
+static uint64_t rh_snap_ino(stm_fs *fs, uint64_t snap_root, const char *nm)
+{
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, snap_root, (const uint8_t *)nm, 1, &ino));
+    return ino;
+}
+
+STM_TEST(fs_read_from_a_hole_stops_its_zeros_at_the_next_extent) {
+    /* The live read and the snapshot read, each down the lock-free path
+     * and the serial locked one. */
+    make_tmp("rh_reads");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t f = 0, g = 0, h = 0;
+    rh_make(fs, &f, &g, &h);
+    stm_sync *s = stm_fs_sync_for_test(fs);
+
+    rh_check(fs, f, g, h);
+    stm_sync_force_locked_read_for_test(s, true);
+    rh_check(fs, f, g, h);
+    stm_sync_force_locked_read_for_test(s, false);
+
+    uint64_t snap_id = 0, snap_root = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "rh", 2, &snap_id));
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                (const uint8_t *)"rh", 2, &snap_root));
+    uint64_t sf = rh_snap_ino(fs, snap_root, "f");
+    uint64_t sg = rh_snap_ino(fs, snap_root, "g");
+    uint64_t sh = rh_snap_ino(fs, snap_root, "h");
+    rh_check(fs, sf, sg, sh);
+    stm_sync_force_locked_read_for_test(s, true);
+    rh_check(fs, sf, sg, sh);
+    stm_sync_force_locked_read_for_test(s, false);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(sync_read_extent_answers_one_hole_or_one_extent) {
+    /* The primitive itself: at a hole, zeros to the next extent's start;
+     * at an extent, its bytes to its end; on both paths. */
+    make_tmp("rh_sync");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t f = 0, g = 0, h = 0;
+    rh_make(fs, &f, &g, &h);
+    stm_sync *s = stm_fs_sync_for_test(fs);
+    for (int locked = 0; locked < 2; locked++) {
+        stm_sync_force_locked_read_for_test(s, locked != 0);
+        size_t got = 0;
+        memset(rh_buf, 0x11, sizeof rh_buf);
+        STM_ASSERT_OK(stm_sync_read_extent(s, 1, f, 0, rh_buf, 12288, &got));
+        STM_ASSERT_EQ(got, 8192u);
+        STM_ASSERT(rh_is(rh_buf, 0, 8192, 0));
+        STM_ASSERT(rh_is(rh_buf, 8192, 12288, 0x11));
+        STM_ASSERT_OK(stm_sync_read_extent(s, 1, g, 0, rh_buf, 12288, &got));
+        STM_ASSERT_EQ(got, 4096u);
+        STM_ASSERT_OK(stm_sync_read_extent(s, 1, h, 0, rh_buf, 69632, &got));
+        STM_ASSERT_EQ(got, 8192u);
+        STM_ASSERT_OK(stm_sync_read_extent(s, 1, h, 12288, rh_buf, 69632, &got));
+        STM_ASSERT_EQ(got, 65536u - 12288u);
+        STM_ASSERT_OK(stm_sync_read_extent(s, 1, h, 69632, rh_buf, 8192, &got));
+        STM_ASSERT_EQ(got, 8192u);                /* past the last extent: all of len */
+    }
+    stm_sync_force_locked_read_for_test(s, false);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_read_answers_its_prefix_when_a_later_extent_fails) {
+    /* g's second extent damaged on disk: a read over both answers the first
+     * extent and the hole, short; a read of the damaged one fails. */
+    make_tmp("rh_prefix");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t f = 0, g = 0, h = 0;
+    rh_make(fs, &f, &g, &h);
+    stm_extent_record rec;
+    memset(&rec, 0, sizeof rec);
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(stm_fs_sync_for_test(fs)),
+                                       1, g, 8192, &rec));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT(rec.n_replicas >= 1u);
+    uint8_t junk[4096];
+    memset(junk, 0x5a, sizeof junk);
+    int fd = open(g_tmp_path, O_WRONLY);
+    STM_ASSERT(fd >= 0);
+    if (fd >= 0) {
+        for (uint8_t i = 0; i < rec.n_replicas; i++) {
+            ssize_t w = pwrite(fd, junk, sizeof junk,
+                               (off_t)(stm_paddr_offset(rec.paddrs[i]) * 4096u));
+            STM_ASSERT(w == (ssize_t)sizeof junk);
+        }
+        close(fd);
+    }
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    size_t got = 0;
+    memset(rh_buf, 0x11, sizeof rh_buf);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, g, 0, rh_buf, 12288, &got));
+    STM_ASSERT_EQ(got, 8192u);
+    STM_ASSERT(rh_is(rh_buf, 0, 4096, 'A'));
+    STM_ASSERT(rh_is(rh_buf, 4096, 8192, 0));
+    got = 0;
+    STM_ASSERT(stm_fs_read(fs, 1, g, 8192, rh_buf, 4096, &got) != STM_OK);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_read_of_a_record_size_from_mid_block) {
+    /* The first piece of a read that starts mid-block is cut below the
+     * aligned helper's recordsize cap, so a recordsize read at 2048 answers
+     * whole: 'A' to the block's end, then the hole's zeros. */
+    make_tmp("rh_big");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0, f = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"big", 3, 0644u, 0, 0, &f));
+    uint8_t b[4096];
+    memset(b, 'A', sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, b, sizeof b));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 9u * 1024u * 1024u - 4096u, b, sizeof b));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    size_t n = STM_FS_RECORDSIZE_MAX;
+    uint8_t *big = malloc(n);
+    STM_ASSERT(big != NULL);
+    if (big) {
+        memset(big, 0x11, n);
+        size_t got = 0;
+        STM_ASSERT_OK(stm_fs_read(fs, 1, f, 2048, big, n, &got));
+        STM_ASSERT_EQ(got, n);
+        STM_ASSERT(rh_is(big, 0, 2048, 'A'));
+        STM_ASSERT(rh_is(big, 2048, n, 0));
+        free(big);
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}

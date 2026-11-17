@@ -2458,10 +2458,11 @@ stm_status stm_extent_record_promote_read_hit(stm_extent_index *idx,
 /* Read paths.                                                         */
 /* ------------------------------------------------------------------ */
 
-stm_status stm_extent_lookup_at(const stm_extent_index *idx,
-                                   uint64_t dataset_id, uint64_t ino,
-                                   uint64_t off,
-                                   stm_extent_record *out_extent) {
+static stm_status ex_lookup_at_impl(const stm_extent_index *idx,
+                                    uint64_t dataset_id, uint64_t ino,
+                                    uint64_t off,
+                                    stm_extent_record *out_extent,
+                                    uint64_t *out_next) {
     if (!idx || !out_extent) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
 
@@ -2480,9 +2481,13 @@ stm_status stm_extent_lookup_at(const stm_extent_index *idx,
         return cs;
     }
     bool got = false;
+    uint64_t next = UINT64_MAX;
     for (size_t i = 0; i < c.n; i++) {
         const stm_extent_record *e = &c.records[i];
-        if (off < e->off) continue;
+        if (off < e->off) {
+            if (e->off < next) next = e->off;
+            continue;
+        }
         if (off >= e->off + e->len) continue;
         *out_extent = *e;
         got = true;
@@ -2490,7 +2495,25 @@ stm_status stm_extent_lookup_at(const stm_extent_index *idx,
     }
     ex_collect_free(&c);
     must_unlock(lock);
+    if (!got && out_next) *out_next = next;
     return got ? STM_OK : STM_ENOENT;
+}
+
+stm_status stm_extent_lookup_at(const stm_extent_index *idx,
+                                   uint64_t dataset_id, uint64_t ino,
+                                   uint64_t off,
+                                   stm_extent_record *out_extent) {
+    return ex_lookup_at_impl(idx, dataset_id, ino, off, out_extent, NULL);
+}
+
+stm_status stm_extent_lookup_or_next(const stm_extent_index *idx,
+                                     uint64_t dataset_id, uint64_t ino,
+                                     uint64_t off,
+                                     stm_extent_record *out_extent,
+                                     uint64_t *out_next) {
+    if (!out_next) return STM_EINVAL;
+    *out_next = UINT64_MAX;
+    return ex_lookup_at_impl(idx, dataset_id, ino, off, out_extent, out_next);
 }
 
 /* 9.8-LF-3b: concurrent (EBR-pinned) offset-covering extent lookup.
@@ -2522,6 +2545,7 @@ typedef struct {
     stm_extent_record  hit;
     bool               found;
     stm_status         err;
+    uint64_t           next;    /* least start past target_off */
 } ex_concurrent_lookup_ctx;
 
 static int ex_concurrent_lookup_cb(const void *k, size_t klen,
@@ -2530,9 +2554,12 @@ static int ex_concurrent_lookup_cb(const void *k, size_t klen,
     uint64_t ino = 0, off = 0;
     stm_status ks = ex_decode_key(k, klen, &ino, &off);
     if (ks != STM_OK) { c->err = ks; return 1; }
-    if (off > c->target_off) return 0;             /* cannot cover; keep
+    if (off > c->target_off) {                     /* cannot cover; keep
                                                     * scanning (lex order
                                                     * != integer order) */
+        if (off < c->next) c->next = off;
+        return 0;
+    }
     stm_extent_record r;
     memset(&r, 0, sizeof r);
     stm_status vs = ex_decode_value(v, vlen, c->ds, ino, off, &r);
@@ -2545,11 +2572,12 @@ static int ex_concurrent_lookup_cb(const void *k, size_t klen,
     return 0;
 }
 
-stm_status stm_extent_lookup_at_concurrent(const stm_extent_index *idx,
-                                              stm_ebr_thread *ebr,
-                                              uint64_t dataset_id, uint64_t ino,
-                                              uint64_t off,
-                                              stm_extent_record *out_extent) {
+static stm_status ex_lookup_at_concurrent_impl(const stm_extent_index *idx,
+                                               stm_ebr_thread *ebr,
+                                               uint64_t dataset_id,
+                                               uint64_t ino, uint64_t off,
+                                               stm_extent_record *out_extent,
+                                               uint64_t *out_next) {
     if (!idx || !ebr || !out_extent) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
 
@@ -2572,16 +2600,40 @@ stm_status stm_extent_lookup_at_concurrent(const stm_extent_index *idx,
 
     ex_concurrent_lookup_ctx c = {
         .ds = dataset_id, .target_off = off,
-        .hit = {0}, .found = false, .err = STM_OK,
+        .hit = {0}, .found = false, .err = STM_OK, .next = UINT64_MAX,
     };
     stm_status ss = stm_btree_engine_scan_range_concurrent(
         eng, ebr, lo, EX_KEY_LEN, hi, EX_KEY_LEN,
         ex_concurrent_lookup_cb, &c);
     if (ss != STM_OK) return ss;
     if (c.err != STM_OK) return c.err;
-    if (!c.found) return STM_ENOENT;
+    if (!c.found) {
+        if (out_next) *out_next = c.next;   /* a miss scanned every record */
+        return STM_ENOENT;
+    }
     *out_extent = c.hit;
     return STM_OK;
+}
+
+stm_status stm_extent_lookup_at_concurrent(const stm_extent_index *idx,
+                                              stm_ebr_thread *ebr,
+                                              uint64_t dataset_id, uint64_t ino,
+                                              uint64_t off,
+                                              stm_extent_record *out_extent) {
+    return ex_lookup_at_concurrent_impl(idx, ebr, dataset_id, ino, off,
+                                        out_extent, NULL);
+}
+
+stm_status stm_extent_lookup_or_next_concurrent(const stm_extent_index *idx,
+                                                stm_ebr_thread *ebr,
+                                                uint64_t dataset_id,
+                                                uint64_t ino, uint64_t off,
+                                                stm_extent_record *out_extent,
+                                                uint64_t *out_next) {
+    if (!out_next) return STM_EINVAL;
+    *out_next = UINT64_MAX;
+    return ex_lookup_at_concurrent_impl(idx, ebr, dataset_id, ino, off,
+                                        out_extent, out_next);
 }
 
 typedef struct {
@@ -3554,6 +3606,7 @@ typedef struct {
     bool               found;
     uint64_t           ds;
     stm_status         err;            /* set on decode failure        */
+    uint64_t           next;           /* least start past probe_off   */
 } ex_lookup_at_ctx;
 
 static int ex_lookup_at_adapter(const void *k, size_t klen,
@@ -3575,16 +3628,18 @@ static int ex_lookup_at_adapter(const void *k, size_t klen,
         gc->found = true;
         return 1;       /* stop — no other extent can cover probe_off */
     }
+    if (r.off > gc->probe_off && r.off < gc->next) gc->next = r.off;
     return 0;
 }
 
-stm_status stm_extent_index_lookup_at_root(stm_extent_index *idx,
-                                              uint64_t dataset_id,
-                                              uint64_t root_paddr,
-                                              uint64_t root_gen,
-                                              const uint8_t root_csum[32],
-                                              uint64_t ino, uint64_t off,
-                                              stm_extent_record *out_extent) {
+static stm_status ex_lookup_at_root_impl(stm_extent_index *idx,
+                                         uint64_t dataset_id,
+                                         uint64_t root_paddr,
+                                         uint64_t root_gen,
+                                         const uint8_t root_csum[32],
+                                         uint64_t ino, uint64_t off,
+                                         stm_extent_record *out_extent,
+                                         uint64_t *out_next) {
     /* R167 P2-1: refuse NULL root_csum at the entry — the empty-triple
      * branch inside `stm_dataset_index_scan_engine_range_at` doesn't
      * touch root_csum, so a (paddr=0, gen=0, csum=NULL) call would
@@ -3626,6 +3681,7 @@ stm_status stm_extent_index_lookup_at_root(stm_extent_index *idx,
         .found     = false,
         .ds        = dataset_id,
         .err       = STM_OK,
+        .next      = UINT64_MAX,
     };
     /* Delegate the throwaway-engine open + bounded scan to the dataset
      * index. Lock order: extent idx->lock (held) -> dataset idx->lock
@@ -3641,9 +3697,37 @@ stm_status stm_extent_index_lookup_at_root(stm_extent_index *idx,
     must_unlock(lock);
     if (rc != STM_OK) return rc;
     if (gc.err != STM_OK) return gc.err;
-    if (!gc.found) return STM_ENOENT;
+    if (!gc.found) {
+        if (out_next) *out_next = gc.next;  /* a miss scanned every record */
+        return STM_ENOENT;
+    }
     *out_extent = gc.hit;
     return STM_OK;
+}
+
+stm_status stm_extent_index_lookup_at_root(stm_extent_index *idx,
+                                              uint64_t dataset_id,
+                                              uint64_t root_paddr,
+                                              uint64_t root_gen,
+                                              const uint8_t root_csum[32],
+                                              uint64_t ino, uint64_t off,
+                                              stm_extent_record *out_extent) {
+    return ex_lookup_at_root_impl(idx, dataset_id, root_paddr, root_gen,
+                                  root_csum, ino, off, out_extent, NULL);
+}
+
+stm_status stm_extent_index_lookup_or_next_at_root(stm_extent_index *idx,
+                                                   uint64_t dataset_id,
+                                                   uint64_t root_paddr,
+                                                   uint64_t root_gen,
+                                                   const uint8_t root_csum[32],
+                                                   uint64_t ino, uint64_t off,
+                                                   stm_extent_record *out_extent,
+                                                   uint64_t *out_next) {
+    if (!out_next) return STM_EINVAL;
+    *out_next = UINT64_MAX;
+    return ex_lookup_at_root_impl(idx, dataset_id, root_paddr, root_gen,
+                                  root_csum, ino, off, out_extent, out_next);
 }
 
 /* ------------------------------------------------------------------ */

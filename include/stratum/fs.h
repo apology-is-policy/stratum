@@ -333,7 +333,9 @@ stm_status stm_fs_commit(stm_fs *fs);
  * aligned, len at most the recordsize.
  *
  * `stm_fs_read` (extent-lookup + bdev-read + decrypt; holes return
- * zeros).
+ * zeros) answers min(len, size - off) bytes, across every extent and
+ * hole in the range; it is short only when an error stops it after the
+ * first bytes, and then answers those (a later call reports the error).
  *
  * Returns:
  *   - STM_OK on success.

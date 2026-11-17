@@ -1043,6 +1043,19 @@ stm_status stm_extent_lookup_at(const stm_extent_index *idx,
                                    stm_extent_record *out_extent);
 
 /*
+ * As stm_extent_lookup_at, and on STM_ENOENT (off in a hole) sets
+ * *out_next to the least start of an extent of (ds, ino) past `off`,
+ * UINT64_MAX when none: where the hole ends. A read answers a hole's
+ * zeros only up to there. STM_EINVAL if out_next is NULL.
+ */
+STM_MUST_USE
+stm_status stm_extent_lookup_or_next(const stm_extent_index *idx,
+                                     uint64_t dataset_id, uint64_t ino,
+                                     uint64_t off,
+                                     stm_extent_record *out_extent,
+                                     uint64_t *out_next);
+
+/*
  * Lock-free metadata-read sibling of stm_extent_lookup_at — the
  * offset-covering counterpart of stm_inode_lookup_concurrent. Phase
  * 9.8-LF-3b: composes stm_dataset_index_get_engine +
@@ -1084,6 +1097,19 @@ stm_status stm_extent_lookup_at_concurrent(const stm_extent_index *idx,
                                               uint64_t dataset_id, uint64_t ino,
                                               uint64_t off,
                                               stm_extent_record *out_extent);
+
+/*
+ * The concurrent twin of stm_extent_lookup_or_next: same pin contract
+ * as stm_extent_lookup_at_concurrent; a dataset the index lacks is a
+ * hole with no next (UINT64_MAX).
+ */
+STM_MUST_USE
+stm_status stm_extent_lookup_or_next_concurrent(const stm_extent_index *idx,
+                                                stm_ebr_thread *ebr,
+                                                uint64_t dataset_id,
+                                                uint64_t ino, uint64_t off,
+                                                stm_extent_record *out_extent,
+                                                uint64_t *out_next);
 
 /*
  * Look up the live extent backed by `paddr`. Used by the production
@@ -1430,6 +1456,21 @@ stm_status stm_extent_index_lookup_at_root(stm_extent_index *idx,
                                               const uint8_t root_csum[32],
                                               uint64_t ino, uint64_t off,
                                               stm_extent_record *out_extent);
+
+/*
+ * As stm_extent_index_lookup_at_root, and on STM_ENOENT sets *out_next
+ * to the least start of an extent of (ds, ino) past `off` in that
+ * frozen tree, UINT64_MAX when none. STM_EINVAL if out_next is NULL.
+ */
+STM_MUST_USE
+stm_status stm_extent_index_lookup_or_next_at_root(stm_extent_index *idx,
+                                                   uint64_t dataset_id,
+                                                   uint64_t root_paddr,
+                                                   uint64_t root_gen,
+                                                   const uint8_t root_csum[32],
+                                                   uint64_t ino, uint64_t off,
+                                                   stm_extent_record *out_extent,
+                                                   uint64_t *out_next);
 
 /*
  * R167 P1-1: count HOT EXTENT records whose `key_id` matches `want_key_id`

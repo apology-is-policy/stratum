@@ -1348,8 +1348,11 @@ stm_status stm_sync_scrub_step_with_cas_gc(stm_sync *s, stm_scrub *sc,
  * OverwriteBlock + allocator.tla::Free composition).
  *
  * `stm_sync_read_extent` looks up the extent covering `off`, reads
- * ciphertext+tag, AEAD-decrypts, and copies `len` bytes to the
- * caller. Holes (no extent) return zeros.
+ * ciphertext+tag, AEAD-decrypts, and copies the bytes from `off` to the
+ * extent's end, at most `len`. At a hole it answers zeros from `off` to
+ * the next extent's start, at most `len` (all of `len` past the last
+ * extent). So one call answers one extent's bytes or one hole's, and a
+ * caller that wants `len` reads on from `off + *out_read`.
  *
  * MVP constraints (P7-4; cap lifted at P7-CAS-16):
  *   - len > 0, multiple of 4 KiB, ≤ STM_FS_RECORDSIZE_MAX (8 MiB
@@ -1415,12 +1418,10 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  * `dataset_id` (the AEAD-AD's tree-id binding) is structurally
  * refused at the engine open layer with STM_EBADTAG.
  *
- * Holes (no extent at this `(ino, off)` in the frozen tree) return
- * STM_OK with `*out_read = len` and the buffer zero-filled — same
- * shape as the live `stm_sync_read_extent_locked`'s STM_ENOENT
- * branch. Reads past a record's end inside the same logical inode
- * (the gap between two extents in the frozen tree) ALSO return zeros
- * for that slice.
+ * As the live read, one call answers one extent's bytes or one hole's:
+ * at a hole (no extent at this `(ino, off)` in the frozen tree) STM_OK
+ * with zeros from `off` to the frozen tree's next extent of the inode,
+ * at most `len`; at an extent, its bytes from `off` to its end.
  *
  * The COLD promote-read-hit bump that the live read path uses is
  * intentionally OMITTED: snap views are frozen, and the heuristic
