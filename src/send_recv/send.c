@@ -522,12 +522,13 @@ stm_status stm_send_init(stm_sync *sync,
         send_dek_slot *slot = &h->deks[h->n_deks++];
         slot->dataset_id = kds;
         slot->key_id = kid;
-        stm_status ks = stm_sync_get_dek(sync, kds, kid, slot->dek);
+        stm_status ks = stm_sync_get_dek_or_locked(sync, kds, kid, slot->dek);
         if (ks != STM_OK) {
-            /* No DEK for an extent the iter just collected — must
-             * be a sweep race that resolved against this exact
-             * key_id between iter and lookup. Bail; caller can
-             * retry. send_handle_free wipes the DEKs captured. */
+            /* No such key for an extent the iter just collected: a sweep
+             * pruned it between the two, so retry (STM_EBUSY). A locked
+             * dataset's key (the origin's, for a clone's shared extent)
+             * is STM_ELOCKED, which no retry mends before its DEK is
+             * installed. send_handle_free wipes the DEKs captured. */
             rc = (ks == STM_ENOENT) ? STM_EBUSY : ks;
             goto fail;
         }

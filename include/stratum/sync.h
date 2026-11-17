@@ -977,6 +977,17 @@ stm_status stm_sync_keyschema_sweep(stm_sync *s,
  * the right DEK for reads of extents that carry the key_id in their
  * AD struct.
  */
+/*
+ * As stm_sync_get_dek, but a key the keyschema has and the in-RAM map
+ * lacks -- a locked dataset's, until its DEK is installed -- answers
+ * STM_ELOCKED; STM_ENOENT only for a key the pool does not have. Takes
+ * s->lock.
+ */
+STM_MUST_USE
+stm_status stm_sync_get_dek_or_locked(const stm_sync *s,
+                                      uint64_t dataset_id, uint64_t key_id,
+                                      uint8_t out_dek[32]);
+
 STM_MUST_USE
 stm_status stm_sync_get_dek(const stm_sync *s,
                               uint64_t dataset_id, uint64_t key_id,
@@ -1295,7 +1306,9 @@ stm_status stm_sync_scrub_step_with_cas_gc(stm_sync *s, stm_scrub *sc,
  * gives proper key isolation + enables key rotation. Datasets
  * whose CURRENT DEK is missing (caller forgot to call
  * stm_sync_add_dataset_key on a non-root dataset) get STM_ENOENT
- * from write_extent.
+ * from write_extent. A key the keyschema has and the RAM map lacks (a
+ * locked dataset, until its DEK is installed) answers STM_ELOCKED, from
+ * write_extent and the read paths alike.
  *
  * An index change that fails part way (a record the extent overlaps
  * not deleted, or a replaced block's drop failing) wedges the handle

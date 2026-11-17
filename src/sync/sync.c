@@ -5511,6 +5511,40 @@ stm_status stm_sync_keyschema_sweep(stm_sync *s,
     return STM_OK;
 }
 
+/* No key in RAM for (dataset_id, key_id). The keyschema having it is a
+ * locked dataset's (the deferred unwrap; sync_resolve_current_dek_locked):
+ * access deferred, not damage, so STM_ELOCKED; otherwise `absent`. Caller
+ * holds s->lock. */
+static stm_status sync_dek_missing_locked(const stm_sync *s,
+                                          uint64_t dataset_id,
+                                          uint64_t key_id,
+                                          stm_status absent)
+{
+    stm_keyschema_state st;
+    size_t len = 0;
+    stm_status ls = stm_keyschema_lookup((const stm_keyschema *)s->keyschema,
+                                         dataset_id, key_id, &st, NULL,
+                                         NULL, 0, &len);
+    return (ls == STM_OK || ls == STM_ERANGE) ? STM_ELOCKED : absent;
+}
+
+stm_status stm_sync_get_dek_or_locked(const stm_sync *s,
+                                      uint64_t dataset_id, uint64_t key_id,
+                                      uint8_t out_dek[32])
+{
+    if (!s || !out_dek) return STM_EINVAL;
+    stm_sync *ms = (stm_sync *)s;
+    pthread_mutex_lock(&ms->lock);
+    stm_status rc = STM_OK;
+    sync_dek_slot *slot = sync_dek_find(ms, dataset_id, key_id);
+    if (slot)
+        memcpy(out_dek, slot->dek, 32);
+    else
+        rc = sync_dek_missing_locked(ms, dataset_id, key_id, STM_ENOENT);
+    pthread_mutex_unlock(&ms->lock);
+    return rc;
+}
+
 stm_status stm_sync_get_dek(const stm_sync *s,
                               uint64_t dataset_id, uint64_t key_id,
                               uint8_t out_dek[32])
@@ -7830,7 +7864,16 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
         dek_found = (rd_slot != NULL);
         if (rd_slot) memcpy(dek, rd_slot->dek, 32);
     }
-    if (!dek_found) return STM_ECORRUPT;
+    if (!dek_found) {
+        /* A locked dataset's key is deferred, not damage, as on the write
+         * path; a key the keyschema lacks is damage. The lock-free path
+         * holds nothing here, the other already holds s->lock. */
+        if (ebr) pthread_mutex_lock(&s->lock);
+        stm_status missing = sync_dek_missing_locked(s, rec.origin_dataset_id,
+                                                     rec.key_id, STM_ECORRUPT);
+        if (ebr) pthread_mutex_unlock(&s->lock);
+        return missing;
+    }
 
     /* R36 P1-3: hardcode AEGIS-256 — see write path for rationale. */
     stm_aead_mode mode = STM_AEAD_AEGIS256;

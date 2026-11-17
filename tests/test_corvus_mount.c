@@ -43,6 +43,7 @@
 #include <stratum/extent.h>
 #include <stratum/pool.h>
 #include <stratum/scrub.h>
+#include <stratum/send_recv.h>
 #include <stratum/super.h>
 #include <stratum/sync.h>
 #include <stratum/sync_testing.h>
@@ -381,6 +382,13 @@ STM_TEST(corvus_mount_soft_skips_locked_user_dataset) {
     uint8_t dek[32];
     STM_ASSERT_ERR(stm_sync_get_dek(s2, CORVUS_DATASET_ID, CORVUS_KEY_ID,
                                       dek), STM_ENOENT);
+    /* Asked whether it is locked, the same key is; a key the pool does not
+     * have is not. */
+    STM_ASSERT_ERR(stm_sync_get_dek_or_locked(s2, CORVUS_DATASET_ID,
+                                              CORVUS_KEY_ID, dek), STM_ELOCKED);
+    STM_ASSERT_ERR(stm_sync_get_dek_or_locked(s2, CORVUS_DATASET_ID,
+                                              CORVUS_KEY_ID + 1000u, dek),
+                   STM_ENOENT);
 
     /* A write resolves the dataset's CURRENT DEK first: the keyslot
      * exists (lookup_current succeeds) but its DEK is not installed ->
@@ -473,10 +481,9 @@ STM_TEST(corvus_install_evict_dek_roundtrip) {
      * the plaintext -- the extent need never be READ for its cleartext
      * to become resident. After evict, a read of that extent must be
      * DENIED, not served from RAM past the DEK denial (pre-drain this
-     * returned STM_OK + the plaintext). Asserted as "not OK" rather
-     * than an exact code: the read path's missing-DEK error is
-     * STM_ECORRUPT today (the write path's is STM_ELOCKED -- a
-     * recorded alignment seam). */
+     * returned STM_OK + the plaintext), and denied as locked: the read
+     * path's missing key is STM_ELOCKED, as the write path's is. A send
+     * of it is refused the same way, not as a retry. */
     {
         uint64_t ds_ev = 0;
         STM_ASSERT_OK(stm_dataset_create_child(stm_sync_dataset_index(s2),
@@ -493,7 +500,10 @@ STM_TEST(corvus_install_evict_dek_roundtrip) {
         size_t rgot = 0;
         stm_status rrs = stm_sync_read_extent(s2, ds_ev, 1u, 0u,
                                                 rout, sizeof rout, &rgot);
-        STM_ASSERT(rrs != STM_OK);
+        STM_ASSERT_ERR(rrs, STM_ELOCKED);
+        stm_send_handle *sh = NULL;
+        STM_ASSERT_ERR(stm_send_init(s2, ds_ev, 0u, 0u, &sh), STM_ELOCKED);
+        STM_ASSERT(sh == NULL);
     }
 
     /* evict_dek removes + zeroes the DEK -> the dataset re-locks. */
