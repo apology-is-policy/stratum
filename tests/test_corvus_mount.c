@@ -1358,7 +1358,9 @@ STM_TEST(corvus_logout_flushes_dirty_home_before_key_eviction) {
 
 /* T0.91: a clone's own writes go under a key the pool seals, so a clone of a
  * user's dataset would take the user's new data out of the user's seal.
- * Refused, nothing minted; a clone of the root dataset is made. */
+ * Refused with the user logged in, logged out, and after a remount with no
+ * session; nothing is minted (no dataset id, key, hold or name). A clone of a
+ * pool-keyed sibling, one variable away, is made. */
 STM_TEST(corvus_clone_of_a_user_sealed_dataset_is_refused) {
     make_tmp("sealclone");
     char key_path[300];
@@ -1381,9 +1383,11 @@ STM_TEST(corvus_clone_of_a_user_sealed_dataset_is_refused) {
     fake_corvus_start(&fc, "sealclone", STM_CORVUS_STATUS_OK, NULL);
     stm_corvus_mount_cfg cc = {.socket_path = fc.sock_path,
                                .session_token = TEST_TOKEN};
-    uint64_t ds = 0, ino = 0;
+    uint64_t ds = 0, sib = 0, ino = 0;
     STM_ASSERT_OK(stm_fs_provision_corvus_dataset(fs, 1, "home", "users/alice",
                                                  11, 1000, 1000, &cc, &ds));
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "sib", &sib));
+    STM_ASSERT_EQ(sib, ds + 1u);
     STM_ASSERT_OK(stm_fs_create_file(fs, ds, 1, (const uint8_t *)"file", 4,
                                     0600, 1000, 1000, &ino));
     uint8_t bytes[4096];
@@ -1395,27 +1399,49 @@ STM_TEST(corvus_clone_of_a_user_sealed_dataset_is_refused) {
     bool sealed = false;
     STM_ASSERT_OK(stm_sync_dataset_key_user_sealed(sync, ds, &sealed));
     STM_ASSERT(sealed);
+    STM_ASSERT_OK(stm_sync_dataset_key_user_sealed(sync, sib, &sealed));
+    STM_ASSERT(!sealed);
     STM_ASSERT_OK(stm_sync_dataset_key_user_sealed(sync, 1, &sealed));
     STM_ASSERT(!sealed);
     sealed = true;
     STM_ASSERT_OK(stm_sync_dataset_key_user_sealed(sync, ds + 1000u, &sealed));
     STM_ASSERT(!sealed);
 
-    uint64_t snap = 0, rsnap = 0, clone = 77, probe = 0;
+    uint64_t snap = 0, ssnap = 0, clone = 77, probe = 0;
     STM_ASSERT_OK(stm_fs_create_snapshot(fs, ds, "s", 1, &snap));
     STM_ASSERT_ERR(stm_fs_create_clone(fs, 1, "c", snap, &clone),
                    STM_ENOTSUPPORTED);
     STM_ASSERT_EQ(clone, 0u);
+    /* Logged out: the seal is in the keyschema, not in RAM. */
+    STM_ASSERT_OK(stm_fs_evict_dek(fs, ds));
+    STM_ASSERT_ERR(stm_fs_create_clone(fs, 1, "c", snap, &clone),
+                   STM_ENOTSUPPORTED);
+    /* Remounted with no session: the home is locked, still sealed. */
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mo, &fs));
+    if (!fs) { fake_corvus_stop(&fc); return; }
+    sync = stm_fs_sync(fs);
+    sealed = false;
+    STM_ASSERT_OK(stm_sync_dataset_key_user_sealed(sync, ds, &sealed));
+    STM_ASSERT(sealed);
+    STM_ASSERT_ERR(stm_fs_create_clone(fs, 1, "c", snap, &clone),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_EQ(clone, 0u);
+
+    /* Nothing minted: no such child, no key for the next id, no hold. */
     STM_ASSERT_ERR(stm_fs_lookup_child_dataset(fs, 1, "c", 1, &probe),
                    STM_ENOENT);
-    /* No hold was taken: the snapshot deletes. */
+    uint8_t dek[32];
+    STM_ASSERT_ERR(stm_sync_get_dek(sync, sib + 1u, 0, dek), STM_ENOENT);
     STM_ASSERT_OK(stm_fs_delete_snapshot(fs, snap, NULL));
-    /* The root dataset's key is the pool's: its snapshot clones. */
-    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "r", 1, &rsnap));
-    STM_ASSERT_OK(stm_fs_create_clone(fs, 1, "c", rsnap, &clone));
-    STM_ASSERT(clone != 0);
+    /* A pool-keyed sibling's snapshot clones, at the next id. */
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, sib, "t", 1, &ssnap));
+    STM_ASSERT_OK(stm_fs_create_clone(fs, 1, "c", ssnap, &clone));
+    STM_ASSERT_EQ(clone, sib + 1u);
     STM_ASSERT_OK(stm_fs_lookup_child_dataset(fs, 1, "c", 1, &probe));
     STM_ASSERT_EQ(probe, clone);
+    STM_ASSERT_OK(stm_sync_get_dek(sync, clone, 0, dek));
     STM_ASSERT_OK(stm_fs_unmount(fs));
     fake_corvus_stop(&fc);
     unlink(g_tmp_path);

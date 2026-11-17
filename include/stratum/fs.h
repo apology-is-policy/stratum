@@ -1619,7 +1619,8 @@ stm_status stm_fs_provision_corvus_dataset(stm_fs *fs, uint64_t parent_id,
  * STM_EEXIST on sibling-name collision. STM_ENOTSUPPORTED for a
  * user-sealed origin. Errors propagate from
  * `stm_snapshot_hold`, `stm_dataset_create_clone`,
- * `stm_dataset_index_set_engine_root`, and `stm_sync_add_dataset_key`.
+ * `stm_dataset_index_set_engine_root`, `stm_sync_add_dataset_key` and
+ * `stm_sync_dataset_key_user_sealed`.
  */
 STM_MUST_USE
 stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
