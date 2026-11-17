@@ -2037,44 +2037,52 @@ static void fs_inode_bump_size(struct stm_inode_value *iv, uint64_t end_off)
     if (end_off > cur_size) iv->si_size = stm_store_le64(end_off);
 }
 
-/* Read [a_off, a_end) (both 4 KiB-aligned) into pre-zeroed `scratch`,
- * accumulating each covering extent's plaintext and leaving holes zero.
+/* Read [a_off, a_end) (both 4 KiB-aligned) into pre-zeroed `scratch`, a
+ * piece per extent or hole, leaving holes zero (the right content for an
+ * unallocated range).
  *
- * Why a loop and not one stm_sync_read_extent: that primitive zero-fills
- * the ENTIRE requested len at a hole and reports it as fully read (the
- * sync hole-as-zeros contract, sync.c). So a single read over a span whose
- * head -- or any interior gap -- is a hole would zero straight over a LATER
- * extent in the span and then re-write those zeros as live data (the
- * deep-fix F2 class, re-triggered by a leading/interior hole). This loop
- * classifies each block-aligned position via stm_extent_lookup_at and
- * bounds each read to the covering extent's end, so a hole only zero-fills
- * its own block run, never a following extent. Holes stay zero (calloc),
- * which is the correct content for an unallocated range.
+ * Why a loop and not one stm_sync_read_extent: that primitive answers one
+ * extent's bytes or one hole's per call. A hole is stepped over whole, to
+ * the next extent's start, which stm_extent_lookup_or_next names; so a
+ * record that starts inside a block (a pool that received one before the
+ * receive refused them may hold it) is read from its own start, not from
+ * the next block. Each extent is read from cur to its end or a_end.
+ *
+ * `cover`: the span is a covering write's, which drops every record it
+ * overlaps whole, so each must lie inside it (the caller widened it so);
+ * one reaching outside answers STM_ECORRUPT rather than lose the part
+ * outside. A read passes false: it may read part of an extent.
  *
  * Caller holds fs->lock. */
 static stm_status fs_rmw_read_span_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
                                             uint64_t a_off, uint64_t a_end,
-                                            uint8_t *scratch)
+                                            uint8_t *scratch, bool cover)
 {
-    const uint64_t BLK = 4096u;
     stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
     if (!eidx) return STM_OK;   /* no index reachable -> treat span as a hole */
     uint64_t cur = a_off;
     while (cur < a_end) {
         stm_extent_record e;
-        stm_status ls = stm_extent_lookup_at(eidx, ds, ino, cur, &e);
-        if (ls == STM_ENOENT) { cur += BLK; continue; }   /* hole: stays zero */
+        uint64_t next = UINT64_MAX;
+        stm_status ls = stm_extent_lookup_or_next(eidx, ds, ino, cur, &e,
+                                                  &next);
+        if (ls == STM_ENOENT) {                     /* a hole: stays zero */
+            if (next <= cur) return STM_ECORRUPT;
+            cur = next;
+            continue;
+        }
         if (ls != STM_OK) return ls;
         uint64_t ext_end = e.off + e.len;
+        if (cover && (e.off < a_off || ext_end > a_end)) return STM_ECORRUPT;
         uint64_t want = (a_end < ext_end ? a_end : ext_end) - cur;
         size_t got = 0;
         stm_status rs = stm_sync_read_extent(fs->sync, ds, ino, cur,
                                                scratch + (cur - a_off),
                                                (size_t)want, &got);
-        if (rs != STM_OK && rs != STM_ENOENT) return rs;
-        /* got==want for a covering extent; a raced removal returns a hole-
-         * filled `want` (still progress). 0 is defensive only. */
-        cur += (got > 0u) ? (uint64_t)got : BLK;
+        if (rs != STM_OK) return rs;
+        /* The extent covers cur, so the read answers a byte at least. */
+        if (got == 0u) return STM_ECORRUPT;
+        cur += (uint64_t)got;
     }
     return STM_OK;
 }
@@ -2226,18 +2234,42 @@ static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
 
     stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
     uint64_t exp_off = off, exp_end = end_off;
+    uint64_t a_off = off & ~(BLK - 1u);
+    uint64_t a_end = (end_off + BLK - 1u) & ~(BLK - 1u);
     if (eidx) {
-        stm_extent_record e;
-        stm_status ls = stm_extent_lookup_at(eidx, ds, ino, off, &e);
-        if (ls == STM_OK) { if (e.off < exp_off) exp_off = e.off; }
-        else if (ls != STM_ENOENT) return ls;
-        ls = stm_extent_lookup_at(eidx, ds, ino, end_off - 1u, &e);
-        if (ls == STM_OK) { if (e.off + e.len > exp_end) exp_end = e.off + e.len; }
-        else if (ls != STM_ENOENT) return ls;
+        /* Each edge of the cover, rounded to the block grid, widens to the
+         * record straddling it and is rounded again, until nothing
+         * straddles it. A record on the grid that covers the write's edge
+         * covers the rounded edge too, so the first look serves a pool
+         * whose records are all on the grid; one that starts or ends
+         * inside a block can straddle an edge only rounding reached. An
+         * edge rounding leaves in place is a record's start or end, or the
+         * write's own: nothing straddles it. */
+        uint64_t lo = a_off;
+        for (;;) {
+            stm_extent_record e;
+            stm_status ls = stm_extent_lookup_at(eidx, ds, ino, lo, &e);
+            if (ls == STM_OK) { if (e.off < exp_off) exp_off = e.off; }
+            else if (ls != STM_ENOENT) return ls;
+            a_off = exp_off & ~(BLK - 1u);
+            if (a_off == exp_off || a_off == lo) break;
+            if (a_end - a_off > (uint64_t)STM_FS_RECORDSIZE_MAX * 4u)
+                return STM_ERANGE;
+            lo = a_off;
+        }
+        uint64_t hi = a_end;
+        for (;;) {
+            stm_extent_record e;
+            stm_status ls = stm_extent_lookup_at(eidx, ds, ino, hi - 1u, &e);
+            if (ls == STM_OK) { if (e.off + e.len > exp_end) exp_end = e.off + e.len; }
+            else if (ls != STM_ENOENT) return ls;
+            a_end = (exp_end + BLK - 1u) & ~(BLK - 1u);
+            if (a_end == exp_end || a_end == hi) break;
+            if (a_end - a_off > (uint64_t)STM_FS_RECORDSIZE_MAX * 4u)
+                return STM_ERANGE;
+            hi = a_end;
+        }
     }
-
-    uint64_t a_off = exp_off & ~(BLK - 1u);
-    uint64_t a_end = (exp_end + BLK - 1u) & ~(BLK - 1u);
 
     /* Fast path: no existing extent sticks out beyond the write and the
      * write is block-aligned -> every overlapped extent is fully covered,
@@ -2257,12 +2289,13 @@ static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
      * reach ~3*recordsize (a <=recordsize cover whose two ends each abut a
      * full-recordsize legacy cross-slot extent, plus block rounding); cap
      * generously above that so a future direct caller passing a huge
-     * non-aligned len cannot drive an unbounded calloc (the symmetric read
-     * path bounds its scratch the same way, fs_read_extent_aligned_locked). */
+     * non-aligned len cannot drive an unbounded calloc (the buffered read
+     * bounds its scratch the same way, fs_read_span_filled_locked). */
     if (a_len > (uint64_t)STM_FS_RECORDSIZE_MAX * 4u) return STM_ERANGE;
     uint8_t *scratch = (uint8_t *)calloc(1, (size_t)a_len);
     if (!scratch) return STM_ENOMEM;
-    stm_status rs = fs_rmw_read_span_locked(fs, ds, ino, a_off, a_end, scratch);
+    stm_status rs = fs_rmw_read_span_locked(fs, ds, ino, a_off, a_end, scratch,
+                                            true);
     if (rs != STM_OK) { free(scratch); return rs; }
     if (view) stm_dirty_buffer_view_overlay(view, a_off, a_len, scratch);
     memcpy(scratch + (off - a_off), buf, len);
@@ -2291,76 +2324,32 @@ static stm_status fs_sync_read_piece(stm_fs *fs, const stm_snapshot_entry *snap,
     return stm_sync_read_extent(fs->sync, ds, ino, off, buf, len, out_read);
 }
 
-/* Read-side counterpart to fs_write_extent_aligned_locked: the extent layer
- * requires the read offset to be 4 KiB-aligned (stm_sync_read_extent rejects
- * (off % STM_UB_SIZE != 0) with STM_EINVAL). A client reading at a non-aligned
- * offset -- e.g. the 2nd chunk of a multi-chunk 9P Tread, which starts at 2048
- * -- would otherwise fail. Align the offset down, read the covering aligned
- * span into scratch, and copy out the caller's [off, off+len) slice. `len`
- * need not be aligned (the extent layer only constrains the offset). Returns
- * the number of real bytes copied in *out_read (the caller clamps to EOF).
- * Caller holds fs->lock. */
-static stm_status fs_read_extent_aligned_locked(stm_fs *fs,
-                                                     const stm_snapshot_entry *snap,
-                                                     uint64_t ds, uint64_t ino,
-                                                     uint64_t off,
-                                                     void *buf, size_t len,
-                                                     size_t *out_read)
-{
-    if (out_read) *out_read = 0;
-    if (len == 0u) return STM_OK;
-    const uint64_t BLK = 4096u;
-    if (off % BLK == 0u) {
-        return fs_sync_read_piece(fs, snap, ds, ino, off, buf, len, out_read);
-    }
-    uint64_t aligned_off = off & ~(BLK - 1u);
-    uint64_t end_off     = off + (uint64_t)len;
-    uint64_t aligned_end = (end_off + BLK - 1u) & ~(BLK - 1u);
-    /* Bound the scratch allocation, symmetric to fs_write_extent_aligned_locked.
-     * Unreachable via 9P (h_read clamps count to iounit_for_msize before
-     * stm_fs_read), but a future direct caller passing a huge non-aligned len
-     * would otherwise attempt an unbounded calloc. */
-    if (aligned_end > (uint64_t)STM_FS_RECORDSIZE_MAX + aligned_off) {
-        return STM_ERANGE;
-    }
-    uint64_t aligned_len = aligned_end - aligned_off;
-    uint8_t *scratch = (uint8_t *)calloc(1, (size_t)aligned_len);
-    if (!scratch) return STM_ENOMEM;
-    size_t got = 0;
-    stm_status rs = fs_sync_read_piece(fs, snap, ds, ino, aligned_off,
-                                       scratch, (size_t)aligned_len, &got);
-    if (rs != STM_OK && rs != STM_ENOENT) { free(scratch); return rs; }
-    uint64_t skip   = off - aligned_off;
-    size_t   avail  = (got > skip) ? (size_t)(got - skip) : 0u;
-    size_t   copy_n = (len < avail) ? len : avail;
-    if (copy_n > 0u) memcpy(buf, scratch + skip, copy_n);
-    free(scratch);
-    if (out_read) *out_read = copy_n;
-    return STM_OK;
-}
+/* Pieces one stm_fs_read takes before it answers short. Each piece looks
+ * the file's records up, all under one fs->global SH hold, so the bound
+ * keeps a read of a sparse file from holding it long; the caller reads on
+ * from the short count, as it does at any other. */
+#define FS_READ_PIECES_MAX 64u
 
 /* Read [off, off + want) of a file's committed extents into buf, a piece
- * per extent or hole (stm_sync_read_extent answers one at a time), until
- * want is filled. A piece starting mid-block goes through the aligned
- * helper, so the first is bounded below its recordsize cap. An error after
- * the first piece answers the bytes read so far, as read(2) does. snap NULL
- * reads the live tree, else that snapshot's. Caller holds fs->lock. */
+ * per extent or hole (stm_sync_read_extent answers one at a time, from any
+ * offset), until want is filled or FS_READ_PIECES_MAX pieces are read. An
+ * error after the first piece answers the bytes read so far, as read(2)
+ * does; the next call reports it. snap NULL reads the live tree, else
+ * that snapshot's. Caller holds fs->lock. */
 static stm_status fs_read_extents_locked(stm_fs *fs,
                                          const stm_snapshot_entry *snap,
                                          uint64_t ds, uint64_t ino,
                                          uint64_t off, uint8_t *buf,
                                          size_t want, size_t *out_read)
 {
-    const uint64_t BLK = 4096u;
     size_t done = 0;
-    while (done < want) {
-        uint64_t at = off + (uint64_t)done;
+    for (unsigned piece = 0; done < want && piece < FS_READ_PIECES_MAX;
+         piece++) {
         size_t n = want - done;
-        size_t cap = (size_t)(STM_FS_RECORDSIZE_MAX - (at % BLK));
-        if (n > cap) n = cap;
         size_t got = 0;
-        stm_status rs = fs_read_extent_aligned_locked(fs, snap, ds, ino, at,
-                                                      buf + done, n, &got);
+        stm_status rs = fs_sync_read_piece(fs, snap, ds, ino,
+                                           off + (uint64_t)done,
+                                           buf + done, n, &got);
         if (rs != STM_OK) {
             if (done == 0u) {
                 if (out_read) *out_read = 0;
@@ -2368,7 +2357,16 @@ static stm_status fs_read_extents_locked(stm_fs *fs,
             }
             break;
         }
-        if (got == 0u) break;
+        /* A hole ends past its start and an extent covers it, so a piece
+         * answers a byte at least; none is an index the read cannot
+         * trust. */
+        if (got == 0u) {
+            if (done == 0u) {
+                if (out_read) *out_read = 0;
+                return STM_ECORRUPT;
+            }
+            break;
+        }
         done += (got < n) ? got : n;
     }
     if (out_read) *out_read = done;
@@ -2377,18 +2375,15 @@ static stm_status fs_read_extents_locked(stm_fs *fs,
 
 /* Fill buf[0, want) with the committed extent content of [off, off+want),
  * looping across EVERY extent in the span (holes read as zeros). The
- * MULTI-EXTENT counterpart to fs_read_extent_aligned_locked's single
- * stm_sync_read_extent.
+ * buffered read's counterpart to fs_read_extents_locked.
  *
  * Area B / F2: the buffered read path returns the FULL requested length
  * (so the dirty-buffer overlay can surface a buffer-only tail past the
  * extent edge), which defeats the caller's short-read loop -- so a read
  * spanning >=2 committed extents whose gap is not in the dirty buffer must
  * fill ALL of them HERE, or the 2nd+ extent reads back as zeros. Reuses the
- * write side's already-audited per-extent-bounded looped read
- * (fs_rmw_read_span_locked), which bounds each stm_sync_read_extent to the
- * covering extent's end so a leading/interior hole zero-fills only its own
- * block run, never a following extent.
+ * write side's looped read (fs_rmw_read_span_locked), which reads each
+ * extent to its end and steps each hole to the next extent's start.
  *
  * Contract: on STM_OK, buf[0, want) is FULLY written (the memcpy of the
  * calloc'd, hole-zeroed scratch). Returns STM_OK or a real error -- NEVER
@@ -2405,11 +2400,12 @@ static stm_status fs_read_span_filled_locked(stm_fs *fs, uint64_t ds,
     uint64_t end_off = off + (uint64_t)want;
     uint64_t a_end   = (end_off + BLK - 1u) & ~(BLK - 1u);
     uint64_t a_len   = a_end - a_off;
-    /* F2-cap parity with the write RMW + fs_read_extent_aligned_locked. */
+    /* F2-cap parity with the write RMW. */
     if (a_len > (uint64_t)STM_FS_RECORDSIZE_MAX * 4u) return STM_ERANGE;
     uint8_t *scratch = (uint8_t *)calloc(1, (size_t)a_len);
     if (!scratch) return STM_ENOMEM;
-    stm_status rs = fs_rmw_read_span_locked(fs, ds, ino, a_off, a_end, scratch);
+    stm_status rs = fs_rmw_read_span_locked(fs, ds, ino, a_off, a_end, scratch,
+                                            false);
     if (rs == STM_OK) memcpy(buf, scratch + (off - a_off), want);
     free(scratch);
     return rs;
@@ -3019,7 +3015,7 @@ static stm_status fs_read_regular_locked(stm_fs *fs,
         }
         /* SWISS-4q-flush: probe the dirty buffer. If this inode has
          * buffered ranges, we take the buffered read path; otherwise
-         * preserve the original (non-buffer) behavior verbatim. */
+         * the committed extents, a piece at a time. */
         size_t resident =
             stm_dirty_buffer_inode_bytes(fs->dirty_buffer, ds, ino);
         if (resident == 0) {

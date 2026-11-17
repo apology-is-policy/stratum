@@ -497,9 +497,9 @@ STM_TEST(recv_rejects_extent_before_header) {
     testpool_teardown(&tgt);
 }
 
-/* An extent ending past the largest file size is malformed: no file holds
- * it. One block inside the bound is the control. */
-static stm_status recv_header_then_extent(stm_recv_handle *rh, uint64_t off)
+/* A header, then one extent record of `len` bytes at `off` of ino 1. */
+static stm_status recv_header_then_extent(stm_recv_handle *rh, uint64_t off,
+                                          uint64_t len)
 {
     uint8_t hdr[STM_SEND_RECORD_HDR_LEN + STM_SEND_HEADER_BODY_LEN] = {0};
     le32 ht = stm_store_le32(STM_SEND_REC_HEADER);
@@ -512,32 +512,56 @@ static stm_status recv_header_then_extent(stm_recv_handle *rh, uint64_t off)
     memcpy(hdr + 20, vr.v, 4);
     stm_status hs = stm_recv_apply(rh, hdr, sizeof hdr);
     if (hs != STM_OK) return hs;
-    static uint8_t rec[STM_SEND_RECORD_HDR_LEN + STM_SEND_EXTENT_META_LEN + 4096];
+    static uint8_t rec[STM_SEND_RECORD_HDR_LEN + STM_SEND_EXTENT_META_LEN + 8192];
+    if (len > 8192u) return STM_EINVAL;
     memset(rec, 0, sizeof rec);
     le32 t = stm_store_le32(STM_SEND_REC_EXTENT);
-    le64 b = stm_store_le64(STM_SEND_EXTENT_META_LEN + 4096);
+    le64 b = stm_store_le64(STM_SEND_EXTENT_META_LEN + len);
     le64 ino = stm_store_le64(1);
     le64 o = stm_store_le64(off);
-    le64 ln = stm_store_le64(4096);
+    le64 ln = stm_store_le64(len);
     memcpy(rec + 0, t.v, 4);
     memcpy(rec + 8, b.v, 8);
     memcpy(rec + 16, ino.v, 8);
     memcpy(rec + 16 + 8, o.v, 8);
     memcpy(rec + 16 + 16, ln.v, 8);
-    return stm_recv_apply(rh, rec, sizeof rec);
+    return stm_recv_apply(rh, rec,
+                          STM_SEND_RECORD_HDR_LEN + STM_SEND_EXTENT_META_LEN + len);
 }
 
+/* An extent ending past the largest file size is malformed: no file holds
+ * it. One block inside the bound is the control. */
 STM_TEST(recv_refuses_an_extent_past_the_largest_file_size) {
     testpool tgt; testpool_setup(&tgt, "ext_past_max", POOL_UUID_TGT);
     stm_sync *s_tgt = stm_fs_sync_for_test(tgt.fs);
     stm_recv_handle *rh = NULL;
     STM_ASSERT_OK(stm_recv_init(s_tgt, 1, &rh));
-    STM_ASSERT_OK(recv_header_then_extent(rh, STM_FS_FILE_MAX + 1u - 8192u));
+    STM_ASSERT_OK(recv_header_then_extent(rh, STM_FS_FILE_MAX + 1u - 8192u, 4096u));
     stm_recv_close(rh);
     rh = NULL;
     STM_ASSERT_OK(stm_recv_init(s_tgt, 1, &rh));
-    STM_ASSERT_ERR(recv_header_then_extent(rh, STM_FS_FILE_MAX + 1u - 4096u),
+    STM_ASSERT_ERR(recv_header_then_extent(rh, STM_FS_FILE_MAX + 1u - 4096u, 4096u),
                    STM_ECORRUPT);
+    stm_recv_close(rh);
+    testpool_teardown(&tgt);
+}
+
+/* An extent off the 4 KiB grid is malformed: every producer keeps them on
+ * it. One block at 4096 is the control. */
+STM_TEST(recv_refuses_an_extent_off_the_block_grid) {
+    testpool tgt; testpool_setup(&tgt, "ext_off_grid", POOL_UUID_TGT);
+    stm_sync *s_tgt = stm_fs_sync_for_test(tgt.fs);
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(s_tgt, 1, &rh));
+    STM_ASSERT_OK(recv_header_then_extent(rh, 4096u, 4096u));
+    stm_recv_close(rh);
+    rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(s_tgt, 1, &rh));
+    STM_ASSERT_ERR(recv_header_then_extent(rh, 100u, 4096u), STM_ECORRUPT);
+    stm_recv_close(rh);
+    rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(s_tgt, 1, &rh));
+    STM_ASSERT_ERR(recv_header_then_extent(rh, 0u, 5000u), STM_ECORRUPT);
     stm_recv_close(rh);
     testpool_teardown(&tgt);
 }

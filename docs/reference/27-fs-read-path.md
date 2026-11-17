@@ -56,11 +56,16 @@ Dispatch on `si_data_kind`:
   `read(2)`'s "up to EOF" contract). Then probe `stm_dirty_buffer_has_ino`:
   - **no buffered data -> the non-buffered path.** `fs_read_extents_locked` over
     `[off, min(off + len, si_size))`: a piece per extent or hole until the range
-    is filled, each one `stm_sync_read_extent` (through
-    `fs_read_extent_aligned_locked`, so a piece starting mid-block reads its
-    aligned span; the first piece is cut below that helper's recordsize cap). It
-    returns the whole range; it is short only when an error stops it after the
-    first piece (read(2)'s prefix; the next call reports the error).
+    is filled, each one `stm_sync_read_extent` from the piece's own offset (the
+    primitive takes any offset since the T0.96 review; before, the loop read a
+    mid-block piece's aligned span through a scratch helper, which could not
+    serve a record that starts inside a block). It returns the whole range; it
+    is short when an error stops it after the first piece (read(2)'s prefix; the
+    next call reports the error) and after `FS_READ_PIECES_MAX` (64) pieces,
+    each a lookup over the file's records under one `fs->global` SH hold. A
+    piece that answers no bytes cannot happen (a hole ends past its start, an
+    extent covers it); the loop answers `STM_ECORRUPT` for one rather than a
+    silent short count.
     *Before T0.96 this was ONE `fs_read_extent_aligned_locked`: short at an
     extent's end, and a read that started in a hole answered zeros over the
     extent after it, with a full count (the sync read zero-filled all of len at
@@ -73,10 +78,8 @@ Dispatch on `si_data_kind`:
 
 ### The single-extent vs multi-extent split (the F2 fix)
 
-`fs_read_extent_aligned_locked` is **single-extent**: it satisfies a non-aligned
-read offset by reading the block-aligned covering span via one
-`stm_sync_read_extent` and copying the slice. `stm_sync_read_extent` answers one
-extent's bytes (to its end) or one hole's zeros (to the next extent's start,
+`stm_sync_read_extent` is **single-extent**: it answers one extent's bytes (to
+its end) or one hole's zeros (to the next extent's start,
 `stm_extent_lookup_or_next`; all of len past the last extent; since T0.96, before
 which a hole zero-filled the *entire* requested len). So it returns a short count
 at an extent boundary -- `fs_read_extents_locked` loops over it -- and was
@@ -89,13 +92,13 @@ zero** (F2).
 `fs_read_span_filled_locked` (the Area-B fix) fills the whole range across *every*
 extent: block-align `[off, off+want)` → `[a_off, a_end)`, `calloc` scratch (so
 holes are zero), drive the **per-extent-bounded looped read**
-`fs_rmw_read_span_locked` (shared with the write side — it classifies each block
-via `stm_extent_lookup_at` and bounds each `stm_sync_read_extent` to the covering
-extent's end, so a leading/interior hole zero-fills only its own block run, never
-a following extent), then `memcpy` the `[off - a_off, +want)` slice into `buf`.
+`fs_rmw_read_span_locked` (shared with the write side: it steps each hole to the
+next extent's start, `stm_extent_lookup_or_next`, so a record that starts inside a
+block is read from its start, and reads each extent to its end or the span's),
+then `memcpy` the `[off - a_off, +want)` slice into `buf`.
 The buffered path calls it instead of the single-extent read (the prior `memset`
 is dropped — the `memcpy` fully fills `buf`). A `4 * recordsize` scratch cap
-(parity with the write RMW + `fs_read_extent_aligned_locked`) bounds the alloc.
+(parity with the write RMW) bounds the alloc.
 
 ## Spec cross-reference
 
@@ -111,15 +114,24 @@ is dropped — the `memcpy` fully fills `buf`). A `4 * recordsize` scratch cap
 | `fs_io_buffered_read_spans_two_extents` | F2 — a read over two committed extents with a disjoint buffered range returns both (not zeros for the 2nd). Non-vacuous (single-extent → the 2nd half reads zeros) |
 | `fs_read_from_a_hole_stops_its_zeros_at_the_next_extent` | T0.96: reads from a leading hole, across an interior hole, from mid-block and over extents whose key order is not their offset order answer the data after the hole and the whole range; live and on a snapshot, each down the lock-free and the locked sync path |
 | `sync_read_extent_answers_one_hole_or_one_extent` | T0.96: the primitive at a hole answers zeros to the next extent's start (the least, not the first scanned), at an extent its bytes to its end, past the last extent all of len |
-| `fs_read_answers_its_prefix_when_a_later_extent_fails` | T0.96: a later extent damaged on disk: the read answers the first extent and the hole, short; a read of the damaged extent fails |
-| `fs_read_of_a_record_size_from_mid_block` | T0.96: the first piece of a mid-block read is cut below the aligned helper's cap, so a recordsize read at 2048 answers whole |
+| `fs_read_answers_its_prefix_when_a_later_extent_fails` | T0.96: a later extent damaged on disk: the read answers the first extent and the hole, short; a read of the damaged extent fails `STM_EBADTAG` |
+| `fs_read_of_a_record_size_from_mid_block` | T0.96: a recordsize read at 2048 answers whole |
+| `fs_read_serves_a_record_off_the_block_grid` | T0.96 review: a record that starts inside a block and one that ends inside one read whole, from their starts, mid-block and across their ends; live and on a snapshot, down both sync paths |
+| `fs_write_into_a_record_off_the_block_grid_keeps_its_bytes` | T0.96 review: a 10-byte write inside a record at 100 keeps every byte of it and rewrites it on the grid |
+| `fs_write_widens_its_cover_to_a_record_a_rounded_edge_meets` | T0.96 review: a record that straddles the cover's rounded start, or its rounded end, widens it again, so the write does not drop it |
+| `fs_read_answers_at_most_64_pieces_a_call` | T0.96 review: one read of 100 extents and their holes answers 64 pieces; reading on answers the file |
+| `recv_cold_extent_refuses_a_record_off_the_block_grid` | T0.96 review: both receive calls refuse an off or a len off the grid (`STM_EINVAL`); the test seam admits one |
 
 ## Error paths
 
 - `STM_ECORRUPT` — INLINE `si_data_len` exceeds the inline cap.
 - `STM_ERANGE` -- the buffered path's scratch span exceeds `4 * recordsize` --
-  defensive, unreachable via 9P (iounit-clamped). The non-buffered path cuts its
-  pieces below the aligned helper's recordsize cap, so it does not answer it.
+  defensive, unreachable via 9P (iounit-clamped). The non-buffered path reads
+  into the caller's buffer and does not answer it.
+- `STM_ECORRUPT` -- a piece answered no bytes, or the write side's span met a
+  record it should hold whole reaching outside it, or a hole's next start at or
+  before it: an index the read cannot trust. Defensive; none is reachable while
+  the lookups keep their contract.
 - Any sync-layer error after the first piece: the read answers the bytes before
   it instead (STM_OK, short).
 - `STM_ENOMEM` — scratch alloc.
@@ -142,16 +154,24 @@ No P0/P1/P2 open on the read path after F2.
 
 ## Known caveats / footguns
 
-- Both paths return the whole range (to EOF); the non-buffered one is short only
-  after an error part way (T0.96; it was short at every extent boundary before,
-  and wrong after a hole).
+- Both paths return the whole range (to EOF); the non-buffered one is short
+  after an error part way and after 64 pieces (T0.96; it was short at every
+  extent boundary before, and wrong after a hole). The legacy arm (an ino the
+  inode index does not hold, or not a regular file) still makes one
+  `stm_sync_read_extent` call: short at every extent or hole boundary.
 - A snapshot file's read (the `.snaps` view) takes the same piece loop over the
   frozen tree (`fs_read_extents_locked` with the snapshot entry); before T0.96 it
   made one `stm_sync_read_extent_at_snap` call, with the same hole defect, and
   answered `STM_EINVAL` at an offset not a multiple of 4 KiB.
-- A hole the write side's RMW or the buffered fill crosses is still stepped a
-  block at a time (`fs_rmw_read_span_locked`, one extent lookup per block): the
-  same content, a cost in lookups on a large hole.
+- Each piece looks the file's records up (a scan of the inode's key range; on a
+  snapshot a throwaway engine over the frozen root), so a call costs O(pieces x
+  records); the 64-piece bound caps how long one call holds `fs->global` SH.
+- A record off the 4 KiB grid: the receive refuses one since the T0.96 review
+  (every producer keeps records on the grid), but a pool that took one before
+  may hold it. The read serves it whole; a write into it rewrites its cover on
+  the grid (the cover widens until no record straddles a rounded edge); a
+  truncate whose new size falls inside one that starts off the grid answers
+  `STM_ECORRUPT` (its kept-prefix rewrite needs a record on the grid).
 - Read-after-write within an un-flushed window is served by the overlay, not the
   extents; a crash before `stm_sync_commit` loses both the buffer and the
   in-memory `si_size` bump (neither happened on disk).

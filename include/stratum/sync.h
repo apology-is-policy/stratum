@@ -1354,11 +1354,13 @@ stm_status stm_sync_scrub_step_with_cas_gc(stm_sync *s, stm_scrub *sc,
  * extent). So one call answers one extent's bytes or one hole's, and a
  * caller that wants `len` reads on from `off + *out_read`.
  *
- * MVP constraints (P7-4; cap lifted at P7-CAS-16):
+ * The write's constraints (P7-4; cap lifted at P7-CAS-16):
  *   - len > 0, multiple of 4 KiB, ≤ STM_FS_RECORDSIZE_MAX (8 MiB
  *     since UB v23; 128 KiB at v22 and earlier).
  *   - off must be 4 KiB aligned.
- *   - Single-extent per call: caller iterates for spans > recordsize.
+ * The read takes any off and len (len == 0 answers no bytes): a record
+ * off the 4 KiB grid, which a pool that received one before the receive
+ * refused them may hold, reads whole.
  *
  * P7-10: encryption uses the dataset's CURRENT DEK from the
  * keyschema. The write path resolves (key_id, DEK) for `dataset_id`
@@ -1428,8 +1430,7 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  * counts dirty the LIVE extent_idx — meaningless for a frozen
  * snapshot view (R167 P3-3 doctrine carry).
  *
- * MVP constraints (carry from `stm_sync_read_extent`):
- *   - off must be 4 KiB aligned (caller's loop chunks at iounit).
+ * As the live read, it takes any off.
  *
  * `len == 0` is permitted and returns STM_OK with `*out_read = 0`.
  *
@@ -1437,13 +1438,15 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  * returns STM_OK with `*out_read = len` and the buffer zero-filled.
  *
  * Returns STM_EINVAL on NULL s / NULL buf / NULL out_read /
- * NULL root_csum / dataset_id == 0 / ino == 0 / unaligned off,
+ * NULL root_csum / dataset_id == 0 / ino == 0,
  * STM_EWEDGED when the sync is wedged, STM_ECORRUPT / STM_EBADTAG
  * on a value-decode / AEAD / Merkle failure, device errors
  * otherwise.
  *
- * Thread safety: serialized by sync's internal mutex (same as the
- * live read variant).
+ * Thread safety: as the live read (RC-2), it holds no sync lock on its
+ * common path (the frozen-tree lookup takes the extent index's own lock);
+ * with no EBR handle or no extent index it reads under sync's internal
+ * mutex.
  */
 STM_MUST_USE
 stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
@@ -1783,6 +1786,8 @@ stm_status stm_sync_migrate_policy_collect(
  *   - NULL s, NULL plain, NULL claimed_hash (STM_EINVAL).
  *   - target_dataset_id == 0 OR ino == 0 OR plain_len == 0
  *     (STM_EINVAL).
+ *   - off or len not a multiple of 4 KiB (STM_EINVAL): every producer
+ *     keeps records on that grid.
  *   - Wedged or read-only (STM_EWEDGED / STM_EROFS).
  *   - !s->cas_idx (STM_EINVAL — cas_idx must be initialized).
  *   - Hash mismatch (STM_EBADTAG).
@@ -1886,6 +1891,8 @@ stm_status stm_sync_recv_cold_extent_ref(
  * Refusals:
  *   - NULL s, NULL claimed_hash (STM_EINVAL).
  *   - target_dataset_id == 0 OR ino == 0 OR len == 0 (STM_EINVAL).
+ *   - off or len not a multiple of 4 KiB (STM_EINVAL): every producer
+ *     keeps records on that grid.
  *   - Wedged or read-only (STM_EWEDGED / STM_EROFS).
  *   - !s->cas_idx (STM_EINVAL).
  *   - claimed_hash not present in CAS (STM_ECORRUPT — the wire

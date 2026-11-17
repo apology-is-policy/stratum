@@ -334,8 +334,12 @@ stm_status stm_fs_commit(stm_fs *fs);
  *
  * `stm_fs_read` (extent-lookup + bdev-read + decrypt; holes return
  * zeros) answers min(len, size - off) bytes, across every extent and
- * hole in the range; it is short only when an error stops it after the
- * first bytes, and then answers those (a later call reports the error).
+ * hole in the range. It is short when an error stops it after the first
+ * bytes, and then answers those (a later call reports the error), and
+ * after 64 extents and holes, which bounds how long one call holds the
+ * pool's shared lock; a caller reads on from the count, as a read(2)
+ * caller does. An ino the inode index does not hold, or one that is not a
+ * regular file, answers one extent or one hole per call.
  *
  * Returns:
  *   - STM_OK on success.

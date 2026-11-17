@@ -149,6 +149,14 @@ void stm_sync_set_cas_admits_sealed_for_test(stm_sync *s, bool on);
 void stm_sync_set_cold_chunks_uncapped_for_test(stm_sync *s, bool on);
 
 /*
+ * on=true lets stm_sync_recv_cold_extent and stm_sync_recv_cold_extent_ref
+ * take a record off the 4 KiB grid, as they did before they refused one,
+ * so a test can build the records an older pool may hold. on=false
+ * restores the refusal.
+ */
+void stm_sync_set_recv_admits_offgrid_for_test(stm_sync *s, bool on);
+
+/*
  * The evict's seam: invoked by stm_sync_evict_dek after it publishes the
  * map that shows the evict and before it moves the evict count, with
  * s->lock HELD (a hook must not take it; a thread it starts that does
@@ -160,9 +168,11 @@ void stm_sync_set_evict_published_hook_for_test(stm_sync *s,
 
 /*
  * on=true sends stm_sync_read_extent and stm_sync_read_extent_at_snap
- * down their serial locked paths (otherwise taken only when the thread
- * has no EBR handle or the lock-free lookup keeps meeting a seal), so a
- * test can reach them. on=false restores the lock-free path.
+ * down their serial locked paths, so a test can reach them. Otherwise the
+ * live read takes its locked path when the thread has no EBR handle, when
+ * the lock-free lookup keeps meeting a seal, or when the unlocked fetch
+ * fails; the snapshot read only with no EBR handle or no extent index.
+ * on=false restores the lock-free path.
  */
 void stm_sync_force_locked_read_for_test(stm_sync *s, bool on);
 

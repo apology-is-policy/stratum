@@ -246,6 +246,10 @@ static stm_status apply_extent(stm_recv_handle *h,
     /* No file holds an extent past the largest file size. */
     if (off > STM_FS_FILE_MAX || len > STM_FS_FILE_MAX - off)
         return STM_ECORRUPT;
+    /* Every producer keeps extents on the 4 KiB grid, and the truncate
+     * and the migrate refuse one off it: a stream with one is malformed. */
+    if ((off % STM_UB_SIZE) != 0u || (len % STM_UB_SIZE) != 0u)
+        return STM_ECORRUPT;
 
     bool is_cold = (flags & STM_SEND_FLAG_COLD) != 0u;
     if (is_cold) {

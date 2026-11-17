@@ -598,6 +598,7 @@ struct stm_sync {
     void             *read_prefetch_test_ctx;
     bool              cas_admits_sealed_for_test;
     bool              cold_chunks_uncapped_for_test;
+    bool              recv_admits_offgrid_for_test;
     void            (*evict_published_test_hook)(void *ctx);
     void             *evict_published_test_ctx;
     _Atomic bool      force_locked_read_for_test;
@@ -6215,6 +6216,14 @@ void stm_sync_set_cold_chunks_uncapped_for_test(stm_sync *s, bool on)
     pthread_mutex_unlock(&s->lock);
 }
 
+void stm_sync_set_recv_admits_offgrid_for_test(stm_sync *s, bool on)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    s->recv_admits_offgrid_for_test = on;
+    pthread_mutex_unlock(&s->lock);
+}
+
 void stm_sync_set_evict_published_hook_for_test(stm_sync *s,
                                                 void (*hook)(void *ctx),
                                                 void *ctx)
@@ -7849,12 +7858,15 @@ static void dcache_account(stm_sync *s, bool hit) {
 
 /* The bytes of [off, off + len) a hole holds: up to `next`, the start of
  * the extent after it (UINT64_MAX when none), so a read that starts in a
- * hole never answers zeros over that extent's bytes. */
-static size_t sync_hole_span(uint64_t off, size_t len, uint64_t next)
+ * hole never answers zeros over that extent's bytes. A next at or before
+ * off is a lookup that broke its contract: STM_ECORRUPT, not zeros. */
+static stm_status sync_hole_span(uint64_t off, size_t len, uint64_t next,
+                                 size_t *out)
 {
-    if (next <= off) return len;
+    if (next <= off) return STM_ECORRUPT;
     uint64_t gap = next - off;
-    return gap < (uint64_t)len ? (size_t)gap : len;
+    *out = gap < (uint64_t)len ? (size_t)gap : len;
+    return STM_OK;
 }
 
 static stm_status stm_sync_read_extent_locked(stm_sync *s,
@@ -7868,7 +7880,9 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
                                               off, &rec, &hole_end);
     if (ls == STM_ENOENT) {
         /* A hole: zeros up to the next extent. */
-        size_t zn = sync_hole_span(off, len, hole_end);
+        size_t zn = 0;
+        stm_status zs = sync_hole_span(off, len, hole_end, &zn);
+        if (zs != STM_OK) return zs;
         memset(buf, 0, zn);
         *out_read = zn;
         return STM_OK;
@@ -8363,7 +8377,6 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     if (!s || !buf || !out_read) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     if (len == 0) { *out_read = 0; return STM_OK; }
-    if ((off % STM_UB_SIZE) != 0) return STM_EINVAL;
     /* A HOT extent of a locked dataset refuses at its key, but a COLD one
      * decrypts under the pool's key (a pool written before the cold tier
      * refused sealed data may hold some), and the cache would serve it:
@@ -8437,7 +8450,9 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             if (ls == STM_ENOENT) {
                 /* A hole: zeros up to the next extent (the locked path's
                  * contract). */
-                size_t hn = sync_hole_span(off, len, hole_end);
+                size_t hn = 0;
+                stm_status hs = sync_hole_span(off, len, hole_end, &hn);
+                if (hs != STM_OK) return hs;
                 memset(buf, 0, hn);
                 *out_read = hn;
                 return STM_OK;
@@ -8525,7 +8540,9 @@ static stm_status stm_sync_read_extent_at_snap_locked(stm_sync *s,
     if (ls == STM_ENOENT) {
         /* A hole in the frozen tree: zeros up to its next extent, as the
          * live read. */
-        size_t sz = sync_hole_span(off, len, hole_end);
+        size_t sz = 0;
+        stm_status ss = sync_hole_span(off, len, hole_end, &sz);
+        if (ss != STM_OK) return ss;
         memset(buf, 0, sz);
         *out_read = sz;
         return STM_OK;
@@ -8549,7 +8566,6 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
     if (!s || !buf || !out_read || !root_csum) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     if (len == 0) { *out_read = 0; return STM_OK; }
-    if ((off % STM_UB_SIZE) != 0) return STM_EINVAL;
     /* As the live read: a locked dataset's frozen view is refused whole. */
     if (stm_sync_dataset_locked(s, dataset_id)) return STM_ELOCKED;
 
@@ -8576,7 +8592,9 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
                 ino, off, &rec, &hole_end);
         if (ls == STM_ENOENT) {
             /* A hole in the frozen tree: zeros up to its next extent. */
-            size_t fz = sync_hole_span(off, len, hole_end);
+            size_t fz = 0;
+            stm_status fs_ = sync_hole_span(off, len, hole_end, &fz);
+            if (fs_ != STM_OK) return fs_;
             memset(buf, 0, fz);
             *out_read = fz;
             return STM_OK;
@@ -10376,6 +10394,22 @@ stm_status stm_sync_migrate_to_cold(stm_sync *s,
  * followed by extent_write_cold's failure.)
  *
  * Locking mirrors stm_sync_migrate_to_cold's per-extent loop body. */
+/* Every producer keeps extent records on the 4 KiB grid (the write, the
+ * migrate's chunk rounding, the truncate's kept prefix), and the truncate
+ * and the migrate refuse a record off it: the receive takes no other. */
+static stm_status sync_recv_on_grid_locked(const stm_sync *s, uint64_t off,
+                                           uint64_t len)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (s->recv_admits_offgrid_for_test) return STM_OK;
+#else
+    (void)s;
+#endif
+    if ((off % STM_UB_SIZE) != 0u || (len % STM_UB_SIZE) != 0u)
+        return STM_EINVAL;
+    return STM_OK;
+}
+
 stm_status stm_sync_recv_cold_extent(
         stm_sync *s,
         uint64_t target_dataset_id,
@@ -10391,6 +10425,8 @@ stm_status stm_sync_recv_cold_extent(
     if (plain_len == 0u || len != plain_len)   return STM_EINVAL;
 
     pthread_mutex_lock(&s->lock);
+    stm_status grid_rc = sync_recv_on_grid_locked(s, off, len);
+    if (grid_rc != STM_OK) { pthread_mutex_unlock(&s->lock); return grid_rc; }
     if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
     if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
     if (!s->cas_idx)  { pthread_mutex_unlock(&s->lock); return STM_EINVAL;  }
@@ -10546,6 +10582,8 @@ stm_status stm_sync_recv_cold_extent_ref(stm_sync *s,
     if (target_dataset_id == 0u || ino == 0u || len == 0u)   return STM_EINVAL;
 
     pthread_mutex_lock(&s->lock);
+    stm_status grid_rc = sync_recv_on_grid_locked(s, off, len);
+    if (grid_rc != STM_OK) { pthread_mutex_unlock(&s->lock); return grid_rc; }
     if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
     if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
     if (!s->cas_idx)  { pthread_mutex_unlock(&s->lock); return STM_EINVAL;  }

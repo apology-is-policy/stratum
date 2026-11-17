@@ -30,6 +30,7 @@
 #include <stratum/extent_testing.h>
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>
+#include <stratum/hash.h>
 #include <stratum/inode.h>
 #include <stratum/keyfile.h>
 #include <stratum/repair_log.h>
@@ -11511,6 +11512,21 @@ STM_TEST(fs_read_from_a_hole_stops_its_zeros_at_the_next_extent) {
     uint64_t sf = rh_snap_ino(fs, snap_root, "f");
     uint64_t sg = rh_snap_ino(fs, snap_root, "g");
     uint64_t sh = rh_snap_ino(fs, snap_root, "h");
+    /* The live files change after the snapshot, their holes included: the
+     * snapshot's reads must answer the frozen bytes. */
+    uint8_t lb[4096];
+    memset(lb, 'x', sizeof lb); STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, lb, sizeof lb));
+    memset(lb, 'b', sizeof lb); STM_ASSERT_OK(stm_fs_write(fs, 1, f, 8192, lb, sizeof lb));
+    memset(lb, 'a', sizeof lb); STM_ASSERT_OK(stm_fs_write(fs, 1, g, 0, lb, sizeof lb));
+    memset(lb, 'x', sizeof lb); STM_ASSERT_OK(stm_fs_write(fs, 1, g, 4096, lb, sizeof lb));
+    memset(lb, 'c', sizeof lb); STM_ASSERT_OK(stm_fs_write(fs, 1, g, 8192, lb, sizeof lb));
+    memset(lb, 'd', sizeof lb); STM_ASSERT_OK(stm_fs_write(fs, 1, h, 8192, lb, sizeof lb));
+    memset(lb, 'x', sizeof lb); STM_ASSERT_OK(stm_fs_write(fs, 1, h, 32768, lb, sizeof lb));
+    memset(lb, 'e', sizeof lb); STM_ASSERT_OK(stm_fs_write(fs, 1, h, 65536, lb, sizeof lb));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    rh_read(fs, g, 2048, 4096, 4096);             /* control: the live tree moved */
+    STM_ASSERT(rh_is(rh_buf, 0, 2048, 'a'));
+    STM_ASSERT(rh_is(rh_buf, 2048, 4096, 'x'));
     rh_check(fs, sf, sg, sh);
     stm_sync_force_locked_read_for_test(s, true);
     rh_check(fs, sf, sg, sh);
@@ -11595,16 +11611,15 @@ STM_TEST(fs_read_answers_its_prefix_when_a_later_extent_fails) {
     STM_ASSERT(rh_is(rh_buf, 0, 4096, 'A'));
     STM_ASSERT(rh_is(rh_buf, 4096, 8192, 0));
     got = 0;
-    STM_ASSERT(stm_fs_read(fs, 1, g, 8192, rh_buf, 4096, &got) != STM_OK);
+    STM_ASSERT_ERR(stm_fs_read(fs, 1, g, 8192, rh_buf, 4096, &got), STM_EBADTAG);
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);
 }
 
 STM_TEST(fs_read_of_a_record_size_from_mid_block) {
-    /* The first piece of a read that starts mid-block is cut below the
-     * aligned helper's recordsize cap, so a recordsize read at 2048 answers
-     * whole: 'A' to the block's end, then the hole's zeros. */
+    /* A recordsize read at 2048 answers whole: 'A' to the block's end,
+     * then the hole's zeros. */
     make_tmp("rh_big");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -11634,4 +11649,254 @@ STM_TEST(fs_read_of_a_record_size_from_mid_block) {
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);
+}
+
+/* ========================================================================= */
+/* A record off the 4 KiB grid: refused at the receive, served whole where */
+/* a pool already holds one.                                                */
+/* ========================================================================= */
+
+/* A 16384-byte file with no extents, kept in EXTENT mode. */
+static uint64_t og_file(stm_fs *fs, const char *nm)
+{
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)nm,
+                                     (uint8_t)strlen(nm), 0644u, 0, 0, &f));
+    uint8_t blk[4096];
+    memset(blk, 'q', sizeof blk);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, blk, sizeof blk));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 0));
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 16384));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    return f;
+}
+
+/* One COLD record [off, off + len) of `fill`, through the receive's own
+ * calls, the seam admitting it off the grid as a pool that received one
+ * before the receive refused them may hold it. */
+static void og_plant(stm_fs *fs, uint64_t f, uint64_t off, size_t len,
+                     uint8_t fill)
+{
+    stm_sync *s = stm_fs_sync_for_test(fs);
+    uint8_t *plain = malloc(len);
+    STM_ASSERT(plain != NULL);
+    if (!plain) return;
+    memset(plain, fill, len);
+    stm_blake3_hash h;
+    stm_blake3(plain, len, &h);
+    stm_sync_set_recv_admits_offgrid_for_test(s, true);
+    STM_ASSERT_OK(stm_sync_recv_cold_chunk(s, h.bytes, plain, len));
+    STM_ASSERT_OK(stm_sync_recv_cold_extent_ref(s, 1, f, off, len, h.bytes));
+    STM_ASSERT_OK(stm_sync_recv_cold_chunk_release(s, h.bytes));
+    stm_sync_set_recv_admits_offgrid_for_test(s, false);
+    free(plain);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+}
+
+static stm_fs *og_mount(const char *nm)
+{
+    make_tmp(nm);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    if (fs) STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+    return fs;
+}
+
+static void og_unmount(stm_fs *fs)
+{
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(recv_cold_extent_refuses_a_record_off_the_block_grid) {
+    /* Both receive calls, off and len each off the grid; a record on it
+     * is the control, and the seam lets the same call through. */
+    stm_fs *fs = og_mount("og_recv");
+    if (!fs) return;
+    uint64_t f = og_file(fs, "f");
+    stm_sync *s = stm_fs_sync_for_test(fs);
+    static uint8_t p4[4096], p5[5000];
+    memset(p4, 'Z', sizeof p4);
+    memset(p5, 'Y', sizeof p5);
+    stm_blake3_hash h4, h5;
+    stm_blake3(p4, sizeof p4, &h4);
+    stm_blake3(p5, sizeof p5, &h5);
+    STM_ASSERT_OK(stm_sync_recv_cold_chunk(s, h4.bytes, p4, sizeof p4));
+    STM_ASSERT_OK(stm_sync_recv_cold_chunk(s, h5.bytes, p5, sizeof p5));
+    STM_ASSERT_ERR(stm_sync_recv_cold_extent_ref(s, 1, f, 100, sizeof p4, h4.bytes),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_sync_recv_cold_extent_ref(s, 1, f, 0, sizeof p5, h5.bytes),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_sync_recv_cold_extent(s, 1, f, 100, sizeof p4, h4.bytes,
+                                             p4, sizeof p4), STM_EINVAL);
+    STM_ASSERT_ERR(stm_sync_recv_cold_extent(s, 1, f, 0, sizeof p5, h5.bytes,
+                                             p5, sizeof p5), STM_EINVAL);
+    STM_ASSERT_OK(stm_sync_recv_cold_extent_ref(s, 1, f, 4096, sizeof p4, h4.bytes));
+    stm_sync_set_recv_admits_offgrid_for_test(s, true);
+    STM_ASSERT_OK(stm_sync_recv_cold_extent_ref(s, 1, f, 8192 + 100, sizeof p4, h4.bytes));
+    stm_sync_set_recv_admits_offgrid_for_test(s, false);
+    STM_ASSERT_OK(stm_sync_recv_cold_chunk_release(s, h4.bytes));
+    STM_ASSERT_OK(stm_sync_recv_cold_chunk_release(s, h5.bytes));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    og_unmount(fs);
+}
+
+/* f: 'Z' at [100, 4196); g: 'Y' at [0, 5000); both 16384 bytes. */
+static void og_check(stm_fs *fs, uint64_t f, uint64_t g)
+{
+    rh_read(fs, f, 0, 16384, 16384);
+    STM_ASSERT(rh_is(rh_buf, 0, 100, 0));
+    STM_ASSERT(rh_is(rh_buf, 100, 4196, 'Z'));
+    STM_ASSERT(rh_is(rh_buf, 4196, 16384, 0));
+    rh_read(fs, f, 100, 4096, 4096);              /* from the record's start */
+    STM_ASSERT(rh_is(rh_buf, 0, 4096, 'Z'));
+    rh_read(fs, f, 2048, 4096, 4096);             /* from mid-block, inside it */
+    STM_ASSERT(rh_is(rh_buf, 0, 2148, 'Z'));
+    STM_ASSERT(rh_is(rh_buf, 2148, 4096, 0));
+    rh_read(fs, g, 0, 16384, 16384);
+    STM_ASSERT(rh_is(rh_buf, 0, 5000, 'Y'));
+    STM_ASSERT(rh_is(rh_buf, 5000, 16384, 0));
+    rh_read(fs, g, 4096, 4096, 4096);             /* across the record's end */
+    STM_ASSERT(rh_is(rh_buf, 0, 904, 'Y'));
+    STM_ASSERT(rh_is(rh_buf, 904, 4096, 0));
+}
+
+STM_TEST(fs_read_serves_a_record_off_the_block_grid) {
+    /* A record that starts inside a block and one that ends inside one,
+     * read whole, live and on a snapshot, down both paths. */
+    stm_fs *fs = og_mount("og_read");
+    if (!fs) return;
+    uint64_t f = og_file(fs, "f");
+    uint64_t g = og_file(fs, "g");
+    og_plant(fs, f, 100, 4096, 'Z');
+    og_plant(fs, g, 0, 5000, 'Y');
+    stm_sync *s = stm_fs_sync_for_test(fs);
+    og_check(fs, f, g);
+    stm_sync_force_locked_read_for_test(s, true);
+    og_check(fs, f, g);
+    stm_sync_force_locked_read_for_test(s, false);
+    uint64_t snap_id = 0, snap_root = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "og", 2, &snap_id));
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                (const uint8_t *)"og", 2, &snap_root));
+    uint64_t sf = rh_snap_ino(fs, snap_root, "f");
+    uint64_t sg = rh_snap_ino(fs, snap_root, "g");
+    og_check(fs, sf, sg);
+    stm_sync_force_locked_read_for_test(s, true);
+    og_check(fs, sf, sg);
+    stm_sync_force_locked_read_for_test(s, false);
+    og_unmount(fs);
+}
+
+STM_TEST(fs_write_into_a_record_off_the_block_grid_keeps_its_bytes) {
+    /* A 10-byte write inside [100, 4196): the cover reads the record from
+     * its own start, so all of it is kept, and rewrites it on the grid. */
+    stm_fs *fs = og_mount("og_rmw");
+    if (!fs) return;
+    uint64_t f = og_file(fs, "f");
+    og_plant(fs, f, 100, 4096, 'Z');
+    uint8_t w[10];
+    memset(w, 'w', sizeof w);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 2000, w, sizeof w));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    rh_read(fs, f, 0, 16384, 16384);
+    STM_ASSERT(rh_is(rh_buf, 0, 100, 0));
+    STM_ASSERT(rh_is(rh_buf, 100, 2000, 'Z'));
+    STM_ASSERT(rh_is(rh_buf, 2000, 2010, 'w'));
+    STM_ASSERT(rh_is(rh_buf, 2010, 4196, 'Z'));
+    STM_ASSERT(rh_is(rh_buf, 4196, 16384, 0));
+    stm_extent_record rec;
+    memset(&rec, 0, sizeof rec);
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(stm_fs_sync_for_test(fs)),
+                                       1, f, 100, &rec));
+    STM_ASSERT_EQ(rec.off, 0u);
+    STM_ASSERT_EQ(rec.len, 8192u);
+    og_unmount(fs);
+}
+
+STM_TEST(fs_write_widens_its_cover_to_a_record_a_rounded_edge_meets) {
+    /* C = [4000, 5000), A = [5000, 9000), and an aligned write [8192,
+     * 12288). A straddles the write's start, so the cover starts at 5000,
+     * rounded to 4096; C straddles 4096, so it must widen again to C's
+     * start, or the write would drop C whole and lose [4000, 4096). */
+    stm_fs *fs = og_mount("og_widen");
+    if (!fs) return;
+    uint64_t f = og_file(fs, "f");
+    og_plant(fs, f, 4000, 1000, 'C');
+    og_plant(fs, f, 5000, 4000, 'A');
+    uint8_t w[4096];
+    memset(w, 'W', sizeof w);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 8192, w, sizeof w));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    rh_read(fs, f, 0, 16384, 16384);
+    STM_ASSERT(rh_is(rh_buf, 0, 4000, 0));
+    STM_ASSERT(rh_is(rh_buf, 4000, 5000, 'C'));
+    STM_ASSERT(rh_is(rh_buf, 5000, 8192, 'A'));
+    STM_ASSERT(rh_is(rh_buf, 8192, 12288, 'W'));
+    STM_ASSERT(rh_is(rh_buf, 12288, 16384, 0));
+    /* The other edge: A = [3000, 7100) straddles the end of a write at
+     * [0, 4096), whose cover then ends at 7100, rounded to 8192; B =
+     * [7100, 9000) straddles 8192, so the cover must reach 9000. */
+    uint64_t u = og_file(fs, "u");
+    og_plant(fs, u, 3000, 4100, 'A');
+    og_plant(fs, u, 7100, 1900, 'B');
+    STM_ASSERT_OK(stm_fs_write(fs, 1, u, 0, w, sizeof w));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    rh_read(fs, u, 0, 16384, 16384);
+    STM_ASSERT(rh_is(rh_buf, 0, 4096, 'W'));
+    STM_ASSERT(rh_is(rh_buf, 4096, 7100, 'A'));
+    STM_ASSERT(rh_is(rh_buf, 7100, 9000, 'B'));
+    STM_ASSERT(rh_is(rh_buf, 9000, 16384, 0));
+    og_unmount(fs);
+}
+
+STM_TEST(fs_read_answers_at_most_64_pieces_a_call) {
+    /* 100 extents of 4 KiB at an 8 KiB stride: one read takes 32 extents
+     * and the 32 holes after them; reading on from each count answers the
+     * whole file. */
+    stm_fs *fs = og_mount("og_pieces");
+    if (!fs) return;
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"p", 1, 0644u, 0, 0, &f));
+    uint8_t b[4096];
+    for (unsigned i = 0; i < 100u; i++) {
+        memset(b, (int)(i + 1u), sizeof b);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, f, (uint64_t)i * 8192u, b, sizeof b));
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    size_t size = 99u * 8192u + 4096u;
+    uint8_t *all = malloc(size);
+    STM_ASSERT(all != NULL);
+    if (all) {
+        memset(all, 0xEE, size);
+        size_t got = 0;
+        STM_ASSERT_OK(stm_fs_read(fs, 1, f, 0, all, size, &got));
+        STM_ASSERT_EQ(got, 64u * 4096u);
+        size_t tot = got, calls = 1;
+        while (tot < size) {
+            size_t g = 0;
+            STM_ASSERT_OK(stm_fs_read(fs, 1, f, tot, all + tot, size - tot, &g));
+            if (g == 0u) break;
+            tot += g;
+            calls++;
+        }
+        STM_ASSERT_EQ(tot, size);
+        STM_ASSERT_EQ(calls, 4u);
+        bool ok = true;
+        for (unsigned i = 0; i < 100u && ok; i++) {
+            ok = rh_is(all, (size_t)i * 8192u, (size_t)i * 8192u + 4096u,
+                       (uint8_t)(i + 1u));
+            if (ok && i < 99u)
+                ok = rh_is(all, (size_t)i * 8192u + 4096u, (size_t)(i + 1u) * 8192u, 0);
+        }
+        STM_ASSERT(ok);
+        free(all);
+    }
+    og_unmount(fs);
 }
