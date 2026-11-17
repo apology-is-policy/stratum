@@ -894,6 +894,10 @@ stm_status stm_sync_add_dataset_key(stm_sync *s,
  * data encrypted under it can still decrypt. It is removed only by
  * `stm_sync_keyschema_sweep` (RETIRED → PRUNING → deleted).
  *
+ * A dataset whose CURRENT key is user-sealed (STM_KS_WRAPPER_CORVUS) is
+ * refused with STM_ENOTSUPPORTED: this path wraps with wk or janus, which
+ * would take the new key out of its user's seal.
+ *
  * On success, `*out_new_key_id` and `*out_old_key_id` are populated.
  */
 STM_MUST_USE
@@ -978,10 +982,11 @@ stm_status stm_sync_keyschema_sweep(stm_sync *s,
  * AD struct.
  */
 /*
- * As stm_sync_get_dek, but a key the keyschema has and the in-RAM map
- * lacks -- a locked dataset's, until its DEK is installed -- answers
- * STM_ELOCKED; STM_ENOENT only for a key the pool does not have. Takes
- * s->lock.
+ * As stm_sync_get_dek, but tells why a key is not in RAM: a dataset's
+ * CURRENT key (a locked dataset's, until its DEK is installed) answers
+ * STM_ELOCKED; any other key the keyschema has (a RETIRED one the mount
+ * could not unwrap) STM_ECORRUPT; STM_ENOENT only for a key the pool does
+ * not have. Takes s->lock.
  */
 STM_MUST_USE
 stm_status stm_sync_get_dek_or_locked(const stm_sync *s,
@@ -1306,9 +1311,10 @@ stm_status stm_sync_scrub_step_with_cas_gc(stm_sync *s, stm_scrub *sc,
  * gives proper key isolation + enables key rotation. Datasets
  * whose CURRENT DEK is missing (caller forgot to call
  * stm_sync_add_dataset_key on a non-root dataset) get STM_ENOENT
- * from write_extent. A key the keyschema has and the RAM map lacks (a
- * locked dataset, until its DEK is installed) answers STM_ELOCKED, from
- * write_extent and the read paths alike.
+ * from write_extent. A CURRENT key the keyschema has and the RAM map
+ * lacks (a locked dataset, until its DEK is installed) answers
+ * STM_ELOCKED, from write_extent and the read paths alike; a read of a
+ * record whose RETIRED key the mount could not unwrap, STM_ECORRUPT.
  *
  * An index change that fails part way (a record the extent overlaps
  * not deleted, or a replaced block's drop failing) wedges the handle

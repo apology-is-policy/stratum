@@ -321,14 +321,16 @@ typedef struct stm_send_handle stm_send_handle;
  *   STM_ENOMEM on allocation failure.
  *   STM_EBUSY, a transient: a COLD extent's CAS record or a key was
  *     dropped between the collect and its lookup (retry).
- *   STM_ELOCKED if a collected record's key is a locked dataset's (for
- *     a clone's shared record, its origin's), until its DEK is installed.
+ *   STM_ELOCKED if a collected record's key is a locked dataset's
+ *     CURRENT key (for a clone's shared record, its origin's), until its
+ *     DEK is installed.
  *   STM_ENOENT also if the snapshot named was deleted after init
  *     found it and its tree could not then be read whole (its nodes
  *     given out again): as if the delete had come first. A tree read
  *     whole streams as found.
  *   STM_ECORRUPT if a collected record names no block the pool's
- *     allocators hold, among others. Best-effort: a block given out
+ *     allocators hold, or its key is a RETIRED one the mount could not
+ *     unwrap, among others. Best-effort: a block given out
  *     again since is pinned on the new write's run, and the stream
  *     fails its tag check instead (STM_EBADTAG from stm_send_next).
  *

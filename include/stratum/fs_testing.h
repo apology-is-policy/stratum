@@ -175,15 +175,16 @@ void stm_fs_set_rollback_committed_hook_for_test(stm_fs *fs,
                                                  void *arg);
 
 /*
- * Call `fn` as a snapshot rollback's reclaim returns: the newer snapshots are
- * out of the index and the frees made, the target's lists not yet cleared,
- * nothing committed. Under fs->global EX; `fn` may not call the fs. NULL
- * restores it.
+ * Call `fn` in a snapshot rollback's reclaim as soon as its data-extent tier
+ * has made its frees, the first of blocks a send streams: the newer snapshots
+ * are out of the index; the cold tier, the target's lists and the cascade are
+ * still to come; nothing is committed. Under fs->global EX; `fn` may not call
+ * the fs. NULL restores it.
  */
-typedef void (*stm_fs_rollback_reclaimed_hook)(void *arg);
-void stm_fs_set_rollback_reclaimed_hook_for_test(stm_fs *fs,
-                                                 stm_fs_rollback_reclaimed_hook fn,
-                                                 void *arg);
+typedef void (*stm_fs_rollback_data_freed_hook)(void *arg);
+void stm_fs_set_rollback_data_freed_hook_for_test(stm_fs *fs,
+                                                  stm_fs_rollback_data_freed_hook fn,
+                                                  void *arg);
 
 /*
  * Call `fn` as stm_fs_write passes its wedge check under fs->global SH,

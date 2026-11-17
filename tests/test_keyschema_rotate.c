@@ -23,6 +23,8 @@
 #include <stratum/keyschema.h>
 #include <stratum/pool.h>
 #include <stratum/sync.h>
+#include <stratum/dataset.h>
+#include <stratum/send_recv.h>
 
 #include "../src/janus/backend.h"
 #include "../src/janus/daemon.h"
@@ -780,6 +782,79 @@ STM_TEST(p7_10_root_dek_persists_across_mount) {
     uint8_t root_dek_after[32];
     STM_ASSERT_OK(stm_sync_get_dek(s2, 1, 0, root_dek_after));
     STM_ASSERT_MEM_EQ(root_dek_before, root_dek_after, 32);
+
+    teardown(a2, s2, pool2);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A RETIRED key whose wrapped blob the mount's key cannot open is skipped at
+ * mount (a degraded read of pre-rotation data). A record under it is damage,
+ * not a locked dataset: no install ever brings that key. A dataset beside it
+ * whose keys all open sends. */
+STM_TEST(retired_key_that_will_not_unwrap_reads_as_damage_not_locked) {
+    make_tmp("retired_unwrap");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+
+    stm_hybrid_keys other;
+    STM_ASSERT_OK(stm_hybrid_keygen(other.pk, other.sk));
+    uint64_t ds = 0, ds_ok = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(stm_sync_dataset_index(s), 1u,
+                                           "rt", &ds));
+    STM_ASSERT_OK(stm_dataset_create_child(stm_sync_dataset_index(s), 1u,
+                                           "ok", &ds_ok));
+    uint64_t kid = 0, kid_ok = 0;
+    STM_ASSERT_OK(stm_sync_add_dataset_key(s, ds, &other, NULL, &kid));
+    STM_ASSERT_OK(stm_sync_add_dataset_key(s, ds_ok, make_wk(), NULL,
+                                           &kid_ok));
+    uint8_t buf[4096];
+    memset(buf, 0x5a, sizeof buf);
+    STM_ASSERT_OK(stm_sync_write_extent(s, ds, 1u, 0u, buf, sizeof buf));
+    STM_ASSERT_OK(stm_sync_write_extent(s, ds_ok, 1u, 0u, buf, sizeof buf));
+    uint64_t nid = 0, oid = 0;
+    STM_ASSERT_OK(stm_sync_rotate_dataset_key(s, ds, make_wk(), NULL,
+                                              &nid, &oid));
+    STM_ASSERT_EQ(oid, kid);
+    STM_ASSERT_OK(stm_sync_commit(s));
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+    stm_hybrid_keys_wipe(&other);
+
+    d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_sync *s2 = NULL;
+    stm_pool *pool2 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
+
+    /* Premises: the old key was skipped, the new one opened. */
+    uint8_t dek[32];
+    STM_ASSERT_ERR(stm_sync_get_dek(s2, ds, oid, dek), STM_ENOENT);
+    STM_ASSERT_OK(stm_sync_get_dek(s2, ds, nid, dek));
+
+    uint8_t rout[4096];
+    size_t got = 0;
+    STM_ASSERT_ERR(stm_sync_read_extent(s2, ds, 1u, 0u, rout, sizeof rout,
+                                        &got), STM_ECORRUPT);
+    STM_ASSERT_ERR(stm_sync_get_dek_or_locked(s2, ds, oid, dek),
+                   STM_ECORRUPT);
+    STM_ASSERT_ERR(stm_sync_get_dek_or_locked(s2, ds, oid + 1000u, dek),
+                   STM_ENOENT);
+    STM_ASSERT_OK(stm_sync_get_dek_or_locked(s2, ds, nid, dek));
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_ERR(stm_send_init(s2, ds, 0u, 0u, &sh), STM_ECORRUPT);
+    STM_ASSERT(sh == NULL);
+    STM_ASSERT_OK(stm_send_init(s2, ds_ok, 0u, 0u, &sh));
+    STM_ASSERT(sh != NULL);
+    stm_send_close(sh);
+
+    /* The same dataset's CURRENT key reads and writes. */
+    STM_ASSERT_OK(stm_sync_write_extent(s2, ds, 2u, 0u, buf, sizeof buf));
+    STM_ASSERT_OK(stm_sync_read_extent(s2, ds, 2u, 0u, rout, sizeof rout,
+                                       &got));
+    STM_ASSERT_MEM_EQ(rout, buf, sizeof buf);
 
     teardown(a2, s2, pool2);
     stm_bdev_close(d);

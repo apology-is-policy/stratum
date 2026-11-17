@@ -1756,8 +1756,9 @@ static void *scrub_walk_rollback(void *a_)
     return NULL;
 }
 
-/* A rollback takes the extent lock to read the view and to commit, so a walk it can
- * retire an engine under is one that starts after its first commit. */
+/* A rollback takes the extent lock to read the view, to swap the root and to
+ * commit, so a walk it could reach the swap inside is one that starts after its
+ * first commit. */
 typedef struct {
     scrub_walk_gate *g;
     scrub_walk_arg  *wa;
@@ -1775,9 +1776,30 @@ static void scrub_walk_start_late(void *arg)
     pthread_mutex_unlock(&l->g->mu);
 }
 
-STM_TEST(fs_scrub_extent_walk_keeps_a_retired_engine_alive) {
+static bool scrub_walk_wait_paused(scrub_walk_gate *g)
+{
+    for (int i = 0; i < 10000; i++) {
+        pthread_mutex_lock(&g->mu);
+        bool p = g->paused;
+        pthread_mutex_unlock(&g->mu);
+        if (p) return true;
+        usleep(1000);
+    }
+    return false;
+}
+
+/* The scrub's paddr walk holds the extent index's lock and an EBR pin while
+ * it is inside a dataset's engine. by_rollback: a rollback runs, and the walk
+ * begins after its first commit, the one window in which a walk can be inside
+ * the engine the rollback's swap retires; the swap waits for the walk and
+ * retires the engine only after it. Otherwise the engine is retired under the
+ * walk by a close no lock fences (stm_dataset_index_close_engine), and the pin
+ * keeps it alive until the walk leaves. Either way it is freed once the walk
+ * is gone. */
+static void scrub_walk_case(const char *tag, bool by_rollback)
+{
     uint64_t dir = 0;
-    stm_fs *fs = reuse_fs("scrub_walk_retire", &dir);
+    stm_fs *fs = reuse_fs(tag, &dir);
     if (!fs) return;
     stm_sync *sync = stm_fs_sync(fs);
     uint64_t f = 0;
@@ -1808,38 +1830,54 @@ STM_TEST(fs_scrub_extent_walk_keeps_a_retired_engine_alive) {
 
     scrub_walk_arg wa = { .fs = fs, .rc = STM_EINVAL };
     scrub_walk_late late = { .g = &g, .wa = &wa, .started = false };
-    stm_fs_set_rollback_committed_hook_for_test(fs, scrub_walk_start_late, &late);
-
     scrub_walk_arg ra = { .fs = fs, .snap = snap, .rc = STM_EINVAL };
     pthread_t rt;
-    STM_ASSERT_EQ(pthread_create(&rt, NULL, scrub_walk_rollback, &ra), 0);
-    /* The race is set up only once the rollback has retired the engine
-     * the walk is inside. */
-    for (int i = 0; i < 10000 && !atomic_load(&g.retired); i++) usleep(1000);
-    STM_ASSERT_TRUE(atomic_load(&g.retired));
-    STM_ASSERT_TRUE(late.started);
-    /* Readers' dcache inserts advance EBR; stand in for them. */
-    for (int i = 0; i < 200; i++) {
-        (void)stm_ebr_try_advance();
-        usleep(1000);
-    }
-    bool freed_under_walk = atomic_load(&g.freed);
-    if (freed_under_walk) {
-        /* Resuming would walk freed memory. */
-        fprintf(stderr, "  retired engine freed under the walk\n");
-        _exit(3);
+    bool rb_started = false;
+    if (by_rollback) {
+        stm_fs_set_rollback_committed_hook_for_test(fs, scrub_walk_start_late,
+                                                    &late);
+        rb_started = pthread_create(&rt, NULL, scrub_walk_rollback, &ra) == 0;
+        STM_ASSERT_TRUE(rb_started);
+        STM_ASSERT_TRUE(rb_started && scrub_walk_wait_paused(&g));
+        /* The swap is the rollback's next step; unfenced, it retires the
+         * engine under the walk within this second. */
+        for (int i = 0; i < 1000 && !atomic_load(&g.retired); i++)
+            usleep(1000);
+        STM_ASSERT_TRUE(!atomic_load(&g.retired));
+    } else {
+        late.started = pthread_create(&late.wt, NULL, scrub_walk_lookup,
+                                      &wa) == 0;
+        STM_ASSERT_TRUE(late.started);
+        STM_ASSERT_TRUE(late.started && scrub_walk_wait_paused(&g));
+        STM_ASSERT_OK(stm_dataset_index_close_engine(
+                          stm_sync_dataset_index(sync), 1));
+        STM_ASSERT_TRUE(atomic_load(&g.retired));
+        /* Readers' dcache inserts advance EBR; stand in for them. */
+        for (int i = 0; i < 200; i++) {
+            (void)stm_ebr_try_advance();
+            usleep(1000);
+        }
+        if (atomic_load(&g.freed)) {
+            /* Resuming would walk freed memory. */
+            fprintf(stderr, "  retired engine freed under the walk\n");
+            _exit(3);
+        }
     }
 
     pthread_mutex_lock(&g.mu);
     g.resume = true;
     pthread_cond_broadcast(&g.cv);
     pthread_mutex_unlock(&g.mu);
-    pthread_join(late.wt, NULL);
-    pthread_join(rt, NULL);
+    if (late.started) pthread_join(late.wt, NULL);
+    if (rb_started) pthread_join(rt, NULL);
     stm_fs_set_rollback_committed_hook_for_test(fs, NULL, NULL);
     stm_extent_set_paddr_walk_hook_for_test(NULL, NULL);
     STM_ASSERT_ERR(wa.rc, STM_ENOENT);
-    STM_ASSERT_OK(ra.rc);
+    if (by_rollback) {
+        STM_ASSERT_TRUE(late.started);
+        STM_ASSERT_OK(ra.rc);
+        STM_ASSERT_TRUE(atomic_load(&g.retired));
+    }
     /* Control: with the walk gone, nothing holds the engine back. */
     for (int i = 0; i < 1000 && !atomic_load(&g.freed); i++) {
         (void)stm_ebr_try_advance();
@@ -1850,6 +1888,14 @@ STM_TEST(fs_scrub_extent_walk_keeps_a_retired_engine_alive) {
     pthread_cond_destroy(&g.cv);
     pthread_mutex_destroy(&g.mu);
     reuse_fs_done(fs);
+}
+
+STM_TEST(fs_scrub_extent_walk_keeps_a_retired_engine_alive) {
+    scrub_walk_case("scrub_walk_retire", false);
+}
+
+STM_TEST(fs_rollback_waits_for_the_scrub_extent_walk) {
+    scrub_walk_case("scrub_walk_rbwait", true);
 }
 
 /* The walk reads each dataset's engine slot inside its pin, so no retire

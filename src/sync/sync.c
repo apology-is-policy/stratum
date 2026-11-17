@@ -5235,6 +5235,21 @@ stm_status stm_sync_rotate_dataset_key(stm_sync *s,
     if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
     if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
 
+    /* A user-sealed key is wrapped by corvus under its user's session; this
+     * path wraps with the pool's wk or janus, which would take the new key
+     * out of the user's seal (and leave the old one RETIRED, which no
+     * install brings back). */
+    {
+        uint64_t cur_id = 0;
+        stm_keyschema_wrapper cur_w = STM_KS_WRAPPER_LEGACY;
+        if (stm_keyschema_lookup_current(s->keyschema, dataset_id, &cur_id,
+                                         &cur_w, NULL, 0, NULL) == STM_OK
+            && cur_w == STM_KS_WRAPPER_CORVUS) {
+            pthread_mutex_unlock(&s->lock);
+            return STM_ENOTSUPPORTED;
+        }
+    }
+
     uint64_t next_id = 0;
     stm_status rc = stm_keyschema_next_key_id(s->keyschema, dataset_id, &next_id);
     if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
@@ -5511,21 +5526,26 @@ stm_status stm_sync_keyschema_sweep(stm_sync *s,
     return STM_OK;
 }
 
-/* No key in RAM for (dataset_id, key_id). The keyschema having it is a
- * locked dataset's (the deferred unwrap; sync_resolve_current_dek_locked):
- * access deferred, not damage, so STM_ELOCKED; otherwise `absent`. Caller
- * holds s->lock. */
+/* No key in RAM for (dataset_id, key_id). A CURRENT key is missing only
+ * while its dataset is locked: the mount defers a user-sealed one when it
+ * has no session (sync_unwrap_cb; a CURRENT it cannot unwrap fails the
+ * mount), logout evicts it, stm_sync_install_dek brings it back. That is
+ * access deferred, STM_ELOCKED, as on the write path
+ * (sync_resolve_current_dek_locked). No install brings any other key the
+ * keyschema has -- a RETIRED one the mount could not unwrap, a PRUNING one
+ * read back -- so it is damage, STM_ECORRUPT. A key it lacks is `absent`.
+ * Caller holds s->lock. */
 static stm_status sync_dek_missing_locked(const stm_sync *s,
                                           uint64_t dataset_id,
                                           uint64_t key_id,
                                           stm_status absent)
 {
-    stm_keyschema_state st;
-    size_t len = 0;
+    stm_keyschema_state st = STM_KS_STATE_INVALID;
     stm_status ls = stm_keyschema_lookup((const stm_keyschema *)s->keyschema,
                                          dataset_id, key_id, &st, NULL,
-                                         NULL, 0, &len);
-    return (ls == STM_OK || ls == STM_ERANGE) ? STM_ELOCKED : absent;
+                                         NULL, 0, NULL);
+    if (ls != STM_OK) return absent;
+    return st == STM_KS_STATE_CURRENT ? STM_ELOCKED : STM_ECORRUPT;
 }
 
 stm_status stm_sync_get_dek_or_locked(const stm_sync *s,
@@ -7866,8 +7886,8 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
     }
     if (!dek_found) {
         /* A locked dataset's key is deferred, not damage, as on the write
-         * path; a key the keyschema lacks is damage. The lock-free path
-         * holds nothing here, the other already holds s->lock. */
+         * path; any other missing key is damage. The lock-free path holds
+         * nothing here, the other already holds s->lock. */
         if (ebr) pthread_mutex_lock(&s->lock);
         stm_status missing = sync_dek_missing_locked(s, rec.origin_dataset_id,
                                                      rec.key_id, STM_ECORRUPT);

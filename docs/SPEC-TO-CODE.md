@@ -59,7 +59,7 @@ send hold (T0.88):
 | `SendEnd` | `stm_send_close` -> `send_handle_free` -> `stm_sync_send_hold_end` | also every failed init |
 | `Held` in `Commit` | `stm_alloc_commit`'s sweep | `free_gen < committed_gen && !alloc_held_locked` |
 | `AuthStampedFrees` | the evacuation / replace frees at `s->auth_gen` (sync.c) | |
-| `DeindexBeforeFree`, `stale`, `Deindex` | every path that makes a data run PENDING drops the record naming it first, or in the same `s->lock` hold: the write path, truncate, punch, migrate and promote, reflink undo, CAS GC, the reservation rollbacks (sync.c); a snapshot delete; a rollback, through `fs_rollback_detach_newer_snaps` before its reclaim (fs.c) | an obligation on the code, not checked by it; `allocator_send_free_before_deindex_buggy.cfg` frees first |
+| `DeindexBeforeFree`, `stale`, `Deindex` | every path that makes a data run PENDING drops the record naming it first, or in the same `s->lock` hold: the write path, truncate, punch, migrate and promote, reflink undo, CAS GC, the reservation rollbacks (sync.c); a snapshot delete; a rollback, through `fs_rollback_detach_newer_snaps` before its reclaim (fs.c). Not yet the evacuation and replace steps, which free a run their records still name (T0.89) | an obligation on the code, not checked by it (with the constant TRUE, `stale` never grows); `allocator_send_free_before_deindex_buggy.cfg` frees first |
 
 ## `dcache_ebr.tla` ↔ v2 code (RC arc, spec-first — impl lands at RC-1)
 

@@ -378,9 +378,17 @@ typedef struct {
     stm_status          err;
 } ex_collect_ctx;
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+static stm_extent_serial_walk_hook serial_walk_hook;
+static void *serial_walk_hook_arg;
+#endif
+
 static int ex_collect_cb(const void *k, size_t klen,
                          const void *v, size_t vlen, void *ctx_) {
     ex_collect_ctx *c = ctx_;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (serial_walk_hook) serial_walk_hook(c->ds, serial_walk_hook_arg);
+#endif
     uint64_t ino = 0, off = 0;
     stm_status ks = ex_decode_key(k, klen, &ino, &off);
     if (ks != STM_OK) { c->err = ks; return 1; }
@@ -2494,6 +2502,13 @@ void stm_extent_set_paddr_walk_hook_for_test(stm_extent_paddr_walk_hook fn,
     paddr_walk_hook_arg = arg;
 }
 
+void stm_extent_set_serial_walk_hook_for_test(stm_extent_serial_walk_hook fn,
+                                              void *arg)
+{
+    serial_walk_hook = fn;
+    serial_walk_hook_arg = arg;
+}
+
 void stm_extent_fail_next_shift_for_test(stm_extent_index *idx,
                                          unsigned del_n, unsigned put_n,
                                          stm_status fail)
@@ -2639,6 +2654,23 @@ static void ex_iter_emit_sorted(ex_collect_ctx *c, stm_extent_iter_cb cb, void *
     }
     free(c->records);
     free(c->offs);
+}
+
+stm_status stm_extent_index_set_engine_root(stm_extent_index *idx,
+                                            uint64_t dataset_id,
+                                            uint64_t root_paddr,
+                                            uint64_t root_gen,
+                                            const uint8_t root_csum[32])
+{
+    if (!idx) return STM_EINVAL;
+    pthread_mutex_t *lock = ex_lock(idx);
+    must_lock(lock);
+    stm_status s = idx->ds_idx
+        ? stm_dataset_index_set_engine_root(idx->ds_idx, dataset_id,
+                                            root_paddr, root_gen, root_csum)
+        : STM_EINVAL;
+    must_unlock(lock);
+    return s;
 }
 
 stm_status stm_extent_iter_ds(const stm_extent_index *idx,

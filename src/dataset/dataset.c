@@ -1569,7 +1569,11 @@ static stm_status dataset_engine_open_locked(stm_dataset_index *idx,
  * the free past its exit; a reader arriving after sees NULL and lazily
  * re-opens from the durable triple. Serial ops and _concurrent writers
  * are excluded by the callers' fs-level EX envelope (rollback / destroy
- * / unmount all hold fs->global EX). The scrub's extent lookups (the
+ * / unmount all hold fs->global EX), all but a serial walk of the extent
+ * index run outside the fs (a live send's collect): it fetches the engine
+ * and walks it under the extent index's lock and no EBR pin, so a rollback
+ * swaps the root under that lock (stm_extent_index_set_engine_root). The
+ * scrub's extent lookups (the
  * paddr walk and the second look's concurrent lookup) hold no
  * fs->global: each resolves its engine inside an EBR pin, which keeps a
  * retired engine alive until it leaves (extent_index.c).

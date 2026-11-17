@@ -400,6 +400,18 @@ STM_TEST(corvus_mount_soft_skips_locked_user_dataset) {
                                            /*ino=*/1u, /*off=*/0u,
                                            buf, sizeof buf), STM_ELOCKED);
 
+    /* A rotation would wrap the dataset's new key with the pool's key, out
+     * of its user's seal: refused, the user's key still CURRENT. The root
+     * dataset, sealed by the pool's key, rotates. */
+    uint64_t nid = 0, oid = 0;
+    STM_ASSERT_ERR(stm_sync_rotate_dataset_key(s2, CORVUS_DATASET_ID,
+                                               make_wk(), NULL, &nid, &oid),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_ERR(stm_sync_get_dek_or_locked(s2, CORVUS_DATASET_ID,
+                                              CORVUS_KEY_ID, dek), STM_ELOCKED);
+    STM_ASSERT_OK(stm_sync_rotate_dataset_key(s2, 1u, make_wk(), NULL,
+                                              &nid, &oid));
+
     stm_sync_close(s2);
     stm_alloc_close(a2);
     stm_pool_close(pool2);
@@ -495,12 +507,30 @@ STM_TEST(corvus_install_evict_dek_roundtrip) {
                           &ev_kid));
         STM_ASSERT_OK(stm_sync_write_extent(s2, ds_ev, 1u, 0u,
                                               buf, sizeof buf));
-        STM_ASSERT_OK(stm_sync_evict_dek(s2, ds_ev));
+        STM_ASSERT_OK(stm_sync_commit(s2));
+        /* Read as a captured tree (the snapshot read, which has no locked
+         * fallback for the lock-free branch's answer): served while the key
+         * is in, refused as locked once it is out. */
+        stm_dataset_entry de_ev;
+        STM_ASSERT_OK(stm_dataset_lookup(stm_sync_dataset_index(s2), ds_ev,
+                                         &de_ev));
         uint8_t rout[4096] = {0};
         size_t rgot = 0;
+        STM_ASSERT_OK(stm_sync_read_extent_at_snap(
+                          s2, ds_ev, de_ev.di_tree_root, de_ev.di_root_gen,
+                          de_ev.di_root_csum, 1u, 0u, rout, sizeof rout,
+                          &rgot));
+        STM_ASSERT_EQ(rgot, sizeof buf);
+        STM_ASSERT_MEM_EQ(rout, buf, sizeof buf);
+        STM_ASSERT_OK(stm_sync_evict_dek(s2, ds_ev));
+        rgot = 0;
         stm_status rrs = stm_sync_read_extent(s2, ds_ev, 1u, 0u,
                                                 rout, sizeof rout, &rgot);
         STM_ASSERT_ERR(rrs, STM_ELOCKED);
+        STM_ASSERT_ERR(stm_sync_read_extent_at_snap(
+                           s2, ds_ev, de_ev.di_tree_root, de_ev.di_root_gen,
+                           de_ev.di_root_csum, 1u, 0u, rout, sizeof rout,
+                           &rgot), STM_ELOCKED);
         stm_send_handle *sh = NULL;
         STM_ASSERT_ERR(stm_send_init(s2, ds_ev, 0u, 0u, &sh), STM_ELOCKED);
         STM_ASSERT(sh == NULL);

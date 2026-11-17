@@ -39,11 +39,14 @@
 \*     SendBlocksKept rests on DeindexBeforeFree, an obligation on the
 \*     code: a range's last free comes only after every tree a send
 \*     reads has dropped the record naming it, or in one sync-lock hold
-\*     with that drop. Every stm_alloc_free path de-indexes first; a
-\*     rollback takes the newer snapshots out of the index before its
-\*     reclaim. A fourth buggy cfg lets a last free come while a tree
-\*     still names the range (`stale`), and SendBlocksKept fails: the
-\*     free precedes the barrier, the collect then finds the record.
+\*     with that drop. Every stm_alloc_free path de-indexes first, but
+\*     the evacuation and replace steps free a run their records still
+\*     name (T0.89 rehomes the records first); a rollback takes the
+\*     newer snapshots out of the index before its reclaim. A fourth
+\*     buggy cfg lets a last free come while a tree still names the
+\*     range (`stale`), and SendBlocksKept fails: the free precedes the
+\*     barrier, the collect then finds the record. With the constant
+\*     TRUE, `stale` never grows: the fixed cfgs check nothing new.
 \*
 \* What this spec does NOT model (deferred to other specs and code):
 \*

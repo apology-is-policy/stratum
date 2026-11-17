@@ -1110,6 +1110,22 @@ stm_status stm_extent_iter_ds(const stm_extent_index *idx,
                                  stm_extent_iter_cb cb, void *ctx);
 
 /*
+ * stm_dataset_index_set_engine_root under this index's lock. A serial walk
+ * of a dataset's live engine (stm_extent_iter_ds, and the other serial
+ * reads) fetches the engine and walks it holding this lock and no EBR pin,
+ * and may run outside every fs lock (a live send's collect); the set retires
+ * the engine it replaces, so it waits for such a walk to end. Lock order:
+ * this index's lock, then the dataset index's, as every serial read takes
+ * them.
+ */
+STM_MUST_USE
+stm_status stm_extent_index_set_engine_root(stm_extent_index *idx,
+                                            uint64_t dataset_id,
+                                            uint64_t root_paddr,
+                                            uint64_t root_gen,
+                                            const uint8_t root_csum[32]);
+
+/*
  * The same over a captured tree: what a snapshot's view holds, however the live
  * tree has moved on since. The triple is opened on a throwaway engine.
  */

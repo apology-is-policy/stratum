@@ -528,7 +528,8 @@ stm_status stm_send_init(stm_sync *sync,
              * pruned it between the two, so retry (STM_EBUSY). A locked
              * dataset's key (the origin's, for a clone's shared extent)
              * is STM_ELOCKED, which no retry mends before its DEK is
-             * installed. send_handle_free wipes the DEKs captured. */
+             * installed; a RETIRED key the mount could not unwrap is
+             * STM_ECORRUPT. send_handle_free wipes the DEKs captured. */
             rc = (ks == STM_ENOENT) ? STM_EBUSY : ks;
             goto fail;
         }

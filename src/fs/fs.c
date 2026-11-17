@@ -326,8 +326,8 @@ struct stm_fs {
     void *rename_walk_hook_arg;
     stm_fs_rollback_committed_hook rollback_committed_hook;
     void *rollback_committed_hook_arg;
-    stm_fs_rollback_reclaimed_hook rollback_reclaimed_hook;
-    void *rollback_reclaimed_hook_arg;
+    stm_fs_rollback_data_freed_hook rollback_data_freed_hook;
+    void *rollback_data_freed_hook_arg;
     stm_fs_write_guard_hook write_guard_hook;
     void *write_guard_hook_arg;
     stm_fs_reclaim_hook reclaim_hook;
@@ -3785,12 +3785,12 @@ void stm_fs_set_rollback_committed_hook_for_test(stm_fs *fs,
     fs->rollback_committed_hook_arg = arg;
 }
 
-void stm_fs_set_rollback_reclaimed_hook_for_test(stm_fs *fs,
-                                                 stm_fs_rollback_reclaimed_hook fn,
-                                                 void *arg)
+void stm_fs_set_rollback_data_freed_hook_for_test(stm_fs *fs,
+                                                  stm_fs_rollback_data_freed_hook fn,
+                                                  void *arg)
 {
-    fs->rollback_reclaimed_hook = fn;
-    fs->rollback_reclaimed_hook_arg = arg;
+    fs->rollback_data_freed_hook = fn;
+    fs->rollback_data_freed_hook_arg = arg;
 }
 
 void stm_fs_set_write_guard_hook_for_test(stm_fs *fs,
@@ -11001,8 +11001,8 @@ typedef struct {
  * the index: a send that found one began its hold before this, so what the
  * reclaim frees waits for it (sync.h, send holds); one that looks after this
  * finds it gone. Returns whether every one went. `out` (n entries) gets the
- * lists for fs_rollback_reclaim_newer_snap_cascade; NULL drops them, a leak.
- * Caller holds fs->global EX. */
+ * lists for fs_rollback_reclaim_newer_snap_cascade. Caller holds fs->global
+ * EX. */
 static bool fs_rollback_detach_newer_snaps(stm_snapshot_index *sidx,
                                            const uint64_t *ids, size_t n,
                                            fs_rb_detached *out)
@@ -11015,13 +11015,7 @@ static bool fs_rollback_detach_newer_snaps(stm_snapshot_index *sidx,
                 &d.paddrs, &d.n_paddrs, &d.cold, &d.n_cold, &d.boot, &d.n_boot);
         d.gone = (del == STM_OK);
         if (!d.gone) all = false;
-        if (out) {
-            out[i] = d;
-        } else {
-            free(d.paddrs);
-            free(d.cold);
-            free(d.boot);
-        }
+        out[i] = d;
     }
     return all;
 }
@@ -11095,18 +11089,22 @@ static void fs_rb_detached_free(fs_rb_detached *d, size_t n)
  * tiers — best-effort, walk-must-complete, NEVER over-deref / over-free.
  * If a walk fails the corresponding tier is skipped entirely (no partial
  * filtering -- that would risk freeing case-(a) survivors). If a per-snap
- * delete refused, THAT SNAP's reclaim is skipped (and the caller skipped
- * 4b/4c/4c-ii/4c-iii); the remaining snaps still process. Leaked paddrs / cold
+ * delete refused, the caller calls neither this nor 4b/4c/4c-ii/4c-iii (see
+ * below). Leaked paddrs / cold
  * refcounts are a space cost, never a corruption — a leaked paddr stays
  * ALLOCATED so the AEAD-nonce (paddr, write_gen) pair stays unique.
  *
  * The snapshots left the index before 4b/4c/4c-ii (the spec's order), in
  * fs_rollback_detach_newer_snaps. Those tiers free `OLD \ s_target.view`,
  * which includes blocks a newer snapshot's frozen tree names, and a send
- * finds that tree's records only while the snapshot is in the index. A
- * delete that refused (only a hold or a clone, which the caller refuses
- * first under fs->global EX) makes the caller skip those tiers: that
- * snapshot's tree never names a freed block.
+ * finds that tree's records only while the snapshot is in the index. If any
+ * delete refused, neither those tiers nor this one run, and their blocks
+ * leak: a block in two snapshots' views goes on the newer one's list, so a
+ * list here may hold a block a snapshot still in the index names, and this
+ * filter is by the target's view alone. Only a hold or a clone refuses a
+ * delete today, and the caller refuses both before its first destructive
+ * step, under fs->global EX. A new refusal mode has to be refused there too:
+ * here it only leaks.
  *
  * AGGREGATION (cold tier only): newer snaps' cold dead-lists are
  * accumulated into a single agg_cold buffer (one realloc-growth pass),
@@ -11554,6 +11552,20 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         }
     }
 
+    /* The newer snapshots' lists, from their detach below to the cascade:
+     * allocated before the first destructive step, so its failure refuses
+     * as a no-op. */
+    fs_rb_detached *detached = NULL;
+    if (n_newer > 0) {
+        detached = calloc(n_newer, sizeof *detached);
+        if (!detached) {
+            free(view_data.v);
+            free(newer_ids);
+            pthread_rwlock_unlock(&fs->global);
+            return STM_ENOMEM;
+        }
+    }
+
     /* R128 P2-3 carry: drain every dirty buffer before touching the
      * metadata tree. The post-snapshot buffered writes are exactly what
      * the rollback discards; draining empties the buffer so no stale
@@ -11566,6 +11578,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         if (fr != STM_OK) {
             free(view_data.v);
             free(newer_ids);
+            free(detached);
             pthread_rwlock_unlock(&fs->global);
             return fr;
         }
@@ -11583,6 +11596,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         if (cr != STM_OK) {
             free(view_data.v);
             free(newer_ids);
+            free(detached);
             fs_mark_wedged_locked(fs);
             pthread_rwlock_unlock(&fs->global);
             return cr;
@@ -11613,6 +11627,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
     if (s != STM_OK) {
         free(view_data.v);
         free(newer_ids);
+        free(detached);
         pthread_rwlock_unlock(&fs->global);
         return s;
     }
@@ -11624,16 +11639,25 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * OPEN — skips this slot, so the stamped triple survives untouched
      * to the dataset_index_commit. The engine stays CLOSED until the
      * next post-rollback access opens it lazily at the swapped root. */
-    s = stm_dataset_index_set_engine_root(didx, dataset_id,
-                                             entry.tree_root_paddr,
-                                             entry.root_gen,
-                                             entry.root_csum);
+    /* Under the extent index's lock: a live send's collect walks this
+     * dataset's live engine holding that lock and no EBR pin, outside the
+     * fs, and the set retires that engine. */
+    stm_extent_index *eidx_swap = stm_sync_extent_index(fs->sync);
+    s = eidx_swap
+        ? stm_extent_index_set_engine_root(eidx_swap, dataset_id,
+                                           entry.tree_root_paddr,
+                                           entry.root_gen, entry.root_csum)
+        : stm_dataset_index_set_engine_root(didx, dataset_id,
+                                            entry.tree_root_paddr,
+                                            entry.root_gen,
+                                            entry.root_csum);
     if (s != STM_OK) {
         /* set_engine_root fails here only with STM_ENOENT (the dataset
          * is not PRESENT) — and it refuses as a clean no-op (it bails
          * before mutating the slot). No wedge: the tree is as committed. */
         free(view_data.v);
         free(newer_ids);
+        free(detached);
         pthread_rwlock_unlock(&fs->global);
         return s;
     }
@@ -11648,6 +11672,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
     if (s != STM_OK) {
         free(view_data.v);
         free(newer_ids);
+        free(detached);
         fs_mark_wedged_locked(fs);
         pthread_rwlock_unlock(&fs->global);
         return s;
@@ -11656,14 +11681,10 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
     /* Every newer snapshot leaves the index before the first free below: its
      * frozen tree names blocks the reclaim frees (fs_rollback_detach_newer_snaps).
      * The counts above only went down to what the view names, never to zero.
-     * If one would not go, the reclaim is skipped and its blocks leak. */
-    fs_rb_detached *detached = NULL;
-    bool newer_gone = true;
-    if (n_newer > 0) {
-        detached = calloc(n_newer, sizeof *detached);
-        newer_gone = fs_rollback_detach_newer_snaps(sidx, newer_ids, n_newer,
-                                                    detached);
-    }
+     * If one would not go, nothing below frees, the reclaim nor the cascade,
+     * and their blocks leak. */
+    bool newer_gone = n_newer == 0
+        || fs_rollback_detach_newer_snaps(sidx, newer_ids, n_newer, detached);
 
     /* Reclaim the post-snapshot divergence — blocks reachable from the
      * pre-rollback live tree but not from the snapshot's frozen tree.
@@ -11708,6 +11729,10 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
             fs_rollback_reclaim_diverged_extents(fs, eidx, dataset_id,
                 de_old.di_tree_root, de_old.di_root_gen, de_old.di_root_csum,
                 &view_data);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+            if (fs->rollback_data_freed_hook)
+                fs->rollback_data_freed_hook(fs->rollback_data_freed_hook_arg);
+#endif
 
             /* 9.7-impl-4c-ii: the COLD-extent (CAS) tier — release the
              * CAS refcount of every cold record reachable from the old
@@ -11736,10 +11761,6 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
                 entry.tree_root_paddr, entry.root_gen, entry.root_csum);
     }
     free(view_data.v);
-#ifdef STRATUM_BUILD_TESTING_HOOKS
-    if (fs->rollback_reclaimed_hook)
-        fs->rollback_reclaimed_hook(fs->rollback_reclaimed_hook_arg);
-#endif
 
     /* Clear the target snapshot's dead-lists. MOVED here from
      * pre-reclaim (impl-4 original position) at 9.7-impl-4c-iii: the
@@ -11783,7 +11804,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * effort per snap — a fail on one snap leaves the others reclaimed.
      * Runs BEFORE the commit so every per-snap delete + every reclaim
      * frees / derefs in the SAME atomic commit as the swap. */
-    if (n_newer > 0) {
+    if (n_newer > 0 && newer_gone) {
         stm_extent_index *eidx_n = stm_sync_extent_index(fs->sync);
         uint64_t old_paddr_n   = have_old_root ? de_old.di_tree_root  : 0;
         uint64_t old_gen_n     = have_old_root ? de_old.di_root_gen   : 0;

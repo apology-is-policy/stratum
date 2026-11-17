@@ -2904,13 +2904,13 @@ static void rb_send_case(const char *tag, bool from_seam)
 
     stm_send_set_init_hook_for_test(rb_send_pins_hook, &c);
     if (from_seam) {
-        stm_fs_set_rollback_reclaimed_hook_for_test(src.fs, rb_send_start, &c);
+        stm_fs_set_rollback_data_freed_hook_for_test(src.fs, rb_send_start, &c);
     } else {
         rb_send_start(&c);
         STM_ASSERT(c.at_pins);
     }
     STM_ASSERT_OK(stm_fs_rollback_snapshot(src.fs, 1, s1, false));
-    stm_fs_set_rollback_reclaimed_hook_for_test(src.fs, NULL, NULL);
+    stm_fs_set_rollback_data_freed_hook_for_test(src.fs, NULL, NULL);
     STM_ASSERT(c.started);
     stm_snapshot_entry e;
     STM_ASSERT_ERR(stm_snapshot_lookup(stm_sync_snapshot_index(stm_fs_sync_for_test(src.fs)),
@@ -2947,6 +2947,254 @@ STM_TEST(send_of_a_snapshot_a_rollback_deletes_finds_it_gone) {
 
 STM_TEST(send_of_a_snapshot_found_before_a_rollback_keeps_its_blocks) {
     rb_send_case("hrb_first", false);
+}
+
+/* ---- A newer snapshot whose delete refuses after the rollback's checks ----
+ * A hold taken from the post-commit seam stands in for a refusal the checks
+ * before the first destructive step do not see. The snapshot stays in the
+ * index, and a block on a detached newer snapshot's list that it names is not
+ * freed under it. The control, one variable away, refuses nothing, and the
+ * cascade frees that block. */
+typedef struct { testpool *src; uint64_t snap; int fired; } rr_ctx;
+
+static void rr_hold_hook(void *arg)
+{
+    rr_ctx *c = arg;
+    c->fired++;
+    STM_ASSERT_OK(stm_snapshot_hold(
+        stm_sync_snapshot_index(stm_fs_sync_for_test(c->src->fs)), c->snap));
+}
+
+static void rb_refusal_case(const char *tag, bool refuse)
+{
+    testpool src; testpool_setup(&src, tag, POOL_UUID_SRC);
+    uint8_t z[4096], a[4096], b[4096];
+    memset(z, 0x11, sizeof z);
+    memset(a, 0x22, sizeof a);
+    memset(b, 0x33, sizeof b);
+    uint64_t s1 = 0, s2 = 0, s3 = 0;
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 2, 0, z, sizeof z));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "s1", 2, &s1));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    const uint64_t x = hold_rec(&src, 1).paddrs[0];
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "s2", 2, &s2));
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "s3", 2, &s3));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, b, sizeof b));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    stm_snapshot_index *sidx =
+        stm_sync_snapshot_index(stm_fs_sync_for_test(src.fs));
+    /* Premise: x is on s3's list, counted once; s2's tree names it. */
+    uint64_t *dl = NULL;
+    size_t ndl = 0;
+    bool on3 = false;
+    STM_ASSERT_OK(stm_snapshot_dead_list_get(sidx, s3, &dl, &ndl));
+    for (size_t i = 0; i < ndl; i++)
+        if (dl[i] == x) on3 = true;
+    free(dl);
+    STM_ASSERT(on3);
+    uint32_t rc = 99;
+    STM_ASSERT_OK(stm_alloc_lookup(hold_alloc(&src, x), x, NULL, &rc));
+    STM_ASSERT_EQ(rc, 1u);
+
+    rr_ctx c = { .src = &src, .snap = s2, .fired = 0 };
+    if (refuse)
+        stm_fs_set_rollback_committed_hook_for_test(src.fs, rr_hold_hook, &c);
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(src.fs, 1, s1, false));
+    stm_fs_set_rollback_committed_hook_for_test(src.fs, NULL, NULL);
+    STM_ASSERT_EQ(c.fired, refuse ? 1 : 0);
+    stm_snapshot_entry e;
+    STM_ASSERT_ERR(stm_snapshot_lookup(sidx, s3, &e), STM_ENOENT);
+    rc = 99;
+    STM_ASSERT_OK(stm_alloc_lookup(hold_alloc(&src, x), x, NULL, &rc));
+    stm_test_info("rollback with s2's delete %s: x counted %u",
+                  refuse ? "refused" : "made", rc);
+    if (refuse) {
+        STM_ASSERT_OK(stm_snapshot_lookup(sidx, s2, &e));
+        STM_ASSERT_EQ(rc, 1u);
+        /* Two commits sweep nothing of it, and s2 still sends whole. */
+        STM_ASSERT_OK(stm_fs_commit(src.fs));
+        STM_ASSERT_OK(stm_fs_commit(src.fs));
+        rc = 99;
+        STM_ASSERT_OK(stm_alloc_lookup(hold_alloc(&src, x), x, NULL, &rc));
+        STM_ASSERT_EQ(rc, 1u);
+        stm_send_handle *sh = NULL;
+        STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0, s2,
+                                    &sh));
+        STM_ASSERT_OK(hold_drain(sh));
+        stm_send_close(sh);
+        STM_ASSERT_OK(stm_snapshot_release(sidx, s2));
+    } else {
+        STM_ASSERT_ERR(stm_snapshot_lookup(sidx, s2, &e), STM_ENOENT);
+        STM_ASSERT_EQ(rc, 0u);
+    }
+    testpool_teardown(&src);
+}
+
+STM_TEST(rollback_whose_newer_delete_refuses_frees_nothing_a_present_snapshot_names) {
+    rb_refusal_case("hrr_refuse", true);
+}
+
+STM_TEST(rollback_cascade_frees_a_newer_list_block_the_view_lacks) {
+    rb_refusal_case("hrr_made", false);
+}
+
+/* ---- A live send walking the engine a rollback retires ----
+ * A live send's collect walks the dataset's live engine under the extent
+ * index's lock and no EBR pin, outside the fs. A rollback of the dataset
+ * retires that engine at its root swap; it waits for the walk to end, so the
+ * engine is never retired, and then freed, under it. The send starts from the
+ * rollback's post-commit seam, before the swap, and parks at its first record;
+ * the swap is the rollback's next step. */
+#include <stratum/btree_engine_testing.h>
+#include <stratum/dataset.h>
+#include <stratum/extent_testing.h>
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool in_walk, release, retired, retired_in_walk, retired_before_walk;
+    bool send_started, send_done, rb_started;
+    const void *live;
+    testpool *src;
+    uint64_t s1;
+    stm_status rb_rc, init_rc, stream_rc;
+    pthread_t th_send, th_rb;
+} lw_ctx;
+
+static _Thread_local bool lw_is_send;
+
+static bool lw_wait(lw_ctx *c, const bool *a, const bool *b, int secs)
+{
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += secs;
+    pthread_mutex_lock(&c->mu);
+    while (!*a && !(b && *b))
+        if (pthread_cond_timedwait(&c->cv, &c->mu, &until) != 0) break;
+    bool got = *a || (b && *b);
+    pthread_mutex_unlock(&c->mu);
+    return got;
+}
+
+static void lw_set(lw_ctx *c, bool *flag)
+{
+    pthread_mutex_lock(&c->mu);
+    *flag = true;
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+}
+
+static void lw_walk_hook(uint64_t ds, void *arg)
+{
+    lw_ctx *c = arg;
+    if (!lw_is_send || ds != 1) return;
+    pthread_mutex_lock(&c->mu);
+    bool first = !c->in_walk;
+    if (first) {
+        c->retired_before_walk = c->retired;
+        c->in_walk = true;
+        pthread_cond_broadcast(&c->cv);
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (first) (void)lw_wait(c, &c->release, NULL, 60);
+}
+
+static void lw_life_hook(const stm_btree_engine *eng, bool freed, void *arg)
+{
+    lw_ctx *c = arg;
+    if (freed || (const void *)eng != c->live) return;
+    pthread_mutex_lock(&c->mu);
+    c->retired = true;
+    if (c->in_walk && !c->release) c->retired_in_walk = true;
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+}
+
+static void *lw_send_thread(void *arg)
+{
+    lw_ctx *c = arg;
+    lw_is_send = true;
+    stm_send_handle *sh = NULL;
+    c->init_rc = stm_send_init(stm_fs_sync_for_test(c->src->fs), 1, 0, 0, &sh);
+    c->stream_rc = (c->init_rc == STM_OK && sh) ? hold_drain(sh) : c->init_rc;
+    stm_send_close(c->init_rc == STM_OK ? sh : NULL);
+    lw_set(c, &c->send_done);
+    return NULL;
+}
+
+/* On the rollback thread, after its first commit, before the swap. */
+static void lw_committed_hook(void *arg)
+{
+    lw_ctx *c = arg;
+    if (pthread_create(&c->th_send, NULL, lw_send_thread, c) != 0) return;
+    c->send_started = true;
+    (void)lw_wait(c, &c->in_walk, &c->send_done, 60);
+}
+
+static void *lw_rb_thread(void *arg)
+{
+    lw_ctx *c = arg;
+    c->rb_rc = stm_fs_rollback_snapshot(c->src->fs, 1, c->s1, false);
+    return NULL;
+}
+
+STM_TEST(rollback_waits_for_a_live_send_walking_the_engine_it_retires) {
+    testpool src; testpool_setup(&src, "hlw", POOL_UUID_SRC);
+    uint8_t a[4096], b[4096];
+    memset(a, 0x44, sizeof a);
+    memset(b, 0x55, sizeof b);
+    lw_ctx c;
+    memset(&c, 0, sizeof c);
+    pthread_mutex_init(&c.mu, NULL);
+    pthread_cond_init(&c.cv, NULL);
+    c.src = &src;
+    for (uint64_t ino = 1; ino <= 8; ino++)
+        STM_ASSERT_OK(stm_fs_write(src.fs, 1, ino, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "s1", 2, &c.s1));
+    for (uint64_t ino = 1; ino <= 8; ino++)
+        STM_ASSERT_OK(stm_fs_write(src.fs, 1, ino, 0, b, sizeof b));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    stm_btree_engine *live = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(
+        stm_sync_dataset_index(stm_fs_sync_for_test(src.fs)), 1, &live));
+    c.live = live;
+
+    stm_btree_engine_set_lifecycle_hook_for_test(lw_life_hook, &c);
+    stm_extent_set_serial_walk_hook_for_test(lw_walk_hook, &c);
+    stm_fs_set_rollback_committed_hook_for_test(src.fs, lw_committed_hook, &c);
+    if (pthread_create(&c.th_rb, NULL, lw_rb_thread, &c) == 0)
+        c.rb_started = true;
+    const bool in_walk = c.rb_started && lw_wait(&c, &c.in_walk, NULL, 60);
+    /* Unfenced, the swap retires the engine within this second. */
+    (void)lw_wait(&c, &c.retired, NULL, 1);
+    pthread_mutex_lock(&c.mu);
+    const bool retired_in_walk = c.retired_in_walk;
+    const bool retired_before_walk = c.retired_before_walk;
+    pthread_mutex_unlock(&c.mu);
+    lw_set(&c, &c.release);
+    if (c.rb_started) pthread_join(c.th_rb, NULL);
+    if (c.send_started) pthread_join(c.th_send, NULL);
+    stm_fs_set_rollback_committed_hook_for_test(src.fs, NULL, NULL);
+    stm_extent_set_serial_walk_hook_for_test(NULL, NULL);
+    stm_btree_engine_set_lifecycle_hook_for_test(NULL, NULL);
+    stm_test_info("live send beside a rollback: parked %d, engine retired "
+                  "before the walk %d, under it %d, at all %d; rollback %d, "
+                  "init %d, stream %d", (int)in_walk, (int)retired_before_walk,
+                  (int)retired_in_walk, (int)c.retired, (int)c.rb_rc,
+                  (int)c.init_rc, (int)c.stream_rc);
+    STM_ASSERT(in_walk);
+    STM_ASSERT(!retired_before_walk);
+    STM_ASSERT(!retired_in_walk);
+    STM_ASSERT(c.retired);
+    STM_ASSERT_OK(c.rb_rc);
+    STM_ASSERT_OK(c.init_rc);
+    STM_ASSERT_OK(c.stream_rc);
+    pthread_cond_destroy(&c.cv);
+    pthread_mutex_destroy(&c.mu);
+    testpool_teardown(&src);
 }
 
 STM_TEST_MAIN("send_recv")
