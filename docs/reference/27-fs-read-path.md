@@ -132,6 +132,17 @@ is dropped — the `memcpy` fully fills `buf`). A `4 * recordsize` scratch cap
   record it should hold whole reaching outside it, or a hole's next start at or
   before it: an index the read cannot trust. Defensive; none is reachable while
   the lookups keep their contract.
+- `STM_ECORRUPT` on the write side's cover: its split would end a piece at an
+  off-grid record's start, a chain of off-grid records widens it past
+  `4 * recordsize`, or a record over the recordsize at an edge is not COLD or
+  is off the grid (an older pool's COLD one is promoted, to pieces of at most
+  the recordsize, and the cover looks again). A drain drops the run and
+  reports it at the file's next fsync (T0.97); a direct write answers it.
+- `STM_ERANGE` on the write side: a direct write whose widened cover passes
+  `4 * recordsize` (a library call; a 9P write is clamped to its iounit). A
+  drain's run is at most a recordsize, and its cover, with any record over the
+  recordsize at its edges promoted first, stays under 3 recordsizes plus
+  rounding.
 - Any sync-layer error after the first piece: the read answers the bytes before
   it instead (STM_OK, short).
 - `STM_ENOMEM` — scratch alloc.
@@ -168,10 +179,15 @@ No P0/P1/P2 open on the read path after F2.
   records); the 64-piece bound caps how long one call holds `fs->global` SH.
 - A record off the 4 KiB grid: the receive refuses one since the T0.96 review
   (every producer keeps records on the grid), but a pool that took one before
-  may hold it. The read serves it whole; a write into it rewrites its cover on
-  the grid (the cover widens until no record straddles a rounded edge); a
-  truncate whose new size falls inside one that starts off the grid answers
-  `STM_ECORRUPT` (its kept-prefix rewrite needs a record on the grid).
+  may hold it. The read serves it whole; a write whose cover (widened until no
+  record straddles a rounded edge) is within one recordsize rewrites it on the
+  grid. A larger cover cannot be written as pieces on the grid when its split
+  would end a piece at such a record's start, or when a chain of them widens it
+  past 4 recordsizes: the write answers `STM_ECORRUPT`, which a drain takes as
+  a run it can never write (it drops the run, the record keeps its bytes, and
+  the file's next fsync answers `STM_EIO`, T0.97). A truncate whose new size
+  falls inside one that starts off the grid answers `STM_ECORRUPT` (its
+  kept-prefix rewrite needs a record on the grid).
 - Read-after-write within an un-flushed window is served by the overlay, not the
   extents; a crash before `stm_sync_commit` loses both the buffer and the
   in-memory `si_size` bump (neither happened on disk).

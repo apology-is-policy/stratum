@@ -396,12 +396,14 @@ stm_status stm_send_next(stm_send_handle *h,
 void stm_send_close(stm_send_handle *h);
 
 #ifdef STRATUM_BUILD_TESTING_HOOKS
-/* Runs inside stm_send_init with the hold's barriers up and no lock
- * held, twice: after the snapshot lookups, before the collect; and
- * after the collect and the key capture, before the pins. Process-wide;
- * NULL clears it. */
-#define STM_SEND_INIT_HOOK_BEFORE_COLLECT 0
-#define STM_SEND_INIT_HOOK_BEFORE_PINS    1
+/* Runs inside stm_send_init with no lock held, three times: after the
+ * evict baseline is read and the dataset found unlocked, before the hold;
+ * with the hold's barriers up, after the snapshot lookups, before the
+ * collect; and after the collect and the key capture, before the pins.
+ * Process-wide; NULL clears it. */
+#define STM_SEND_INIT_HOOK_BEFORE_COLLECT    0
+#define STM_SEND_INIT_HOOK_BEFORE_PINS       1
+#define STM_SEND_INIT_HOOK_AFTER_LOCK_CHECK  2
 void stm_send_set_init_hook_for_test(void (*hook)(void *ctx, int stage),
                                      void *ctx);
 /* True once the handle captured keys and every byte of them is zero. */

@@ -11007,17 +11007,18 @@ static bool sync_promote_err_stops(stm_status e)
 }
 
 /* max_bytes 0: every COLD extent of the ino, past a failed one, the first
- * error returned. Otherwise, in offset order, until the next extent would
- * take the bytes moved past max_bytes (one moved at least), passing over a
- * failed extent; an error the next extent would meet too
- * (sync_promote_err_stops) stops it and is returned, else the first error.
- * *out_more says whether a COLD extent is left untried. */
+ * error returned. Otherwise the ones starting at or past `from`, in offset
+ * order (stm_extent_iter's), until the next would take the
+ * bytes tried past max_bytes (one tried at least), passing over a failed
+ * extent, which counts as tried; an error the next extent would meet too
+ * (sync_promote_err_stops) stops it and is returned, else the first
+ * error. */
 static stm_status sync_promote_ino(stm_sync *s, uint64_t dataset_id,
-                                   uint64_t ino, uint64_t max_bytes,
-                                   uint64_t *out_bytes, bool *out_more)
+                                   uint64_t ino, uint64_t from,
+                                   uint64_t max_bytes,
+                                   stm_sync_promote_step *out)
 {
-    *out_bytes = 0;
-    *out_more  = false;
+    *out = (stm_sync_promote_step){ .next = from };
     pthread_mutex_lock(&s->lock);
     if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
     if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
@@ -11040,21 +11041,24 @@ static stm_status sync_promote_ino(stm_sync *s, uint64_t dataset_id,
 
     stm_status promote_err = STM_OK;
     for (size_t i = 0; i < cx.n; i++) {
-        if (max_bytes != 0u && *out_bytes != 0u &&
-            (*out_bytes >= max_bytes ||
-             cx.records[i].len > max_bytes - *out_bytes)) {
-            *out_more = true;
+        const stm_extent_record *r = &cx.records[i];
+        if (r->off < from) continue;
+        if (max_bytes != 0u && out->tried != 0u &&
+            (out->tried >= max_bytes || r->len > max_bytes - out->tried)) {
+            out->more = true;
             break;
         }
-        stm_status pe = promote_one_extent_locked(s, &cx.records[i]);
-        if (pe == STM_OK) {
-            *out_bytes += cx.records[i].len;
-            continue;
-        }
-        if (max_bytes != 0u && sync_promote_err_stops(pe)) {
+        stm_status pe = promote_one_extent_locked(s, r);
+        if (pe != STM_OK && max_bytes != 0u && sync_promote_err_stops(pe)) {
             promote_err = pe;
-            *out_more = true;
+            out->more = true;
             break;
+        }
+        out->tried += r->len;
+        out->next = r->off + r->len;
+        if (pe == STM_OK) {
+            out->bytes += r->len;
+            continue;
         }
         if (promote_err == STM_OK) promote_err = pe;
     }
@@ -11070,21 +11074,19 @@ stm_status stm_sync_promote_to_hot(stm_sync *s,
 {
     if (!s) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
-    uint64_t bytes = 0;
-    bool more = false;
-    return sync_promote_ino(s, dataset_id, ino, 0u, &bytes, &more);
+    stm_sync_promote_step st;
+    return sync_promote_ino(s, dataset_id, ino, 0u, 0u, &st);
 }
 
 stm_status stm_sync_promote_to_hot_bounded(stm_sync *s, uint64_t dataset_id,
-                                           uint64_t ino, uint64_t max_bytes,
-                                           uint64_t *out_bytes, bool *out_more)
+                                           uint64_t ino, uint64_t from,
+                                           uint64_t max_bytes,
+                                           stm_sync_promote_step *out)
 {
-    if (out_bytes) *out_bytes = 0;
-    if (out_more)  *out_more  = false;
-    if (!s || !out_bytes || !out_more) return STM_EINVAL;
+    if (out) *out = (stm_sync_promote_step){ .next = from };
+    if (!s || !out) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0 || max_bytes == 0) return STM_EINVAL;
-    stm_status rc = sync_promote_ino(s, dataset_id, ino, max_bytes,
-                                     out_bytes, out_more);
+    stm_status rc = sync_promote_ino(s, dataset_id, ino, from, max_bytes, out);
     return rc == STM_ENOENT ? STM_OK : rc;
 }
 

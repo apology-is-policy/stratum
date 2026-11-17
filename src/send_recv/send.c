@@ -339,6 +339,7 @@ stm_status stm_send_init(stm_sync *sync,
      * An extent's key would refuse below, but a locked dataset may hold no
      * HOT extent, and its COLD chunks open under the pool's key. */
     if (stm_sync_dataset_locked(sync, dataset_id)) return STM_ELOCKED;
+    SEND_INIT_HOOK(STM_SEND_INIT_HOOK_AFTER_LOCK_CHECK);
 
     /* Resolve gen range from snapshot ids. */
     uint64_t gen_min_excl = 0;

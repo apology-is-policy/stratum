@@ -48,6 +48,7 @@
 #include <stratum/keyfile.h>
 #include <stratum/keyschema.h>
 #include <stratum/extent.h>
+#include <stratum/extent_testing.h>
 #include <stratum/pool.h>
 #include <stratum/scrub.h>
 #include <stratum/send_recv.h>
@@ -3720,12 +3721,12 @@ STM_TEST(corvus_login_promote_moves_a_step_at_a_time_and_stops_at_a_logout) {
     seal_ext_sum z = seal_extents(sp.fs, sp.home.ds, c[1]);
     STM_ASSERT_EQ(a.cold + z.cold, 2);
     uint64_t left = a.cold ? c[0] : c[1];
-    uint64_t got = 1;
-    bool more = false;
-    STM_ASSERT_ERR(stm_sync_promote_to_hot_bounded(sync, sp.home.ds, left, STEP,
-                                                   &got, &more), STM_ELOCKED);
-    STM_ASSERT_EQ(got, 0u);
-    STM_ASSERT(more);
+    stm_sync_promote_step ps;
+    STM_ASSERT_ERR(stm_sync_promote_to_hot_bounded(sync, sp.home.ds, left, 0u,
+                                                   STEP, &ps), STM_ELOCKED);
+    STM_ASSERT_EQ(ps.bytes, 0u);
+    STM_ASSERT_EQ(ps.tried, 0u);
+    STM_ASSERT(ps.more);
     STM_ASSERT_OK(stm_fs_install_dek(sp.fs, sp.home.ds, &sp.cc));
     STM_ASSERT_OK(stm_fs_commit(sp.fs));
     seal_pool_close(&sp);
@@ -3772,4 +3773,500 @@ STM_TEST(corvus_clone_of_a_home_cannot_promote_its_shared_cold_record) {
     STM_ASSERT_OK(stm_fs_install_dek(sp.fs, sp.home.ds, &sp.cc));
     STM_ASSERT_OK(stm_fs_commit(sp.fs));
     seal_pool_close(&sp);
+}
+
+/* ========================================================================= */
+/* Round 3 of T0.94: an older pool's oversized COLD records at a cover's    */
+/* edges, the multi-piece promote's failures, a relogin inside a send's     */
+/* init, and a login pass over unreadable records.                          */
+/* ========================================================================= */
+
+static void r3_noise17(uint8_t *p, size_t n)
+{
+    uint64_t x = 0x9E3779B97F4A7C15ull * 17u + 12345u;
+    for (size_t j = 0; j + 8u <= n; j += 8u) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        memcpy(p + j, &x, 8);
+    }
+}
+
+static void r3_read_all(stm_fs *fs, uint64_t ds, uint64_t ino, uint64_t off,
+                        uint8_t *buf, size_t len)
+{
+    size_t done = 0;
+    while (done < len) {
+        size_t got = 0;
+        stm_status rs = stm_fs_read(fs, ds, ino, off + done, buf + done,
+                                    len - done, &got);
+        STM_ASSERT_OK(rs);
+        if (rs != STM_OK || got == 0u) break;
+        done += got;
+    }
+    STM_ASSERT_EQ(done, len);
+}
+
+/* A 64 MiB file migrated as an older pool's cold tier did (chunks
+ * uncapped), whose records A = [0, 15622144), B, C = [22212608, 35303424)
+ * have A + B + C over 4 recordsizes; a buffered rewrite from inside A to
+ * inside C in 512 KiB writes, one drain run. Before, the cover took A and
+ * C whole and the drain answered STM_ERANGE at every commit (another
+ * file's write was lost), and a home's logout, which drains first, could
+ * not evict its key. Now the cover promotes A and C. */
+static void r3_big_edges(bool home)
+{
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, home ? "r3edgeh" : "r3edge",
+                           UINT64_C(1) << 30, UINT64_C(128) << 20)) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const uint64_t ds = home ? sp.home.ds : sp.sib.ds;
+    const uint64_t REC = STM_FS_RECORDSIZE_MAX;
+    const size_t LEN = (size_t)64 << 20;
+    uint8_t *all = malloc(LEN);
+    STM_ASSERT(all != NULL);
+    if (!all) { seal_pool_close(&sp); return; }
+    r3_noise17(all, LEN);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(sp.fs, ds, 1, (const uint8_t *)"b64", 3,
+                                     0600, 1000, 1000, &f));
+    for (size_t k = 0; k < LEN; k += (size_t)4 << 20)
+        STM_ASSERT_OK(stm_fs_write(sp.fs, ds, f, k, all + k, (size_t)4 << 20));
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    stm_sync_set_cold_chunks_uncapped_for_test(sync, true);
+    if (home) stm_sync_set_cas_admits_sealed_for_test(sync, true);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(sp.fs, ds, f));
+    if (home) stm_sync_set_cas_admits_sealed_for_test(sync, false);
+    stm_sync_set_cold_chunks_uncapped_for_test(sync, false);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    const uint64_t lo = 15622144u - 4096u, hi = 22212608u + 4096u;
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record a, c;
+    memset(&a, 0, sizeof a);
+    memset(&c, 0, sizeof c);
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, ds, f, lo, &a));
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, ds, f, hi - 1u, &c));
+    /* The layout under test: two COLD records over the recordsize, a
+     * cover over 4 recordsizes. */
+    STM_ASSERT_EQ(a.kind, STM_EXTENT_KIND_COLD);
+    STM_ASSERT_EQ(c.kind, STM_EXTENT_KIND_COLD);
+    STM_ASSERT(a.len > REC && c.len > REC);
+    STM_ASSERT(c.off + c.len - a.off > 4u * REC);
+    const uint64_t P = (uint64_t)512 << 10;
+    for (uint64_t at = lo; at < hi; at += P) {
+        size_t n = (hi - at) < P ? (size_t)(hi - at) : (size_t)P;
+        memset(all + at, 'W', n);
+        STM_ASSERT_OK(stm_fs_write(sp.fs, ds, f, at, all + at, n));
+    }
+    /* Admitted on what the drain writes: both promotes, and the cover over
+     * the pieces at their edges, each block up to twice on one device (a
+     * drain's pieces may be as short as the free runs). */
+    stm_fs_stats fst;
+    memset(&fst, 0, sizeof fst);
+    STM_ASSERT_OK(stm_fs_stats_get(sp.fs, &fst));
+    STM_ASSERT(fst.data_dirty_reserved_blocks >=
+               2u * ((a.len + c.len + (c.off - a.off)) / 4096u));
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    STM_ASSERT_OK(stm_fs_fsync(sp.fs, ds, f, NULL));
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, ds, f, lo, &a));
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, ds, f, hi - 1u, &c));
+    STM_ASSERT_EQ(a.kind, STM_EXTENT_KIND_HOT);
+    STM_ASSERT_EQ(c.kind, STM_EXTENT_KIND_HOT);
+    STM_ASSERT(a.len <= REC && c.len <= REC);
+    const uint64_t r0 = lo - ((uint64_t)1 << 20), rn = (hi - lo) + ((uint64_t)2 << 20);
+    uint8_t *got = malloc((size_t)rn);
+    STM_ASSERT(got != NULL);
+    if (home) {
+        STM_ASSERT_OK(stm_fs_evict_dek(sp.fs, ds));          /* the logout */
+        STM_ASSERT(stm_fs_dataset_locked(sp.fs, ds));
+        size_t n = 0;
+        STM_ASSERT_ERR(stm_fs_read(sp.fs, ds, f, 0, got, 16, &n), STM_ELOCKED);
+        STM_ASSERT_OK(stm_fs_install_dek(sp.fs, ds, &sp.cc));
+    }
+    uint64_t g = 0;
+    STM_ASSERT_OK(stm_fs_create_file(sp.fs, ds, 1, (const uint8_t *)"g", 1,
+                                     0600, 1000, 1000, &g));
+    STM_ASSERT_OK(stm_fs_write(sp.fs, ds, g, 0, "other", 5));
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    if (got && !home && seal_pool_remount(&sp)) {
+        r3_read_all(sp.fs, ds, f, r0, got, (size_t)rn);
+        STM_ASSERT(memcmp(got, all + r0, (size_t)rn) == 0);
+        uint64_t g2 = 0;
+        uint8_t o[8] = {0};
+        size_t n = 0;
+        STM_ASSERT_OK(stm_fs_lookup(sp.fs, ds, 1, (const uint8_t *)"g", 1, &g2));
+        STM_ASSERT_OK(stm_fs_read(sp.fs, ds, g2, 0, o, 5, &n));
+        STM_ASSERT(n == 5u && memcmp(o, "other", 5) == 0);
+    } else if (got) {
+        r3_read_all(sp.fs, ds, f, r0, got, (size_t)rn);
+        STM_ASSERT(memcmp(got, all + r0, (size_t)rn) == 0);
+    }
+    free(got);
+    free(all);
+    seal_pool_close(&sp);
+}
+
+STM_TEST(corvus_write_across_two_big_cold_records_promotes_them) {
+    r3_big_edges(false);
+}
+
+STM_TEST(corvus_logout_after_a_write_across_two_big_cold_records_locks_the_home) {
+    r3_big_edges(true);
+}
+
+/* The multi-piece promote: the second piece's index insert fails (the
+ * index's put seam), after the first replaced the record: the handle
+ * wedges and no commit makes the half-done index durable. */
+STM_TEST(corvus_promote_whose_second_piece_insert_fails_wedges) {
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, "r3ins", UINT64_C(1) << 30,
+                           UINT64_C(128) << 20)) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    uint64_t f = 0;
+    uint8_t *want = seal_big_cold_file(sp.fs, sp.sib.ds, "c24", true, &f);
+    if (!want) { seal_pool_close(&sp); return; }
+    seal_ext_sum e = seal_extents(sp.fs, sp.sib.ds, f);
+    STM_ASSERT(e.big_len > STM_FS_RECORDSIZE_MAX);
+    stm_extent_fail_next_put_for_test(stm_sync_extent_index(sync), 2u, STM_ENOMEM);
+    stm_status pr = stm_sync_promote_cold_at(sync, sp.sib.ds, f, e.big_off);
+    stm_extent_fail_next_put_for_test(stm_sync_extent_index(sync), 0u, STM_OK);
+    STM_ASSERT_ERR(pr, STM_EWEDGED);
+    STM_ASSERT(stm_fs_commit(sp.fs) != STM_OK);
+    free(want);
+    seal_pool_close(&sp);
+}
+
+/* The second piece's device write fails: the promote answers the error,
+ * the record stays COLD, and after a commit every block is free again,
+ * the first piece's included. */
+STM_TEST(corvus_promote_whose_second_piece_write_fails_frees_the_first) {
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, "r3pcw", UINT64_C(1) << 30,
+                           UINT64_C(128) << 20)) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    uint64_t f = 0;
+    uint8_t *want = seal_big_cold_file(sp.fs, sp.sib.ds, "h24", true, &f);
+    if (!want) { seal_pool_close(&sp); return; }
+    seal_ext_sum e = seal_extents(sp.fs, sp.sib.ds, f);
+    STM_ASSERT(e.big_len > STM_FS_RECORDSIZE_MAX);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    stm_fs_stats a, b;
+    STM_ASSERT_OK(stm_fs_stats_get(sp.fs, &a));
+    struct stm_bdev *d = stm_fs_bdev_for_test(sp.fs);
+    stm_bdev_inject_fail_after(d, 2);
+    stm_status pr = stm_sync_promote_cold_at(sync, sp.sib.ds, f, e.big_off);
+    stm_bdev_inject_fail_after(d, 0);
+    STM_ASSERT(pr != STM_OK);
+    STM_ASSERT_EQ(seal_extent_kind_at(sp.fs, sp.sib.ds, f, e.big_off),
+                  STM_EXTENT_KIND_COLD);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    STM_ASSERT_OK(stm_fs_stats_get(sp.fs, &b));
+    STM_ASSERT_EQ(b.data_avail_blocks, a.data_avail_blocks);
+    free(want);
+    seal_pool_close(&sp);
+}
+
+/* A logout and a login inside stm_send_init stop the stream at its first
+ * record, wherever they land: after the evict baseline is read and the
+ * lock checked (the baseline must be that read, not a later one), and
+ * after the key capture (the keys captured before a logout must not go
+ * out). */
+static stm_fs *g_relog_fs;
+static uint64_t g_relog_ds;
+static stm_corvus_mount_cfg *g_relog_cc;
+static int g_relog_stage, g_relog_fired;
+static stm_status g_relog_out, g_relog_in;
+
+static void r3_relog_hook(void *ctx, int stage)
+{
+    (void)ctx;
+    if (stage != g_relog_stage || g_relog_fired) return;
+    g_relog_fired = 1;
+    g_relog_out = stm_fs_evict_dek(g_relog_fs, g_relog_ds);
+    g_relog_in  = stm_fs_install_dek(g_relog_fs, g_relog_ds, g_relog_cc);
+}
+
+static void r3_relog_send(int stage)
+{
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "r3relog")) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    g_relog_fs = sp.fs;
+    g_relog_ds = sp.home.ds;
+    g_relog_cc = &sp.cc;
+    g_relog_stage = stage;
+    g_relog_fired = 0;
+    g_relog_out = g_relog_in = STM_EINVAL;
+    stm_send_set_init_hook_for_test(r3_relog_hook, NULL);
+    stm_send_handle *h = NULL;
+    stm_status ir = stm_send_init(sync, sp.home.ds, 0, 0, &h);
+    stm_send_set_init_hook_for_test(NULL, NULL);
+    STM_ASSERT_OK(ir);
+    STM_ASSERT_EQ(g_relog_fired, 1);
+    STM_ASSERT_OK(g_relog_out);
+    STM_ASSERT_OK(g_relog_in);
+    if (ir == STM_OK) {
+        size_t cap = (size_t)1 << 16, n = 0, need = 0;
+        uint8_t *buf = malloc(cap);
+        int records = 0;
+        stm_status r;
+        while ((r = stm_send_next(h, buf, cap, &n, &need)) == STM_OK) records++;
+        STM_ASSERT_ERR(r, STM_ELOCKED);
+        STM_ASSERT_EQ(records, 0);
+        free(buf);
+        stm_send_close(h);
+    }
+    /* The control: with no relogin the same home sends records. */
+    STM_ASSERT_OK(stm_send_init(sync, sp.home.ds, 0, 0, &h));
+    if (h) {
+        size_t cap = (size_t)1 << 16, n = 0, need = 0;
+        uint8_t *buf = malloc(cap);
+        int records = 0;
+        while (stm_send_next(h, buf, cap, &n, &need) == STM_OK) records++;
+        STM_ASSERT(records > 0);
+        free(buf);
+        stm_send_close(h);
+    }
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    seal_pool_close(&sp);
+}
+
+STM_TEST(corvus_send_stops_after_a_relogin_past_its_lock_check) {
+    r3_relog_send(STM_SEND_INIT_HOOK_AFTER_LOCK_CHECK);
+}
+
+STM_TEST(corvus_send_stops_after_a_relogin_after_its_key_capture) {
+    r3_relog_send(STM_SEND_INIT_HOOK_BEFORE_PINS);
+}
+
+/* Damages, on the device, the first n records of a seal_sparse_cold_file
+ * file of len-byte records. */
+static void r3_damage(seal_pool *sp, uint64_t f, int n, uint64_t len)
+{
+    stm_sync *sync = stm_fs_sync(sp->fs);
+    for (int k = 0; k < n; k++) {
+        stm_extent_record e;
+        memset(&e, 0, sizeof e);
+        STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(sync),
+                                           sp->home.ds, f,
+                                           (uint64_t)k * 2u * len, &e));
+        stm_cas_record cr;
+        memset(&cr, 0, sizeof cr);
+        STM_ASSERT_OK(stm_cas_lookup(stm_sync_cas_index(sync), e.content_hash,
+                                     &cr));
+        uint8_t junk[64];
+        memset(junk, 0xee, sizeof junk);
+        STM_ASSERT_OK(stm_bdev_write(stm_fs_bdev_for_test(sp->fs),
+                                     stm_paddr_offset(cr.paddrs[0]) *
+                                         (uint64_t)STM_UB_SIZE,
+                                     junk, sizeof junk));
+    }
+}
+
+/* A login pass tries an unreadable record once: it counts against the
+ * pass's budget, the next step resumes past it, and the next pass where
+ * this one stopped. A home file of eleven 256 KiB cold records whose
+ * first three are damaged; passes of 2 MiB in 1 MiB steps. Before, each
+ * step tried the damaged three again, and they cost nothing: two steps
+ * moved 1 MiB each. */
+static uint64_t g_r3_moved[8];
+static int g_r3_steps;
+
+static void r3_step_hook(uint64_t ino, uint64_t got, void *arg)
+{
+    (void)ino;
+    (void)arg;
+    if (g_r3_steps < 8) g_r3_moved[g_r3_steps] = got;
+    g_r3_steps++;
+}
+
+STM_TEST(corvus_login_promote_tries_an_unreadable_record_once_a_pass) {
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, "r3bad", UINT64_C(256) << 20,
+                           UINT64_C(16) << 20)) return;
+    const uint64_t L = (uint64_t)256 << 10;
+    uint64_t f = seal_sparse_cold_file(sp.fs, sp.home.ds, "bad3", 11, (size_t)L, 0x41);
+    r3_damage(&sp, f, 3, L);
+    const uint64_t want[3][3] = {
+        { L, 4u * L, UINT64_MAX },          /* 3 damaged + 1, then 4 */
+        { 3u * L, UINT64_MAX, UINT64_MAX }, /* from where it stopped: the last 3 */
+        { 0, UINT64_MAX, UINT64_MAX },      /* round again: the 3 damaged */
+    };
+    stm_fs_set_promote_step_hook_for_test(sp.fs, r3_step_hook, NULL);
+    for (int pass = 0; pass < 3; pass++) {
+        g_r3_steps = 0;
+        memset(g_r3_moved, 0, sizeof g_r3_moved);
+        stm_fs_promote_policy_stats st;
+        stm_status pr = stm_fs_promote_sealed_cold(sp.fs, sp.home.ds,
+                                                   (uint64_t)2 << 20, &st);
+        STM_ASSERT_OK(pr);
+        STM_ASSERT((st.last_err != STM_OK) == (pass != 1));
+        int n = 0;
+        while (n < 3 && want[pass][n] != UINT64_MAX) n++;
+        STM_ASSERT_EQ(g_r3_steps, n);
+        for (int k = 0; k < n && k < g_r3_steps; k++)
+            STM_ASSERT_EQ(g_r3_moved[k], want[pass][k]);
+    }
+    stm_fs_set_promote_step_hook_for_test(sp.fs, NULL, NULL);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    seal_pool_close(&sp);
+}
+
+/* A file whose eight records are all damaged takes a whole pass's budget;
+ * the next pass starts past it, at the file after it. Before (every pass
+ * from the first file) no login moved the second file's records. */
+STM_TEST(corvus_login_promote_resumes_past_a_file_of_unreadable_records) {
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, "r3res", UINT64_C(256) << 20,
+                           UINT64_C(16) << 20)) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const uint64_t L = (uint64_t)256 << 10, PASS = (uint64_t)2 << 20;
+    uint64_t bad = seal_sparse_cold_file(sp.fs, sp.home.ds, "bad8", 8, (size_t)L, 0x41);
+    uint64_t good = seal_sparse_cold_file(sp.fs, sp.home.ds, "good4", 4, (size_t)L, 0x61);
+    STM_ASSERT(bad < good);   /* a pass in ino order meets bad8 first */
+    r3_damage(&sp, bad, 8, L);
+    stm_fs_promote_policy_stats st;
+    STM_ASSERT_OK(stm_fs_promote_sealed_cold(sp.fs, sp.home.ds, PASS, &st));
+    STM_ASSERT(st.last_err != STM_OK);
+    STM_ASSERT_EQ(st.last_err_ino, bad);
+    STM_ASSERT_EQ(st.bytes_promoted, 0u);
+    STM_ASSERT_OK(stm_fs_promote_sealed_cold(sp.fs, sp.home.ds, PASS, &st));
+    STM_ASSERT_EQ(st.bytes_promoted, 4u * L);
+    for (int k = 0; k < 4; k++) {
+        stm_extent_record e;
+        memset(&e, 0, sizeof e);
+        STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(sync), sp.home.ds,
+                                           good, (uint64_t)k * 2u * L, &e));
+        STM_ASSERT_EQ(e.kind, STM_EXTENT_KIND_HOT);
+    }
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    seal_pool_close(&sp);
+}
+
+/* Seventeen 512 KiB records 1 MiB apart, the last at 16 MiB, which the
+ * extent index's key order (offsets stored little-endian) puts second.
+ * Each step of the bounded promote resumes past the last record it tried,
+ * so it needs a file's records in offset order (stm_extent_iter sorts
+ * them): in key order its first 1 MiB step would end past every record but
+ * the first, and the steps after it would skip them. */
+STM_TEST(corvus_login_promote_moves_every_record_of_a_file_past_16_mib) {
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, "r3ord", UINT64_C(256) << 20,
+                           UINT64_C(16) << 20)) return;
+    const uint64_t L = (uint64_t)512 << 10;
+    (void)seal_sparse_cold_file(sp.fs, sp.home.ds, "ord17", 17, (size_t)L, 0x21);
+    stm_fs_promote_policy_stats st;
+    STM_ASSERT_OK(stm_fs_promote_sealed_cold(sp.fs, sp.home.ds,
+                                             (uint64_t)32 << 20, &st));
+    STM_ASSERT_EQ(st.last_err, STM_OK);
+    STM_ASSERT_EQ(st.bytes_promoted, 17u * L);
+    bool has_cold = true;
+    STM_ASSERT_OK(stm_sync_dataset_has_cold(stm_fs_sync(sp.fs), sp.home.ds,
+                                            &has_cold));
+    STM_ASSERT(!has_cold);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    seal_pool_close(&sp);
+}
+
+static int g_r3_writes;
+static stm_fs *g_r3_fs;
+
+/* After the second piece's device write: the third piece's fails. */
+static void r3_fail_third_piece(void *ctx)
+{
+    (void)ctx;
+    if (++g_r3_writes == 2)
+        stm_bdev_inject_fail_after(stm_fs_bdev_for_test(g_r3_fs), 1);
+}
+
+/* A direct write (a megabyte or more) over the whole of an older pool's
+ * cold record over the recordsize, C of r3_big_edges' file: the cover's
+ * edges are in the records beside it, and its split meets C inside. A
+ * write replaces every record it overlaps whole, so the piece ending
+ * inside C would take C's tail with it; the split promotes C first, so
+ * that piece replaces only C's first piece. With `fail`, the piece after
+ * it fails: the write lands a prefix and C's tail keeps its old bytes. */
+static void r3_direct_over_big(bool fail)
+{
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, "r3dir", UINT64_C(1) << 30,
+                           UINT64_C(128) << 20)) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const uint64_t ds = sp.sib.ds;
+    const uint64_t REC = STM_FS_RECORDSIZE_MAX;
+    const size_t LEN = (size_t)64 << 20;
+    uint8_t *all = malloc(LEN);
+    STM_ASSERT(all != NULL);
+    if (!all) { seal_pool_close(&sp); return; }
+    r3_noise17(all, LEN);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(sp.fs, ds, 1, (const uint8_t *)"d64", 3,
+                                     0600, 1000, 1000, &f));
+    uint8_t *old = malloc(LEN);
+    STM_ASSERT(old != NULL);
+    if (!old) { free(all); seal_pool_close(&sp); return; }
+    memcpy(old, all, LEN);
+    for (size_t k = 0; k < LEN; k += (size_t)4 << 20)
+        STM_ASSERT_OK(stm_fs_write(sp.fs, ds, f, k, all + k, (size_t)4 << 20));
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    stm_sync_set_cold_chunks_uncapped_for_test(sync, true);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(sp.fs, ds, f));
+    stm_sync_set_cold_chunks_uncapped_for_test(sync, false);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record c;
+    memset(&c, 0, sizeof c);
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, ds, f, 22212608u, &c));
+    STM_ASSERT_EQ(c.kind, STM_EXTENT_KIND_COLD);
+    STM_ASSERT_EQ(c.off, 22212608u);
+    STM_ASSERT(c.len > REC);
+    const uint64_t lo = c.off - 4096u, hi = c.off + c.len + 4096u;
+    memset(all + lo, 'D', (size_t)(hi - lo));
+    size_t wrote = 0;
+    if (fail) {
+        g_r3_writes = 0;
+        g_r3_fs = sp.fs;
+        stm_sync_set_write_phase2_hook_for_test(sync, r3_fail_third_piece, NULL);
+    }
+    STM_ASSERT_OK(stm_fs_pwrite(sp.fs, ds, f, lo, all + lo, (size_t)(hi - lo),
+                                &wrote));
+    stm_sync_set_write_phase2_hook_for_test(sync, NULL, NULL);
+    if (fail) {
+        /* The pieces: [B.off, C.off), C's first recordsize, then C's
+         * tail, which failed. */
+        STM_ASSERT_EQ(stm_bdev_inject_fired_count(stm_fs_bdev_for_test(sp.fs)), 1u);
+        STM_ASSERT_EQ((uint64_t)wrote, c.off + REC - lo);
+        memcpy(all + lo + wrote, old + lo + wrote, (size_t)(hi - lo - wrote));
+    } else {
+        STM_ASSERT_EQ((uint64_t)wrote, hi - lo);
+    }
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    STM_ASSERT_OK(stm_fs_fsync(sp.fs, ds, f, NULL));
+    for (uint64_t at = lo; !fail && at < hi; at += REC / 2u) {
+        stm_extent_record e;
+        memset(&e, 0, sizeof e);
+        STM_ASSERT_OK(stm_extent_lookup_at(eidx, ds, f, at, &e));
+        STM_ASSERT_EQ(e.kind, STM_EXTENT_KIND_HOT);
+        STM_ASSERT(e.len <= REC);
+    }
+    const uint64_t r0 = lo - ((uint64_t)1 << 20), rn = (hi - lo) + ((uint64_t)2 << 20);
+    uint8_t *got = malloc((size_t)rn);
+    STM_ASSERT(got != NULL);
+    if (got && seal_pool_remount(&sp)) {
+        uint64_t f2 = 0;
+        STM_ASSERT_OK(stm_fs_lookup(sp.fs, ds, 1, (const uint8_t *)"d64", 3, &f2));
+        r3_read_all(sp.fs, ds, f2, r0, got, (size_t)rn);
+        STM_ASSERT(memcmp(got, all + r0, (size_t)rn) == 0);
+    }
+    free(got);
+    free(old);
+    free(all);
+    seal_pool_close(&sp);
+}
+
+STM_TEST(corvus_direct_write_over_a_whole_big_cold_record_promotes_it) {
+    r3_direct_over_big(false);
+}
+
+STM_TEST(corvus_direct_write_over_a_big_cold_record_failing_part_way_keeps_its_tail) {
+    r3_direct_over_big(true);
 }

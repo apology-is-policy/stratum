@@ -2576,13 +2576,20 @@ stm_status stm_fs_promote_policy_step(stm_fs *fs,
  * A pool written before the cold tier refused sealed data may hold a
  * user-sealed dataset's extents in the CAS, under the pool's key. With the
  * dataset's key installed, this moves its COLD extents to HOT under that
- * key until it has moved `max_bytes`; the next call takes up what is left.
- * It moves a file a step at a time, each step about 1 MiB, or one record
- * when that is larger (an older pool's cold record may be up to 16 MiB; it
- * goes back as HOT extents of at most the recordsize), so a pass may pass
- * max_bytes by less than one record. A record that fails -- unreadable, or
- * first written by another, user-sealed dataset -- is passed over and stays
- * cold. out_stats->inos_promoted counts the files it moved bytes of.
+ * key until it has tried `max_bytes` of them. A record that fails --
+ * unreadable, or first written by another, user-sealed dataset -- is
+ * passed over, stays cold, and counts against max_bytes, so what fails
+ * costs a call at most its budget. A call goes through the files in ino
+ * order from where the last call on the dataset stopped, and wraps, so the
+ * next call takes up what is left and tries a failed record again only
+ * when it comes round to it. Where to start is kept in RAM, for the last
+ * 64 datasets: a remount starts at the first file, and of two calls on one
+ * dataset at once the later to finish sets it. It moves a file a step at
+ * a time, each step trying about 1 MiB of records, or one record when that
+ * is larger (an older pool's cold record may be up to 16 MiB; it goes back
+ * as HOT extents of at most the recordsize), so a pass may pass max_bytes
+ * by less than one record. out_stats->inos_promoted counts the files it
+ * moved bytes of.
  * The /ctl/ driver calls it after each login's install, once the lease is
  * published, outside its lease lock, and logs what could not move.
  *

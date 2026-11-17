@@ -12197,3 +12197,163 @@ STM_TEST(fs_event_sink_is_removed_only_by_its_own_ctx) {
     unlink(g_tmp_path);
     unlink(g_key_path);
 }
+
+/* ========================================================================= */
+/* A record off the block grid that a split cover meets: the drain drops    */
+/* the run and reports it, and the pool commits.                            */
+/* ========================================================================= */
+
+static stm_fs *r3_mount(const char *nm)
+{
+    make_tmp(nm);
+    stm_fs_format_opts fopts = p7cas16_format_opts();
+    fopts.device_size_bytes = UINT64_C(256) << 20;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    if (fs) STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+    return fs;
+}
+
+/* An extent file of `size` bytes, all a hole. */
+static uint64_t r3_file(stm_fs *fs, const char *nm, uint64_t size)
+{
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)nm,
+                                     (uint8_t)strlen(nm), 0644u, 0, 0, &f));
+    uint8_t blk[4096];
+    memset(blk, 'q', sizeof blk);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, blk, sizeof blk));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 0));
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, size));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    return f;
+}
+
+static void r3_byte(stm_fs *fs, uint64_t f, uint64_t off, uint8_t v)
+{
+    uint8_t b = 0x11;
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, off, &b, 1, &got));
+    STM_ASSERT_EQ(got, (size_t)1);
+    STM_ASSERT_EQ(b, v);
+}
+
+/* The commit answers OK twice, another file's write commits, f's fsync
+ * answers `want`, and after an unmount and a remount the other file reads
+ * back. */
+static void r3_after(stm_fs *fs, uint64_t f, stm_status want)
+{
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    uint64_t g = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"other", 5,
+                                     0644u, 0, 0, &g));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 0, "other", 5));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_ERR(stm_fs_fsync(fs, 1, f, NULL), want);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs2 = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs2));
+    if (fs2) {
+        uint64_t g2 = 0;
+        uint8_t got[8] = {0};
+        size_t n = 0;
+        STM_ASSERT_OK(stm_fs_lookup(fs2, 1, 1, (const uint8_t *)"other", 5, &g2));
+        STM_ASSERT_OK(stm_fs_read(fs2, 1, g2, 0, got, 5, &n));
+        STM_ASSERT_EQ(n, (size_t)5);
+        STM_ASSERT(memcmp(got, "other", 5) == 0);
+        STM_ASSERT_OK(stm_fs_unmount(fs2));
+    }
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* The control: an 8 MiB record on the grid takes a 10-byte write. */
+STM_TEST(fs_write_into_an_8_mib_record_on_the_grid_lands) {
+    stm_fs *fs = r3_mount("r3_a0");
+    if (!fs) return;
+    uint64_t f = r3_file(fs, "f", (uint64_t)16 << 20);
+    og_plant(fs, f, 4096, (size_t)8 << 20, 'Z');
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 5000, "wwwwwwwwww", 10));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    r3_byte(fs, f, 4096, 'Z');
+    r3_byte(fs, f, 5000, 'w');
+    r3_byte(fs, f, 5010, 'Z');
+    r3_byte(fs, f, 4096 + ((uint64_t)8 << 20) - 1u, 'Z');
+    r3_after(fs, f, STM_OK);
+}
+
+/* The same record at 100: the cover [0, 8 MiB + 4 KiB) splits at 8 MiB,
+ * inside it, and no piece can end at 100 (before, STM_EINVAL at every
+ * commit, and the other file was gone after the remount). */
+STM_TEST(fs_write_into_an_8_mib_record_off_the_grid_is_dropped_and_reported) {
+    stm_fs *fs = r3_mount("r3_a1");
+    if (!fs) return;
+    uint64_t f = r3_file(fs, "f", (uint64_t)16 << 20);
+    og_plant(fs, f, 100, (size_t)8 << 20, 'Z');
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 5000, "wwwwwwwwww", 10));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    r3_byte(fs, f, 100, 'Z');
+    r3_byte(fs, f, 5000, 'Z');                    /* the old bytes */
+    r3_byte(fs, f, 100 + ((uint64_t)8 << 20) - 1u, 'Z');
+    r3_after(fs, f, STM_EIO);
+}
+
+/* A 4 KiB record off the grid at a sequential rewrite's split point. */
+STM_TEST(fs_rewrite_up_to_a_small_record_off_the_grid_is_dropped_and_reported) {
+    stm_fs *fs = r3_mount("r3_a2");
+    if (!fs) return;
+    uint64_t f = r3_file(fs, "f", (uint64_t)16 << 20);
+    const uint64_t M8 = (uint64_t)8 << 20;
+    og_plant(fs, f, M8 - 3996u, 4096, 'Z');
+    uint8_t *b = malloc((size_t)512 << 10);
+    STM_ASSERT(b != NULL);
+    if (!b) { (void)stm_fs_unmount(fs); return; }
+    memset(b, 'W', (size_t)512 << 10);
+    const uint64_t end = M8 - 2000u, P = (uint64_t)512 << 10;
+    for (uint64_t at = 0; at < end; at += P)
+        STM_ASSERT_OK(stm_fs_write(fs, 1, f, at, b,
+                                   (size_t)((end - at) < P ? (end - at) : P)));
+    free(b);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    r3_byte(fs, f, 0, 0);                          /* the old hole */
+    r3_byte(fs, f, M8 - 3996u, 'Z');
+    r3_after(fs, f, STM_EIO);
+}
+
+/* Five adjacent 8 MiB records off the grid: the cover's lower edge moves
+ * from one to the next past the bound (before, STM_ERANGE at every
+ * commit). */
+STM_TEST(fs_write_beside_a_chain_of_records_off_the_grid_is_dropped_and_reported) {
+    stm_fs *fs = r3_mount("r3_e");
+    if (!fs) return;
+    const uint64_t M8 = (uint64_t)8 << 20;
+    uint64_t f = r3_file(fs, "f", (uint64_t)48 << 20);
+    for (unsigned k = 0; k < 5u; k++)
+        og_plant(fs, f, 100u + k * M8, (size_t)M8, (uint8_t)('A' + k));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 5u * M8 - 50u, "wwwwwwwwww", 10));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    r3_byte(fs, f, 5u * M8 - 50u, 'E');
+    r3_after(fs, f, STM_EIO);
+}
+
+
+/* The same chain, the write in its first record: the cover's upper edge
+ * moves from one to the next past the bound. */
+STM_TEST(fs_write_into_the_first_of_a_chain_of_records_off_the_grid_is_dropped_and_reported) {
+    stm_fs *fs = r3_mount("r3_e2");
+    if (!fs) return;
+    const uint64_t M8 = (uint64_t)8 << 20;
+    uint64_t f = r3_file(fs, "f", (uint64_t)48 << 20);
+    for (unsigned k = 0; k < 5u; k++)
+        og_plant(fs, f, 100u + k * M8, (size_t)M8, (uint8_t)('A' + k));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 150u, "wwwwwwwwww", 10));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    r3_byte(fs, f, 150u, 'A');
+    r3_after(fs, f, STM_EIO);
+}

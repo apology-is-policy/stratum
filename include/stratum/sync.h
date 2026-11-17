@@ -1391,7 +1391,9 @@ stm_status stm_sync_scrub_step_with_cas_gc(stm_sync *s, stm_scrub *sc,
  * answers STM_ENOSPC only when the pieces do not fit either. Each extra
  * piece costs its own tag block.
  *
- * Thread safety: serialized by sync's internal mutex. Composes with
+ * Thread safety: the write is serialized by sync's internal mutex. The
+ * read (RC-2) holds no sync lock on its common path; with no EBR handle
+ * or no extent index it reads under that mutex. Composes with
  * sync_commit's idempotent persistence — every commit captures all
  * writes since the prior commit.
  */
@@ -1981,18 +1983,30 @@ stm_status stm_sync_promote_to_hot(stm_sync *s,
                                       uint64_t dataset_id,
                                       uint64_t ino);
 
+/* What one step of stm_sync_promote_to_hot_bounded did. */
+typedef struct stm_sync_promote_step {
+    uint64_t bytes;   /* moved */
+    uint64_t tried;   /* moved, or failed and passed over */
+    uint64_t next;    /* where the next step starts */
+    bool     more;    /* a COLD extent at or past `next` is left */
+} stm_sync_promote_step;
+
 /*
- * stm_sync_promote_to_hot in steps: the ino's COLD extents, in offset
- * order, until the next would take the bytes moved past `max_bytes` (one
- * extent at least), in one hold of s->lock. Stops at the first extent that
- * fails and returns its error. `*out_bytes` is what moved, `*out_more`
- * whether a COLD extent is left. STM_OK with nothing moved for an ino with
- * no COLD extent. STM_EINVAL on NULL, dataset or ino 0, or max_bytes 0.
+ * stm_sync_promote_to_hot in steps: the ino's COLD extents starting at or
+ * past `from`, in offset order, until the next would take the bytes tried
+ * past `max_bytes` (one extent at least), in one hold of s->lock. An
+ * extent that fails is passed over and counts as tried, so the next step,
+ * from `out->next`, does not try it again; an error the next extent would
+ * meet too (the pool's or the dataset's: STM_ENOSPC, STM_ELOCKED,
+ * STM_EWEDGED, STM_EROFS, STM_ENOMEM) stops the step and is returned,
+ * else the first error. STM_OK with nothing tried for an ino with no COLD
+ * extent there. STM_EINVAL on NULL, dataset or ino 0, or max_bytes 0.
  */
 STM_MUST_USE
 stm_status stm_sync_promote_to_hot_bounded(stm_sync *s, uint64_t dataset_id,
-                                           uint64_t ino, uint64_t max_bytes,
-                                           uint64_t *out_bytes, bool *out_more);
+                                           uint64_t ino, uint64_t from,
+                                           uint64_t max_bytes,
+                                           stm_sync_promote_step *out);
 
 /*
  * Promote the COLD record covering `off` of (dataset_id, ino), if one does:

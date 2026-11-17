@@ -33,6 +33,7 @@
  *
  * fs->werr_mu is a leaf below all of them (the drain takes it under
  * dbuf->mu): only the event sink's own lock is taken under it.
+ * fs->promote_cur_mu is a leaf, taken with no other lock held.
  *
  * NEVER call stm_fs_mark_wedged from inside a held fs->global —
  * it takes the wrlock itself, and a recursive same-thread lock is
@@ -170,6 +171,13 @@ struct fs_write_error {
 #define FS_WRITE_ERRORS_MAX 256u
 #define FS_WERR_NO_INODE    UINT64_MAX
 
+/* Where a dataset's next login promote starts (stm_fs_promote_sealed_cold):
+ * the first file at or past ino, at off in that file. */
+struct fs_promote_cursor {
+    uint64_t ds, ino, off;
+};
+#define FS_PROMOTE_CURSORS 64u
+
 struct stm_fs {
     /* P9.5-PARALLEL-3 impl-1: the big-fs-lock from PARALLEL-2 baseline
      * has been promoted to an rwlock. Existing call sites take it in
@@ -229,6 +237,9 @@ struct stm_fs {
     pthread_mutex_t werr_mu;
     struct fs_write_error werr[FS_WRITE_ERRORS_MAX];   /* oldest first */
     uint32_t werr_count;
+    pthread_mutex_t promote_cur_mu;
+    struct fs_promote_cursor promote_cur[FS_PROMOTE_CURSORS];  /* oldest first */
+    uint32_t promote_cur_count;
     stm_fs_event_sink event_sink;
     void *event_sink_ctx;
 
@@ -1420,6 +1431,12 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         free(fs);
         return NULL;
     }
+    if (pthread_mutex_init(&fs->promote_cur_mu, NULL) != 0) {
+        pthread_mutex_destroy(&fs->werr_mu);
+        pthread_mutex_destroy(&fs->dir_move_mu);
+        free(fs);
+        return NULL;
+    }
     /* R133 P1-1: glibc default rwlock attribute is reader-preference;
      * a continuous stream of SH-takers (the new PARALLEL-3 ported ops)
      * can starve a queued EX-taker (stm_fs_unmount, stm_fs_commit,
@@ -1930,6 +1947,7 @@ stm_status stm_fs_unmount(stm_fs *fs)
     pthread_rwlock_destroy(&fs->global);
     pthread_mutex_destroy(&fs->dir_move_mu);
     pthread_mutex_destroy(&fs->werr_mu);
+    pthread_mutex_destroy(&fs->promote_cur_mu);
     free(fs->keyfile_path);
     free(fs->janus_socket);
     /* SWISS-4m1: wipe + munlock + free the cached hybrid keys on
@@ -2198,6 +2216,32 @@ static stm_status fs_rmw_read_span_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
  * induction it never lands inside an extent.
  *
  * Caller holds fs->lock. */
+/* A record over the recordsize that a cover meets: a COLD one the cold
+ * tier wrote before it capped its chunks at the recordsize (up to
+ * 16 MiB - 4 KiB). Taken whole, two of them at a cover's edges make it
+ * outgrow its 4 x recordsize bound, and a split could not end a piece
+ * inside one; so it is promoted, to pieces of at most the recordsize, and
+ * the caller looks again (*again). Anything else over the recordsize, or
+ * one off the block grid, cannot be promoted: STM_ECORRUPT, which a drain
+ * drops and reports. */
+static stm_status fs_cover_big_record_locked(stm_fs *fs, uint64_t ds,
+                                             uint64_t ino,
+                                             const stm_extent_record *e,
+                                             uint64_t *promoted_at, bool *again)
+{
+    const uint64_t REC = (uint64_t)STM_FS_RECORDSIZE_MAX, BLK = 4096u;
+    *again = false;
+    if (e->len <= REC) return STM_OK;
+    if (e->kind != STM_EXTENT_KIND_COLD || *promoted_at == e->off ||
+        (e->off % BLK) != 0u || (e->len % BLK) != 0u)
+        return STM_ECORRUPT;
+    stm_status pz = stm_sync_promote_cold_at(fs->sync, ds, ino, e->off);
+    if (pz != STM_OK) return pz;
+    *promoted_at = e->off;
+    *again = true;
+    return STM_OK;
+}
+
 static stm_status fs_write_covering_split_locked(stm_fs *fs, uint64_t ds,
                                                    uint64_t ino, uint64_t a_off,
                                                    const uint8_t *buf,
@@ -2225,23 +2269,23 @@ static stm_status fs_write_covering_split_locked(stm_fs *fs, uint64_t ds,
             if (ls == STM_OK) {
                 /* F3: the no-bisection induction (a covering extent at
                  * cur+REC must have e.off > cur, else it would span >REC)
-                 * rests on no extent exceeding the recordsize -- which the
-                 * index layer does not itself enforce. A corrupt oversized
-                 * record (surfaced past AEAD) would break it; fail closed,
-                 * matching stm_sync_truncate's posture (sync.c). */
-                if (e.len > REC) {
-                    /* A COLD record the cold tier made before it capped
-                     * its chunks at REC: promoted, it is pieces of at most
-                     * REC, and this split runs again over them. */
-                    if (e.kind != STM_EXTENT_KIND_COLD || promoted_at == e.off)
-                        return STM_ECORRUPT;
-                    stm_status pz = stm_sync_promote_cold_at(fs->sync, ds,
-                                                             ino, e.off);
-                    if (pz != STM_OK) return pz;
-                    promoted_at = e.off;
-                    continue;
+                 * rests on no extent exceeding the recordsize, which the
+                 * index layer does not itself enforce: an older pool's
+                 * COLD record over it is promoted and the split runs
+                 * again over its pieces; anything else fails closed. */
+                bool again = false;
+                stm_status bs = fs_cover_big_record_locked(fs, ds, ino, &e,
+                                                           &promoted_at,
+                                                           &again);
+                if (bs != STM_OK) return bs;
+                if (again) continue;
+                if (e.off > cur && e.off < piece_end) {
+                    /* A record off the block grid: no piece can end at
+                     * its start (pieces are whole blocks), and none may
+                     * bisect it. */
+                    if ((e.off % 4096u) != 0u) return STM_ECORRUPT;
+                    piece_end = e.off;
                 }
-                if (e.off > cur && e.off < piece_end) piece_end = e.off;
             } else if (ls != STM_ENOENT) {
                 return ls;
             }
@@ -2327,29 +2371,57 @@ static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
          * whose records are all on the grid; one that starts or ends
          * inside a block can straddle an edge only rounding reached. An
          * edge rounding leaves in place is a record's start or end, or the
-         * write's own: nothing straddles it. */
-        uint64_t lo = a_off;
+         * write's own: nothing straddles it. A record over the recordsize
+         * straddling an edge is promoted first (fs_cover_big_record_locked),
+         * so each edge takes in at most a recordsize and a drain's cover
+         * (a run of at most one) stays under 3 recordsizes plus rounding.
+         * The edges move again only past records off the grid, which no
+         * producer makes: a chain of them wider than the bound is
+         * corrupt. */
+        uint64_t lo = a_off, promoted_at = UINT64_MAX;
         for (;;) {
             stm_extent_record e;
             stm_status ls = stm_extent_lookup_at(eidx, ds, ino, lo, &e);
-            if (ls == STM_OK) { if (e.off < exp_off) exp_off = e.off; }
-            else if (ls != STM_ENOENT) return ls;
+            if (ls == STM_OK) {
+                bool again = false;
+                if (e.off < lo) {
+                    stm_status bs = fs_cover_big_record_locked(fs, ds, ino, &e,
+                                                               &promoted_at,
+                                                               &again);
+                    if (bs != STM_OK) return bs;
+                }
+                if (again) continue;
+                if (e.off < exp_off) exp_off = e.off;
+            } else if (ls != STM_ENOENT) {
+                return ls;
+            }
             a_off = exp_off & ~(BLK - 1u);
             if (a_off == exp_off || a_off == lo) break;
             if (a_end - a_off > (uint64_t)STM_FS_RECORDSIZE_MAX * 4u)
-                return STM_ERANGE;
+                return STM_ECORRUPT;
             lo = a_off;
         }
         uint64_t hi = a_end;
         for (;;) {
             stm_extent_record e;
             stm_status ls = stm_extent_lookup_at(eidx, ds, ino, hi - 1u, &e);
-            if (ls == STM_OK) { if (e.off + e.len > exp_end) exp_end = e.off + e.len; }
-            else if (ls != STM_ENOENT) return ls;
+            if (ls == STM_OK) {
+                bool again = false;
+                if (e.off + e.len > hi) {
+                    stm_status bs = fs_cover_big_record_locked(fs, ds, ino, &e,
+                                                               &promoted_at,
+                                                               &again);
+                    if (bs != STM_OK) return bs;
+                }
+                if (again) continue;
+                if (e.off + e.len > exp_end) exp_end = e.off + e.len;
+            } else if (ls != STM_ENOENT) {
+                return ls;
+            }
             a_end = (exp_end + BLK - 1u) & ~(BLK - 1u);
             if (a_end == exp_end || a_end == hi) break;
             if (a_end - a_off > (uint64_t)STM_FS_RECORDSIZE_MAX * 4u)
-                return STM_ERANGE;
+                return STM_ECORRUPT;
             hi = a_end;
         }
     }
@@ -2683,6 +2755,18 @@ static stm_status fs_write_cutover_locked(stm_fs *fs, stm_inode_index *iidx,
     return s;
 }
 
+/* A COLD record over the recordsize sticking out of a range's cover is
+ * promoted at the drain (fs_cover_big_record_locked): its bytes go out once
+ * as pieces, which the span below charges, and then the cover rewrites the
+ * piece at its edge, up to a recordsize more. */
+static uint64_t fs_cover_promote_blocks(const stm_fs *fs,
+                                        const stm_extent_record *e)
+{
+    const uint64_t BLK = 4096u, REC = (uint64_t)STM_FS_RECORDSIZE_MAX;
+    if (e->len <= REC || e->kind != STM_EXTENT_KIND_COLD) return 0;
+    return fs->charge_factor * (REC / BLK) + 2u * ((e->len + REC - 1u) / REC);
+}
+
 /* The blocks a drain's covering write of [off, off+len) reserves beyond the
  * range's own: it rewrites whole any extent the range only partly overlaps
  * (fs_write_extent_aligned_locked), in pieces whose pullback can each add a
@@ -2697,20 +2781,28 @@ static stm_status fs_cover_extra_blocks(stm_fs *fs, uint64_t ds, uint64_t ino,
     *out_lo = *out_hi = 0;
     stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
     if (!eidx || len == 0u) return STM_OK;
-    uint64_t end = off + len, lo = off, hi = end;
+    uint64_t end = off + len, lo = off, hi = end, big = 0;
     stm_extent_record e;
     stm_status ls = stm_extent_lookup_at(eidx, ds, ino, off, &e);
-    if (ls == STM_OK) { if (e.off < lo) lo = e.off; }
-    else if (ls != STM_ENOENT) return ls;
+    if (ls == STM_OK) {
+        if (e.off < lo) lo = e.off;
+        if (e.off < off) big += fs_cover_promote_blocks(fs, &e);
+    } else if (ls != STM_ENOENT) {
+        return ls;
+    }
     ls = stm_extent_lookup_at(eidx, ds, ino, end - 1u, &e);
-    if (ls == STM_OK) { if (e.off + e.len > hi) hi = e.off + e.len; }
-    else if (ls != STM_ENOENT) return ls;
+    if (ls == STM_OK) {
+        if (e.off + e.len > hi) hi = e.off + e.len;
+        if (e.off + e.len > end) big += fs_cover_promote_blocks(fs, &e);
+    } else if (ls != STM_ENOENT) {
+        return ls;
+    }
     uint64_t c_lo = lo & ~(BLK - 1u), c_hi = (hi + BLK - 1u) & ~(BLK - 1u);
     uint64_t r_lo = off & ~(BLK - 1u), r_hi = (end + BLK - 1u) & ~(BLK - 1u);
     if (c_lo == r_lo && c_hi == r_hi) return STM_OK;
     uint64_t span = c_hi - c_lo;
     *out_extra = fs->charge_factor * ((span - (r_hi - r_lo)) / BLK)
-               + 2u * ((span + REC - 1u) / REC);
+               + 2u * ((span + REC - 1u) / REC) + big;
     *out_lo = c_lo;
     *out_hi = c_hi;
     return STM_OK;
@@ -9427,12 +9519,9 @@ stm_status stm_fs_promote_to_hot(stm_fs *fs,
     return rc;
 }
 
-/* The most of one file moved per hold of s->lock. */
+/* The most of one file tried per hold of s->lock (one record at least). */
 #define FS_PROMOTE_STEP_BYTES (UINT64_C(1) << 20)
 
-/* One file's COLD extents to HOT, at most `budget` bytes, a step at a time,
- * under fs->global SH and the inode's pin. No reclaim on STM_ENOSPC: it
- * drains and commits the whole pool, which a login must not do. */
 /* The errors that stop the login promote's pass: the pool's or the
  * dataset's, which the next file would meet too. */
 static bool fs_promote_err_stops(stm_status e)
@@ -9441,24 +9530,35 @@ static bool fs_promote_err_stops(stm_status e)
            e == STM_EROFS || e == STM_ENOMEM;
 }
 
+/* One file's COLD extents at or past `from` to HOT until `budget` bytes
+ * are tried, a step at a time, under fs->global SH and the inode's pin. No
+ * reclaim on STM_ENOSPC: it drains and commits the whole pool, which a
+ * login must not do. *out_done is what moved, *out_spent what was tried (a
+ * record that failed counts: the budget bounds the decrypts, and the next
+ * step resumes past it rather than trying it again), *out_next where a
+ * later pass resumes when *out_more. */
 static stm_status fs_promote_ino_bounded(stm_fs *fs, uint64_t ds, uint64_t ino,
-                                         uint64_t budget, uint64_t *out_done,
-                                         bool *out_more)
+                                         uint64_t from, uint64_t budget,
+                                         uint64_t *out_done,
+                                         uint64_t *out_spent,
+                                         uint64_t *out_next, bool *out_more)
 {
     *out_done = 0;
+    *out_spent = 0;
+    *out_next = from;
     *out_more = false;
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) return STM_EINVAL;
     stm_status rc = STM_OK, soft = STM_OK;
-    while (*out_done < budget) {
-        uint64_t step = budget - *out_done;
+    while (*out_spent < budget) {
+        uint64_t step = budget - *out_spent;
         if (step > FS_PROMOTE_STEP_BYTES) step = FS_PROMOTE_STEP_BYTES;
-        uint64_t got = 0;
-        bool more = false;
+        stm_sync_promote_step ps = { .next = from };
         /* fs->global SH and the pin per step, so a commit or a logout waits
          * for one step, not the file's share. A reused ino between steps is
-         * another file of the same dataset, whose COLD extents the pass
-         * moves too. */
+         * another file of the same dataset, whose COLD extents past `from`
+         * the pass moves too (the ones before it wait until a pass comes
+         * round to it again). */
         pthread_rwlock_rdlock(&fs->global);
         FS_GUARD_WRITE(fs);
         stm_inode_handle *h = NULL;
@@ -9473,24 +9573,65 @@ static stm_status fs_promote_ino_bounded(stm_fs *fs, uint64_t ds, uint64_t ino,
         rc = stm_dirty_buffer_drain_ino(fs->dirty_buffer, ds, ino,
                                         fs_flush_drain_cb, fs);
         if (rc == STM_OK)
-            rc = stm_sync_promote_to_hot_bounded(fs->sync, ds, ino, step,
-                                                 &got, &more);
+            rc = stm_sync_promote_to_hot_bounded(fs->sync, ds, ino, from,
+                                                 step, &ps);
         stm_inode_unpin(iidx, h);
         pthread_rwlock_unlock(&fs->global);
 #ifdef STRATUM_BUILD_TESTING_HOOKS
         if (fs->promote_step_hook)
-            fs->promote_step_hook(ino, got, fs->promote_step_hook_arg);
+            fs->promote_step_hook(ino, ps.bytes, fs->promote_step_hook_arg);
 #endif
-        *out_done += got;
-        *out_more = more;
+        *out_done += ps.bytes;
+        *out_spent += ps.tried;
+        *out_more = ps.more;
+        from = ps.next;
+        *out_next = from;
         if (rc != STM_OK && !fs_promote_err_stops(rc)) {
             /* An extent of this file failed and was passed over. */
             if (soft == STM_OK) soft = rc;
             rc = STM_OK;
         }
-        if (rc != STM_OK || !more || got == 0u) break;
+        if (rc != STM_OK || !ps.more || ps.tried == 0u) break;
     }
     return rc != STM_OK ? rc : soft;
+}
+
+static void fs_promote_cursor_get(stm_fs *fs, uint64_t ds, uint64_t *ino,
+                                  uint64_t *off)
+{
+    *ino = *off = 0u;
+    pthread_mutex_lock(&fs->promote_cur_mu);
+    for (uint32_t i = 0; i < fs->promote_cur_count; i++) {
+        if (fs->promote_cur[i].ds != ds) continue;
+        *ino = fs->promote_cur[i].ino;
+        *off = fs->promote_cur[i].off;
+        break;
+    }
+    pthread_mutex_unlock(&fs->promote_cur_mu);
+}
+
+/* A full table forgets the dataset set longest ago: its next pass starts
+ * at the first file. */
+static void fs_promote_cursor_set(stm_fs *fs, uint64_t ds, uint64_t ino,
+                                  uint64_t off)
+{
+    pthread_mutex_lock(&fs->promote_cur_mu);
+    uint32_t i = 0;
+    while (i < fs->promote_cur_count && fs->promote_cur[i].ds != ds) i++;
+    if (i < fs->promote_cur_count) {
+        memmove(&fs->promote_cur[i], &fs->promote_cur[i + 1u],
+                (size_t)(fs->promote_cur_count - i - 1u) *
+                    sizeof fs->promote_cur[0]);
+        fs->promote_cur_count--;
+    }
+    if (fs->promote_cur_count == FS_PROMOTE_CURSORS) {
+        memmove(&fs->promote_cur[0], &fs->promote_cur[1],
+                (size_t)(FS_PROMOTE_CURSORS - 1u) * sizeof fs->promote_cur[0]);
+        fs->promote_cur_count--;
+    }
+    fs->promote_cur[fs->promote_cur_count++] =
+        (struct fs_promote_cursor){ .ds = ds, .ino = ino, .off = off };
+    pthread_mutex_unlock(&fs->promote_cur_mu);
 }
 
 stm_status stm_fs_promote_sealed_cold(stm_fs *fs, uint64_t dataset_id,
@@ -9526,11 +9667,21 @@ stm_status stm_fs_promote_sealed_cold(stm_fs *fs, uint64_t dataset_id,
     st->inos_visited  = visited;
     st->inos_eligible = (uint64_t)n_cands;
 
+    /* The pass starts where the last one on this dataset stopped, in ino
+     * order (the collect's), and wraps: a record that fails counts against
+     * the budget, so a file of them would otherwise keep every login from
+     * the files after it. */
+    uint64_t c_ino = 0u, c_off = 0u;
+    fs_promote_cursor_get(fs, dataset_id, &c_ino, &c_off);
+    size_t start = 0u;
+    while (start < n_cands && cands[start].ino < c_ino) start++;
+    if (start == n_cands) start = 0u;
+
     /* A deduplicated chunk becomes a copy per file, times the replicas:
      * leave a sixteenth of the pool free after twice this pass's bytes. */
     uint64_t due = 0u;
-    for (size_t i = 0; i < n_cands && due < max_bytes; i++)
-        due += cands[i].bytes;
+    for (size_t k = 0; k < n_cands && due < max_bytes; k++)
+        due += cands[(start + k) % n_cands].bytes;
     if (due > max_bytes) due = max_bytes;
     stm_fs_stats fst;
     rc = stm_fs_stats_get(fs, &fst);
@@ -9542,26 +9693,34 @@ stm_status stm_fs_promote_sealed_cold(stm_fs *fs, uint64_t dataset_id,
         return rc;
     }
 
-    for (size_t i = 0; i < n_cands && st->bytes_promoted < max_bytes; i++) {
-        uint64_t done = 0;
+    uint64_t spent = 0, n_ino = c_ino, n_off = c_off;
+    for (size_t k = 0; k < n_cands && spent < max_bytes; k++) {
+        uint64_t ino = cands[(start + k) % n_cands].ino;
+        uint64_t from = (k == 0u && ino == c_ino) ? c_off : 0u;
+        uint64_t done = 0, tried = 0, next = from;
         bool more = false;
-        stm_status one = fs_promote_ino_bounded(fs, dataset_id, cands[i].ino,
-                                                max_bytes - st->bytes_promoted,
-                                                &done, &more);
+        stm_status one = fs_promote_ino_bounded(fs, dataset_id, ino, from,
+                                                max_bytes - spent, &done,
+                                                &tried, &next, &more);
         st->bytes_promoted += done;
+        spent += tried;
         if (done != 0u) st->inos_promoted++;
+        /* The next pass starts inside this file, or past it. */
+        n_ino = more ? ino : (ino == UINT64_MAX ? 0u : ino + 1u);
+        n_off = more ? next : 0u;
         if (one == STM_OK && !more) continue;
         if (one == STM_OK) break;          /* the budget ran out in this file */
         if (one == STM_ENOENT) continue;   /* unlinked since the collect */
         if (st->last_err == STM_OK) {
             st->last_err     = one;
-            st->last_err_ino = cands[i].ino;
+            st->last_err_ino = ino;
         }
         if (fs_promote_err_stops(one)) {
             rc = one;
             break;
         }
     }
+    fs_promote_cursor_set(fs, dataset_id, n_ino, n_off);
     free(cands);
     return rc;
 }
