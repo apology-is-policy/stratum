@@ -546,7 +546,7 @@ mod tests {
 # HELP foo a foo
 # TYPE foo gauge
 foo 42
-bar{label=\"x\"} 3.14
+bar{label=\"x\"} 2.5
 bar{label=\"y\"} 100
 # comment line
 \n";
@@ -557,7 +557,7 @@ bar{label=\"y\"} 100
         let xs: Vec<f64> = bars.iter()
             .filter(|s| s.labels.get("label").map(String::as_str) == Some("x"))
             .map(|s| s.value).collect();
-        assert_eq!(xs, vec![3.14]);
+        assert_eq!(xs, vec![2.5]);
     }
 
     #[test]
