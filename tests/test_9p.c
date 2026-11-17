@@ -6936,3 +6936,54 @@ STM_TEST(p9_stale_fid_stays_stale_across_a_rollback_in_an_unseeded_mount) {
 }
 
 STM_TEST_MAIN("9p")
+
+/* A buffered run a flush dropped (its record failed its integrity check)
+ * is reported by the Tfsync of its own file, once; another file's Tfsync
+ * answers Rfsync. */
+STM_TEST(p9_fsync_answers_eio_once_for_a_dropped_run) {
+    make_tmp("9p_fsync_eio");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+    uint64_t g = mk_file(fs, root, "g");
+    uint8_t *z = malloc(4096);
+    memset(z, 'z', 4096);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 0, z, 4096));   /* an extent file */
+    free(z);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 100, "dropped!", 8));
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(st.data_dirty_reserved_blocks > 0u);  /* buffered */
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+    walk_to(s, 100, 102, "g");
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    uint32_t sz = build_tfsync(req, 2, 101, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RFSYNC);
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    sz = build_tfsync(req, 3, 102, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EIO);
+    sz = build_tfsync(req, 4, 102, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RFSYNC);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}

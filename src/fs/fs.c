@@ -31,6 +31,9 @@
  *                                      inside a span: struct stm_fs)
  *      sync->lock  →  alloc->lock  →  alloc's btree rwlock
  *
+ * fs->werr_mu is a leaf below all of them (the drain takes it under
+ * dbuf->mu): only the event sink's own lock is taken under it.
+ *
  * NEVER call stm_fs_mark_wedged from inside a held fs->global —
  * it takes the wrlock itself, and a recursive same-thread lock is
  * POSIX-undefined and deadlocks on glibc (R133 P1-2). A path that must
@@ -158,6 +161,15 @@ _Static_assert(STM_FLUSH_INODE_CAP_BYTES <= STM_FS_RECORDSIZE_MAX,
  * surface gets one. */
 #define STM_FLUSH_DIRECT_THRESHOLD_BYTES  (1u * 1024u * 1024u)
 
+/* A file whose buffered run a flush dropped (fs_note_write_error_locked):
+ * its next stm_fs_fsync answers STM_EIO. gen is the incarnation the run
+ * was written to, FS_WERR_NO_INODE for an ino the inode index lacks. */
+struct fs_write_error {
+    uint64_t ds, ino, gen;
+};
+#define FS_WRITE_ERRORS_MAX 256u
+#define FS_WERR_NO_INODE    UINT64_MAX
+
 struct stm_fs {
     /* P9.5-PARALLEL-3 impl-1: the big-fs-lock from PARALLEL-2 baseline
      * has been promoted to an rwlock. Existing call sites take it in
@@ -213,6 +225,12 @@ struct stm_fs {
      * directory between the two would meet the child twice and report damage. Taken under the
      * rename's pins, and its holder waits for no pin. */
     pthread_mutex_t dir_move_mu;
+    /* Guards werr[] and the event sink. */
+    pthread_mutex_t werr_mu;
+    struct fs_write_error werr[FS_WRITE_ERRORS_MAX];   /* oldest first */
+    uint32_t werr_count;
+    stm_fs_event_sink event_sink;
+    void *event_sink_ctx;
 
     stm_bdev  *bdev;         /* owned — closed at unmount */
     stm_pool  *pool;         /* owned — P5-1 N=1 wrapper over bdev */
@@ -1397,6 +1415,11 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         return NULL;
     }
     if (!fs) return NULL;
+    if (pthread_mutex_init(&fs->werr_mu, NULL) != 0) {
+        pthread_mutex_destroy(&fs->dir_move_mu);
+        free(fs);
+        return NULL;
+    }
     /* R133 P1-1: glibc default rwlock attribute is reader-preference;
      * a continuous stream of SH-takers (the new PARALLEL-3 ported ops)
      * can starve a queued EX-taker (stm_fs_unmount, stm_fs_commit,
@@ -1906,6 +1929,7 @@ stm_status stm_fs_unmount(stm_fs *fs)
     pthread_rwlock_destroy(&fs->txn);
     pthread_rwlock_destroy(&fs->global);
     pthread_mutex_destroy(&fs->dir_move_mu);
+    pthread_mutex_destroy(&fs->werr_mu);
     free(fs->keyfile_path);
     free(fs->janus_socket);
     /* SWISS-4m1: wipe + munlock + free the cached hybrid keys on
@@ -1952,13 +1976,71 @@ stm_status stm_fs_free(stm_fs *fs, uint64_t paddr, uint64_t free_gen)
     return s;
 }
 
-static stm_status stm_fs_commit_inner(stm_fs *fs);
+/* The file a stm_fs_fsync names. */
+struct fs_fsync_target {
+    uint64_t ds, ino;
+    const uint64_t *gen;
+};
+static stm_status stm_fs_commit_inner(stm_fs *fs,
+                                      const struct fs_fsync_target *t);
 stm_status stm_fs_commit(stm_fs *fs)
 {
-    stm_status crc = stm_fs_commit_inner(fs);
+    stm_status crc = stm_fs_commit_inner(fs, NULL);
     return crc;
 }
-static stm_status stm_fs_commit_inner(stm_fs *fs)
+
+stm_status stm_fs_fsync(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                        const uint64_t *gen)
+{
+    struct fs_fsync_target t = { dataset_id, ino, gen };
+    return stm_fs_commit_inner(fs, &t);
+}
+
+void stm_fs_set_event_sink(stm_fs *fs, stm_fs_event_sink fn, void *ctx)
+{
+    if (!fs) return;
+    pthread_mutex_lock(&fs->werr_mu);
+    if (fn) {
+        fs->event_sink = fn;
+        fs->event_sink_ctx = ctx;
+    } else if (fs->event_sink_ctx == ctx) {
+        fs->event_sink = NULL;
+        fs->event_sink_ctx = NULL;
+    }
+    pthread_mutex_unlock(&fs->werr_mu);
+}
+
+/* Take t's report: STM_EIO if a flush dropped a run of the incarnation t
+ * names. Under fs->global EX, so the live gen looked up is the one held. */
+static stm_status fs_take_write_error_locked(stm_fs *fs,
+                                             const struct fs_fsync_target *t)
+{
+    uint64_t gen = FS_WERR_NO_INODE;
+    if (t->gen) {
+        gen = *t->gen;
+    } else {
+        stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+        struct stm_inode_value iv;
+        if (iidx && stm_inode_lookup(iidx, t->ds, t->ino, &iv) == STM_OK)
+            gen = stm_load_le64(iv.si_gen);
+    }
+    stm_status s = STM_OK;
+    pthread_mutex_lock(&fs->werr_mu);
+    for (uint32_t i = 0; i < fs->werr_count; i++) {
+        const struct fs_write_error *e = &fs->werr[i];
+        if (e->ds != t->ds || e->ino != t->ino || e->gen != gen) continue;
+        memmove(&fs->werr[i], &fs->werr[i + 1u],
+                (size_t)(fs->werr_count - i - 1u) * sizeof fs->werr[0]);
+        fs->werr_count--;
+        s = STM_EIO;
+        break;
+    }
+    pthread_mutex_unlock(&fs->werr_mu);
+    return s;
+}
+
+static stm_status stm_fs_commit_inner(stm_fs *fs,
+                                      const struct fs_fsync_target *t)
 {
     if (!fs) return STM_EINVAL;
     pthread_rwlock_wrlock(&fs->global);
@@ -1991,6 +2073,7 @@ static stm_status stm_fs_commit_inner(stm_fs *fs)
      * intact for retry — only the inode-engine abort makes a failure
      * unrecoverable. */
     if (s != STM_OK) fs_mark_wedged_locked(fs);
+    else if (t) s = fs_take_write_error_locked(fs, t);
     pthread_rwlock_unlock(&fs->global);
     return s;
 }
@@ -2411,6 +2494,61 @@ static stm_status fs_read_span_filled_locked(stm_fs *fs, uint64_t ds,
     return rs;
 }
 
+/* Record that a flush dropped [off, off + len) of (ds, ino), and tell the
+ * event sink. Called by the drain under dbuf->mu inside the caller's fs
+ * lock; the inode index takes its own lock. One report per incarnation:
+ * a second dropped run of it adds none. */
+static void fs_note_write_error_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
+                                       uint64_t off, uint64_t len,
+                                       stm_status why)
+{
+    uint64_t gen = FS_WERR_NO_INODE;
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    struct stm_inode_value iv;
+    if (iidx && stm_inode_lookup(iidx, ds, ino, &iv) == STM_OK)
+        gen = stm_load_le64(iv.si_gen);
+    char line[256];
+    pthread_mutex_lock(&fs->werr_mu);
+    uint32_t i = 0;
+    while (i < fs->werr_count &&
+           !(fs->werr[i].ds == ds && fs->werr[i].ino == ino &&
+             fs->werr[i].gen == gen))
+        i++;
+    if (i == fs->werr_count) {
+        if (fs->werr_count == FS_WRITE_ERRORS_MAX) {
+            const struct fs_write_error *old = &fs->werr[0];
+            if (fs->event_sink) {
+                snprintf(line, sizeof line,
+                         "write-error dataset=%llu ino=%llu gen=%llu "
+                         "report evicted unmade: %u files hold one",
+                         (unsigned long long)old->ds,
+                         (unsigned long long)old->ino,
+                         (unsigned long long)old->gen,
+                         (unsigned)FS_WRITE_ERRORS_MAX);
+                fs->event_sink(fs->event_sink_ctx, line);
+            }
+            memmove(&fs->werr[0], &fs->werr[1],
+                    (size_t)(FS_WRITE_ERRORS_MAX - 1u) * sizeof fs->werr[0]);
+            fs->werr_count--;
+            i = fs->werr_count;
+        }
+        fs->werr[i].ds = ds;
+        fs->werr[i].ino = ino;
+        fs->werr[i].gen = gen;
+        fs->werr_count++;
+    }
+    if (fs->event_sink) {
+        snprintf(line, sizeof line,
+                 "write-error dataset=%llu ino=%llu gen=%llu off=%llu "
+                 "len=%llu status=%d (%s): run dropped, fsync answers EIO",
+                 (unsigned long long)ds, (unsigned long long)ino,
+                 (unsigned long long)gen, (unsigned long long)off,
+                 (unsigned long long)len, (int)why, stm_strerror(why));
+        fs->event_sink(fs->event_sink_ctx, line);
+    }
+    pthread_mutex_unlock(&fs->werr_mu);
+}
+
 /* SWISS-4q-flush drain callback: each buffered range becomes one
  * stm_sync_write_extent via fs_write_extent_aligned_locked. The
  * callback runs under stm_dirty_buffer's internal mutex AND under
@@ -2429,15 +2567,29 @@ static stm_status fs_flush_drain_cb(void *user, uint64_t ds, uint64_t ino,
 {
     stm_fs *fs = (stm_fs *)user;
     size_t landed = 0;
+    stm_status drc;
 #ifdef STRATUM_BUILD_TESTING_HOOKS
-    if (fs->fail_drains != STM_OK) return fs->fail_drains;
+    if (fs->fail_drains != STM_OK) {
+        drc = fs->fail_drains;
+    } else
 #endif
-    /* The write spends the blocks its ranges hold in the reservation. */
-    stm_sync_drain_begin(fs->sync);
-    stm_status drc = fs_write_extent_aligned_locked(fs, ds, ino, off, data,
-                                                        (size_t)len, &landed,
-                                                        view, out_end);
-    stm_sync_drain_end(fs->sync);
+    {
+        /* The write spends the blocks its ranges hold in the reservation. */
+        stm_sync_drain_begin(fs->sync);
+        drc = fs_write_extent_aligned_locked(fs, ds, ino, off, data,
+                                             (size_t)len, &landed, view,
+                                             out_end);
+        stm_sync_drain_end(fs->sync);
+    }
+    /* A run over a record that fails its integrity check can never be
+     * written: kept buffered, it would fail every later flush, and so
+     * every commit of the pool. Drop exactly this run (a cover the write
+     * widened is not taken) and report it at the file's fsync. */
+    if (drc == STM_EBADTAG || drc == STM_ECORRUPT) {
+        fs_note_write_error_locked(fs, ds, ino, off, len, drc);
+        *out_end = off + len;
+        return STM_OK;
+    }
     return drc;
 }
 
@@ -3969,6 +4121,14 @@ void stm_fs_set_promote_step_hook_for_test(stm_fs *fs,
 void stm_fs_fail_drains_for_test(stm_fs *fs, stm_status fail)
 {
     fs->fail_drains = fail;
+}
+
+bool stm_fs_event_sink_for_test(stm_fs *fs)
+{
+    pthread_mutex_lock(&fs->werr_mu);
+    bool on = fs->event_sink != NULL;
+    pthread_mutex_unlock(&fs->werr_mu);
+    return on;
 }
 
 void stm_fs_set_inline_in_sealed_for_test(stm_fs *fs, bool on)

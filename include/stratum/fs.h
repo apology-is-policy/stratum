@@ -292,9 +292,44 @@ STM_MUST_USE
 stm_status stm_fs_free(stm_fs *fs, uint64_t paddr, uint64_t free_gen);
 
 /* Trigger a commit. Flushes allocator state, writes a new uberblock,
- * advances gen. */
+ * advances gen.
+ *
+ * The flush first writes every file's buffered bytes. A run whose write
+ * fails because the record under it fails its integrity check
+ * (STM_EBADTAG, STM_ECORRUPT: a partial write merges the old bytes) is
+ * dropped, so one damaged file cannot fail every commit of the pool: the
+ * record keeps its old bytes, the file's next stm_fs_fsync answers
+ * STM_EIO, and the event sink hears of it. The flushes before a
+ * truncate, reflink, migrate and the write path's own buffer-full flush
+ * drop such a run the same way. Any other flush error (STM_ENOSPC, a
+ * device's STM_EIO, STM_ENOMEM, STM_ERANGE for a cover that records off
+ * the block grid widen past 4 x recordsize) keeps the bytes buffered and
+ * fails the commit. */
 STM_MUST_USE
 stm_status stm_fs_commit(stm_fs *fs);
+
+/* fsync(2) for one file: stm_fs_commit, then STM_EIO once if a flush
+ * since the file's last fsync dropped a run of its buffered bytes (see
+ * stm_fs_commit). gen names the incarnation (a 9P fid's cached si_gen);
+ * NULL names the live one, so a reused inode number never inherits its
+ * predecessor's error. A commit error wins and keeps the report for the
+ * next fsync. Like Linux's errseq, the report is made once: a second
+ * fsync answers STM_OK although the bytes stay lost. The reports live in
+ * RAM, up to 256 files (the oldest goes, with an event, past that); an
+ * unmount or a crash forgets them. */
+STM_MUST_USE
+stm_status stm_fs_fsync(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                        const uint64_t *gen);
+
+/* The fs's operational events (one line each, no newline): a flush that
+ * dropped a file's run. The sink is called under the fs's locks, so it
+ * must take no lock that is ever held across a call into the fs. */
+typedef void (*stm_fs_event_sink)(void *ctx, const char *line);
+
+/* Install fn with ctx; fn == NULL removes the sink if ctx is the one
+ * installed. When this returns, no call into the removed sink is in
+ * progress. */
+void stm_fs_set_event_sink(stm_fs *fs, stm_fs_event_sink fn, void *ctx);
 
 /* P7-CAS-16 (UB v23): recordsize cap lift 128 KiB → 8 MiB. The cap is
  * the runtime invariant on extent record `len` — enforced at write

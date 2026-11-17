@@ -11900,3 +11900,300 @@ STM_TEST(fs_read_answers_at_most_64_pieces_a_call) {
     }
     og_unmount(fs);
 }
+
+/* ========================================================================= */
+/* A flush drops a run it can never write; the file's fsync reports it.     */
+/* ========================================================================= */
+
+static char x6_events[65536];
+static size_t x6_events_len;
+static unsigned x6_event_lines;
+
+static void x6_sink(void *ctx, const char *line)
+{
+    (void)ctx;
+    x6_event_lines++;
+    size_t n = strlen(line);
+    if (x6_events_len + n + 2u < sizeof x6_events) {
+        memcpy(x6_events + x6_events_len, line, n);
+        x6_events_len += n;
+        x6_events[x6_events_len++] = '\n';
+        x6_events[x6_events_len] = '\0';
+    }
+}
+
+static void x6_sink_reset(void)
+{
+    x6_events[0] = '\0';
+    x6_events_len = 0;
+    x6_event_lines = 0;
+}
+
+static uint64_t x6_gen(stm_fs *fs, uint64_t ino)
+{
+    struct stm_inode_value iv;
+    memset(&iv, 0, sizeof iv);
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &iv));
+    return stm_load_le64(iv.si_gen);
+}
+
+/* rh_make's files, committed; with `damage`, g's record at 8192 is
+ * overwritten on every replica. Answers the fs mounted again. */
+static stm_fs *x6_mount(bool damage, uint64_t *f, uint64_t *g, uint64_t *h)
+{
+    make_tmp(damage ? "x6_damaged" : "x6_whole");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return NULL;
+    rh_make(fs, f, g, h);
+    stm_extent_record rec;
+    memset(&rec, 0, sizeof rec);
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(stm_fs_sync_for_test(fs)),
+                                       1, *g, 8192, &rec));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    STM_ASSERT(rec.n_replicas >= 1u);
+    if (damage) {
+        uint8_t junk[4096];
+        memset(junk, 0x5a, sizeof junk);
+        int fd = open(g_tmp_path, O_WRONLY);
+        STM_ASSERT(fd >= 0);
+        if (fd >= 0) {
+            for (uint8_t i = 0; i < rec.n_replicas; i++) {
+                ssize_t w = pwrite(fd, junk, sizeof junk,
+                                   (off_t)(stm_paddr_offset(rec.paddrs[i]) * 4096u));
+                STM_ASSERT_EQ(w, (ssize_t)sizeof junk);
+            }
+            close(fd);
+        }
+    }
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    return fs;
+}
+
+/* A 10-byte write into g's record at 8192, then a commit, then a write to
+ * f and a commit, then a remount. Damaged: the commit drops the run (it
+ * failed every commit before), f's bytes survive, g's fsync answers EIO
+ * once. Whole (the control one variable away): the run lands. */
+static void x6_check(bool damage)
+{
+    uint64_t f = 0, g = 0, h = 0;
+    stm_fs *fs = x6_mount(damage, &f, &g, &h);
+    if (!fs) return;
+    const uint64_t gen = x6_gen(fs, g);
+    x6_sink_reset();
+    stm_fs_set_event_sink(fs, x6_sink, NULL);
+    uint8_t w[10];
+    memset(w, 'w', sizeof w);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 8292, w, sizeof w));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    char want[160];
+    snprintf(want, sizeof want,
+             "write-error dataset=1 ino=%llu gen=%llu off=8292 len=10 status=%d ",
+             (unsigned long long)g, (unsigned long long)gen, (int)STM_EBADTAG);
+    STM_ASSERT_EQ(x6_event_lines, damage ? 1u : 0u);
+    STM_ASSERT_EQ(strstr(x6_events, want) != NULL, damage);
+    uint8_t b[4096];
+    memset(b, 'F', sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, b, sizeof b));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_fsync(fs, 1, f, NULL));
+    STM_ASSERT_ERR(stm_fs_fsync(fs, 1, g, NULL), damage ? STM_EIO : STM_OK);
+    STM_ASSERT_OK(stm_fs_fsync(fs, 1, g, NULL));
+    size_t got = 0;
+    if (damage) {
+        STM_ASSERT_ERR(stm_fs_read(fs, 1, g, 8192, rh_buf, 4096, &got), STM_EBADTAG);
+    } else {
+        rh_read(fs, g, 8192, 4096, 4096);
+        STM_ASSERT(rh_is(rh_buf, 0, 100, 'C'));
+        STM_ASSERT(rh_is(rh_buf, 100, 110, 'w'));
+        STM_ASSERT(rh_is(rh_buf, 110, 4096, 'C'));
+    }
+    rh_read(fs, g, 0, 4096, 4096);
+    STM_ASSERT(rh_is(rh_buf, 0, 4096, 'A'));
+    stm_fs_set_event_sink(fs, NULL, NULL);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (fs) {
+        rh_read(fs, f, 0, 4096, 4096);
+        STM_ASSERT(rh_is(rh_buf, 0, 4096, 'F'));
+        if (damage)
+            STM_ASSERT_ERR(stm_fs_read(fs, 1, g, 8192, rh_buf, 4096, &got), STM_EBADTAG);
+        STM_ASSERT_OK(stm_fs_fsync(fs, 1, g, NULL));   /* RAM only */
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+    }
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_commit_drops_a_run_over_a_damaged_record_and_fsync_reports_it) {
+    x6_check(true);
+}
+
+STM_TEST(fs_commit_writes_the_same_run_over_a_whole_record) {
+    x6_check(false);
+}
+
+STM_TEST(fs_fsync_reports_a_dropped_run_to_its_incarnation_only) {
+    uint64_t f = 0, g = 0, h = 0;
+    stm_fs *fs = x6_mount(true, &f, &g, &h);
+    if (!fs) return;
+    const uint64_t gen = x6_gen(fs, g);
+    uint8_t w[10];
+    memset(w, 'w', sizeof w);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 8292, w, sizeof w));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    const uint64_t other = gen + 1u;
+    STM_ASSERT_OK(stm_fs_fsync(fs, 1, g, &other));
+    STM_ASSERT_OK(stm_fs_fsync(fs, 2, g, NULL));         /* another dataset */
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, 1, (const uint8_t *)"g", 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_fsync(fs, 1, g, NULL));          /* no live g */
+    STM_ASSERT_ERR(stm_fs_fsync(fs, 1, g, &gen), STM_EIO); /* its fid's gen */
+    STM_ASSERT_OK(stm_fs_fsync(fs, 1, g, &gen));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* n files x0.., each one committed block of 'z' (an extent file: a small
+ * write to one is buffered, where an empty file would take it inline). */
+static void x6_make_files(stm_fs *fs, uint64_t *inos, unsigned n)
+{
+    uint8_t z[4096];
+    memset(z, 'z', sizeof z);
+    for (unsigned i = 0; i < n; i++) {
+        char nm[16];
+        int nl = snprintf(nm, sizeof nm, "x%u", i);
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)nm,
+                                         (uint8_t)nl, 0644u, 0, 0, &inos[i]));
+        STM_ASSERT_OK(stm_fs_write(fs, 1, inos[i], 0, z, sizeof z));
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+}
+
+/* A buffered 100-byte run of `v` at 100 in each of inos[from..from+n). */
+static void x6_dirty(stm_fs *fs, const uint64_t *inos, unsigned from,
+                     unsigned n, uint8_t v)
+{
+    uint8_t d[100];
+    memset(d, v, sizeof d);
+    for (unsigned i = from; i < from + n; i++)
+        STM_ASSERT_OK(stm_fs_write(fs, 1, inos[i], 100, d, sizeof d));
+    stm_fs_stats st;
+    memset(&st, 0, sizeof st);
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT(st.data_dirty_reserved_blocks > 0u);   /* buffered, not inline */
+}
+
+static stm_fs *x6_fresh(const char *name)
+{
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return NULL;
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    return fs;
+}
+
+STM_TEST(fs_flush_drops_a_corrupt_run_and_keeps_a_device_failure_buffered) {
+    stm_fs *fs = x6_fresh("x6_corrupt");
+    if (!fs) return;
+    uint64_t inos[2];
+    x6_make_files(fs, inos, 2);
+    const uint64_t a = inos[0], b = inos[1];
+    x6_dirty(fs, inos, 0, 1, 'a');
+    uint8_t v[100];
+    memset(v, 'a', sizeof v);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, a, 65536, v, sizeof v));   /* a second run */
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    rh_read(fs, a, 0, 4096, 4096);
+    STM_ASSERT(rh_is(rh_buf, 0, 4096, 'z'));          /* dropped: the old bytes */
+    /* A device failure keeps b's run buffered and fails the commit, and
+     * a's fsync answers that error and keeps a's report. */
+    x6_dirty(fs, inos, 1, 1, 'b');
+    stm_fs_fail_drains_for_test(fs, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_fsync(fs, 1, a, NULL), STM_EIO);   /* the commit's */
+    STM_ASSERT_ERR(stm_fs_commit(fs), STM_EIO);
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    STM_ASSERT_ERR(stm_fs_fsync(fs, 1, a, NULL), STM_EIO);   /* a's report */
+    STM_ASSERT_OK(stm_fs_fsync(fs, 1, a, NULL));     /* one report for both runs */
+    STM_ASSERT_OK(stm_fs_fsync(fs, 1, b, NULL));
+    rh_read(fs, b, 0, 4096, 4096);
+    STM_ASSERT(rh_is(rh_buf, 0, 100, 'z'));
+    STM_ASSERT(rh_is(rh_buf, 100, 200, 'b'));
+    STM_ASSERT(rh_is(rh_buf, 200, 4096, 'z'));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_fsync_keeps_the_newest_256_reports) {
+    stm_fs *fs = x6_fresh("x6_evict");
+    if (!fs) return;
+    static uint64_t inos[257];
+    x6_make_files(fs, inos, 257);
+    x6_sink_reset();
+    stm_fs_set_event_sink(fs, x6_sink, NULL);
+    x6_dirty(fs, inos, 0, 1, 'd');
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));                 /* x0's report, the oldest */
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    x6_dirty(fs, inos, 1, 256, 'd');
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    STM_ASSERT_EQ(x6_event_lines, 258u);              /* 257 drops + 1 eviction */
+    char want[96];
+    snprintf(want, sizeof want, "write-error dataset=1 ino=%llu gen=",
+             (unsigned long long)inos[0]);
+    const char *ev = strstr(x6_events, "report evicted unmade");
+    STM_ASSERT(ev != NULL);
+    if (ev) {                                         /* x0's, the oldest */
+        const char *ls = ev;
+        while (ls > x6_events && ls[-1] != '\n') ls--;
+        STM_ASSERT(strncmp(ls, want, strlen(want)) == 0);
+    }
+    STM_ASSERT_OK(stm_fs_fsync(fs, 1, inos[0], NULL));
+    for (unsigned i = 1; i < 257u; i++)
+        STM_ASSERT_ERR(stm_fs_fsync(fs, 1, inos[i], NULL), STM_EIO);
+    stm_fs_set_event_sink(fs, NULL, NULL);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_event_sink_is_removed_only_by_its_own_ctx) {
+    stm_fs *fs = x6_fresh("x6_sink");
+    if (!fs) return;
+    int mine = 0, other = 0;
+    x6_sink_reset();
+    stm_fs_set_event_sink(fs, x6_sink, &mine);
+    STM_ASSERT(stm_fs_event_sink_for_test(fs));
+    stm_fs_set_event_sink(fs, NULL, &other);
+    STM_ASSERT(stm_fs_event_sink_for_test(fs));
+    uint64_t inos[1];
+    x6_make_files(fs, inos, 1);
+    x6_dirty(fs, inos, 0, 1, 'd');
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    STM_ASSERT_EQ(x6_event_lines, 1u);
+    stm_fs_set_event_sink(fs, NULL, &mine);
+    STM_ASSERT(!stm_fs_event_sink_for_test(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}

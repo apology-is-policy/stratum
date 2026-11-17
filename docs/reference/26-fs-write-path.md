@@ -332,6 +332,11 @@ cover = [a_off, a_end)   (block-aligned, fully contains all stuck-out extents)
 ## Spec cross-reference
 
 - `writeback.tla` — the dirty-buffer flush model (`Flush`, `BufferBoundedSize`).
+  `FlushFails` drops a run the drain can never write and owes its inode a
+  report, `Fsync` takes it, and `DroppedIsReported` holds a dropped run's
+  inode owed until then; `writeback_drop_silently_buggy.cfg` (a drop with no
+  report) fails it. Inode incarnations are not modelled; the tests carry
+  them.
   The coalescer realizes `Flush` iteratively across runs; it does not constrain
   extent granularity, so coalescing preserves `ReadHidesFlushOrder` /
   `FlushPaddrFreshness` / `FlushPreservesNoOverlap`.
@@ -355,11 +360,17 @@ cover = [a_off, a_end)   (block-aligned, fully contains all stuck-out extents)
 | `fs_a_transition_retried_after_a_reclaim_keeps_the_inline_bytes` | a first write to an inline file whose inode update answers ENOSPC: the reclaim's retry starts from the stored inline value, and the file's first bytes survive a commit and a remount |
 | `fs_a_transition_whose_update_fails_during_a_peer_drain_wedges` | the update fails while a peer's drain of the range is held between its encrypt and its index commit: the drop waits the drain out, the count sees its extent, and the fs wedges |
 | `fs_a_transition_whose_extent_count_fails_wedges` | the update fails and then the extent count fails: the fs wedges; with the count answering, the same failure only answers its error |
+| `fs_commit_drops_a_run_over_a_damaged_record_and_fsync_reports_it` | X6: a 10-byte write into a record damaged on every replica. The commit drops the run (before, it and every later commit answered `STM_EBADTAG`, and another file's write was gone after a remount); another file's write commits and survives a remount; the file's fsync answers `STM_EIO` once; the record still reads `STM_EBADTAG`; the sink hears one line |
+| `fs_commit_writes_the_same_run_over_a_whole_record` | X6's control one variable away: the same run over an undamaged record lands, with no report and no event |
+| `fs_fsync_reports_a_dropped_run_to_its_incarnation_only` | another gen, another dataset and the ino after an unlink answer OK; the unlinked file's gen answers `STM_EIO` once |
+| `fs_flush_drops_a_corrupt_run_and_keeps_a_device_failure_buffered` | `STM_ECORRUPT` drops two runs of a file for one report; a device `STM_EIO` keeps its run buffered and fails the commit, whose error the fsync answers while the report stays |
+| `fs_fsync_keeps_the_newest_256_reports` | the 257th file's report evicts the oldest, with an event naming it |
+| `fs_event_sink_is_removed_only_by_its_own_ctx` | a removal naming another ctx leaves the sink installed |
 | `fs_a_write_far_past_a_small_file_is_sparse` | an empty or inline file takes a write at 16 MiB or 9 MiB and keeps its prefix, and a 1-byte write at 7 MiB costs its own blocks, not 7 MiB of zeros |
 
 Each is non-vacuous (each fails on its named pre-fix bug; verified by
-reintroducing the bug surgically). `test_fs` holds 234 tests and
-`test_fs_write_path` 33; the full ctest suite is 78 binaries.
+reintroducing the bug surgically). `test_fs` holds 252 tests and
+`test_fs_write_path` 37; the full ctest suite is 84 binaries.
 
 ## Error paths
 
@@ -410,6 +421,19 @@ reintroducing the bug surgically). `test_fs` holds 234 tests and
 - `STM_ECORRUPT` — the split's pullback found an existing extent with
   `len > recordsize` (F3 fail-closed; only reachable on an already-corrupt FS,
   which the AEAD read path catches first).
+- `STM_EBADTAG` / `STM_ECORRUPT` at a drain (the RMW's merge read of a record
+  damaged on every replica, or a corrupt record the cover meets): such a run
+  can never be written, and kept buffered it failed every later commit of the
+  pool, and the files written after it were lost at unmount (X6). The drain
+  callback (`fs_flush_drain_cb`) drops exactly that run and records it
+  (`fs_note_write_error_locked`); the record keeps its old bytes, every other
+  run and inode still drains, and the commit goes on. The file's next
+  `stm_fs_fsync` answers `STM_EIO` once, for the incarnation the run was
+  written to, and the event sink (the ctl's `/events`) gets a `write-error`
+  line. The flushes before a truncate, reflink and migrate, the write's
+  buffer-full flush and the reclaim's drain take the same callback. A direct
+  write answers the error to its caller. Every other drain error keeps the
+  run buffered and fails the flush, as before.
 
 ## Performance characteristics
 

@@ -345,6 +345,12 @@ Every successful admin write logs `result=ok` to /events via
 - Once buffer hits cap, further appends DROPPED (log pressure never OOMs).
 - Reset via admin Twrite to /admin/clear-events → zeros buffer + bumps
   `event_gen` under `event_mu`.
+- The fs's events arrive too: `stm_ctl_create` installs `ctl_fs_event` as the
+  fs's event sink (`stm_fs_set_event_sink`) and `stm_ctl_destroy` removes it.
+  A flush that dropped a file's run logs `write-error dataset=D ino=I gen=G
+  off=O len=L status=S (...): run dropped, fsync answers EIO`, and a report
+  the 256-file bound evicts logs `... report evicted unmade`. The fs calls the
+  sink under its own locks, which holds because `event_mu` is a leaf.
 
 ### Reader-vs-clear snapshot invalidation (R101 P2-1 → PARALLEL-1)
 

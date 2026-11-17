@@ -292,6 +292,9 @@ void stm_fs_set_buffer_insert_hook_for_test(stm_fs *fs,
  */
 void stm_fs_fail_drains_for_test(stm_fs *fs, stm_status fail);
 
+/* Whether an event sink (stm_fs_set_event_sink) is installed. */
+bool stm_fs_event_sink_for_test(stm_fs *fs);
+
 /*
  * The login promote's seam: invoked after each step of one file's move
  * (stm_fs_promote_sealed_cold), with no lock held, given the file and the

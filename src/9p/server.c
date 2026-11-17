@@ -3682,9 +3682,10 @@ static stm_status h_statfs(stm_9p_server *s,
 /* Tfsync:  fid[4] datasync[4]                                             */
 /* Rfsync:  (header only)                                                   */
 /*                                                                         */
-/* For v2.0 routes to stm_fs_commit (whole-pool fsync). datasync flag      */
-/* ignored — we don't yet differentiate data-only vs full fsync;           */
-/* per-file fsync requires a new stm_fs_* API (forward-note).              */
+/* Routes to stm_fs_fsync: the commit is pool-wide, and the fid's file    */
+/* answers EIO once for a buffered run a flush dropped (its record failed */
+/* its integrity check). datasync is ignored: a commit makes the data and */
+/* the metadata durable together.                                         */
 /* ────────────────────────────────────────────────────────────────────── */
 
 static stm_status h_fsync(stm_9p_server *s,
@@ -3708,10 +3709,11 @@ static stm_status h_fsync(stm_9p_server *s,
      * write-out); holding s->lock across it was the single worst
      * full-lock stall in the pre-CF-2b server. */
     fid_pin_locked(f);
+    const uint64_t ds = f->dataset_id, ino = f->ino, gen = f->cached_gen;
     phase_b_enter(s, STM_9P_TFSYNC, tag);
 
     /* (b) unlocked. */
-    stm_status rc = stm_fs_commit(s->fs);
+    stm_status rc = stm_fs_fsync(s->fs, ds, ino, &gen);
 
     /* (c) no fid mutation; unpin. */
     must_lock(&s->lock);

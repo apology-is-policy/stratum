@@ -107,6 +107,16 @@
 (*   - InodeCapBlocks ≥ 1 — per-inode buffer cap (blocks).                  *)
 (*   - GlobalCapBlocks ≥ 1 — global buffer cap (blocks).                    *)
 (*                                                                          *)
+(* A flush that cannot ever write a run (the record under it fails its     *)
+(* integrity check, so the merge read fails at every drain): kept         *)
+(* buffered, the run would fail every later flush and so every Commit,    *)
+(* which needs buffer = {}. FlushFails drops exactly that run and records *)
+(* its inode in write_errors; Fsync(ino) reports the error once. The      *)
+(* ghost `lost` holds the dropped runs not yet reported, and              *)
+(* DroppedIsReported says each one's inode is recorded until its Fsync.   *)
+(* BuggyDropSilently drops without recording: the invariant fires. Inode  *)
+(* incarnations (si_gen) are not modelled; the C tests carry them.        *)
+(*                                                                          *)
 (***************************************************************************)
 
 EXTENDS Naturals, FiniteSets
@@ -120,7 +130,8 @@ CONSTANTS
     InodeCapBlocks,
     GlobalCapBlocks,
     BuggyReadSkipsBuffer,
-    BuggyFlushReusesPaddr
+    BuggyFlushReusesPaddr,
+    BuggyDropSilently
 
 ASSUME MaxInos          \in (Nat \ {0})
 ASSUME MaxOff           \in (Nat \ {0})
@@ -131,6 +142,7 @@ ASSUME InodeCapBlocks   \in (Nat \ {0})
 ASSUME GlobalCapBlocks  \in (Nat \ {0})
 ASSUME BuggyReadSkipsBuffer       \in BOOLEAN
 ASSUME BuggyFlushReusesPaddr      \in BOOLEAN
+ASSUME BuggyDropSilently          \in BOOLEAN
 
 InoIds  == 1..MaxInos
 Offsets == 0..(MaxOff - 1)
@@ -159,9 +171,12 @@ VARIABLES
     durable_disk,   \* SUBSET ExtentRec — post-fsync state, survives crash
     used_paddrs,    \* SUBSET Paddrs — monotonic
     current_txg,    \* 0..MaxTxg, monotonic
-    next_seq        \* 1..MaxSeq+1 — next writer's seq stamp
+    next_seq,       \* 1..MaxSeq+1 -- next writer's seq stamp
+    write_errors,   \* SUBSET InoIds -- inodes owed an fsync error report
+    lost            \* SUBSET BufRange -- ghost: dropped runs not yet reported
 
-vars == <<buffer, committed, durable_disk, used_paddrs, current_txg, next_seq>>
+vars == <<buffer, committed, durable_disk, used_paddrs, current_txg, next_seq,
+          write_errors, lost>>
 
 (***************************************************************************)
 (* Helpers.                                                                  *)
@@ -199,6 +214,8 @@ Init ==
     /\ used_paddrs   = {}
     /\ current_txg   = 0
     /\ next_seq      = 1
+    /\ write_errors  = {}
+    /\ lost          = {}
 
 (***************************************************************************)
 (* BufferedWrite — add a range to the buffer.                                *)
@@ -245,7 +262,8 @@ BufferedWrite(ino, off, len) ==
            /\ buffer' = ((buffer \ overlapping) \union remnants) \union
                 {[ino |-> ino, off |-> off, len |-> len, seq |-> next_seq]}
     /\ next_seq' = next_seq + 1
-    /\ UNCHANGED <<committed, durable_disk, used_paddrs, current_txg>>
+    /\ UNCHANGED <<committed, durable_disk, used_paddrs, current_txg,
+                   write_errors, lost>>
 
 (***************************************************************************)
 (* DirectWrite — large-and-aligned write that bypasses the buffer.          *)
@@ -277,7 +295,7 @@ DirectWrite(ino, off, len, p) ==
                   paddr |-> p, gen |-> current_txg, src_seq |-> next_seq]}
     /\ used_paddrs' = used_paddrs \union {p}
     /\ next_seq' = next_seq + 1
-    /\ UNCHANGED <<durable_disk, current_txg>>
+    /\ UNCHANGED <<durable_disk, current_txg, write_errors, lost>>
 
 (***************************************************************************)
 (* Flush — drain ALL buffered ranges for one inode into `committed`.        *)
@@ -307,7 +325,7 @@ Flush(ino) ==
            IN  /\ committed' = (committed \ comm_overlap) \union new_extents
                /\ used_paddrs' = used_paddrs \union { pmap[b] : b \in to_drain }
                /\ buffer' = buffer \ to_drain
-    /\ UNCHANGED <<durable_disk, current_txg, next_seq>>
+    /\ UNCHANGED <<durable_disk, current_txg, next_seq, write_errors, lost>>
 
 (***************************************************************************)
 (* Commit — promote `committed` to `durable_disk`. Models a successful     *)
@@ -323,7 +341,8 @@ Commit ==
     /\ current_txg < MaxTxg
     /\ durable_disk' = committed
     /\ current_txg' = current_txg + 1
-    /\ UNCHANGED <<buffer, committed, used_paddrs, next_seq>>
+    /\ UNCHANGED <<buffer, committed, used_paddrs, next_seq, write_errors,
+                   lost>>
 
 (***************************************************************************)
 (* Crash — power loss. Buffer goes to /dev/null; in-RAM `committed` that   *)
@@ -334,7 +353,35 @@ Commit ==
 Crash ==
     /\ buffer' = {}
     /\ committed' = durable_disk
+    /\ write_errors' = {}
+    /\ lost' = {}
     /\ UNCHANGED <<durable_disk, used_paddrs, current_txg, next_seq>>
+
+(***************************************************************************)
+(* FlushFails -- the drain cannot write run r of ino (its record failed its *)
+(* integrity check): r leaves the buffer unwritten, so the inode's other   *)
+(* runs and every other inode still flush and Commit stays reachable; the *)
+(* inode is owed a report. committed is unchanged: the record keeps its   *)
+(* old bytes.                                                               *)
+(***************************************************************************)
+FlushFails(ino, r) ==
+    /\ r \in BufferedFor(ino)
+    /\ buffer' = buffer \ {r}
+    /\ lost' = lost \union {r}
+    /\ write_errors' = IF BuggyDropSilently THEN write_errors
+                                            ELSE write_errors \union {ino}
+    /\ UNCHANGED <<committed, durable_disk, used_paddrs, current_txg,
+                   next_seq>>
+
+(***************************************************************************)
+(* Fsync -- the file's fsync answers its error, once: the report is taken.  *)
+(***************************************************************************)
+Fsync(ino) ==
+    /\ ino \in write_errors
+    /\ write_errors' = write_errors \ {ino}
+    /\ lost' = { r \in lost : r.ino # ino }
+    /\ UNCHANGED <<buffer, committed, durable_disk, used_paddrs, current_txg,
+                   next_seq>>
 
 (***************************************************************************)
 (* Top-level Next.                                                           *)
@@ -345,6 +392,8 @@ Next ==
     \/ \E ino \in InoIds, off \in Offsets, len \in Lengths, p \in Paddrs :
         DirectWrite(ino, off, len, p)
     \/ \E ino \in InoIds : Flush(ino)
+    \/ \E ino \in InoIds : \E r \in buffer : FlushFails(ino, r)
+    \/ \E ino \in InoIds : Fsync(ino)
     \/ Commit
     \/ Crash
 
@@ -394,6 +443,8 @@ TypeOK ==
     /\ used_paddrs  \subseteq Paddrs
     /\ current_txg  \in Gens
     /\ next_seq     \in 1..(MaxSeq + 1)
+    /\ write_errors \subseteq InoIds
+    /\ lost         \subseteq BufRange
 
 (* ReadHidesFlushOrder — Read returns the latest writer-issued seq         *)
 (* regardless of whether it's in buffer or committed.                       *)
@@ -438,8 +489,14 @@ BufferRangesNonOverlapWithinIno ==
 DurableUsedPaddrs ==
     \A e \in durable_disk : e.paddr \in used_paddrs
 
+(* DroppedIsReported -- a run the drain dropped leaves its inode owed a     *)
+(* report until that inode's Fsync takes it.                              *)
+DroppedIsReported ==
+    \A r \in lost : r.ino \in write_errors
+
 Invariants ==
     /\ TypeOK
+    /\ DroppedIsReported
     /\ ReadHidesFlushOrder
     /\ FlushPaddrFreshness
     /\ PaddrUniquenessAcrossCommitted

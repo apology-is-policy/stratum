@@ -113,8 +113,10 @@
  * Subsystem-internal locks (stm_fs->lock, stm_pool::lock,
  * stm_scrub::lock, stm_snapshot::idx_mu) MAY be acquired
  * underneath cn->mu by materializers — they're at a lower
- * lock-order layer and no subsystem calls back into /ctl/, so
- * no cycle is reachable.
+ * lock-order layer. One subsystem calls back into /ctl/: the fs's
+ * event sink (ctl_fs_event) logs under the fs's own locks, which
+ * holds because event_mu is a leaf -- nothing is taken under it and
+ * no holder of it calls into a subsystem -- so no cycle is reachable.
  *
  * Future writable kinds that log audit lines from inside a
  * sessions[]-touching critical section MUST follow the same
@@ -1677,6 +1679,12 @@ static void event_append_locked(stm_ctl *c, const char *data, size_t len)
  * + vsnprintf-into-stack-buffer + append. Truncated lines are
  * forced-newline-terminated (R11 P3-4 lesson) so the line-oriented
  * format stays valid. */
+/* The fs's events (stm_fs_set_event_sink): called under the fs's locks. */
+static void ctl_fs_event(void *ctx, const char *line)
+{
+    stm_ctl_log_event((stm_ctl *)ctx, "%s", line);
+}
+
 void stm_ctl_log_event(stm_ctl *c, const char *fmt, ...)
 {
     if (!c || !fmt) return;
@@ -4290,6 +4298,7 @@ stm_status stm_ctl_create(struct stm_fs *fs, stm_ctl **out)
      * correctly detects a clear-events that bumped gen 1→2. */
     c->event_gen = 1;
     c->worker_count = 0;
+    if (fs) stm_fs_set_event_sink(fs, ctl_fs_event, c);
     *out = c;
     return STM_OK;
 }
@@ -4526,6 +4535,8 @@ stm_status stm_ctl_attach_scrub(stm_ctl *c, struct stm_scrub *scrub)
 void stm_ctl_destroy(stm_ctl *c)
 {
     if (!c) return;
+    /* Before event_mu goes: the fs is unmounted after the ctl. */
+    if (c->fs) stm_fs_set_event_sink(c->fs, NULL, c);
     /* P9.5-PARALLEL-1: wait until every live stm_ctl_conn has been
      * destroyed before tearing the shared state down. Detached /ctl/
      * workers may still be inside a vops dispatch reading c->fs /

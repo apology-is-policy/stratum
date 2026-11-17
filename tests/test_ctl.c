@@ -5891,3 +5891,62 @@ STM_TEST(ctl_a5_r146_mark_reports_changed)
 }
 
 STM_TEST_MAIN("ctl")
+
+/* /events logs a buffered run a flush dropped; the ctl's sink goes with
+ * the ctl. */
+STM_TEST(ctl_events_log_a_dropped_run)
+{
+    make_tmp("ctl_dropped_run");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t r = 0, a = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"a", 1, 0644u, 0, 0, &a));
+    char *z = malloc(4096);
+    memset(z, 'z', 4096);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, a, 0, z, 4096));   /* an extent file */
+    free(z);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    STM_ASSERT(!stm_fs_event_sink_for_test(fs));
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    STM_ASSERT(stm_fs_event_sink_for_test(fs));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, a, 100, "dropped!", 8));
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
+    do_handshake(s, 10);
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "events" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_tread(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    char body[8192];
+    count = take_body(body, sizeof body, resp, count);
+    char want[96];
+    snprintf(want, sizeof want, "write-error dataset=1 ino=%llu gen=",
+             (unsigned long long)a);
+    STM_ASSERT(strstr(body, want) != NULL);
+    STM_ASSERT(strstr(body, "run dropped, fsync answers EIO\n") != NULL);
+    stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
+    stm_ctl_destroy(c);
+
+    STM_ASSERT(!stm_fs_event_sink_for_test(fs));
+    STM_ASSERT_ERR(stm_fs_fsync(fs, 1, a, NULL), STM_EIO);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}

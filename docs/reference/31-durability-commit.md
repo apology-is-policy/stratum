@@ -294,9 +294,15 @@ redundancy guarantees).
 ## 31.6 fsync / Tsync semantics
 
 `h_sync` (`src/9p/server.c`) maps `Tsync` → `stm_fs_commit` → a full pool-wide
-commit. There is **no per-file fsync**: an extent write is durable only after a
-pool commit. A clean unmount (`stm_fs_unmount`) performs a final commit unless
-the fs is read-only or wedged.
+commit. `h_fsync` maps `Tfsync` -> `stm_fs_fsync(ds, ino, the fid's gen)`: the
+same pool-wide commit (an extent write is durable only after a pool commit),
+then `STM_EIO` once if a flush since the file's last fsync dropped a run of its
+buffered bytes because the record under it failed its integrity check (26,
+Error paths). A commit error wins and keeps the report. As with Linux's errseq
+the report is made once, so a retried fsync answers OK over the lost bytes. The
+reports live in RAM, for 256 files at most; an unmount or a crash forgets them.
+A clean unmount (`stm_fs_unmount`) performs a final commit unless the fs is
+read-only or wedged.
 
 ---
 
