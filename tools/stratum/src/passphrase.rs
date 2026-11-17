@@ -856,14 +856,24 @@ fn erase_char(buf: &mut Vec<u8>) {
 #[cfg(test)]
 mod hand_over_tests {
     /// A child that has gone takes no line, and that is left to what it said; one variable away,
-    /// a plain write to the same pipe is the error.
+    /// a plain write to the same pipe is the error. A peer test's fork copies a pipe made
+    /// meanwhile, read end and all, and its child holds that until it exits: pipes are tried
+    /// until the control finds no reader, which none can become once the read end is dropped.
     #[test]
     fn a_child_gone_before_its_passphrase_is_no_error() {
-        let (r, mut w) = std::io::pipe().expect("pipe");
-        drop(r);
-        let plain = std::io::Write::write_all(&mut w, b"x\n");
-        assert_eq!(plain.map_err(|e| e.kind()), Err(std::io::ErrorKind::BrokenPipe), "it proves nothing");
-        assert!(super::hand_over(&mut w, b"x\n").is_ok());
+        for _ in 0..1000 {
+            let (r, mut w) = std::io::pipe().expect("pipe");
+            drop(r);
+            match std::io::Write::write_all(&mut w, b"x\n") {
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                    assert!(super::hand_over(&mut w, b"x\n").is_ok());
+                    return;
+                }
+                Err(e) => panic!("the control failed otherwise: {e}"),
+                Ok(()) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        panic!("it proves nothing: every pipe kept a reader");
     }
 }
 
