@@ -583,10 +583,6 @@ static void fs_buffer_insert_gap(stm_fs *fs, uint64_t dataset_id,
 #endif
 }
 
-/* The inode update that completes a data op. After the op changed
- * extents (extents_changed), a failure leaves them under the old inode, so
- * the fs wedges before the op's span ends and no commit makes that durable.
- * The caller holds fs->global and the inode's pin. */
 /* A regular file of a user-sealed dataset keeps no bytes in its inode: the
  * pool's metadata key seals inodes, and every mount unwraps it with no
  * session. Its bytes go to extents, under the dataset's own key. */
@@ -607,6 +603,10 @@ static void fs_iv_make_extent(struct stm_inode_value *iv)
     memset(&iv->si_data, 0, sizeof iv->si_data);
 }
 
+/* The inode update that completes a data op. After the op changed
+ * extents (extents_changed), a failure leaves them under the old inode, so
+ * the fs wedges before the op's span ends and no commit makes that durable.
+ * The caller holds fs->global and the inode's pin. */
 static stm_status fs_data_iset_locked(stm_fs *fs, stm_inode_index *iidx,
                                       uint64_t ds, uint64_t ino,
                                       const struct stm_inode_value *iv,
@@ -9210,6 +9210,121 @@ stm_status stm_fs_promote_to_hot(stm_fs *fs,
     return rc;
 }
 
+/* The most of one file moved per hold of s->lock. */
+#define FS_PROMOTE_STEP_BYTES (UINT64_C(1) << 20)
+
+/* One file's COLD extents to HOT, at most `budget` bytes, a step at a time,
+ * under fs->global SH and the inode's pin. No reclaim on STM_ENOSPC: it
+ * drains and commits the whole pool, which a login must not do. */
+static stm_status fs_promote_ino_bounded(stm_fs *fs, uint64_t ds, uint64_t ino,
+                                         uint64_t budget, uint64_t *out_done,
+                                         bool *out_more)
+{
+    *out_done = 0;
+    *out_more = false;
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) return STM_EINVAL;
+    pthread_rwlock_rdlock(&fs->global);
+    FS_GUARD_WRITE(fs);
+    stm_inode_handle *h = NULL;
+    stm_status rc = stm_inode_pin(iidx, ds, ino, &h);
+    if (rc != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        return rc;
+    }
+    rc = fs_flush_ino_locked(fs, ds, ino);
+    while (rc == STM_OK && *out_done < budget) {
+        uint64_t step = budget - *out_done;
+        if (step > FS_PROMOTE_STEP_BYTES) step = FS_PROMOTE_STEP_BYTES;
+        uint64_t got = 0;
+        bool more = false;
+        rc = stm_sync_promote_to_hot_bounded(fs->sync, ds, ino, step,
+                                             &got, &more);
+        *out_done += got;
+        *out_more = more;
+        if (!more || got == 0u) break;
+    }
+    stm_inode_unpin(iidx, h);
+    pthread_rwlock_unlock(&fs->global);
+    return rc;
+}
+
+stm_status stm_fs_promote_sealed_cold(stm_fs *fs, uint64_t dataset_id,
+                                      uint64_t max_bytes,
+                                      stm_fs_promote_policy_stats *out_stats)
+{
+    if (out_stats) *out_stats = (stm_fs_promote_policy_stats){0};
+    if (!fs || dataset_id == 0u || max_bytes == 0u) return STM_EINVAL;
+    stm_fs_promote_policy_stats local = {0};
+    stm_fs_promote_policy_stats *st = out_stats ? out_stats : &local;
+
+    bool sealed = false;
+    stm_status rc = stm_sync_dataset_key_user_sealed(fs->sync, dataset_id,
+                                                     &sealed);
+    if (rc != STM_OK || !sealed) return rc;
+    if (stm_sync_dataset_locked(fs->sync, dataset_id)) return STM_ELOCKED;
+    /* No new COLD extent enters a sealed dataset, so a home holds one only
+     * from an older pool: a scan that stops at the first spares the rest
+     * the walk below. */
+    bool has_cold = false;
+    rc = stm_sync_dataset_has_cold(fs->sync, dataset_id, &has_cold);
+    if (rc != STM_OK || !has_cold) return rc;
+
+    pthread_rwlock_rdlock(&fs->global);
+    FS_GUARD_WRITE(fs);
+    stm_sync_promote_candidate *cands = NULL;
+    size_t   n_cands = 0u;
+    uint64_t visited = 0u;
+    rc = stm_sync_promote_policy_collect(fs->sync, dataset_id, 0u, 0u,
+                                         &cands, &n_cands, &visited);
+    pthread_rwlock_unlock(&fs->global);
+    if (rc != STM_OK) return rc;
+    st->inos_visited  = visited;
+    st->inos_eligible = (uint64_t)n_cands;
+
+    /* A deduplicated chunk becomes a copy per file, times the replicas:
+     * leave a sixteenth of the pool free after twice this pass's bytes. */
+    uint64_t due = 0u;
+    for (size_t i = 0; i < n_cands && due < max_bytes; i++)
+        due += cands[i].bytes;
+    if (due > max_bytes) due = max_bytes;
+    stm_fs_stats fst;
+    rc = stm_fs_stats_get(fs, &fst);
+    if (rc == STM_OK && fst.data_avail_blocks <=
+            fst.data_total_blocks / 16u + (due / 4096u + 1u) * 2u)
+        rc = STM_ENOSPC;
+    if (rc != STM_OK) {
+        free(cands);
+        return rc;
+    }
+
+    for (size_t i = 0; i < n_cands && st->bytes_promoted < max_bytes; i++) {
+        uint64_t done = 0;
+        bool more = false;
+        stm_status one = fs_promote_ino_bounded(fs, dataset_id, cands[i].ino,
+                                                max_bytes - st->bytes_promoted,
+                                                &done, &more);
+        st->bytes_promoted += done;
+        if (one == STM_OK && !more) {
+            if (done != 0u) st->inos_promoted++;
+            continue;
+        }
+        if (one == STM_OK) break;          /* the budget ran out in this file */
+        if (one == STM_ENOENT) continue;   /* unlinked since the collect */
+        if (st->last_err == STM_OK) {
+            st->last_err     = one;
+            st->last_err_ino = cands[i].ino;
+        }
+        if (one == STM_ENOSPC || one == STM_ELOCKED || one == STM_EWEDGED ||
+            one == STM_EROFS || one == STM_ENOMEM) {
+            rc = one;
+            break;
+        }
+    }
+    free(cands);
+    return rc;
+}
+
 /* P7-CAS-11: stm_fs_promote_policy_step. v1 promote-policy primitive.
  * Composes over stm_sync_promote_policy_collect (candidate selection)
  * + stm_fs_promote_to_hot (per-ino data plane). Pass shape mirrors
@@ -10460,23 +10575,6 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
  * UNWRAP round-trip runs under EX -- acceptable because the /ctl/ driver
  * already serializes DEK lifecycle ops on its own lease lock and logins
  * are console-paced (see src/ctl/synfs.c). */
-/* A pool written before the cold tier refused sealed data may hold a sealed
- * dataset's extents in the CAS, under the pool's key. With the dataset's key
- * back, every COLD-bearing file of it moves to the hot tier, under that key.
- * Best effort: a failure leaves the rest where it was, refused whole while
- * the dataset is locked, for the next install to retry; the login stands. A
- * pool whose CAS is empty holds no COLD extent, and is not walked. */
-static void fs_promote_sealed_cold(stm_fs *fs, uint64_t dataset_id)
-{
-    size_t chunks = 0;
-    stm_status cs = stm_cas_count(stm_sync_cas_index(fs->sync), &chunks);
-    if (cs != STM_OK || chunks == 0u) return;
-    stm_fs_promote_policy_params every = {0};
-    stm_fs_promote_policy_stats st;
-    stm_status ps = stm_fs_promote_policy_step(fs, dataset_id, &every, &st);
-    (void)ps;
-}
-
 stm_status stm_fs_install_dek(stm_fs *fs, uint64_t dataset_id,
                                 const stm_corvus_mount_cfg *corvus)
 {
@@ -10485,7 +10583,6 @@ stm_status stm_fs_install_dek(stm_fs *fs, uint64_t dataset_id,
     FS_GUARD_WRITE(fs);
     stm_status s = stm_sync_install_dek(fs->sync, dataset_id, corvus);
     pthread_rwlock_unlock(&fs->global);
-    if (s == STM_OK) fs_promote_sealed_cold(fs, dataset_id);
     return s;
 }
 

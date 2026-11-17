@@ -322,8 +322,9 @@ typedef struct stm_send_handle stm_send_handle;
  *   STM_EBUSY, a transient: a COLD extent's CAS record or a key was
  *     dropped between the collect and its lookup (retry).
  *   STM_ELOCKED if a collected record's key is a locked dataset's
- *     CURRENT key (for a clone's shared record, its origin's), until its
- *     DEK is installed.
+ *     CURRENT key (for a clone's shared record, its origin's), or a
+ *     collected COLD record names a locked dataset as its origin, until
+ *     its DEK is installed.
  *   STM_ENOENT also if the snapshot named was deleted after init
  *     found it and its tree could not then be read whole (its nodes
  *     given out again): as if the delete had come first. A tree read
@@ -377,9 +378,11 @@ stm_status stm_send_init(stm_sync *sync,
  *   STM_ERANGE — out_cap too small; *out_len_needed advises.
  *   STM_EBADTAG / STM_EIO / STM_EPROTOCOL on internal verify failures
  *     (couldn't decrypt a source extent — corruption mid-send).
- *   STM_ELOCKED -- a dataset the stream reads was locked (its user logged
- *     out) after init: the handle's keys are wiped, and every later call
- *     answers the same. Only stm_send_close remains.
+ *   STM_ELOCKED -- the sent dataset, or a dataset that wrote one of its
+ *     records (a clone's origin), was logged out of (stm_sync_evict_dek)
+ *     after init, even if a login followed: the handle's keys are wiped,
+ *     and every later call answers the same. Only stm_send_close remains.
+ *     The keys stay in the handle until that call or the close.
  */
 STM_MUST_USE
 stm_status stm_send_next(stm_send_handle *h,

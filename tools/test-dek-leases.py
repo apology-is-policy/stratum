@@ -38,15 +38,27 @@ static stm_status stm_fs_install_dek(void *fs,uint64_t ds,const stm_corvus_mount
 static stm_status stm_fs_evict_dek(void *fs,uint64_t ds) {
  (void)fs;(void)ds;evictions++;return eviction_result;
 }
+/* The login's promote runs outside dek_mu, once the lease is published. */
+#define CTL_LOGIN_PROMOTE_BYTES 32u
+static stm_ctl *g_ctl; static int promotes;
+static stm_status stm_fs_promote_sealed_cold(void *fs,uint64_t ds,uint64_t max,void *st) {
+ (void)fs;(void)st; assert(max==CTL_LOGIN_PROMOTE_BYTES);
+ assert(pthread_mutex_trylock(&g_ctl->dek_mu)==0); pthread_mutex_unlock(&g_ctl->dek_mu);
+ bool leased=false;
+ for(int i=0;i<STM_CTL_DEK_LEASE_MAX;i++)
+  leased|=g_ctl->dek_leases[i].active&&!g_ctl->dek_leases[i].orphan&&g_ctl->dek_leases[i].dataset_id==ds;
+ assert(leased); promotes++; return STM_OK;
+}
 '''
 tests=r'''
 int main(void) {
  stm_ctl c={.corvus_socket_set=true,.fs=(void*)1,.dek_mu=PTHREAD_MUTEX_INITIALIZER};
  stm_ctl_conn a={&c},b={&c},foreign={&c}; uint8_t tok=1;
- assert(ctl_dek_install(&a,2,&tok)==STM_OK && proofs==1);
+ g_ctl=&c;
+ assert(ctl_dek_install(&a,2,&tok)==STM_OK && proofs==1 && promotes==1);
  assert(ctl_dek_install(&a,2,&tok)==STM_OK && proofs==1);
  proof_result=STM_EACCES;
- assert(ctl_dek_install(&b,2,&tok)==STM_EACCES && proofs==2);
+ assert(ctl_dek_install(&b,2,&tok)==STM_EACCES && proofs==2 && promotes==1);
  assert(ctl_dek_evict(&b,2)==STM_EACCES && evictions==0);
  proof_result=STM_OK;
  assert(ctl_dek_install(&b,2,&tok)==STM_OK && proofs==3);
@@ -101,6 +113,8 @@ mutants={
  'no-orphan-retry':('    if (!c->fs) return;\n    for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {\n        ctl_dek_lease *l','    if (1) return;\n    for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {\n        ctl_dek_lease *l'),
  'no-install-takeover':('            if (c->dek_leases[i].active && c->dek_leases[i].orphan &&\n                c->dek_leases[i].dataset_id == dataset_id)','            if (0)'),
  'evict-hides-orphan':('            orphan_rc = c->dek_leases[i].orphan_rc;','            (void)orphan_rc;'),
+ 'no-login-promote':('    if (rc == STM_OK) {\n        stm_status ps','    if (0) {\n        stm_status ps'),
+ 'promote-under-dek-mu':('        stm_status ps = stm_fs_promote_sealed_cold(','        pthread_mutex_lock(&c->dek_mu);\n        stm_status ps = stm_fs_promote_sealed_cold('),
 }
 # The proof-skipping mutant keeps the call syntactically available but unreachable.
 mutants['skip-new-proof']=(mutants['skip-new-proof'][0], 'stm_status rc = false ? stm_fs_install_dek(c->fs, dataset_id, &cfg) : STM_OK;')

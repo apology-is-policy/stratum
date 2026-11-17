@@ -441,6 +441,8 @@ wrap keypair (X25519 + ML-KEM-768), held in a keyfile or by an agent
 - A **DEK** seals only that dataset's hot file extents.
 - So **per-dataset trees use the pool key**: names, sizes, owners, xattrs, extent maps, symlink targets and inline data up to 100 bytes
   are protected by the pool key rather than the DEK. Per-dataset keys separate file contents, not metadata.
+  A user-sealed dataset's regular files keep no bytes inline: they start as extent files, and a write to an older inline file cuts it
+  over first (an older inline file keeps its bytes until it is rewritten).
 
 **Agents.** `janus` is a Plan-9-style key agent (file and passphrase backends) over 9P on a Unix socket, and it returns plaintext DEKs
 to the filesystem. `corvus`, part of the Thylacine OS, seals per-user dataset keys; a dataset with no key installed reads as locked
@@ -523,7 +525,9 @@ than `Tfadvise`.
 
 **How encryption and dedup coexist.** This is a real difference from peers: ZFS allows dedup only within a dataset, its snapshots and its clones, and its dedup tables are
 plaintext; bcachefs and APFS have no dedup. Stratum dedups across datasets with the hashes hidden from a disk reader. **The price is that migrating a dataset to cold removes
-the DEK from reads**, so a holder of the pool key can read it. *By reading*, a locked dataset's cold extents remain readable, since they decrypt under the pool key with no check of the lock.
+the DEK from reads**, so a holder of the pool key can read it. A user-sealed dataset's data never goes to the cold tier, a locked dataset's cold extents (which an older pool may hold) are refused
+whole, and so are a clone's cold records whose origin is a locked dataset; each login moves a share of a home's cold extents back to
+the hot tier under its key.
 
 **Recorded ratios:** see section 17.
 

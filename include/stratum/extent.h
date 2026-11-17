@@ -1110,6 +1110,16 @@ stm_status stm_extent_iter_ds(const stm_extent_index *idx,
                                  stm_extent_iter_cb cb, void *ctx);
 
 /*
+ * Whether `dataset_id` holds a COLD extent: `*out_has` is set true at the
+ * first one found, in the engine's order, with no sort and no copy of the
+ * set. Takes the index's lock. Returns STM_EINVAL on NULL or dataset 0, or
+ * the scan's error.
+ */
+STM_MUST_USE
+stm_status stm_extent_ds_has_cold(const stm_extent_index *idx,
+                                  uint64_t dataset_id, bool *out_has);
+
+/*
  * stm_dataset_index_set_engine_root under this index's lock. A serial walk
  * of a dataset's live engine (stm_extent_iter_ds, and the other serial
  * reads) fetches the engine and walks it holding this lock and no EBR pin,

@@ -3802,6 +3802,12 @@ For FIFOs and sockets, `si_mode` encodes the file type; `si_data_kind` is `STM_D
 
 Files ≤100 bytes store their content directly in the inode. Benefits:
 
+(Issue note: not in a user-sealed dataset. The inode is sealed by the pool's
+metadata key, which every mount unwraps with no session, so such a dataset's
+regular files keep their bytes in extents under its own key, and an older
+inline file is cut over at its next write. An interim until per-dataset
+metadata keys; PRODUCTION-PLAN T0.94, T0.95.)
+
 - No extent allocation (saves ≥4 KiB of device space per tiny file).
 - No extent-tree lookup (faster reads).
 - Reduces fragmentation on workloads with many tiny files.

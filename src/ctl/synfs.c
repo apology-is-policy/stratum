@@ -652,6 +652,9 @@ static void ctl_dek_reap_orphans(stm_ctl *c)
     }
 }
 
+/* The most of a home's cold-tier residue one login moves back. */
+#define CTL_LOGIN_PROMOTE_BYTES (UINT64_C(32) << 20)
+
 /* D7: one authenticated lease per (connection,dataset), not a singleton
  * dataset owner. A new connection always proves UNWRAP authority, including
  * an already-unlocked dataset. Existing bounded I/O stays under dek_mu;
@@ -702,6 +705,16 @@ static stm_status ctl_dek_install(stm_ctl_conn *cn, uint64_t dataset_id,
                 c->dek_leases[i] = (ctl_dek_lease){0};
     }
     pthread_mutex_unlock(&c->dek_mu);
+    /* A pool written before the cold tier refused sealed data may hold the
+     * home's files there, under the pool's key: each login moves a share
+     * back under the home's key. After the lease and outside dek_mu, so no
+     * other login or logout waits on it. Best effort: the login stands. */
+    if (rc == STM_OK) {
+        stm_status ps = stm_fs_promote_sealed_cold(c->fs, dataset_id,
+                                                   CTL_LOGIN_PROMOTE_BYTES,
+                                                   NULL);
+        (void)ps;
+    }
     return rc;
 }
 

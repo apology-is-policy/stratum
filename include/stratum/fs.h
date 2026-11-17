@@ -347,6 +347,9 @@ stm_status stm_fs_commit(stm_fs *fs);
  *     cover, the blocks it touches plus the extents it partly overlaps,
  *     passes 4 * STM_FS_RECORDSIZE_MAX; nothing is written. Only an
  *     in-process caller can ask that much: a 9P count is bounded by msize.
+ *   - (write to an inline file) the keyschema's error (STM_ECORRUPT for
+ *     two CURRENT keys) when it is asked whether a dataset with no key in
+ *     RAM is user-sealed.
  *   - STM_ENOMEM on allocation failure.
  *   - STM_EBADTAG on AEAD decrypt failure (read).
  */
@@ -451,6 +454,8 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
  *   - chain exhausted (STM_ENOSPC — should never happen in practice).
  *   - inode-allocator out of slots (STM_ENOSPC).
  *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
+ *   - the keyschema's error (STM_ECORRUPT for two CURRENT keys) when it
+ *     is asked whether a dataset with no key in RAM is user-sealed.
  */
 STM_MUST_USE
 stm_status stm_fs_create_file(stm_fs *fs, uint64_t dataset_id,
@@ -921,6 +926,8 @@ stm_status stm_fs_get_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
  *   - mode S_IFMT bits set to a non-S_IFREG type (STM_EINVAL).
  *   - inode-allocator out of slots (STM_ENOSPC).
  *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
+ *   - the keyschema's error (STM_ECORRUPT for two CURRENT keys) when it
+ *     is asked whether a dataset with no key in RAM is user-sealed.
  *
  * Uniform out-param contract: `*out_child_ino` zero-initialized
  * BEFORE arg validation runs.
@@ -2024,14 +2031,8 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
  * the corvus key agent named by `corvus` (socket + the login-forwarded
  * session token) and installs the plaintext DEK, lifting the dataset
  * out of the deferred-unwrap LOCKED posture. Reinstallation still proves
- * the token and live-key equality; CORVUS-only; the install itself is
- * RAM-only (no commit). Then, unless the CAS is empty, every COLD-bearing
- * file of the dataset is promoted to HOT under its key: a pool written
- * before the cold tier refused sealed data may hold them in the CAS, under
- * the pool's key. Best effort: a failure leaves the rest COLD (refused while
- * LOCKED) for the next install, and the install's result stands. A snapshot
- * taken while a file was COLD keeps that copy in the CAS until it is
- * deleted.
+ * the token and live-key equality; CORVUS-only; RAM-only (no commit). The
+ * /ctl/ driver follows a login's install with stm_fs_promote_sealed_cold.
  * stm_fs_evict_dek drains the dataset's own buffered writes under EX
  * before taking the DEK out of RAM, returning the dataset to LOCKED. A
  * drain failure keeps the key and propagates the error. Another dataset's
@@ -2491,9 +2492,9 @@ typedef struct {
     /* Inclusive minimum recency: an ino's COLD extents are eligible
      * only if `max(last_read_gen) >= sync.current_gen -
      * min_recency_txgs` (saturating; if min_recency_txgs >=
-     * current_gen, the cutoff is 0 and any positive last_read_gen
-     * qualifies). 0 means "no recency filter" (only the count
-     * threshold gates eligibility). */
+     * current_gen, the cutoff is 0 and every last_read_gen, a
+     * never-read extent's 0 included, qualifies). 0 means "no recency
+     * filter" (only the count threshold gates eligibility). */
     uint64_t min_recency_txgs;
     /* Maximum number of inos to promote this pass. 0 = no per-pass
      * count cap. */
@@ -2529,6 +2530,38 @@ stm_status stm_fs_promote_policy_step(stm_fs *fs,
                                          uint64_t dataset_id,
                                          const stm_fs_promote_policy_params *params,
                                          stm_fs_promote_policy_stats *out_stats);
+
+/*
+ * A pool written before the cold tier refused sealed data may hold a
+ * user-sealed dataset's extents in the CAS, under the pool's key. With the
+ * dataset's key installed, this moves its COLD extents to HOT under that
+ * key until it has moved `max_bytes` (each file it reaches moves one extent
+ * at least, so it may pass that by less than one extent); the next call
+ * takes up what is left.
+ * The /ctl/ driver calls it after each login's install, once the lease is
+ * published, outside its lease lock.
+ *
+ * Cost: a dataset that is not user-sealed, or that holds no COLD extent,
+ * costs a scan of its extents that stops at the first COLD one (no sort,
+ * under s->lock). One that holds some is then collected whole under
+ * fs->global SH, and its files moved one at a time under SH and the
+ * file's pin, at most 1 MiB per hold of s->lock. It writes, and does not
+ * commit: STM_ENOSPC stops it, with no reclaim.
+ *
+ * Returns STM_OK when nothing was due or the pass ran (to its end or to
+ * the budget; out_stats says what moved, last_err the first failure of a
+ * file, which the pass passes over). Stops with STM_ENOSPC when the pool
+ * would keep less free than a sixteenth of its data blocks after twice
+ * the pass's bytes (checked after the collect) or a write found it full, STM_ELOCKED if the
+ * dataset is locked or became so, STM_EWEDGED / STM_EROFS / STM_ENOMEM.
+ * STM_EINVAL on NULL fs, dataset 0 or max_bytes 0. A snapshot taken while
+ * a file was COLD keeps that copy in the CAS until it is deleted, and a
+ * chunk another dataset shares stays in the CAS for it.
+ */
+STM_MUST_USE
+stm_status stm_fs_promote_sealed_cold(stm_fs *fs, uint64_t dataset_id,
+                                      uint64_t max_bytes,
+                                      stm_fs_promote_policy_stats *out_stats);
 
 /*
  * P7-CAS-11: multi-dataset wrapper over stm_fs_promote_policy_step.

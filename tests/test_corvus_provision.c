@@ -22,12 +22,14 @@
 #include <stratum/corvus_client.h>
 #include <stratum/ctl.h>
 #include <stratum/dataset.h>
+#include <stratum/extent.h>
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>
 #include <stratum/inode.h>
 #include <stratum/lp9.h>
 #include <stratum/stratumd.h>
 #include <stratum/sync.h>
+#include <stratum/sync_testing.h>
 #include <stratum/types.h>
 
 #include <fcntl.h>
@@ -495,6 +497,73 @@ STM_TEST(dek_install_evict_via_ctl) {
     STM_ASSERT_ERR(stm_sync_get_dek(sync, 2u, 0u, dek), STM_ENOENT);
 
     stm_ctl_destroy(ctl);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fake_corvus_stop(&fc);
+    (void)unlink(token_path);
+    (void)unlink(g_tmp_path);
+}
+
+static uint8_t ctl_extent_kind(stm_fs *fs, uint64_t ds, uint64_t ino)
+{
+    stm_extent_record e;
+    memset(&e, 0, sizeof e);
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(stm_fs_sync(fs)),
+                                       ds, ino, 0, &e));
+    return (uint8_t)e.kind;
+}
+
+/* A home file an older pool left in the cold tier (the seam puts it there):
+ * the install alone leaves it cold; a login through /ctl, which follows the
+ * install with the promote once the lease is published, moves it back. */
+STM_TEST(dek_login_via_ctl_moves_a_cold_home_file_back) {
+    make_tmp("dekprom");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    char token_path[256];
+    write_token_file(token_path, sizeof token_path, "dekprom");
+    fake_corvus fc;
+    fake_corvus_start(&fc, "dekprom", STM_CORVUS_STATUS_OK);
+    stm_fs *fs = provision_and_remount_locked(&fc, "dekprom", token_path);
+    stm_sync *sync = stm_fs_sync(fs);
+    stm_corvus_mount_cfg cc = {.socket_path = fc.sock_path,
+                               .session_token = TEST_TOKEN};
+
+    STM_ASSERT_OK(stm_fs_install_dek(fs, 2u, &cc));
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 2u, 1u, (const uint8_t *)"f", 1,
+                                     0600, 1000, 1000, &f));
+    uint8_t blk[4096];
+    memset(blk, 0x77, sizeof blk);
+    STM_ASSERT_OK(stm_fs_write(fs, 2u, f, 0, blk, sizeof blk));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_sync_set_cas_admits_sealed_for_test(sync, true);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 2u, f));
+    stm_sync_set_cas_admits_sealed_for_test(sync, false);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_evict_dek(fs, 2u));
+    STM_ASSERT_OK(stm_fs_install_dek(fs, 2u, &cc));
+    STM_ASSERT_EQ(ctl_extent_kind(fs, 2u, f), STM_EXTENT_KIND_COLD);
+    STM_ASSERT_OK(stm_fs_evict_dek(fs, 2u));
+
+    stm_ctl *ctl = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &ctl));
+    STM_ASSERT_OK(stm_ctl_set_system_uid(ctl, SYS_UID));
+    STM_ASSERT_OK(stm_ctl_set_corvus_socket(ctl, fc.sock_path, 0, 0, 0));
+    uint64_t root = stm_ctl_root(ctl);
+    const stm_lp9_vops *v = stm_ctl_vops();
+    stm_ctl_conn *cn = NULL;
+    STM_ASSERT_OK(stm_ctl_conn_create(ctl, SYS_UID, SYS_GID, &cn));
+    STM_ASSERT_OK(ctl_drive_install(v, cn, root, 2u,
+                                      TEST_TOKEN, STM_CORVUS_TOKEN_LEN, 1u));
+    STM_ASSERT_EQ(ctl_extent_kind(fs, 2u, f), STM_EXTENT_KIND_HOT);
+    uint8_t got[4096];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 2u, f, 0, got, sizeof got, &n));
+    STM_ASSERT_EQ(n, sizeof got);
+    STM_ASSERT_MEM_EQ(got, blk, sizeof got);
+    stm_ctl_conn_destroy(cn);
+    stm_ctl_destroy(ctl);
+    STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_fs_unmount(fs));
     fake_corvus_stop(&fc);
     (void)unlink(token_path);

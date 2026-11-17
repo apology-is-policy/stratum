@@ -142,8 +142,16 @@ struct stm_send_handle {
     /* The blocks the stream reads, kept until close (stm_sync_send_hold_*). */
     stm_sync_send_hold *hold;
 
-    /* A dataset the stream reads was locked after init: the keys are
-     * wiped, and every later record answers STM_ELOCKED. */
+    /* Every dataset other than dataset_id that wrote a collected record
+     * (a clone's shared records, HOT or COLD, name their origin). */
+    uint64_t          *origins;
+    size_t             n_origins;
+
+    /* stm_sync_dek_evict_seq before anything was collected. */
+    uint64_t           evict_seq0;
+
+    /* A dataset the stream reads was logged out of after init: the keys
+     * are wiped, and every later record answers STM_ELOCKED. */
     bool               revoked;
 };
 
@@ -163,17 +171,21 @@ void stm_send_set_init_hook_for_test(void (*hook)(void *ctx, int stage),
 #define SEND_INIT_HOOK(stage) do { } while (0)
 #endif
 
-/* The captured keys must not outlive a logout. Asked before each record, of
- * the sent dataset and of every dataset a captured key belongs to (a clone's
- * shared extents keep their origin's key); a record already being built when
- * the evict lands finishes, as a read in flight does. Callers hold no pin. */
+/* A stream stops at the first record after a logout of the sent dataset or
+ * of any origin of its records, and stays stopped, a login after it
+ * included. Asked before each record: the keys wait in the handle until
+ * that call or the close, and a record already being built when the evict
+ * lands finishes, as a read in flight does. Callers hold no pin. */
 static bool send_revoked(stm_send_handle *h)
 {
     if (h->revoked) return true;
-    bool locked = stm_sync_dataset_locked(h->sync, h->dataset_id);
-    for (size_t i = 0; !locked && i < h->n_deks; i++)
-        locked = stm_sync_dataset_locked(h->sync, h->deks[i].dataset_id);
-    if (!locked) return false;
+    if (stm_sync_dek_evict_seq(h->sync) == h->evict_seq0) return false;
+    bool gone = stm_sync_dataset_evicted_since(h->sync, h->dataset_id,
+                                               h->evict_seq0);
+    for (size_t i = 0; !gone && i < h->n_origins; i++)
+        gone = stm_sync_dataset_evicted_since(h->sync, h->origins[i],
+                                              h->evict_seq0);
+    if (!gone) return false;
     if (h->deks) stm_ct_memzero(h->deks, h->cap_deks * sizeof *h->deks);
     h->revoked = true;
     return true;
@@ -200,6 +212,7 @@ static void send_handle_free(stm_send_handle *h)
         stm_ct_memzero(h->deks, h->cap_deks * sizeof *h->deks);
         free(h->deks);
     }
+    free(h->origins);
     if (h->hasher) stm_blake3_free(h->hasher);
     free(h);
 }
@@ -317,6 +330,9 @@ stm_status stm_send_init(stm_sync *sync,
     if (!sync || !out_handle) return STM_EINVAL;
     if (dataset_id == 0) return STM_EINVAL;
     *out_handle = NULL;
+    /* Read before the lock check and every key copy below, so an evict
+     * after either moves it. */
+    uint64_t evict_seq0 = stm_sync_dek_evict_seq(sync);
     /* As ZFS refuses a non-raw send of a dataset whose key is not loaded.
      * An extent's key would refuse below, but a locked dataset may hold no
      * HOT extent, and its COLD chunks open under the pool's key. */
@@ -387,6 +403,7 @@ stm_status stm_send_init(stm_sync *sync,
     hold            = NULL;
     h->sync         = sync;
     h->dataset_id   = dataset_id;
+    h->evict_seq0   = evict_seq0;
     h->from_snap_id = from_snap_id;
     h->to_snap_id   = to_snap_id;
     h->to_txg       = to_txg;
@@ -520,6 +537,24 @@ stm_status stm_send_init(stm_sync *sync,
      * Capture is bounded: at most `n_extents` unique key_ids; in
      * practice |unique key_ids| ≤ rotation count for the dataset
      * over the snap range, typically tiny. */
+    /* Every origin, COLD records' too: a clone's COLD record that a locked
+     * dataset wrote holds that user's bytes, though the CAS opens them with
+     * the pool's key. */
+    for (size_t i = 0; i < h->n_extents; i++) {
+        uint64_t ods = h->extents[i].origin_dataset_id;
+        if (ods == dataset_id) continue;
+        bool seen = false;
+        for (size_t j = 0; j < h->n_origins && !seen; j++)
+            seen = (h->origins[j] == ods);
+        if (seen) continue;
+        uint64_t *grown = realloc(h->origins,
+                                  (h->n_origins + 1u) * sizeof *grown);
+        if (!grown) { rc = STM_ENOMEM; goto fail; }
+        h->origins = grown;
+        h->origins[h->n_origins++] = ods;
+        if (stm_sync_dataset_locked(sync, ods)) { rc = STM_ELOCKED; goto fail; }
+    }
+
     for (size_t i = 0; i < h->n_extents; i++) {
         /* P7-CAS-9: COLD extents decrypt under the pool metadata
          * key (not a per-dataset DEK; ARCH §7.6.3), so skip the DEK

@@ -15,7 +15,7 @@ unpack) is a **storm of small files**: thousands of create / write / unlink
 across nested directories. This is the metadata path, not the data path —
 each create allocates an inode, links a dirent, and (for ≤100-byte files)
 stores the content inline in the inode, touching **no extent and no data-area
-block**. The cost is therefore dominated by btree-engine inserts + the dirent
+block** (outside a user-sealed dataset; see section 30.5). The cost is therefore dominated by btree-engine inserts + the dirent
 probe walk + the per-commit metadata flush, **not** file-data bandwidth (§30.6).
 
 ## 30.2 — The create path
@@ -118,6 +118,15 @@ all create + readdir-complete + lookup-each).
 (`fs.c:1960` inline write fast-path; wait-free inline read `fs.c:2360`) — no
 extent, no data-area block. Crossing 100 bytes transitions to a single extent
 (`fs.c:1981`). `test_pleiades` pins the 99/100/101-byte boundary round-trip.
+
+**Not in a user-sealed dataset.** The pool's metadata key seals the inode,
+and every mount unwraps it with no session, so a regular file of a dataset
+whose CURRENT key corvus wraps keeps no bytes there: create and
+`stm_fs_create_anon` make it extent-kind (`fs_regular_bytes_sealed`,
+`fs_iv_make_extent`), and a write to an older inline file there, empty or
+not, takes the cutover first. Its small writes therefore pay an extent each.
+An older inline file keeps its bytes until it is rewritten. The interim
+until per-dataset metadata keys (PRODUCTION-PLAN T0.94, T0.95).
 
 **Metadata region.** Inode + dirent + allocator btree nodes are COW'd into the
 **bootstrap region**, NOT the data area (a create-only workload leaves

@@ -489,6 +489,18 @@ static void ex_collect_free(ex_collect_ctx *c) {
     memset(c, 0, sizeof *c);
 }
 
+/* (ino, off) is unique within a dataset, so an unstable sort is exact. */
+static int ex_rec_cmp_off(const void *a_, const void *b_) {
+    const stm_extent_record *a = a_, *b = b_;
+    return (a->off > b->off) - (a->off < b->off);
+}
+
+static int ex_rec_cmp_ino_off(const void *a_, const void *b_) {
+    const stm_extent_record *a = a_, *b = b_;
+    if (a->ino != b->ino) return (a->ino > b->ino) - (a->ino < b->ino);
+    return (a->off > b->off) - (a->off < b->off);
+}
+
 /* Within (ds, ino) — does any existing extent overlap [off, off+len)?
  * Caller holds idx->lock. */
 static stm_status overlap_in_ino_locked(stm_extent_index *idx,
@@ -2614,19 +2626,9 @@ stm_status stm_extent_iter(const stm_extent_index *idx,
         must_unlock(lock);
         return cs;
     }
-    /* Sort by off. */
-    for (size_t i = 1; i < c.n; i++) {
-        stm_extent_record key = c.records[i];
-        uint64_t key_off_v   = c.offs[i];
-        size_t j = i;
-        while (j > 0 && c.offs[j - 1] > key_off_v) {
-            c.records[j] = c.records[j - 1];
-            c.offs[j]    = c.offs[j - 1];
-            j--;
-        }
-        c.records[j] = key;
-        c.offs[j]    = key_off_v;
-    }
+    /* The key stores off little-endian, so the scan's order is not off's.
+     * Only records is read below; offs stays as collected. */
+    if (c.n > 1) qsort(c.records, c.n, sizeof c.records[0], ex_rec_cmp_off);
     for (size_t i = 0; i < c.n; i++) {
         if (!cb(&c.records[i], ctx)) break;
     }
@@ -2637,18 +2639,10 @@ stm_status stm_extent_iter(const stm_extent_index *idx,
 
 /* Hands the collected records to `cb` in (ino, off) order, and frees them. */
 static void ex_iter_emit_sorted(ex_collect_ctx *c, stm_extent_iter_cb cb, void *ctx) {
-    for (size_t i = 1; i < c->n; i++) {
-        stm_extent_record key = c->records[i];
-        size_t j = i;
-        while (j > 0) {
-            bool greater = (c->records[j - 1].ino > key.ino) ||
-                            (c->records[j - 1].ino == key.ino && c->records[j - 1].off > key.off);
-            if (!greater) break;
-            c->records[j] = c->records[j - 1];
-            j--;
-        }
-        c->records[j] = key;
-    }
+    /* The key stores ino and off little-endian, so the scan interleaves
+     * inos: an insertion sort here was quadratic in the dataset's size. */
+    if (c->n > 1)
+        qsort(c->records, c->n, sizeof c->records[0], ex_rec_cmp_ino_off);
     for (size_t i = 0; i < c->n; i++) {
         if (!cb(&c->records[i], ctx)) break;
     }
@@ -2725,6 +2719,67 @@ stm_status stm_extent_iter_ds(const stm_extent_index *idx,
 
     ex_iter_emit_sorted(&c, cb, ctx);
     must_unlock(lock);
+    return STM_OK;
+}
+
+typedef struct {
+    uint64_t   ds;
+    bool       found;
+    stm_status err;
+} ex_find_cold_ctx;
+
+static int ex_find_cold_cb(const void *k, size_t klen,
+                           const void *v, size_t vlen, void *ctx_) {
+    ex_find_cold_ctx *c = ctx_;
+    uint64_t ino = 0, off = 0;
+    stm_status ks = ex_decode_key(k, klen, &ino, &off);
+    if (ks != STM_OK) { c->err = ks; return 1; }
+    stm_extent_record r;
+    memset(&r, 0, sizeof r);
+    stm_status vs = ex_decode_value(v, vlen, c->ds, ino, off, &r);
+    if (vs != STM_OK) { c->err = vs; return 1; }
+    if (r.kind != STM_EXTENT_KIND_COLD) return 0;
+    c->found = true;
+    return 1;
+}
+
+stm_status stm_extent_ds_has_cold(const stm_extent_index *idx,
+                                  uint64_t dataset_id, bool *out_has) {
+    if (out_has) *out_has = false;
+    if (!idx || !out_has || dataset_id == 0) return STM_EINVAL;
+
+    pthread_mutex_t *lock = ex_lock(idx);
+    must_lock(lock);
+    stm_extent_index *m = (stm_extent_index *)idx;
+    if (m->ds_idx == NULL) {
+        must_unlock(lock);
+        return STM_EINVAL;
+    }
+    stm_btree_engine *eng = NULL;
+    stm_status es = ex_get_engine_locked(m, dataset_id, &eng);
+    if (es == STM_ENOENT) {
+        must_unlock(lock);
+        return STM_OK;
+    }
+    if (es != STM_OK) {
+        must_unlock(lock);
+        return es;
+    }
+    uint8_t lo[EX_KEY_LEN], hi[EX_KEY_LEN];
+    stm_status k1 = ex_encode_key(0u,         0u,         lo);
+    stm_status k2 = ex_encode_key(UINT64_MAX, UINT64_MAX, hi);
+    if (k1 != STM_OK || k2 != STM_OK) {
+        must_unlock(lock);
+        return k1 != STM_OK ? k1 : k2;
+    }
+    ex_find_cold_ctx c = { .ds = dataset_id, .found = false, .err = STM_OK };
+    stm_status ss = stm_btree_engine_scan_range(eng, lo, EX_KEY_LEN,
+                                                hi, EX_KEY_LEN,
+                                                ex_find_cold_cb, &c);
+    must_unlock(lock);
+    if (ss != STM_OK) return ss;
+    if (c.err != STM_OK) return c.err;
+    *out_has = c.found;
     return STM_OK;
 }
 

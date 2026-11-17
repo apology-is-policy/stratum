@@ -911,9 +911,11 @@ stm_status stm_sync_rotate_dataset_key(stm_sync *s,
 /*
  * Whether `dataset_id`'s CURRENT key is sealed by its user (corvus,
  * STM_KS_WRAPPER_CORVUS): `*out_sealed` is true if so, false for any other
- * wrapper and for a dataset with no CURRENT key. Takes s->lock. Returns
- * STM_EINVAL on NULL, or the keyschema's error (STM_ECORRUPT for two
- * CURRENT keys).
+ * wrapper and for a dataset with no CURRENT key. A dataset with a slot in
+ * the DEK map is answered from it, lock-free (a short EBR pin, so the
+ * caller must hold none; a dataset's keys all share one wrapper class);
+ * any other takes s->lock and asks the keyschema. Returns STM_EINVAL on
+ * NULL, or the keyschema's error (STM_ECORRUPT for two CURRENT keys).
  */
 STM_MUST_USE
 stm_status stm_sync_dataset_key_user_sealed(stm_sync *s, uint64_t dataset_id,
@@ -928,6 +930,31 @@ stm_status stm_sync_dataset_key_user_sealed(stm_sync *s, uint64_t dataset_id,
  * no EBR handle takes s->lock instead.
  */
 bool stm_sync_dataset_locked(stm_sync *s, uint64_t dataset_id);
+
+/*
+ * A count of the evicts (stm_sync_evict_dek) that have taken a key out of
+ * the DEK map since the mount. Lock-free. With
+ * stm_sync_dataset_evicted_since, a holder of keys it copied out can tell
+ * whether a logout came after the copy, even if a login followed it.
+ */
+uint64_t stm_sync_dek_evict_seq(stm_sync *s);
+
+/*
+ * Whether `dataset_id` is locked, or an evict has taken its key out of the
+ * map after stm_sync_dek_evict_seq read `seq`. Lock-free, as
+ * stm_sync_dataset_locked, and the caller must hold no EBR pin.
+ */
+bool stm_sync_dataset_evicted_since(stm_sync *s, uint64_t dataset_id,
+                                    uint64_t seq);
+
+/*
+ * Whether `dataset_id` holds any COLD extent: a scan of its extents that
+ * stops at the first, with no sort. Takes s->lock. Returns STM_EINVAL on
+ * NULL or dataset 0, or the extent index's error.
+ */
+STM_MUST_USE
+stm_status stm_sync_dataset_has_cold(stm_sync *s, uint64_t dataset_id,
+                                     bool *out_has);
 
 /*
  * TLY-A3-keyslot-wrap: add a new dataset's key via the corvus WRAP
@@ -1937,6 +1964,19 @@ STM_MUST_USE
 stm_status stm_sync_promote_to_hot(stm_sync *s,
                                       uint64_t dataset_id,
                                       uint64_t ino);
+
+/*
+ * stm_sync_promote_to_hot in steps: the ino's COLD extents, in offset
+ * order, until the next would take the bytes moved past `max_bytes` (one
+ * extent at least), in one hold of s->lock. Stops at the first extent that
+ * fails and returns its error. `*out_bytes` is what moved, `*out_more`
+ * whether a COLD extent is left. STM_OK with nothing moved for an ino with
+ * no COLD extent. STM_EINVAL on NULL, dataset or ino 0, or max_bytes 0.
+ */
+STM_MUST_USE
+stm_status stm_sync_promote_to_hot_bounded(stm_sync *s, uint64_t dataset_id,
+                                           uint64_t ino, uint64_t max_bytes,
+                                           uint64_t *out_bytes, bool *out_more);
 
 /*
  * P7-CAS-11: candidate descriptor for the promote policy step.

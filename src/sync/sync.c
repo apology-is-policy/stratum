@@ -92,6 +92,12 @@ typedef struct sync_dek_slot {
     uint64_t dataset_id;
     uint64_t key_id;
     bool     locked;
+    /* The key is wrapped by corvus. A dataset's wrapper class never
+     * changes once it has a key, so every slot of a dataset agrees. */
+    bool     corvus;
+    /* s->dek_evict_seq as the last evict of this slot set it; 0 if none.
+     * An install keeps it. */
+    uint64_t evicted_at;
     uint8_t  dek[32];
 } sync_dek_slot;
 
@@ -427,6 +433,10 @@ struct stm_sync {
      * next insert, freed at close. */
     sync_dek_map *_Atomic dek_map;
     sync_dek_map     *dek_staged;
+    /* Counts the evicts that took a key out of the map; each such slot
+     * records the count it set. Written under s->lock before the map that
+     * shows the evict is published; read lock-free. */
+    _Atomic uint64_t  dek_evict_seq;
 
     /* P5-3a: pool-wide redundancy profile. Set from caller at create,
      * from on-disk UB at open. Consumed by build_uberblock (stamps
@@ -811,6 +821,32 @@ static bool sync_dek_map_locked(const sync_dek_map *m, uint64_t dataset_id)
     return false;
 }
 
+/* 1 if dataset_id's slots are corvus-wrapped, 0 if not, -1 if it has
+ * none. The caller keeps `m` alive: s->lock or an EBR pin. */
+static int sync_dek_map_sealed(const sync_dek_map *m, uint64_t dataset_id)
+{
+    if (!m) return -1;
+    for (size_t i = 0; i < m->count; i++) {
+        if (m->slots[i].dataset_id == dataset_id)
+            return m->slots[i].corvus ? 1 : 0;
+    }
+    return -1;
+}
+
+/* Is dataset_id locked, or has an evict taken one of its keys after the
+ * count `seq`? The caller keeps `m` alive: s->lock or an EBR pin. */
+static bool sync_dek_map_evicted_since(const sync_dek_map *m,
+                                       uint64_t dataset_id, uint64_t seq)
+{
+    if (!m) return false;
+    for (size_t i = 0; i < m->count; i++) {
+        const sync_dek_slot *sl = &m->slots[i];
+        if (sl->dataset_id == dataset_id && (sl->locked || sl->evicted_at > seq))
+            return true;
+    }
+    return false;
+}
+
 /* Lock-free copy-out lookup for the RC-2 read path. REQUIRES the
  * caller's EBR pin (stm_ebr_enter held across the call): the pin keeps
  * a concurrently-retired map alive for the walk + copy (dek_guard.tla
@@ -870,7 +906,7 @@ static bool sync_dek_slot_alive(stm_sync *s, stm_ebr_thread *ebr,
  * is pure memcpy. */
 static stm_status sync_dek_insert(stm_sync *s,
                                     uint64_t dataset_id, uint64_t key_id,
-                                    const uint8_t *dek)
+                                    const uint8_t *dek, bool corvus)
 {
     if (sync_dek_find_any(s, dataset_id, key_id) != NULL) return STM_EEXIST;
     sync_dek_map *cur = dek_map_load(s);
@@ -885,6 +921,8 @@ static stm_status sync_dek_insert(stm_sync *s,
     newm->n_locked = cur ? cur->n_locked : 0;
     newm->slots[old_count].dataset_id = dataset_id;
     newm->slots[old_count].key_id     = key_id;
+    newm->slots[old_count].corvus     = corvus;
+    newm->slots[old_count].evicted_at = 0;
     if (dek) {
         newm->slots[old_count].locked = false;
         memcpy(newm->slots[old_count].dek, dek, 32);
@@ -900,9 +938,11 @@ static stm_status sync_dek_insert(stm_sync *s,
 }
 
 /* Turn the published slot at index `at` into a key (dek non-NULL) or a
- * locked slot (dek NULL), via COW like the insert. Caller holds s->lock.
- * Infallible after a successful sync_dek_grow(s, count). */
-static void sync_dek_replace(stm_sync *s, size_t at, const uint8_t *dek)
+ * locked slot (dek NULL, stamped with `evicted_at`), via COW like the
+ * insert. Caller holds s->lock. Infallible after a successful
+ * sync_dek_grow(s, count). */
+static void sync_dek_replace(stm_sync *s, size_t at, const uint8_t *dek,
+                             uint64_t evicted_at)
 {
     sync_dek_map *cur  = dek_map_load(s);
     sync_dek_map *newm = s->dek_staged;
@@ -917,6 +957,7 @@ static void sync_dek_replace(stm_sync *s, size_t at, const uint8_t *dek)
         memcpy(slot->dek, dek, 32);
     } else {
         slot->locked = true;
+        slot->evicted_at = evicted_at;
         stm_ct_memzero(slot->dek, sizeof slot->dek);
         newm->n_locked++;
     }
@@ -1047,7 +1088,7 @@ static int sync_unwrap_cb(uint64_t dataset_id, uint64_t key_id,
             /* The dataset mounts locked; its slot says so. */
             if (state == STM_KS_STATE_CURRENT) {
                 stm_status ls = sync_dek_insert(u->s, dataset_id, key_id,
-                                                NULL);
+                                                NULL, /*corvus=*/true);
                 if (ls != STM_OK) return (int)ls;
             }
             return 0;
@@ -1153,7 +1194,8 @@ static int sync_unwrap_cb(uint64_t dataset_id, uint64_t key_id,
         return 0;
     }
 
-    rc = sync_dek_insert(u->s, dataset_id, key_id, dek);
+    rc = sync_dek_insert(u->s, dataset_id, key_id, dek,
+                         wrapper == STM_KS_WRAPPER_CORVUS);
     stm_ct_memzero(dek, sizeof dek);
     if (rc != STM_OK) return (int)rc;
     return 0;
@@ -1865,7 +1907,8 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
         stm_status dis = sync_dek_insert(s,
                                            STM_SYNC_POOL_DATASET_ID,
                                            STM_SYNC_POOL_KEY_ID,
-                                           s->metadata_key);
+                                           s->metadata_key,
+                                           /*corvus=*/false);
         if (dis != STM_OK) { stm_sync_close(s); return dis; }
     }
 
@@ -5156,7 +5199,7 @@ stm_status stm_sync_add_dataset_key(stm_sync *s,
     }
 
     /* Post-grow invariant: sync_dek_insert cannot fail from OOM now. */
-    rc = sync_dek_insert(s, dataset_id, /*key_id=*/0, dek);
+    rc = sync_dek_insert(s, dataset_id, /*key_id=*/0, dek, /*corvus=*/false);
     stm_ct_memzero(dek, sizeof dek);
     if (rc != STM_OK) {
         /* Only path left is STM_EEXIST, which means we raced with
@@ -5276,7 +5319,7 @@ stm_status stm_sync_add_dataset_key_corvus(stm_sync *s,
     }
 
     /* Post-grow invariant: sync_dek_insert cannot fail from OOM now. */
-    rc = sync_dek_insert(s, dataset_id, /*key_id=*/0, dek);
+    rc = sync_dek_insert(s, dataset_id, /*key_id=*/0, dek, /*corvus=*/true);
     stm_ct_memzero(dek, sizeof dek);
     if (rc != STM_OK) {
         /* Only STM_EEXIST is reachable — a same-lock self-race, i.e. a
@@ -5325,6 +5368,18 @@ stm_status stm_sync_dataset_key_user_sealed(stm_sync *s, uint64_t dataset_id,
                                             bool *out_sealed)
 {
     if (!s || !out_sealed) return STM_EINVAL;
+    /* A dataset with a slot answers from it without s->lock: its keys all
+     * share the class its CURRENT key has. */
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (ebr) {
+        stm_ebr_enter(ebr);
+        int k = sync_dek_map_sealed(dek_map_load(s), dataset_id);
+        stm_ebr_exit(ebr);
+        if (k >= 0) {
+            *out_sealed = (k == 1);
+            return STM_OK;
+        }
+    }
     pthread_mutex_lock(&s->lock);
     stm_status rc = sync_dataset_user_sealed_locked(s, dataset_id, out_sealed);
     pthread_mutex_unlock(&s->lock);
@@ -5406,7 +5461,7 @@ stm_status stm_sync_rotate_dataset_key(stm_sync *s,
     }
 
     /* Post-grow invariant: cannot fail from OOM. */
-    rc = sync_dek_insert(s, dataset_id, next_id, dek);
+    rc = sync_dek_insert(s, dataset_id, next_id, dek, /*corvus=*/false);
     stm_ct_memzero(dek, sizeof dek);
     if (rc != STM_OK) {
         pthread_mutex_unlock(&s->lock);
@@ -5783,10 +5838,10 @@ stm_status stm_sync_install_dek(stm_sync *s, uint64_t dataset_id,
         sync_dek_slot *slot = sync_dek_find(s, dataset_id, key_id);
         rc = slot && stm_ct_equal(slot->dek, dek, sizeof dek) ? STM_OK : STM_EACCES;
     } else if (held) {
-        sync_dek_replace(s, held_at, dek);
+        sync_dek_replace(s, held_at, dek, 0);
         rc = STM_OK;
     } else {
-        rc = sync_dek_insert(s, dataset_id, key_id, dek);
+        rc = sync_dek_insert(s, dataset_id, key_id, dek, /*corvus=*/true);
     }
     stm_ct_memzero(dek, sizeof dek);
     pthread_mutex_unlock(&s->lock);
@@ -5831,8 +5886,13 @@ stm_status stm_sync_evict_dek(stm_sync *s, uint64_t dataset_id)
         size_t at = slot ? (size_t)(slot - dek_map_load(s)->slots) : 0;
         rc = sync_dek_grow(s, sync_dek_count(s) + (slot ? 0u : 1u));
         if (rc == STM_OK) {
-            if (slot) sync_dek_replace(s, at, NULL);
-            else      rc = sync_dek_insert(s, dataset_id, key_id, NULL);
+            /* The count moves before the map that shows the evict, so a
+             * reader that finds it unmoved has seen no evict complete. */
+            uint64_t seq = atomic_load(&s->dek_evict_seq) + 1u;
+            atomic_store(&s->dek_evict_seq, seq);
+            if (slot) sync_dek_replace(s, at, NULL, seq);
+            else      rc = sync_dek_insert(s, dataset_id, key_id, NULL,
+                                           /*corvus=*/true);
         }
     }
     /* The decrypted-extent cache holds CLEARTEXT the evicted DEK
@@ -5847,6 +5907,28 @@ stm_status stm_sync_evict_dek(stm_sync *s, uint64_t dataset_id)
     dcache_drain(s);
     pthread_mutex_unlock(&s->lock);
     return rc;
+}
+
+uint64_t stm_sync_dek_evict_seq(stm_sync *s)
+{
+    return s ? atomic_load(&s->dek_evict_seq) : 0u;
+}
+
+bool stm_sync_dataset_evicted_since(stm_sync *s, uint64_t dataset_id,
+                                    uint64_t seq)
+{
+    if (!s) return false;
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (!ebr) {
+        pthread_mutex_lock(&s->lock);
+        bool e = sync_dek_map_evicted_since(dek_map_load(s), dataset_id, seq);
+        pthread_mutex_unlock(&s->lock);
+        return e;
+    }
+    stm_ebr_enter(ebr);
+    bool evicted = sync_dek_map_evicted_since(dek_map_load(s), dataset_id, seq);
+    stm_ebr_exit(ebr);
+    return evicted;
 }
 
 bool stm_sync_dataset_locked(stm_sync *s, uint64_t dataset_id)
@@ -7845,11 +7927,26 @@ static stm_status sync_slice_bounds(const stm_extent_record *rec,
  * MUST be called under the caller's EBR pin — the copy-under-pin
  * contract (RC-I1); no pin management inside (nesting is forbidden).
  * Returns true on a hit with buf filled; the caller accounts. */
+/* A clone's COLD record carries the dataset that first wrote it as its
+ * origin. When that is a locked dataset, the bytes are its user's, though
+ * the CAS opens them with the pool's key (a pool written before clones of
+ * sealed datasets were refused may hold such a clone): refused. `held`:
+ * the caller holds s->lock or an EBR pin; else it holds no pin. */
+static bool sync_cold_origin_locked(stm_sync *s, const stm_extent_record *rec,
+                                    bool held)
+{
+    if (rec->kind != STM_EXTENT_KIND_COLD) return false;
+    if (rec->origin_dataset_id == rec->dataset_id) return false;
+    if (held) return sync_dek_map_locked(dek_map_load(s), rec->origin_dataset_id);
+    return stm_sync_dataset_locked(s, rec->origin_dataset_id);
+}
+
 static bool sync_dcache_probe_pinned(stm_sync *s,
                                         const stm_extent_record *rec,
                                         uint64_t slice_off, size_t slice_len,
                                         void *buf) {
     if (rec->kind == STM_EXTENT_KIND_COLD) {
+        if (sync_cold_origin_locked(s, rec, true)) return false;
         return dcache_lookup_copy(s, rec->content_hash,
                                     STM_EXTENT_KIND_COLD, rec->len,
                                     slice_off, slice_len, buf);
@@ -7902,6 +7999,7 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
      * shape but with metadata_key (CAS uses pool-wide key per
      * ARCH §7.6.3 for cross-dataset shareability) and the CAS AD. */
     if (rec.kind == STM_EXTENT_KIND_COLD) {
+        if (sync_cold_origin_locked(s, &rec, ebr == NULL)) return STM_ELOCKED;
         if (!s->cas_idx) return STM_ECORRUPT;
         stm_cas_record cas_rec;
         stm_status cs = stm_cas_lookup(s->cas_idx, rec.content_hash, &cas_rec);
@@ -10694,7 +10792,6 @@ typedef struct {
 
 static bool promote_collect_cb(const stm_extent_record *e, void *cx) {
     promote_collect_ctx *ctx = cx;
-    if (e->dataset_id != ctx->ds || e->ino != ctx->ino) return true;
     if (e->kind != STM_EXTENT_KIND_COLD) return true;       /* skip hot */
     if (ctx->n == ctx->cap) {
         size_t new_cap = ctx->cap == 0 ? 8u : ctx->cap * 2u;
@@ -10708,13 +10805,16 @@ static bool promote_collect_cb(const stm_extent_record *e, void *cx) {
     return true;
 }
 
-stm_status stm_sync_promote_to_hot(stm_sync *s,
-                                      uint64_t dataset_id,
-                                      uint64_t ino)
+/* max_bytes 0: every COLD extent of the ino, past a failed one, the first
+ * error returned. Otherwise, in offset order, until the next extent would
+ * take the bytes moved past max_bytes (one at least), stopping at a failed
+ * one; *out_more says whether a COLD extent is left. */
+static stm_status sync_promote_ino(stm_sync *s, uint64_t dataset_id,
+                                   uint64_t ino, uint64_t max_bytes,
+                                   uint64_t *out_bytes, bool *out_more)
 {
-    if (!s) return STM_EINVAL;
-    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
-
+    *out_bytes = 0;
+    *out_more  = false;
     pthread_mutex_lock(&s->lock);
     if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
     if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
@@ -10723,8 +10823,8 @@ stm_status stm_sync_promote_to_hot(stm_sync *s,
     promote_collect_ctx cx = { .ds = dataset_id, .ino = ino,
                                   .records = NULL, .n = 0, .cap = 0,
                                   .err = STM_OK };
-    stm_status its = stm_extent_iter_ds(s->extent_idx, dataset_id,
-                                           promote_collect_cb, &cx);
+    stm_status its = stm_extent_iter(s->extent_idx, dataset_id, ino,
+                                     promote_collect_cb, &cx);
     if (its != STM_OK || cx.err != STM_OK) {
         free(cx.records);
         pthread_mutex_unlock(&s->lock);
@@ -10737,13 +10837,61 @@ stm_status stm_sync_promote_to_hot(stm_sync *s,
 
     stm_status promote_err = STM_OK;
     for (size_t i = 0; i < cx.n; i++) {
+        if (max_bytes != 0u && *out_bytes != 0u &&
+            cx.records[i].len > max_bytes - *out_bytes) {
+            *out_more = true;
+            break;
+        }
         stm_status pe = promote_one_extent_locked(s, &cx.records[i]);
-        if (pe != STM_OK && promote_err == STM_OK) promote_err = pe;
+        if (pe == STM_OK) {
+            *out_bytes += cx.records[i].len;
+            continue;
+        }
+        if (promote_err == STM_OK) promote_err = pe;
+        if (max_bytes != 0u) {
+            *out_more = true;
+            break;
+        }
     }
 
     free(cx.records);
     pthread_mutex_unlock(&s->lock);
     return promote_err;
+}
+
+stm_status stm_sync_promote_to_hot(stm_sync *s,
+                                      uint64_t dataset_id,
+                                      uint64_t ino)
+{
+    if (!s) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+    uint64_t bytes = 0;
+    bool more = false;
+    return sync_promote_ino(s, dataset_id, ino, 0u, &bytes, &more);
+}
+
+stm_status stm_sync_promote_to_hot_bounded(stm_sync *s, uint64_t dataset_id,
+                                           uint64_t ino, uint64_t max_bytes,
+                                           uint64_t *out_bytes, bool *out_more)
+{
+    if (out_bytes) *out_bytes = 0;
+    if (out_more)  *out_more  = false;
+    if (!s || !out_bytes || !out_more) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0 || max_bytes == 0) return STM_EINVAL;
+    stm_status rc = sync_promote_ino(s, dataset_id, ino, max_bytes,
+                                     out_bytes, out_more);
+    return rc == STM_ENOENT ? STM_OK : rc;
+}
+
+stm_status stm_sync_dataset_has_cold(stm_sync *s, uint64_t dataset_id,
+                                     bool *out_has)
+{
+    if (out_has) *out_has = false;
+    if (!s || !out_has || dataset_id == 0) return STM_EINVAL;
+    pthread_mutex_lock(&s->lock);
+    stm_status rc = stm_extent_ds_has_cold(s->extent_idx, dataset_id, out_has);
+    pthread_mutex_unlock(&s->lock);
+    return rc;
 }
 
 /* Per-ino aggregator state for the promote-policy collect pass.

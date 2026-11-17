@@ -7680,6 +7680,53 @@ STM_TEST(fs_p7cas11_promote_min_read_count_blocks) {
     unlink(g_key_path);
 }
 
+typedef struct { uint64_t ino, off; size_t n; bool ordered; } x1_order_ctx;
+
+static bool x1_order_cb(const stm_extent_record *e, void *arg)
+{
+    x1_order_ctx *c = arg;
+    if (c->n && (e->ino < c->ino || (e->ino == c->ino && e->off <= c->off)))
+        c->ordered = false;
+    c->ino = e->ino;
+    c->off = e->off;
+    c->n++;
+    return true;
+}
+
+STM_TEST(fs_extent_iter_ds_orders_inos_past_a_byte) {
+    /* The extent key stores ino little-endian, so the engine hands back inos
+     * 0x100 apart side by side; the iterator still answers (ino, off)
+     * ascending, over 300 files of a block each. */
+    make_tmp("x1_order");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t ds = 0, r = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "x1", &ds));
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds, 0700, 0, 0, &r));
+    uint8_t blk[4096];
+    memset(blk, 0x3c, sizeof blk);
+    for (int i = 0; i < 300; i++) {
+        char nm[8];
+        int nl = snprintf(nm, sizeof nm, "f%d", i);
+        uint64_t f = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, ds, r, (const uint8_t *)nm,
+                                         (uint8_t)nl, 0600, 0, 0, &f));
+        STM_ASSERT_OK(stm_fs_write(fs, ds, f, 0, blk, sizeof blk));
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    x1_order_ctx c = {0, 0, 0, true};
+    STM_ASSERT_OK(stm_extent_iter_ds(stm_sync_extent_index(stm_fs_sync_for_test(fs)),
+                                     ds, x1_order_cb, &c));
+    STM_ASSERT_EQ(c.n, 300u);
+    STM_ASSERT(c.ordered);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(fs_p7cas11_promote_no_recency_filter_takes_an_unread_file) {
     /* min_recency_txgs 0 is no recency filter: a COLD file never read, its
      * migration commits behind, is promoted with min_read_count 0 (the
