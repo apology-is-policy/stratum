@@ -2984,4 +2984,51 @@ STM_TEST(sync_multi_a_mirror_piece_fits_the_other_device) {
     teardown_mirror_pool(bds, as, pool, s);
 }
 
+/* A send's hold (stm_sync_send_hold_*): a record is held if one of its
+ * replicas is. Here replica 1's block was freed under the record (as an
+ * evacuation step frees what it moved) and swept: the pin holds replica
+ * 0 alone, which then outlasts an overwrite and two commits; a record
+ * with no replica held is refused. */
+STM_TEST(sync_multi_a_send_hold_needs_one_replica_held) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "sendhold", bds, as, &pool, &s);
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)(i * 3u);
+    STM_ASSERT_OK(stm_sync_write_extent(s, 1u, 1u, 0u, plain, sizeof plain));
+    stm_extent_record e;
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(s), 1u, 1u, 0u, &e));
+    STM_ASSERT_EQ((int)e.n_replicas, 2);
+    stm_alloc *a0 = stm_sync_alloc(s, stm_paddr_device(e.paddrs[0]));
+    stm_alloc *a1 = stm_sync_alloc(s, stm_paddr_device(e.paddrs[1]));
+    STM_ASSERT(a0 != NULL && a1 != NULL && a0 != a1);
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_alloc_free(a1, e.paddrs[1], 0u));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_ERR(stm_alloc_lookup(a1, e.paddrs[1], NULL, NULL), STM_ENOENT);
+
+    stm_sync_send_hold *h = NULL;
+    STM_ASSERT_OK(stm_sync_send_hold_begin(s, &h));
+    STM_ASSERT_OK(stm_sync_send_hold_pin(s, h, e.paddrs, e.n_replicas));
+    STM_ASSERT_ERR(stm_sync_send_hold_pin(s, h, &e.paddrs[1], 1u), STM_ECORRUPT);
+    stm_sync_send_hold_settle(s, h);
+    /* Out of the way of the overwrite: the record still names replica 1's
+     * block, and the write would be given it. */
+    uint64_t took = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a1, 2u, e.paddrs[1], &took));
+    STM_ASSERT_EQ(took, e.paddrs[1]);
+    STM_ASSERT_OK(stm_sync_write_extent(s, 1u, 1u, 0u, plain, sizeof plain));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    uint32_t rc = 7;
+    STM_ASSERT_OK(stm_alloc_lookup(a0, e.paddrs[0], NULL, &rc));
+    STM_ASSERT_EQ(rc, 0u);
+    stm_sync_send_hold_end(s, h);
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_ERR(stm_alloc_lookup(a0, e.paddrs[0], NULL, NULL), STM_ENOENT);
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
 STM_TEST_MAIN("sync_multi")

@@ -138,7 +138,40 @@ struct stm_send_handle {
 
     /* Running BLAKE3 hasher over the wire. */
     stm_blake3_ctx    *hasher;
+
+    /* The blocks the stream reads, kept until close (stm_sync_send_hold_*). */
+    stm_sync_send_hold *hold;
 };
+
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+static void (*g_send_init_hook)(void *ctx, int stage);
+static void  *g_send_init_hook_ctx;
+
+void stm_send_set_init_hook_for_test(void (*hook)(void *ctx, int stage),
+                                     void *ctx)
+{
+    g_send_init_hook     = hook;
+    g_send_init_hook_ctx = ctx;
+}
+#define SEND_INIT_HOOK(stage) \
+    do { if (g_send_init_hook) g_send_init_hook(g_send_init_hook_ctx, (stage)); } while (0)
+#else
+#define SEND_INIT_HOOK(stage) do { } while (0)
+#endif
+
+static void send_handle_free(stm_send_handle *h)
+{
+    if (!h) return;
+    stm_sync_send_hold_end(h->sync, h->hold);
+    free(h->extents);
+    free(h->chunk_plan);
+    if (h->deks) {
+        stm_ct_memzero(h->deks, h->cap_deks * sizeof *h->deks);
+        free(h->deks);
+    }
+    if (h->hasher) stm_blake3_free(h->hasher);
+    free(h);
+}
 
 /* ------------------------------------------------------------------ */
 /* Wire serialization helpers.                                         */
@@ -261,6 +294,16 @@ stm_status stm_send_init(stm_sync *sync,
     stm_snapshot_index *snap_idx = stm_sync_snapshot_index(sync);
     if (!snap_idx) return STM_EINVAL;
 
+    /* The hold first, before the snapshot lookups and the collect: a run
+     * that goes PENDING from here on waits for the pins below, so every
+     * record found after this line still has its blocks then. A snapshot
+     * deleted before it is not found; one deleted after it frees its
+     * runs after it. */
+    stm_sync_send_hold *hold = NULL;
+    stm_status rc = stm_sync_send_hold_begin(sync, &hold);
+    if (rc != STM_OK) return rc;
+    stm_send_handle *h = NULL;
+
     /* P7-8: filter by `extent_txg`, the sync.current_gen captured at
      * snap-create. This is the SAME counter space as `extent.gen`, so
      * the filter `gen_min_excl < extent.gen <= gen_max_incl` is now
@@ -274,23 +317,23 @@ stm_status stm_send_init(stm_sync *sync,
     if (from_snap_id != 0) {
         stm_snapshot_entry from_entry;
         stm_status ls = stm_snapshot_lookup(snap_idx, from_snap_id, &from_entry);
-        if (ls != STM_OK) return STM_ENOENT;
-        if (from_entry.dataset_id != dataset_id) return STM_EINVAL;
+        if (ls != STM_OK) { rc = STM_ENOENT; goto fail_hold; }
+        if (from_entry.dataset_id != dataset_id) { rc = STM_EINVAL; goto fail_hold; }
         from_txg = from_entry.extent_txg;
         gen_min_excl = from_txg != 0 ? from_txg - 1u : 0u;
     }
     if (to_snap_id != 0) {
         stm_status ls = stm_snapshot_lookup(snap_idx, to_snap_id, &to_entry);
-        if (ls != STM_OK) return STM_ENOENT;
-        if (to_entry.dataset_id != dataset_id) return STM_EINVAL;
+        if (ls != STM_OK) { rc = STM_ENOENT; goto fail_hold; }
+        if (to_entry.dataset_id != dataset_id) { rc = STM_EINVAL; goto fail_hold; }
         to_txg = to_entry.extent_txg;
         gen_max_incl = to_txg != 0 ? to_txg - 1u : 0u;
     } else {
         /* Full or open-ended: cap at the index's current_txg. */
         stm_extent_index *eidx = stm_sync_extent_index(sync);
-        if (!eidx) return STM_EINVAL;
-        stm_status ts = stm_extent_index_current_txg(eidx, &gen_max_incl);
-        if (ts != STM_OK) return ts;
+        if (!eidx) { rc = STM_EINVAL; goto fail_hold; }
+        rc = stm_extent_index_current_txg(eidx, &gen_max_incl);
+        if (rc != STM_OK) goto fail_hold;
         to_txg = gen_max_incl;
     }
     /* From > To is nonsense — incremental send across snaps must have
@@ -298,11 +341,15 @@ stm_status stm_send_init(stm_sync *sync,
      * than the newer (to). Equal extent_txg means no Write happened
      * between the two — empty diff, but still rejected here as a
      * caller bug rather than silently producing zero EXTENT records. */
-    if (from_snap_id != 0 && to_snap_id != 0 && from_txg >= to_txg)
-        return STM_EINVAL;
+    if (from_snap_id != 0 && to_snap_id != 0 && from_txg >= to_txg) {
+        rc = STM_EINVAL;
+        goto fail_hold;
+    }
 
-    stm_send_handle *h = calloc(1, sizeof(*h));
-    if (!h) return STM_ENOMEM;
+    h = calloc(1, sizeof(*h));
+    if (!h) { rc = STM_ENOMEM; goto fail_hold; }
+    h->hold         = hold;
+    hold            = NULL;
     h->sync         = sync;
     h->dataset_id   = dataset_id;
     h->from_snap_id = from_snap_id;
@@ -312,18 +359,15 @@ stm_status stm_send_init(stm_sync *sync,
     h->gen_max_incl = gen_max_incl;
 
     h->hasher = stm_blake3_new();
-    if (!h->hasher) { free(h); return STM_ENOMEM; }
+    if (!h->hasher) { rc = STM_ENOMEM; goto fail; }
 
     /* Snapshot the matching extent set. */
     stm_extent_index *eidx = stm_sync_extent_index(sync);
-    if (!eidx) {
-        stm_blake3_free(h->hasher);
-        free(h);
-        return STM_EINVAL;
-    }
+    if (!eidx) { rc = STM_EINVAL; goto fail; }
     /* A snapshot's stream comes from its own tree: a record overwritten since is in
      * no live tree, and its blocks stay while the snapshot does. A zero root is an
      * empty capture, where the window above leaves nothing of the live tree. */
+    SEND_INIT_HOOK(STM_SEND_INIT_HOOK_BEFORE_COLLECT);
     send_collect_ctx cc = { .h = h, .err = STM_OK };
     stm_status is = (to_snap_id != 0 && to_entry.tree_root_paddr != 0)
         ? stm_extent_iter_ds_at(eidx, dataset_id, to_entry.tree_root_paddr,
@@ -331,10 +375,16 @@ stm_status stm_send_init(stm_sync *sync,
                                 send_collect_cb, &cc)
         : stm_extent_iter_ds(eidx, dataset_id, send_collect_cb, &cc);
     if (is != STM_OK || cc.err != STM_OK) {
-        free(h->extents);
-        stm_blake3_free(h->hasher);
-        free(h);
-        return is != STM_OK ? is : cc.err;
+        rc = is != STM_OK ? is : cc.err;
+        /* The hold keeps data blocks, not tree nodes: a snapshot deleted
+         * after its lookup, and two commits before the scan begins, can
+         * give its tree's nodes out again, and the scan then fails their
+         * check. That is the snapshot gone, not damage. */
+        stm_snapshot_entry again;
+        if (is != STM_OK && to_snap_id != 0 &&
+            stm_snapshot_lookup(snap_idx, to_snap_id, &again) == STM_ENOENT)
+            rc = STM_ENOENT;
+        goto fail;
     }
 
     /* P7-CAS-9: resolve CAS chunk paddrs + gen for every captured
@@ -360,36 +410,22 @@ stm_status stm_send_init(stm_sync *sync,
         for (size_t i = 0; i < h->n_extents; i++) {
             send_extent_meta *m = &h->extents[i];
             if (m->kind != STM_EXTENT_KIND_COLD) continue;
-            if (!cidx) {
-                free(h->extents);
-                stm_blake3_free(h->hasher);
-                free(h);
-                return STM_ECORRUPT;
-            }
+            if (!cidx) { rc = STM_ECORRUPT; goto fail; }
             stm_cas_record cas_rec;
             stm_status ls = stm_cas_lookup(cidx, m->content_hash, &cas_rec);
             if (ls != STM_OK) {
-                free(h->extents);
-                stm_blake3_free(h->hasher);
-                free(h);
                 /* R60 P2-1: STM_ENOENT → benign concurrent-reclaim
                  * race; STM_EBUSY signals "transient, retry."
                  * Other ls values (STM_EIO from a torn cas_idx
                  * read, STM_ENOMEM) propagate as the real cause. */
-                return (ls == STM_ENOENT) ? STM_EBUSY : ls;
+                rc = (ls == STM_ENOENT) ? STM_EBUSY : ls;
+                goto fail;
             }
-            if (cas_rec.length != m->len) {
-                free(h->extents);
-                stm_blake3_free(h->hasher);
-                free(h);
-                return STM_ECORRUPT;
-            }
+            if (cas_rec.length != m->len) { rc = STM_ECORRUPT; goto fail; }
             if (cas_rec.n_replicas < 1
                 || cas_rec.n_replicas > STM_CAS_MAX_REPLICAS) {
-                free(h->extents);
-                stm_blake3_free(h->hasher);
-                free(h);
-                return STM_ECORRUPT;
+                rc = STM_ECORRUPT;
+                goto fail;
             }
             m->cas_n_replicas = cas_rec.n_replicas;
             for (uint8_t k = 0; k < cas_rec.n_replicas; k++) {
@@ -429,13 +465,7 @@ stm_status stm_send_init(stm_sync *sync,
             size_t new_cap = h->cap_chunk_plan == 0 ? 8 : h->cap_chunk_plan * 2;
             size_t *grown = realloc(h->chunk_plan,
                                        new_cap * sizeof(*h->chunk_plan));
-            if (!grown) {
-                free(h->chunk_plan);
-                free(h->extents);
-                stm_blake3_free(h->hasher);
-                free(h);
-                return STM_ENOMEM;
-            }
+            if (!grown) { rc = STM_ENOMEM; goto fail; }
             h->chunk_plan     = grown;
             h->cap_chunk_plan = new_cap;
         }
@@ -476,17 +506,7 @@ stm_status stm_send_init(stm_sync *sync,
         if (h->n_deks == h->cap_deks) {
             size_t new_cap = h->cap_deks == 0 ? 4 : h->cap_deks * 2;
             send_dek_slot *grown = malloc(new_cap * sizeof *grown);
-            if (!grown) {
-                if (h->deks) {
-                    stm_ct_memzero(h->deks, h->cap_deks * sizeof *h->deks);
-                    free(h->deks);
-                }
-                free(h->chunk_plan);
-                free(h->extents);
-                stm_blake3_free(h->hasher);
-                free(h);
-                return STM_ENOMEM;
-            }
+            if (!grown) { rc = STM_ENOMEM; goto fail; }
             if (h->deks && h->n_deks > 0)
                 memcpy(grown, h->deks, h->n_deks * sizeof *h->deks);
             memset(grown + h->n_deks, 0,
@@ -507,19 +527,42 @@ stm_status stm_send_init(stm_sync *sync,
             /* No DEK for an extent the iter just collected — must
              * be a sweep race that resolved against this exact
              * key_id between iter and lookup. Bail; caller can
-             * retry. Wipe whatever DEKs we did capture. */
-            stm_ct_memzero(h->deks, h->cap_deks * sizeof *h->deks);
-            free(h->deks);
-            free(h->chunk_plan);
-            free(h->extents);
-            stm_blake3_free(h->hasher);
-            free(h);
-            return (ks == STM_ENOENT) ? STM_EBUSY : ks;
+             * retry. send_handle_free wipes the DEKs captured. */
+            rc = (ks == STM_ENOENT) ? STM_EBUSY : ks;
+            goto fail;
         }
     }
 
+    SEND_INIT_HOOK(STM_SEND_INIT_HOOK_BEFORE_PINS);
+
+    /* Pin what the stream reads: each HOT extent's replicas, and each
+     * planned chunk's replicas (a CHUNK record's bytes come from them;
+     * a COLD EXTENT record carries none). The barrier has kept every
+     * run since the hold began, so a collected run is still here even
+     * if it went PENDING meanwhile. Then the barrier can go. */
+    for (size_t i = 0; i < h->n_extents; i++) {
+        const send_extent_meta *m = &h->extents[i];
+        if (m->kind == STM_EXTENT_KIND_COLD) continue;
+        rc = stm_sync_send_hold_pin(sync, h->hold, m->paddrs, m->n_replicas);
+        if (rc != STM_OK) goto fail;
+    }
+    for (size_t j = 0; j < h->n_chunk_plan; j++) {
+        const send_extent_meta *m = &h->extents[h->chunk_plan[j]];
+        rc = stm_sync_send_hold_pin(sync, h->hold, m->cas_paddrs,
+                                    m->cas_n_replicas);
+        if (rc != STM_OK) goto fail;
+    }
+    stm_sync_send_hold_settle(sync, h->hold);
+
     *out_handle = h;
     return STM_OK;
+
+fail:
+    send_handle_free(h);
+    return rc;
+fail_hold:
+    stm_sync_send_hold_end(sync, hold);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -903,13 +946,5 @@ stm_status stm_send_next(stm_send_handle *h,
 
 void stm_send_close(stm_send_handle *h)
 {
-    if (!h) return;
-    free(h->extents);
-    free(h->chunk_plan);
-    if (h->deks) {
-        stm_ct_memzero(h->deks, h->cap_deks * sizeof *h->deks);
-        free(h->deks);
-    }
-    if (h->hasher) stm_blake3_free(h->hasher);
-    free(h);
+    send_handle_free(h);
 }

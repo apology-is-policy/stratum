@@ -279,15 +279,41 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
 STM_MUST_USE
 stm_status stm_sync_commit(stm_sync *s);
 
-/* CF-4 C: O(1) total PENDING free blocks across every attached device
- * allocator (sum of stm_alloc_pending_blocks). The reclaim-on-ENOSPC
- * gate: a reserve that returned STM_ENOSPC may recover space by
- * committing (twice) to sweep the PENDING list iff this is non-zero.
- * Cheap counter reads, no tree scan. Caller holds fs->global (which
+/* CF-4 C: total PENDING free blocks across every attached device
+ * allocator that no hold keeps (stm_alloc_pending_unheld_blocks). The
+ * reclaim-on-ENOSPC gate: a reserve that returned STM_ENOSPC may recover
+ * space by committing (twice) to sweep the PENDING list iff this is
+ * non-zero, so a send's held runs do not buy a commit pair per refused
+ * reserve. Counter reads while nothing is held; with a hold, a walk of
+ * each PENDING list, no tree scan. Caller holds fs->global (which
  * stabilizes the attached-alloc set); this takes s->lock + each
  * a->lock in the canonical fs->global -> s->lock -> a->lock order.
  * Returns 0 for a NULL sync. */
 uint64_t stm_sync_pending_free_blocks(stm_sync *s);
+
+/*
+ * A send's hold on the blocks it collected (send.c): every attached
+ * allocator's barrier (stm_alloc_barrier_raise) from begin until settle,
+ * and a pin per run it was handed until end. In RAM only.
+ *
+ * begin raises the barriers before the send looks anything up: a run
+ * that goes PENDING after begin waits, so a record found after begin
+ * still has its blocks when pin comes. pin takes the replicas of one
+ * record (a HOT extent's paddrs, a CAS chunk's): STM_OK if at least one
+ * was pinned; STM_ECORRUPT if none was (no attached allocator up since
+ * begin holds a run starting at any of them). settle drops the barriers
+ * once every run is pinned. end drops what is left and frees the hold;
+ * a NULL hold is a no-op. Each takes s->lock (then the allocators'
+ * locks), never while the caller holds the extent index's.
+ */
+typedef struct stm_sync_send_hold stm_sync_send_hold;
+STM_MUST_USE
+stm_status stm_sync_send_hold_begin(stm_sync *s, stm_sync_send_hold **out);
+STM_MUST_USE
+stm_status stm_sync_send_hold_pin(stm_sync *s, stm_sync_send_hold *h,
+                                  const uint64_t *paddrs, size_t n);
+void stm_sync_send_hold_settle(stm_sync *s, stm_sync_send_hold *h);
+void stm_sync_send_hold_end(stm_sync *s, stm_sync_send_hold *h);
 
 /* The dirty reservation across the pool (stm_alloc_dirty_reserve): every
  * attached allocator carries it, since a drained extent takes a replica on

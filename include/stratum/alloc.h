@@ -422,6 +422,40 @@ stm_status stm_alloc_ref(stm_alloc *a, uint64_t paddr);
 STM_MUST_USE
 stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen);
 
+/*
+ * Holds, in RAM only: a reader that copied records outside the sync lock
+ * (a send) keeps their runs from the sweep while it reads them. Neither
+ * kind changes a refcount, the tree or anything durable: a held run stays
+ * PENDING (refcount 0), the first commit after its last hold goes sweeps
+ * it, and a crash drops every hold.
+ *
+ * A barrier keeps every run that goes PENDING after it is raised, by the
+ * order of the frees under the allocator's lock (not by their free_gen,
+ * which the evacuation paths stamp below the current gen), until it is
+ * dropped. A pin keeps the run that starts at `paddr` while its count is
+ * above zero; two readers can pin one run.
+ *
+ * stm_alloc_pin: STM_ENOENT if no run starts at `paddr`; a PENDING run
+ * can be pinned. STM_ERANGE at the count's ceiling.
+ * stm_alloc_unpin: STM_ENOENT if the run is not pinned.
+ * stm_alloc_barrier_drop: STM_ENOENT for a token not raised here.
+ */
+STM_MUST_USE
+stm_status stm_alloc_barrier_raise(stm_alloc *a, uint64_t *out_token);
+STM_MUST_USE
+stm_status stm_alloc_barrier_drop(stm_alloc *a, uint64_t token);
+STM_MUST_USE
+stm_status stm_alloc_pin(stm_alloc *a, uint64_t paddr);
+STM_MUST_USE
+stm_status stm_alloc_unpin(stm_alloc *a, uint64_t paddr);
+
+/* Unique per allocator in the process, never 0: tells a replaced
+ * allocator from the one a hold was taken on. */
+uint64_t stm_alloc_serial(const stm_alloc *a);
+
+/* The PENDING blocks no hold keeps: what a pair of commits would sweep. */
+uint64_t stm_alloc_pending_unheld_blocks(const stm_alloc *a);
+
 /* ========================================================================= */
 /* Inspection.                                                                */
 /* ========================================================================= */

@@ -319,6 +319,21 @@ typedef struct stm_send_handle stm_send_handle;
  *   STM_ENOENT if the dataset doesn't exist or a referenced snap
  *     doesn't exist as PRESENT.
  *   STM_ENOMEM on allocation failure.
+ *   STM_EBUSY, a transient: a COLD extent's CAS record or a key was
+ *     dropped between the collect and its lookup (retry).
+ *   STM_ENOENT also if the snapshot named was deleted before init
+ *     had read its tree.
+ *   STM_ECORRUPT if a collected record names no block the pool's
+ *     allocators hold, among others.
+ *
+ * Point in time: the stream is the records init collected, whatever
+ * is written, overwritten or deleted (snapshots included) after. Their
+ * blocks are kept for the handle's life by an in-RAM hold
+ * (stm_sync_send_hold_begin): writers and commits go on, and a block
+ * they free waits, PENDING, until stm_send_close; the first commit
+ * after it reclaims it. So a long send keeps the space its source has
+ * since freed. Nothing is persisted: a crash drops the hold with the
+ * handle.
  *
  * Lifetime: `sync` must outlive the handle. Send does not mutate
  * sync's state; it reads via the extent / snapshot indices.
@@ -360,7 +375,19 @@ stm_status stm_send_next(stm_send_handle *h,
                             size_t *out_len,
                             size_t *out_len_needed);
 
+/* Releases the handle's hold on its blocks (see stm_send_init). */
 void stm_send_close(stm_send_handle *h);
+
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+/* Runs inside stm_send_init with the hold's barriers up and no lock
+ * held, twice: after the snapshot lookups, before the collect; and
+ * after the collect and the key capture, before the pins. Process-wide;
+ * NULL clears it. */
+#define STM_SEND_INIT_HOOK_BEFORE_COLLECT 0
+#define STM_SEND_INIT_HOOK_BEFORE_PINS    1
+void stm_send_set_init_hook_for_test(void (*hook)(void *ctx, int stage),
+                                     void *ctx);
+#endif
 
 /* ========================================================================= */
 /* Receive.                                                                   */

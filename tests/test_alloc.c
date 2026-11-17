@@ -1347,4 +1347,124 @@ STM_TEST(alloc_a_loaded_tree_keeps_its_single_blocks_out_of_the_room) {
     unlink(g_tmp_path);
 }
 
+/* Holds (stm_alloc_pin, stm_alloc_barrier_raise). A pin keeps a PENDING
+ * run from the sweep until its last unpin; the first commit after that
+ * sweeps it. */
+STM_TEST(alloc_a_pinned_run_waits_for_its_last_unpin) {
+    make_tmp("pin");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    uint64_t p = 0, q = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &q));
+    STM_ASSERT_OK(stm_alloc_pin(a, p));
+    STM_ASSERT_OK(stm_alloc_pin(a, p));
+    STM_ASSERT_OK(stm_alloc_free(a, p, 1));
+    STM_ASSERT_OK(stm_alloc_free(a, q, 1));
+    STM_ASSERT_EQ(stm_alloc_pending_blocks(a), (uint64_t)16);
+    STM_ASSERT_EQ(stm_alloc_pending_unheld_blocks(a), (uint64_t)8);
+    STM_ASSERT_OK(stm_alloc_commit(a, 5));
+    uint64_t len = 0;
+    uint32_t rc = 7;
+    STM_ASSERT_OK(stm_alloc_lookup(a, p, &len, &rc));
+    STM_ASSERT_EQ(len, (uint64_t)8);
+    STM_ASSERT_EQ(rc, 0u);
+    STM_ASSERT_ERR(stm_alloc_lookup(a, q, NULL, NULL), STM_ENOENT);
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, p, &r));
+    STM_ASSERT(r != p);
+
+    STM_ASSERT_OK(stm_alloc_unpin(a, p));
+    STM_ASSERT_OK(stm_alloc_commit(a, 6));
+    STM_ASSERT_OK(stm_alloc_lookup(a, p, NULL, NULL));
+    STM_ASSERT_OK(stm_alloc_unpin(a, p));
+    STM_ASSERT_ERR(stm_alloc_unpin(a, p), STM_ENOENT);
+    STM_ASSERT_OK(stm_alloc_commit(a, 7));
+    STM_ASSERT_ERR(stm_alloc_lookup(a, p, NULL, NULL), STM_ENOENT);
+    uint64_t t = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, p, &t));
+    STM_ASSERT_EQ(t, p);
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A pin needs a run starting at its block; a PENDING one will do. */
+STM_TEST(alloc_a_pin_needs_a_run_at_its_block) {
+    make_tmp("pin_run");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p));
+    STM_ASSERT_ERR(stm_alloc_pin(a, stm_paddr_make(0, stm_paddr_offset(p) + 1u)),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_alloc_pin(a, stm_paddr_make(1, stm_paddr_offset(p))),
+                   STM_EINVAL);
+    STM_ASSERT_OK(stm_alloc_free(a, p, 1));
+    STM_ASSERT_OK(stm_alloc_pin(a, p));
+    STM_ASSERT_OK(stm_alloc_commit(a, 5));
+    STM_ASSERT_OK(stm_alloc_lookup(a, p, NULL, NULL));
+    STM_ASSERT_OK(stm_alloc_unpin(a, p));
+    STM_ASSERT_OK(stm_alloc_commit(a, 6));
+    STM_ASSERT_ERR(stm_alloc_pin(a, p), STM_ENOENT);
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A barrier keeps what goes PENDING after it, by the order of the frees,
+ * whatever gen a free is stamped with (the evacuation paths stamp the
+ * authoritative one, here 1 against commits at 5); what went PENDING
+ * before it is swept as ever. */
+STM_TEST(alloc_a_barrier_keeps_what_goes_pending_after_it) {
+    make_tmp("barrier");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    uint64_t before = 0, after = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &before));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &after));
+    STM_ASSERT_OK(stm_alloc_free(a, before, 1));
+    uint64_t t1 = 0, t2 = 0;
+    STM_ASSERT_OK(stm_alloc_barrier_raise(a, &t1));
+    STM_ASSERT_OK(stm_alloc_barrier_raise(a, &t2));
+    STM_ASSERT(t1 != t2);
+    STM_ASSERT_OK(stm_alloc_free(a, after, 1));
+    STM_ASSERT_EQ(stm_alloc_pending_unheld_blocks(a), (uint64_t)8);
+    STM_ASSERT_OK(stm_alloc_commit(a, 5));
+    STM_ASSERT_ERR(stm_alloc_lookup(a, before, NULL, NULL), STM_ENOENT);
+    uint32_t rc = 7;
+    STM_ASSERT_OK(stm_alloc_lookup(a, after, NULL, &rc));
+    STM_ASSERT_EQ(rc, 0u);
+
+    STM_ASSERT_OK(stm_alloc_barrier_drop(a, t1));
+    STM_ASSERT_ERR(stm_alloc_barrier_drop(a, t1), STM_ENOENT);
+    STM_ASSERT_OK(stm_alloc_commit(a, 6));
+    STM_ASSERT_OK(stm_alloc_lookup(a, after, NULL, NULL));
+    STM_ASSERT_OK(stm_alloc_barrier_drop(a, t2));
+    STM_ASSERT_EQ(stm_alloc_pending_unheld_blocks(a), (uint64_t)8);
+    STM_ASSERT_OK(stm_alloc_commit(a, 7));
+    STM_ASSERT_ERR(stm_alloc_lookup(a, after, NULL, NULL), STM_ENOENT);
+    STM_ASSERT_EQ(stm_alloc_pending_blocks(a), (uint64_t)0);
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Allocators tell themselves apart. */
+STM_TEST(alloc_serials_differ) {
+    make_tmp("serial");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    uint64_t sa = stm_alloc_serial(a);
+    stm_alloc_close(a);
+    stm_alloc *b = make_fresh_alloc(d);
+    STM_ASSERT(sa != 0);
+    STM_ASSERT(stm_alloc_serial(b) != 0);
+    STM_ASSERT(stm_alloc_serial(b) != sa);
+    STM_ASSERT_EQ(stm_alloc_serial(NULL), (uint64_t)0);
+    stm_alloc_close(b);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("alloc")

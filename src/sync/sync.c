@@ -3742,7 +3742,7 @@ uint64_t stm_sync_pending_free_blocks(stm_sync *s)
     if (!s) return 0;
     /* Snapshot the attached-alloc pointers under s->lock (the canonical
      * fs->global -> s->lock ordering; the caller holds fs->global), then
-     * sum each alloc's O(1) pending counter. stm_alloc_pending_blocks
+     * sum what each alloc's sweep could take. stm_alloc_pending_unheld_blocks
      * takes a->lock -- s->lock -> a->lock is the established commit-path
      * order (stm_sync_commit holds s->lock across stm_alloc_commit). */
     stm_alloc *snap[STM_POOL_DEVICES_MAX];
@@ -3751,9 +3751,130 @@ uint64_t stm_sync_pending_free_blocks(stm_sync *s)
         snap[dev] = s->allocs[dev];
     uint64_t total = 0;
     for (uint16_t dev = 0; dev < STM_POOL_DEVICES_MAX; dev++)
-        if (snap[dev]) total += stm_alloc_pending_blocks(snap[dev]);
+        if (snap[dev]) total += stm_alloc_pending_unheld_blocks(snap[dev]);
     pthread_mutex_unlock(&s->lock);
     return total;
+}
+
+/* ------------------------------------------------------------------ */
+/* Send holds.                                                         */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    uint64_t paddr;
+    uint64_t serial;        /* the allocator the pin was taken on */
+} sync_hold_pin;
+
+struct stm_sync_send_hold {
+    uint64_t       barrier_token[STM_POOL_DEVICES_MAX];
+    uint64_t       barrier_serial[STM_POOL_DEVICES_MAX];  /* 0: none up */
+    sync_hold_pin *pins;
+    size_t         n_pins;
+    size_t         cap_pins;
+};
+
+/* Caller holds s->lock. A barrier whose allocator went away went with it. */
+static void send_hold_drop_barriers_locked(stm_sync *s, stm_sync_send_hold *h)
+{
+    for (uint16_t dev = 0; dev < STM_POOL_DEVICES_MAX; dev++) {
+        if (h->barrier_serial[dev] == 0) continue;
+        stm_alloc *a = s->allocs[dev];
+        if (a && stm_alloc_serial(a) == h->barrier_serial[dev])
+            (void)stm_alloc_barrier_drop(a, h->barrier_token[dev]);
+        h->barrier_serial[dev] = 0;
+    }
+}
+
+stm_status stm_sync_send_hold_begin(stm_sync *s, stm_sync_send_hold **out)
+{
+    if (!s || !out) return STM_EINVAL;
+    *out = NULL;
+    stm_sync_send_hold *h = calloc(1, sizeof *h);
+    if (!h) return STM_ENOMEM;
+    pthread_mutex_lock(&s->lock);
+    for (uint16_t dev = 0; dev < STM_POOL_DEVICES_MAX; dev++) {
+        stm_alloc *a = s->allocs[dev];
+        if (!a) continue;
+        stm_status rs = stm_alloc_barrier_raise(a, &h->barrier_token[dev]);
+        if (rs != STM_OK) {
+            send_hold_drop_barriers_locked(s, h);
+            pthread_mutex_unlock(&s->lock);
+            free(h);
+            return rs;
+        }
+        h->barrier_serial[dev] = stm_alloc_serial(a);
+    }
+    pthread_mutex_unlock(&s->lock);
+    *out = h;
+    return STM_OK;
+}
+
+stm_status stm_sync_send_hold_pin(stm_sync *s, stm_sync_send_hold *h,
+                                  const uint64_t *paddrs, size_t n)
+{
+    if (!s || !h || (!paddrs && n != 0)) return STM_EINVAL;
+    if (n == 0) return STM_OK;
+    if (h->cap_pins - h->n_pins < n) {
+        size_t cap = h->cap_pins ? h->cap_pins : 64;
+        while (cap - h->n_pins < n) {
+            if (cap > SIZE_MAX / 2 / sizeof *h->pins) return STM_ENOMEM;
+            cap *= 2;
+        }
+        sync_hold_pin *grown = realloc(h->pins, cap * sizeof *grown);
+        if (!grown) return STM_ENOMEM;
+        h->pins = grown;
+        h->cap_pins = cap;
+    }
+    size_t held = 0;
+    pthread_mutex_lock(&s->lock);
+    for (size_t i = 0; i < n; i++) {
+        uint16_t dev = stm_paddr_device(paddrs[i]);
+        if (dev >= STM_POOL_DEVICES_MAX) continue;
+        stm_alloc *a = s->allocs[dev];
+        /* Only an allocator up since the barrier: a run on one attached
+         * after it may have been swept and given out in between. */
+        if (!a || h->barrier_serial[dev] == 0 ||
+            stm_alloc_serial(a) != h->barrier_serial[dev])
+            continue;
+        stm_status ps = stm_alloc_pin(a, paddrs[i]);
+        if (ps == STM_ENOENT) continue;
+        if (ps != STM_OK) {
+            pthread_mutex_unlock(&s->lock);
+            return ps;
+        }
+        h->pins[h->n_pins].paddr  = paddrs[i];
+        h->pins[h->n_pins].serial = h->barrier_serial[dev];
+        h->n_pins++;
+        held++;
+    }
+    pthread_mutex_unlock(&s->lock);
+    return held != 0 ? STM_OK : STM_ECORRUPT;
+}
+
+void stm_sync_send_hold_settle(stm_sync *s, stm_sync_send_hold *h)
+{
+    if (!s || !h) return;
+    pthread_mutex_lock(&s->lock);
+    send_hold_drop_barriers_locked(s, h);
+    pthread_mutex_unlock(&s->lock);
+}
+
+void stm_sync_send_hold_end(stm_sync *s, stm_sync_send_hold *h)
+{
+    if (!h) return;
+    if (s) {
+        pthread_mutex_lock(&s->lock);
+        send_hold_drop_barriers_locked(s, h);
+        for (size_t i = 0; i < h->n_pins; i++) {
+            uint16_t dev = stm_paddr_device(h->pins[i].paddr);
+            stm_alloc *a = dev < STM_POOL_DEVICES_MAX ? s->allocs[dev] : NULL;
+            if (a && stm_alloc_serial(a) == h->pins[i].serial)
+                (void)stm_alloc_unpin(a, h->pins[i].paddr);
+        }
+        pthread_mutex_unlock(&s->lock);
+    }
+    free(h->pins);
+    free(h);
 }
 
 /* Wedge the handle and tell the hook. Caller holds s->lock. */

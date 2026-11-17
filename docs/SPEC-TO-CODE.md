@@ -47,7 +47,18 @@ To be filled in when we spec the full nonce construction + SIV guard.
 
 ## `allocator.tla` ↔ v2 code (stub, Phase 3)
 
-To be filled in when we ship the allocator in Phase 3.
+The refcount and deferred-free rows are still to be filled in. The
+send hold (T0.88):
+
+| Spec variable / action | Code correspondent | Notes |
+|------------------------|--------------------|-------|
+| `phase`, `SendBegin` | `stm_sync_send_hold_begin` (sync.c), first in `stm_send_init` (send.c) | a barrier on every attached allocator, before any lookup |
+| `late`, `BarrierKeeps` | `pending_entry.seq`, `alloc_barrier.seq`, `alloc_held_locked` (alloc.c) | by the order of the frees under `a->lock` |
+| `SendCollect` | `send_collect_cb` via `stm_extent_iter_ds` / `_iter_ds_at`, then the CAS lookups | |
+| `SendPin` | `stm_sync_send_hold_pin` per record, then `stm_sync_send_hold_settle` | pins counted in `a->pins` |
+| `SendEnd` | `stm_send_close` -> `send_handle_free` -> `stm_sync_send_hold_end` | also every failed init |
+| `Held` in `Commit` | `stm_alloc_commit`'s sweep | `free_gen < committed_gen && !alloc_held_locked` |
+| `AuthStampedFrees` | the evacuation / replace frees at `s->auth_gen` (sync.c) | |
 
 ## `dcache_ebr.tla` ↔ v2 code (RC arc, spec-first — impl lands at RC-1)
 

@@ -87,9 +87,74 @@ Reserve scans for the first gap ≥ `nblocks` and inserts a tree entry
 with refcount=1. Free decrements refcount: on reaching 0 the entry
 becomes PENDING (bitmap bit stays set, in-RAM list remembers
 `free_gen`). Ref bumps refcount (future snapshot support). Commit
-sweeps every PENDING entry with `free_gen < committed_gen`, deletes
-the tree entry, drops the PENDING list record, and persists the
-bootstrap pool state.
+sweeps every PENDING entry with `free_gen < committed_gen` that no
+hold keeps (below), deletes the tree entry, drops the PENDING list
+record, and persists the bootstrap pool state.
+
+### Holds (in RAM)
+
+```c
+stm_status stm_alloc_barrier_raise(stm_alloc *a, uint64_t *out_token);
+stm_status stm_alloc_barrier_drop (stm_alloc *a, uint64_t token);
+stm_status stm_alloc_pin          (stm_alloc *a, uint64_t paddr);
+stm_status stm_alloc_unpin        (stm_alloc *a, uint64_t paddr);
+uint64_t   stm_alloc_serial       (const stm_alloc *a);
+uint64_t   stm_alloc_pending_unheld_blocks(const stm_alloc *a);
+```
+
+A send copies records by value outside the sync lock and reads their
+blocks for as long as its handle lives; these keep those blocks from
+the sweep. Neither kind changes a refcount, the tree or anything
+durable: a held run stays PENDING, the first commit after its last
+hold sweeps it, and a crash drops every hold.
+
+- A **barrier** keeps every entry that goes PENDING after it is
+  raised. Each PENDING entry carries a sequence number taken under the
+  allocator's lock at its free, and a barrier keeps entries at or
+  above the number current when it went up. The order of the frees,
+  not their `free_gen`: the evacuation paths stamp the authoritative
+  gen, below the current one, and a `free_gen` test would let them past
+  (`allocator_send_barrier_by_free_gen_buggy.cfg`).
+- A **pin** keeps the run that starts at `paddr`, counted (two sends
+  can pin one run), in a second in-RAM B-tree keyed like the
+  allocation tree. A PENDING run can be pinned; a block with no run
+  starting at it cannot (`STM_ENOENT`).
+- The serial tells a replaced allocator (a device removed and attached
+  again) from the one a hold was taken on.
+- `stm_alloc_pending_unheld_blocks` is what a pair of commits would
+  sweep; the reclaim-on-ENOSPC gate (`stm_sync_pending_free_blocks`)
+  counts it, so held blocks do not buy a commit pair per refused
+  reserve.
+
+The send's use (`stm_sync_send_hold_begin` / `_pin` / `_settle` /
+`_end`, sync.h): every attached allocator's barrier before the send
+looks anything up; the collect; a pin per run the stream reads (each
+HOT extent's replicas, each planned chunk's CAS replicas; a record is
+held if one of its replicas is, `STM_ECORRUPT` if none is); the
+barriers dropped; the pins dropped at `stm_send_close`. What makes the
+barrier enough: a run goes PENDING only after the record naming it has
+left every tree a send reads from (the write path drops a replaced
+record then frees its blocks; a snapshot delete removes the snapshot
+before it frees its dead list), or in one hold of the sync lock with
+it. A run freed before the barrier therefore belongs to no record the
+collect can find. The exception is the evacuation defect (records never
+rehomed): such a record names a block that may already be swept, and
+the send refuses it.
+
+The hold keeps data blocks, not tree nodes (the bootstrap tier). Only
+a snapshot send reads nodes from disk, in its collect, and that scan
+holds the dataset index's lock throughout: a commit gets as far as
+`stm_dataset_index_commit` and waits there, and a node a snapshot
+delete frees meanwhile is stamped with the current gen, that commit's
+target, not below `reuse_below_gen`, so no reserve (forced or not)
+takes it before the scan ends. Before the scan takes that lock,
+though, a delete of the snapshot and two commits can give its nodes
+out again; the scan then fails their check, and send asks again for
+the snapshot: gone, it answers `STM_ENOENT`, as if the delete had come
+before the lookup; still there, the failure is damage and stands. The
+nodes are verified against the snapshot's root checksum, so a scan
+that completes read the snapshot's own records. After the collect the
+send reads only data blocks, which the pins keep.
 
 ### Mount-time reconcile (#791)
 
@@ -399,7 +464,7 @@ carries a dirty flag; a clean-state commit returns the cached
 
 | Spec | Pins |
 |---|---|
-| `allocator.tla` | Refcount + deferred-free state machine (`NoReuseInSameGen`, `PendingSweepCriterion`, `NoOrphanOnCommit`). Proves that a paddr freed at gen G cannot be re-reserved before a commit at gen > G completes. |
+| `allocator.tla` | Refcount + deferred-free state machine (`NoReuseInSameGen`, `PendingSweepCriterion`, `NoOrphanOnCommit`). Proves that a paddr freed at gen G cannot be re-reserved before a commit at gen > G completes. `SendBlocksKept`: no range a send collected goes FREE before it ends (barrier, then pins); three buggy cfgs drop each part. |
 | `metadata_nonce.tla` | Per-device paddr-stamping under a shared metadata_key. Fixed config (DeviceStampPaddrs=TRUE, the R15 fix) clean at 51939 states. |
 
 ## Tests

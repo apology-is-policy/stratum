@@ -80,7 +80,7 @@ in the code, not measurements.
 | `/ctl` administrative tree, Prometheus metrics | Available | |
 | File manager and encrypted containers (`stratum`) | Partial | See section 14 |
 | Clones | Library | Depth 1; cannot be destroyed; promote is a stub |
-| Send and receive | Library | Plaintext stream; extents only, no names or metadata |
+| Send and receive | Library | Plaintext stream; extents only, no names or metadata. A send streams the records it found at init, and keeps their blocks (in RAM) until it closes |
 | Cold tier, content-defined chunking, dedup | Library | Offline only, never on hot writes |
 | Multi-device, mirror, device replace | Library | Metadata on device 0 only |
 | Dataset key rotation | Library | Pool key and wrap key cannot rotate |

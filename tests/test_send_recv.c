@@ -2273,4 +2273,433 @@ STM_TEST(send_to_an_empty_capture_has_nothing_written_since) {
     testpool_teardown(&nxt);
 }
 
+/* ========================================================================= */
+/* T0.88: a send's hold on its blocks.                                       */
+/* ========================================================================= */
+
+/* A send streams the records it collected at init. Writers go on: the
+ * blocks they free wait, PENDING, until the send closes, and another
+ * write cannot take them meanwhile. Each case frees a collected block
+ * (an overwrite, a snapshot delete), commits twice, and then asks the
+ * allocator for exactly that block, and writes junk wherever it is
+ * given: on the old block if the hold failed. */
+
+#include <fcntl.h>
+#include <stratum/alloc.h>
+#include <stratum/super.h>
+
+static stm_alloc *hold_alloc(testpool *p, uint64_t paddr)
+{
+    return stm_sync_alloc(stm_fs_sync_for_test(p->fs), stm_paddr_device(paddr));
+}
+
+static stm_extent_record hold_rec(testpool *p, uint64_t ino)
+{
+    stm_extent_record r;
+    memset(&r, 0, sizeof r);
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(stm_fs_sync_for_test(p->fs)),
+                                       1u, ino, 0u, &r));
+    return r;
+}
+
+static void hold_commit2(testpool *p)
+{
+    STM_ASSERT_OK(stm_fs_commit(p->fs));
+    STM_ASSERT_OK(stm_fs_commit(p->fs));
+}
+
+/* Another write in flight: it asks for `old`'s blocks and puts junk in
+ * what it gets. Returns the reservation, for hold_untake. */
+static uint64_t hold_take(testpool *p, uint64_t old, uint64_t len)
+{
+    uint64_t got = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(hold_alloc(p, old), len, old, &got));
+    size_t n = (size_t)(len * STM_UB_SIZE);
+    uint8_t *junk = malloc(n);
+    STM_ASSERT(junk != NULL);
+    if (!junk) return got;
+    for (size_t i = 0; i < n; i++) junk[i] = (uint8_t)(0x5Au ^ (i * 7u));
+    int fd = open(p->path, O_WRONLY);
+    STM_ASSERT(fd >= 0);
+    if (fd >= 0) {
+        ssize_t put = pwrite(fd, junk, n,
+                             (off_t)(stm_paddr_offset(got) * (uint64_t)STM_UB_SIZE));
+        STM_ASSERT_EQ((size_t)put, n);
+        STM_ASSERT_EQ(close(fd), 0);
+    }
+    free(junk);
+    return got;
+}
+
+static void hold_untake(testpool *p, uint64_t got)
+{
+    STM_ASSERT_OK(stm_alloc_unreserve(hold_alloc(p, got), got));
+}
+
+/* The run at `old` is still there, waiting (PENDING); returns its length. */
+static uint64_t hold_expect_waiting(testpool *p, uint64_t old)
+{
+    uint64_t len = 0;
+    uint32_t rc = 7;
+    STM_ASSERT_OK(stm_alloc_lookup(hold_alloc(p, old), old, &len, &rc));
+    STM_ASSERT_EQ(rc, 0u);
+    return len;
+}
+
+/* After the hold: the run is swept, and a write can have exactly it. */
+static void hold_expect_released(testpool *p, uint64_t old, uint64_t len)
+{
+    hold_commit2(p);
+    STM_ASSERT_ERR(stm_alloc_lookup(hold_alloc(p, old), old, NULL, NULL), STM_ENOENT);
+    uint64_t got = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(hold_alloc(p, old), len, old, &got));
+    STM_ASSERT_EQ(got, old);
+    hold_untake(p, got);
+}
+
+static void hold_stream_to(stm_send_handle *sh, testpool *tgt)
+{
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(stm_fs_sync_for_test(tgt->fs), 1, &rh));
+    STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+    stm_recv_close(rh);
+    stm_sync_dcache_drain_for_test(stm_fs_sync_for_test(tgt->fs));
+}
+
+/* A failed init keeps nothing: a block freed after it is swept as ever. */
+static void hold_expect_none_left(testpool *p)
+{
+    uint8_t x[4096];
+    memset(x, 0x77, sizeof x);
+    STM_ASSERT_OK(stm_fs_write(p->fs, 1, 9, 0, x, sizeof x));
+    STM_ASSERT_OK(stm_fs_commit(p->fs));
+    const uint64_t old = hold_rec(p, 9).paddrs[0];
+    STM_ASSERT_OK(stm_fs_write(p->fs, 1, 9, 0, x, sizeof x));
+    hold_commit2(p);
+    STM_ASSERT_ERR(stm_alloc_lookup(hold_alloc(p, old), old, NULL, NULL), STM_ENOENT);
+}
+
+STM_TEST(send_streams_what_it_collected_over_an_overwrite) {
+    testpool src; testpool_setup(&src, "hov_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "hov_tgt", POOL_UUID_TGT);
+    uint8_t a[4096], b[4096];
+    memset(a, 0xA8, sizeof a);
+    memset(b, 0xB9, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    const uint64_t old = hold_rec(&src, 1).paddrs[0];
+
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0, 0, &sh));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, b, sizeof b));
+    hold_commit2(&src);
+    STM_ASSERT(hold_rec(&src, 1).paddrs[0] != old);
+    uint64_t len = hold_expect_waiting(&src, old);
+    uint64_t took = hold_take(&src, old, len);
+    STM_ASSERT(took != old);
+    if (sh) hold_stream_to(sh, &tgt);
+    send_expect(&tgt, 1, a, "collected before the overwrite");
+    stm_send_close(sh);
+    hold_untake(&src, took);
+    hold_expect_released(&src, old, len);
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+STM_TEST(send_of_a_snapshot_streams_it_after_its_delete) {
+    testpool src; testpool_setup(&src, "hsd_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "hsd_tgt", POOL_UUID_TGT);
+    uint8_t a[4096], b[4096];
+    memset(a, 0xAA, sizeof a);
+    memset(b, 0xBB, sizeof b);
+    uint64_t snap = 0;
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    const uint64_t old = hold_rec(&src, 1).paddrs[0];
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "s", 1, &snap));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, b, sizeof b));
+    hold_commit2(&src);
+    uint64_t len = 0;
+    uint32_t rc = 0;
+    STM_ASSERT_OK(stm_alloc_lookup(hold_alloc(&src, old), old, &len, &rc));
+    STM_ASSERT(rc >= 1u);
+
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0, snap, &sh));
+    size_t freed = 0;
+    STM_ASSERT_OK(stm_fs_delete_snapshot(src.fs, snap, &freed));
+    STM_ASSERT(freed >= 1u);
+    hold_commit2(&src);
+    STM_ASSERT_EQ(hold_expect_waiting(&src, old), len);
+    uint64_t took = hold_take(&src, old, len);
+    STM_ASSERT(took != old);
+    if (sh) hold_stream_to(sh, &tgt);
+    send_expect(&tgt, 1, a, "the deleted snapshot's record");
+    stm_send_close(sh);
+    hold_untake(&src, took);
+    hold_expect_released(&src, old, len);
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* A COLD extent's bytes come from its CAS chunk: overwritten, the chunk
+ * loses its last reference and the next commit's GC frees it. */
+STM_TEST(send_streams_a_cold_chunk_over_an_overwrite) {
+    testpool src; testpool_setup(&src, "hcc_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "hcc_tgt", POOL_UUID_TGT);
+    uint8_t a[4096], b[4096];
+    for (size_t i = 0; i < sizeof a; i++) a[i] = (uint8_t)(i * 11u + 3u);
+    memset(b, 0xBE, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    stm_extent_record r = hold_rec(&src, 1);
+    STM_ASSERT_EQ((int)r.kind, (int)STM_EXTENT_KIND_COLD);
+    stm_cas_record cr;
+    STM_ASSERT_OK(stm_cas_lookup(stm_sync_cas_index(stm_fs_sync_for_test(src.fs)),
+                                 r.content_hash, &cr));
+    const uint64_t old = cr.paddrs[0];
+
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0, 0, &sh));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, b, sizeof b));
+    hold_commit2(&src);
+    STM_ASSERT_ERR(stm_cas_lookup(stm_sync_cas_index(stm_fs_sync_for_test(src.fs)),
+                                  r.content_hash, &cr), STM_ENOENT);
+    uint64_t len = hold_expect_waiting(&src, old);
+    uint64_t took = hold_take(&src, old, len);
+    STM_ASSERT(took != old);
+    if (sh) hold_stream_to(sh, &tgt);
+    send_expect(&tgt, 1, a, "the chunk collected before the overwrite");
+    stm_send_close(sh);
+    hold_untake(&src, took);
+    hold_expect_released(&src, old, len);
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* Between the collect and the pins, only the barrier keeps a collected
+ * run: an overwrite, two commits and a write wanting the block, all in
+ * that window. */
+typedef struct {
+    testpool *src;
+    uint64_t  old;
+    uint64_t  len;
+    uint64_t  took;
+    int       fired;
+} hold_window_ctx;
+
+static void hold_window_hook(void *arg, int stage)
+{
+    hold_window_ctx *c = arg;
+    if (stage != STM_SEND_INIT_HOOK_BEFORE_PINS) return;
+    c->fired++;
+    uint8_t b[4096];
+    memset(b, 0xBD, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(c->src->fs, 1, 1, 0, b, sizeof b));
+    hold_commit2(c->src);
+    STM_ASSERT_EQ(hold_expect_waiting(c->src, c->old), c->len);
+    c->took = hold_take(c->src, c->old, c->len);
+}
+
+STM_TEST(send_collected_run_is_kept_until_it_is_pinned) {
+    testpool src; testpool_setup(&src, "hbw_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "hbw_tgt", POOL_UUID_TGT);
+    uint8_t a[4096];
+    memset(a, 0xAD, sizeof a);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    hold_window_ctx c = { .src = &src, .old = hold_rec(&src, 1).paddrs[0] };
+    STM_ASSERT_OK(stm_alloc_lookup(hold_alloc(&src, c.old), c.old, &c.len, NULL));
+
+    stm_send_set_init_hook_for_test(hold_window_hook, &c);
+    stm_send_handle *sh = NULL;
+    stm_status is = stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0, 0, &sh);
+    stm_send_set_init_hook_for_test(NULL, NULL);
+    STM_ASSERT_OK(is);
+    STM_ASSERT_EQ(c.fired, 1);
+    STM_ASSERT(c.took != c.old);
+    if (sh) hold_stream_to(sh, &tgt);
+    send_expect(&tgt, 1, a, "collected before the window's overwrite");
+    stm_send_close(sh);
+    hold_untake(&src, c.took);
+    hold_expect_released(&src, c.old, c.len);
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* The hold keeps data blocks, not a snapshot's tree nodes. A snapshot
+ * deleted after init found it and before the collect read its tree can
+ * have those nodes given out again: init answers that the snapshot is
+ * gone. Junk over the snapshot's root node stands for the commit that
+ * gave it out. The snapshot's tree is its own: the live tree moved on
+ * before it was deleted. Kept, the same junk is damage, and said so. */
+typedef struct {
+    testpool *src;
+    uint64_t  snap;
+    uint64_t  root;
+    bool      delete_it;
+    int       fired;
+} hold_gone_ctx;
+
+static void hold_gone_hook(void *arg, int stage)
+{
+    hold_gone_ctx *c = arg;
+    if (stage != STM_SEND_INIT_HOOK_BEFORE_COLLECT) return;
+    c->fired++;
+    if (c->delete_it) {
+        size_t freed = 0;
+        STM_ASSERT_OK(stm_fs_delete_snapshot(c->src->fs, c->snap, &freed));
+        hold_commit2(c->src);
+    }
+    uint8_t junk[4096];
+    for (size_t i = 0; i < sizeof junk; i++) junk[i] = (uint8_t)(0xC5u ^ (i * 5u));
+    int fd = open(c->src->path, O_WRONLY);
+    STM_ASSERT(fd >= 0);
+    if (fd >= 0) {
+        ssize_t put = pwrite(fd, junk, sizeof junk,
+                             (off_t)(stm_paddr_offset(c->root) * (uint64_t)STM_UB_SIZE));
+        STM_ASSERT_EQ((size_t)put, sizeof junk);
+        STM_ASSERT_EQ(close(fd), 0);
+    }
+}
+
+static stm_status hold_gone_case(const char *tag, bool delete_it)
+{
+    testpool src; testpool_setup(&src, tag, POOL_UUID_SRC);
+    uint8_t a[4096], b[4096];
+    memset(a, 0xA6, sizeof a);
+    memset(b, 0xB7, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    hold_gone_ctx c = { .src = &src, .delete_it = delete_it };
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "g", 1, &c.snap));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, b, sizeof b));
+    hold_commit2(&src);
+    stm_snapshot_entry e;
+    stm_sync *s = stm_fs_sync_for_test(src.fs);
+    STM_ASSERT_OK(stm_snapshot_lookup(stm_sync_snapshot_index(s), c.snap, &e));
+    c.root = e.tree_root_paddr;
+    STM_ASSERT(c.root != 0);
+
+    stm_send_set_init_hook_for_test(hold_gone_hook, &c);
+    stm_send_handle *sh = (stm_send_handle *)&src;
+    stm_status is = stm_send_init(s, 1, 0, c.snap, &sh);
+    stm_send_set_init_hook_for_test(NULL, NULL);
+    fprintf(stderr, "send hold %s: init answers %d (%s)\n", tag, (int)is,
+            delete_it ? "snapshot deleted" : "snapshot kept");
+    STM_ASSERT_EQ(c.fired, 1);
+    STM_ASSERT(sh == NULL);
+    stm_send_close(is == STM_OK ? sh : NULL);
+    hold_expect_none_left(&src);
+    testpool_teardown(&src);
+    return is;
+}
+
+STM_TEST(send_of_a_snapshot_deleted_before_its_collect_says_it_is_gone) {
+    STM_ASSERT_ERR(hold_gone_case("hgd", true), STM_ENOENT);
+}
+
+STM_TEST(send_of_a_snapshot_whose_tree_is_damaged_says_so) {
+    stm_status is = hold_gone_case("hgk", false);
+    STM_ASSERT(is != STM_OK && is != STM_ENOENT);
+}
+
+/* Two sends of one block: it waits for the second to close. */
+STM_TEST(send_shared_run_waits_for_both_sends) {
+    testpool src; testpool_setup(&src, "h2s_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "h2s_tgt", POOL_UUID_TGT);
+    uint8_t a[4096], b[4096];
+    memset(a, 0xA2, sizeof a);
+    memset(b, 0xB3, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    const uint64_t old = hold_rec(&src, 1).paddrs[0];
+    stm_send_handle *first = NULL, *second = NULL;
+    STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0, 0, &first));
+    STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0, 0, &second));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, b, sizeof b));
+    hold_commit2(&src);
+    uint64_t len = hold_expect_waiting(&src, old);
+    stm_send_close(first);
+    hold_commit2(&src);
+    STM_ASSERT_EQ(hold_expect_waiting(&src, old), len);
+    uint64_t took = hold_take(&src, old, len);
+    STM_ASSERT(took != old);
+    if (second) hold_stream_to(second, &tgt);
+    send_expect(&tgt, 1, a, "the second send");
+    stm_send_close(second);
+    hold_untake(&src, took);
+    hold_expect_released(&src, old, len);
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* A held block is not reclaimable space: the reclaim-on-ENOSPC gate does
+ * not count it until the send closes. */
+STM_TEST(send_held_blocks_are_not_counted_reclaimable) {
+    testpool src; testpool_setup(&src, "hrc_src", POOL_UUID_SRC);
+    uint8_t a[4096], b[4096];
+    memset(a, 0xA5, sizeof a);
+    memset(b, 0xB6, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    const uint64_t old = hold_rec(&src, 1).paddrs[0];
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0, 0, &sh));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, b, sizeof b));
+    uint64_t len = hold_expect_waiting(&src, old);
+    stm_sync *s = stm_fs_sync_for_test(src.fs);
+    uint64_t held = stm_sync_pending_free_blocks(s);
+    stm_send_close(sh);
+    uint64_t freed = stm_sync_pending_free_blocks(s);
+    stm_test_info("send hold: reclaimable %llu while held, %llu after; the run is %llu",
+                  (unsigned long long)held, (unsigned long long)freed,
+                  (unsigned long long)len);
+    STM_ASSERT_EQ(freed, held + len);
+    testpool_teardown(&src);
+}
+
+
+STM_TEST(send_init_refused_keeps_no_hold) {
+    testpool src; testpool_setup(&src, "hnf_src", POOL_UUID_SRC);
+    uint8_t a[4096];
+    memset(a, 0xAF, sizeof a);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    stm_send_handle *sh = (stm_send_handle *)&src;
+    STM_ASSERT_ERR(stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0, 999u, &sh),
+                   STM_ENOENT);
+    STM_ASSERT(sh == NULL);
+    hold_expect_none_left(&src);
+    testpool_teardown(&src);
+}
+
+/* A record naming a block its allocator no longer holds (freed under it,
+ * as an evacuation step frees what it moved) cannot be held: the send
+ * refuses rather than stream a block anyone can take. */
+STM_TEST(send_of_a_record_naming_a_freed_block_is_refused) {
+    testpool src; testpool_setup(&src, "hfb_src", POOL_UUID_SRC);
+    uint8_t a[4096];
+    memset(a, 0xAE, sizeof a);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    const uint64_t old = hold_rec(&src, 1).paddrs[0];
+    STM_ASSERT_OK(stm_alloc_free(hold_alloc(&src, old), old, 0u));
+    hold_commit2(&src);
+    STM_ASSERT_EQ(hold_rec(&src, 1).paddrs[0], old);
+    STM_ASSERT_ERR(stm_alloc_lookup(hold_alloc(&src, old), old, NULL, NULL), STM_ENOENT);
+    stm_send_handle *sh = (stm_send_handle *)&src;
+    STM_ASSERT_ERR(stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0, 0, &sh),
+                   STM_ECORRUPT);
+    STM_ASSERT(sh == NULL);
+    /* The record still names the block, and the next write would be given
+     * it (then refused at publish): keep it out of the way first. */
+    uint64_t len = 2u, took = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(hold_alloc(&src, old), len, old, &took));
+    STM_ASSERT_EQ(took, old);
+    hold_expect_none_left(&src);
+    testpool_teardown(&src);
+}
+
 STM_TEST_MAIN("send_recv")

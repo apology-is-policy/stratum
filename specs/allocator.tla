@@ -27,6 +27,15 @@
 \*     nonce. Unreserve hands a range back FREE at once, bypassing
 \*     PENDING; it is sound only for a range nothing was written to,
 \*     which UnreserveChecksWritten guards (the buggy cfg drops it).
+\*   - SendBlocksKept: a send that copied records outside the sync lock
+\*     (stm_send_init) reads blocks no write can have taken: none it
+\*     collected goes FREE before it ends. A barrier raised before the
+\*     collect keeps every range that goes PENDING after it, by the order
+\*     of the frees; pins keep the collected ranges after. Three buggy
+\*     cfgs: the sweep ignores the pins; it ignores the barrier; the
+\*     barrier keeps by free_gen, which frees stamped with the
+\*     authoritative gen (the evacuation paths; AuthStampedFrees) get
+\*     past.
 \*
 \* What this spec does NOT model (deferred to other specs and code):
 \*
@@ -58,13 +67,21 @@ CONSTANTS
     Owners,       \* set of refcount holders (main FS tree + snapshots)
     MainOwner,    \* distinguished primary owner; first Allocate goes here
     MaxGen,       \* bound on the commit counter for state-space sizing
-    UnreserveChecksWritten  \* FALSE: Unreserve may hand back a written range
+    UnreserveChecksWritten, \* FALSE: Unreserve may hand back a written range
+    AuthStampedFrees,       \* a free may stamp the gen before the current
+    SweepHonoursPins,       \* FALSE: the sweep ignores a send's pins
+    SweepHonoursBarrier,    \* FALSE: the sweep ignores a send's barrier
+    BarrierByOrder          \* FALSE: the barrier keeps by free_gen
 
 ASSUME /\ Ranges  # {}
        /\ Owners  # {}
        /\ MainOwner \in Owners
        /\ MaxGen \in Nat \ {0}
        /\ UnreserveChecksWritten \in BOOLEAN
+       /\ AuthStampedFrees \in BOOLEAN
+       /\ SweepHonoursPins \in BOOLEAN
+       /\ SweepHonoursBarrier \in BOOLEAN
+       /\ BarrierByOrder \in BOOLEAN
 
 States == {"FREE", "ALLOCATED", "PENDING"}
 
@@ -80,10 +97,15 @@ VARIABLES
     durable_gen,   \* last commit whose Final phase has landed
     written,       \* Ranges -> BOOLEAN: written since its Allocate
     last_sealed,   \* Ranges -> Nat: the gen of its last write (0: none)
-    reused         \* a write sealed a (range, gen) already sealed
+    reused,        \* a write sealed a (range, gen) already sealed
+    phase,         \* the send: "idle", "collecting" (barrier up), "holding"
+    collected,     \* ranges the send's records name
+    late,          \* ranges that went PENDING while the barrier was up
+    barrier_gen    \* current_gen when the barrier went up
 
+send_vars == <<phase, collected, late, barrier_gen>>
 vars == <<state, owns, free_gen, current_gen, durable_gen,
-          written, last_sealed, reused>>
+          written, last_sealed, reused, phase, collected, late, barrier_gen>>
 
 \* --------------------------------------------------------------------------
 \* Helpers.
@@ -95,6 +117,14 @@ vars == <<state, owns, free_gen, current_gen, durable_gen,
 Refcount(r) == Cardinality({o \in Owners : owns[r][o]})
 
 AllOwnersClear(r) == \A o \in Owners : ~owns[r][o]
+
+\* What keeps a PENDING range from the sweep: a send's pin on it (the
+\* ranges it collected, once it holds), or its barrier while it collects.
+BarrierKeeps(r) == IF BarrierByOrder THEN r \in late
+                                     ELSE free_gen[r] >= barrier_gen
+Held(r) ==
+    \/ SweepHonoursPins /\ phase = "holding" /\ r \in collected
+    \/ SweepHonoursBarrier /\ phase = "collecting" /\ BarrierKeeps(r)
 
 \* --------------------------------------------------------------------------
 \* Initial state: every range is FREE, no owners, gen = 1 (first live
@@ -110,6 +140,10 @@ Init ==
     /\ written     = [r \in Ranges |-> FALSE]
     /\ last_sealed = [r \in Ranges |-> 0]
     /\ reused      = FALSE
+    /\ phase       = "idle"
+    /\ collected   = {}
+    /\ late        = {}
+    /\ barrier_gen = 0
 
 \* --------------------------------------------------------------------------
 \* Actions.
@@ -125,7 +159,7 @@ Allocate(r) ==
     /\ state' = [state EXCEPT ![r] = "ALLOCATED"]
     /\ owns'  = [owns  EXCEPT ![r][MainOwner] = TRUE]
     /\ written' = [written EXCEPT ![r] = FALSE]
-    /\ UNCHANGED <<free_gen, current_gen, durable_gen, last_sealed, reused>>
+    /\ UNCHANGED <<free_gen, current_gen, durable_gen, last_sealed, reused, send_vars>>
 
 \* Write(r) -- the main owner seals the range's bytes, once per
 \* allocation, under the nonce (r, current_gen).
@@ -136,7 +170,7 @@ Write(r) ==
     /\ written'     = [written     EXCEPT ![r] = TRUE]
     /\ last_sealed' = [last_sealed EXCEPT ![r] = current_gen]
     /\ reused'      = (reused \/ last_sealed[r] = current_gen)
-    /\ UNCHANGED <<state, owns, free_gen, current_gen, durable_gen>>
+    /\ UNCHANGED <<state, owns, free_gen, current_gen, durable_gen, send_vars>>
 
 \* Unreserve(r) -- a reservation only the main owner holds goes back FREE
 \* at once, with no PENDING stay: nothing durable names it, and, when
@@ -149,7 +183,7 @@ Unreserve(r) ==
     /\ state' = [state EXCEPT ![r] = "FREE"]
     /\ owns'  = [owns  EXCEPT ![r][MainOwner] = FALSE]
     /\ UNCHANGED <<free_gen, current_gen, durable_gen, written, last_sealed,
-                   reused>>
+                   reused, send_vars>>
 
 \* Ref(r, s) — snapshot s takes an additional reference on an already-
 \* allocated range. Happens during snapshot creation (ARCH §8).
@@ -161,11 +195,16 @@ Ref(r, s) ==
     /\ ~owns[r][s]
     /\ owns' = [owns EXCEPT ![r][s] = TRUE]
     /\ UNCHANGED <<state, free_gen, current_gen, durable_gen, written,
-                   last_sealed, reused>>
+                   last_sealed, reused, send_vars>>
 
 \* Unref(r, o) — owner o releases its reference. If it was the last
 \* reference, the range transitions ALLOCATED -> PENDING with
 \* free_gen captured at the current commit's gen.
+\* A free stamps the current gen, or (AuthStampedFrees: the evacuation
+\* paths) the one before it. One made while a send's barrier is up is late.
+Stamps == IF AuthStampedFrees /\ current_gen > 1
+            THEN {current_gen - 1, current_gen} ELSE {current_gen}
+
 Unref(r, o) ==
     /\ state[r] = "ALLOCATED"
     /\ owns[r][o]
@@ -174,10 +213,14 @@ Unref(r, o) ==
        IN  /\ owns' = new_owns
            /\ IF last_ref
                 THEN /\ state'    = [state    EXCEPT ![r] = "PENDING"]
-                     /\ free_gen' = [free_gen EXCEPT ![r] = current_gen]
+                     /\ \E g \in Stamps : free_gen' = [free_gen EXCEPT ![r] = g]
+                     /\ late' = IF phase = "collecting" THEN late \cup {r}
+                                                        ELSE late
                 ELSE /\ UNCHANGED state
                      /\ UNCHANGED free_gen
-    /\ UNCHANGED <<current_gen, durable_gen, written, last_sealed, reused>>
+                     /\ UNCHANGED late
+    /\ UNCHANGED <<current_gen, durable_gen, written, last_sealed, reused,
+                   phase, collected, barrier_gen>>
 
 \* Commit — this commit's Final phase lands. durable_gen catches up to
 \* current_gen; current_gen advances. Any PENDING range whose free_gen
@@ -195,11 +238,49 @@ Commit ==
     /\ current_gen' = current_gen + 1
     /\ state'       = [r \in Ranges |->
                          IF state[r] = "PENDING" /\ free_gen[r] < current_gen
+                            /\ ~Held(r)
                            THEN "FREE" ELSE state[r]]
     /\ free_gen'    = [r \in Ranges |->
                          IF state[r] = "PENDING" /\ free_gen[r] < current_gen
+                            /\ ~Held(r)
                            THEN 0 ELSE free_gen[r]]
-    /\ UNCHANGED <<owns, written, last_sealed, reused>>
+    /\ UNCHANGED <<owns, written, last_sealed, reused, send_vars>>
+
+\* The send (stm_send_init, stm_send_close). Begin raises the barrier;
+\* Collect copies a published record, which names a written range some
+\* owner holds (Unreserve, which skips PENDING, cannot take a written
+\* range); Pin pins what was collected and drops the barrier; End drops
+\* the pins.
+SendBegin ==
+    /\ phase = "idle"
+    /\ phase' = "collecting"
+    /\ collected' = {}
+    /\ late' = {}
+    /\ barrier_gen' = current_gen
+    /\ UNCHANGED <<state, owns, free_gen, current_gen, durable_gen, written,
+                   last_sealed, reused>>
+
+SendCollect(r) ==
+    /\ phase = "collecting"
+    /\ state[r] = "ALLOCATED"
+    /\ written[r]
+    /\ collected' = collected \cup {r}
+    /\ UNCHANGED <<state, owns, free_gen, current_gen, durable_gen, written,
+                   last_sealed, reused, phase, late, barrier_gen>>
+
+SendPin ==
+    /\ phase = "collecting"
+    /\ phase' = "holding"
+    /\ late' = {}
+    /\ UNCHANGED <<state, owns, free_gen, current_gen, durable_gen, written,
+                   last_sealed, reused, collected, barrier_gen>>
+
+SendEnd ==
+    /\ phase = "holding"
+    /\ phase' = "idle"
+    /\ collected' = {}
+    /\ UNCHANGED <<state, owns, free_gen, current_gen, durable_gen, written,
+                   last_sealed, reused, late, barrier_gen>>
 
 \* --------------------------------------------------------------------------
 \* Next / Spec.
@@ -212,6 +293,10 @@ Next ==
     \/ \E r \in Ranges, s \in Owners     : Ref(r, s)
     \/ \E r \in Ranges, o \in Owners     : Unref(r, o)
     \/ Commit
+    \/ SendBegin
+    \/ \E r \in Ranges                   : SendCollect(r)
+    \/ SendPin
+    \/ SendEnd
 
 Spec == Init /\ [][Next]_vars
 
@@ -258,6 +343,11 @@ NoDoubleAlloc ==
 
 NonceNeverReused == ~reused
 
+\* No range a send collected goes FREE (and so to another write) before
+\* the send ends.
+SendBlocksKept ==
+    phase # "idle" => \A r \in collected : state[r] # "FREE"
+
 TypeOK ==
     /\ state       \in [Ranges -> States]
     /\ owns        \in [Ranges -> [Owners -> BOOLEAN]]
@@ -267,6 +357,10 @@ TypeOK ==
     /\ written     \in [Ranges -> BOOLEAN]
     /\ last_sealed \in [Ranges -> 0..MaxGen+1]
     /\ reused      \in BOOLEAN
+    /\ phase       \in {"idle", "collecting", "holding"}
+    /\ collected   \subseteq Ranges
+    /\ late        \subseteq Ranges
+    /\ barrier_gen \in 0..MaxGen+1
 
 Invariants ==
     /\ TypeOK
@@ -277,5 +371,6 @@ Invariants ==
     /\ FreeGenClearedAfterReclamation
     /\ NoDoubleAlloc
     /\ NonceNeverReused
+    /\ SendBlocksKept
 
 =============================================================================

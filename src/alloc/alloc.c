@@ -59,6 +59,7 @@
 #include <stratum/xor_filter.h>
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -71,7 +72,15 @@ struct pending_entry {
     uint64_t       start_block;     /* device block of the freed range   */
     uint64_t       length_blocks;
     uint64_t       free_gen;
+    uint64_t       seq;             /* order it went PENDING, for barriers */
     pending_entry *next;
+};
+
+typedef struct alloc_barrier alloc_barrier;
+struct alloc_barrier {
+    uint64_t       token;
+    uint64_t       seq;             /* first pending seq it keeps */
+    alloc_barrier *next;
 };
 
 struct stm_alloc {
@@ -97,6 +106,15 @@ struct stm_alloc {
     pending_entry  *pending_head;
     uint64_t        pending_count;
     uint64_t        pending_blocks;
+    uint64_t        pending_seq;    /* next seq a free stamps */
+
+    /* Holds (stm_alloc_pin, stm_alloc_barrier_raise): in RAM only. pins
+     * maps a run's start block to its pin count; created with the tree. */
+    stm_btree_mt   *pins;
+    uint64_t        n_pinned;       /* distinct pinned starts */
+    alloc_barrier  *barriers;
+    uint64_t        next_barrier_token;
+    uint64_t        serial;         /* unique per allocator in the process */
     /* O(1) mirror of the sum of refcount>=1 range lengths, so the free-block
      * count (total - allocated - pending) is a counter read, not a B-tree
      * scan. Maintained at reserve (+), unref-to-0 (-), recovery-rebuild, init. */
@@ -546,8 +564,21 @@ static stm_alloc *alloc_new(stm_bdev *d,
         return NULL;
     }
 
+    stm_btree_mt *pins = NULL;
+    if (stm_btree_mt_new(&opts, &pins) != STM_OK) {
+        stm_btree_mt_free(tree);
+        pthread_mutex_destroy(&a->lock);
+        free(a);
+        return NULL;
+    }
+    static _Atomic uint64_t next_serial = 1;
+
     a->boot              = boot;
     a->tree              = tree;
+    a->pins              = pins;
+    a->serial            = atomic_fetch_add_explicit(&next_serial, 1,
+                                                     memory_order_relaxed);
+    a->next_barrier_token = 1;
     a->data_first_block  = data_first;
     a->data_last_block   = data_last;
     a->data_total_blocks = data_last - data_first + 1;
@@ -687,6 +718,7 @@ typedef struct {
     uint64_t        root_gen;      /* free_gen to stamp on emitted entries */
     uint64_t       *count_out;     /* &a->pending_count */
     uint64_t       *blocks_out;    /* &a->pending_blocks */
+    uint64_t       *seq_io;        /* &a->pending_seq */
     uint64_t       *allocated_out; /* &a->allocated_blocks (refcount>=1 sum) */
     uint64_t        cursor;        /* first block past the previous entry */
     uint64_t        singletons;    /* 1-block gaps + 1-block entries */
@@ -728,6 +760,7 @@ static int alloc_pending_rebuild_cb(const void *key, size_t key_len,
     e->start_block   = decode_key(key);
     e->length_blocks = length_blocks;
     e->free_gen      = ctx->root_gen;
+    e->seq           = (*ctx->seq_io)++;
     e->next          = *ctx->head;
     *ctx->head       = e;
     *ctx->count_out  += 1;
@@ -781,6 +814,7 @@ stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr,
             .root_gen   = root_gen,
             .count_out  = &a->pending_count,
             .blocks_out = &a->pending_blocks,
+            .seq_io     = &a->pending_seq,
             .allocated_out = &a->allocated_blocks,
             .cursor     = a->data_first_block,
             .singletons = 0,
@@ -945,7 +979,14 @@ void stm_alloc_close(stm_alloc *a)
         free(e);
         e = next;
     }
+    alloc_barrier *b = a->barriers;
+    while (b) {
+        alloc_barrier *next = b->next;
+        free(b);
+        b = next;
+    }
     accel_free(a);
+    if (a->pins) stm_btree_mt_free(a->pins);
     if (a->tree) stm_btree_mt_free(a->tree);
     if (a->boot) stm_bootstrap_close(a->boot);
     /* P4-3b: wipe key material. stm_ct_memzero is the compiler-
@@ -1506,6 +1547,7 @@ stm_status stm_alloc_free(stm_alloc *a, uint64_t paddr, uint64_t free_gen)
         new_entry->start_block   = start_block;
         new_entry->length_blocks = length;
         new_entry->free_gen      = free_gen;
+        new_entry->seq           = a->pending_seq++;
         new_entry->next          = a->pending_head;
         a->pending_head          = new_entry;
         a->pending_count++;
@@ -1572,6 +1614,144 @@ stm_status stm_alloc_ref(stm_alloc *a, uint64_t paddr)
     return s;
 }
 
+/* ========================================================================= */
+/* Holds.                                                                     */
+/* ========================================================================= */
+
+static bool alloc_pin_count_locked(stm_alloc *a, uint64_t start_block,
+                                   uint32_t *out_count)
+{
+    uint8_t key_buf[8], val_buf[8];
+    size_t  val_len = 0;
+    encode_key(start_block, key_buf);
+    *out_count = 0;
+    if (stm_btree_mt_lookup(a->pins, key_buf, 8, val_buf, sizeof val_buf,
+                            &val_len) != STM_OK || val_len != 8)
+        return false;
+    uint32_t length = 0;
+    decode_val(val_buf, &length, out_count);
+    return *out_count != 0;
+}
+
+/* A barrier keeps every entry that went PENDING after it was raised:
+ * the free's own order under a->lock, not its free_gen, which some
+ * callers stamp with the authoritative gen, below a barrier's. */
+static bool alloc_held_locked(stm_alloc *a, const pending_entry *e)
+{
+    for (const alloc_barrier *b = a->barriers; b; b = b->next)
+        if (e->seq >= b->seq) return true;
+    if (a->n_pinned == 0) return false;
+    uint32_t count = 0;
+    return alloc_pin_count_locked(a, e->start_block, &count);
+}
+
+stm_status stm_alloc_barrier_raise(stm_alloc *a, uint64_t *out_token)
+{
+    if (!a || !out_token) return STM_EINVAL;
+    alloc_barrier *b = calloc(1, sizeof *b);
+    if (!b) return STM_ENOMEM;
+    pthread_mutex_lock(&a->lock);
+    b->token = a->next_barrier_token++;
+    b->seq   = a->pending_seq;
+    b->next  = a->barriers;
+    a->barriers = b;
+    *out_token = b->token;
+    pthread_mutex_unlock(&a->lock);
+    return STM_OK;
+}
+
+stm_status stm_alloc_barrier_drop(stm_alloc *a, uint64_t token)
+{
+    if (!a) return STM_EINVAL;
+    pthread_mutex_lock(&a->lock);
+    for (alloc_barrier **link = &a->barriers; *link; link = &(*link)->next) {
+        alloc_barrier *b = *link;
+        if (b->token != token) continue;
+        *link = b->next;
+        pthread_mutex_unlock(&a->lock);
+        free(b);
+        return STM_OK;
+    }
+    pthread_mutex_unlock(&a->lock);
+    return STM_ENOENT;
+}
+
+stm_status stm_alloc_pin(stm_alloc *a, uint64_t paddr)
+{
+    if (!a) return STM_EINVAL;
+    if (stm_paddr_device(paddr) != a->device_id) return STM_EINVAL;
+    uint64_t start_block = stm_paddr_offset(paddr);
+    uint8_t key_buf[8], val_buf[8];
+    size_t  val_len = 0;
+    encode_key(start_block, key_buf);
+
+    pthread_mutex_lock(&a->lock);
+    stm_status s = stm_btree_mt_lookup(a->tree, key_buf, 8, val_buf,
+                                       sizeof val_buf, &val_len);
+    if (s != STM_OK || val_len != 8) {
+        pthread_mutex_unlock(&a->lock);
+        if (s == STM_OK || s == STM_ERANGE) return STM_ECORRUPT;
+        return s;
+    }
+    uint32_t count = 0;
+    bool was_pinned = alloc_pin_count_locked(a, start_block, &count);
+    if (count >= UINT32_MAX - 1u) {
+        pthread_mutex_unlock(&a->lock);
+        return STM_ERANGE;
+    }
+    encode_val(0, count + 1, val_buf);
+    s = stm_btree_mt_insert(a->pins, key_buf, 8, val_buf, 8);
+    if (s == STM_OK && !was_pinned) a->n_pinned++;
+    pthread_mutex_unlock(&a->lock);
+    return s;
+}
+
+stm_status stm_alloc_unpin(stm_alloc *a, uint64_t paddr)
+{
+    if (!a) return STM_EINVAL;
+    if (stm_paddr_device(paddr) != a->device_id) return STM_EINVAL;
+    uint64_t start_block = stm_paddr_offset(paddr);
+    uint8_t key_buf[8], val_buf[8];
+    encode_key(start_block, key_buf);
+
+    pthread_mutex_lock(&a->lock);
+    uint32_t count = 0;
+    if (!alloc_pin_count_locked(a, start_block, &count)) {
+        pthread_mutex_unlock(&a->lock);
+        return STM_ENOENT;
+    }
+    stm_status s;
+    if (count == 1) {
+        s = stm_btree_mt_delete(a->pins, key_buf, 8);
+        if (s == STM_OK) a->n_pinned--;
+    } else {
+        encode_val(0, count - 1, val_buf);
+        s = stm_btree_mt_insert(a->pins, key_buf, 8, val_buf, 8);
+    }
+    pthread_mutex_unlock(&a->lock);
+    return s;
+}
+
+uint64_t stm_alloc_serial(const stm_alloc *a)
+{
+    return a ? a->serial : 0;
+}
+
+uint64_t stm_alloc_pending_unheld_blocks(const stm_alloc *a)
+{
+    if (!a) return 0;
+    stm_alloc *ma = (stm_alloc *)a;
+    pthread_mutex_lock(&ma->lock);
+    uint64_t n = ma->pending_blocks;
+    if (ma->barriers || ma->n_pinned) {
+        n = 0;
+        for (const pending_entry *e = ma->pending_head; e; e = e->next)
+            if (!alloc_held_locked(ma, e)) n += e->length_blocks;
+    }
+    pthread_mutex_unlock(&ma->lock);
+    return n;
+}
+
 stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
 {
     if (!a) return STM_EINVAL;
@@ -1579,13 +1759,13 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
     pthread_mutex_lock(&a->lock);
 
     /* Sweep PENDING: delete tree entries whose free_gen < committed_gen
-     * (allocator.tla's Commit rule). */
+     * (allocator.tla's Commit rule), unless a hold keeps them. */
     bool swept_anything = false;
     pending_entry **link = &a->pending_head;
     pending_entry  *e    = a->pending_head;
     while (e) {
         pending_entry *next = e->next;
-        if (e->free_gen < committed_gen) {
+        if (e->free_gen < committed_gen && !alloc_held_locked(a, e)) {
             uint8_t key_buf[8];
             encode_key(e->start_block, key_buf);
             stm_status ds = stm_btree_mt_delete(a->tree, key_buf, 8);
