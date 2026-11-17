@@ -909,6 +909,17 @@ stm_status stm_sync_rotate_dataset_key(stm_sync *s,
                                          uint64_t *out_old_key_id);
 
 /*
+ * Whether `dataset_id`'s CURRENT key is sealed by its user (corvus,
+ * STM_KS_WRAPPER_CORVUS): `*out_sealed` is true if so, false for any other
+ * wrapper and for a dataset with no CURRENT key. Takes s->lock. Returns
+ * STM_EINVAL on NULL, or the keyschema's error (STM_ECORRUPT for two
+ * CURRENT keys).
+ */
+STM_MUST_USE
+stm_status stm_sync_dataset_key_user_sealed(stm_sync *s, uint64_t dataset_id,
+                                            bool *out_sealed);
+
+/*
  * TLY-A3-keyslot-wrap: add a new dataset's key via the corvus WRAP
  * verb — the provisioning-time counterpart of stm_sync_add_dataset_key
  * for a corvus-encrypted dataset.

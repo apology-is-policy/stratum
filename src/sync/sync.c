@@ -5213,6 +5213,22 @@ stm_status stm_sync_add_dataset_key_corvus(stm_sync *s,
     return STM_OK;
 }
 
+stm_status stm_sync_dataset_key_user_sealed(stm_sync *s, uint64_t dataset_id,
+                                            bool *out_sealed)
+{
+    if (!s || !out_sealed) return STM_EINVAL;
+    *out_sealed = false;
+    stm_keyschema_wrapper w = STM_KS_WRAPPER_LEGACY;
+    pthread_mutex_lock(&s->lock);
+    stm_status rc = stm_keyschema_lookup_current(s->keyschema, dataset_id,
+                                                 NULL, &w, NULL, 0, NULL);
+    pthread_mutex_unlock(&s->lock);
+    if (rc == STM_ENOENT) return STM_OK;
+    if (rc != STM_OK) return rc;
+    *out_sealed = (w == STM_KS_WRAPPER_CORVUS);
+    return STM_OK;
+}
+
 stm_status stm_sync_rotate_dataset_key(stm_sync *s,
                                          uint64_t dataset_id,
                                          const stm_hybrid_keys *wk,

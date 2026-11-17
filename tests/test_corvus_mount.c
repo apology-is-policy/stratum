@@ -1356,6 +1356,72 @@ STM_TEST(corvus_logout_flushes_dirty_home_before_key_eviction) {
     unlink(g_tmp_path); unlink(key_path);
 }
 
+/* T0.91: a clone's own writes go under a key the pool seals, so a clone of a
+ * user's dataset would take the user's new data out of the user's seal.
+ * Refused, nothing minted; a clone of the root dataset is made. */
+STM_TEST(corvus_clone_of_a_user_sealed_dataset_is_refused) {
+    make_tmp("sealclone");
+    char key_path[300];
+    snprintf(key_path, sizeof key_path, "%s.key", g_tmp_path);
+    unlink(key_path);
+    STM_ASSERT_OK(stm_keyfile_generate(key_path));
+    stm_fs_format_opts fo = {
+        .device_size_bytes = TEST_DEVICE_BYTES,
+        .bootstrap_size_bytes = TEST_BOOTSTRAP_BYTES,
+        .pool_uuid = {0xc0c0face, 0xfeed5252},
+        .device_uuid = {0x9090a0a0, 0xb0b0c0c1},
+        .keyfile_path = key_path,
+    };
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fo));
+    stm_fs_mount_opts mo = {.keyfile_path = key_path};
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mo, &fs));
+    if (!fs) return;
+    fake_corvus fc;
+    fake_corvus_start(&fc, "sealclone", STM_CORVUS_STATUS_OK, NULL);
+    stm_corvus_mount_cfg cc = {.socket_path = fc.sock_path,
+                               .session_token = TEST_TOKEN};
+    uint64_t ds = 0, ino = 0;
+    STM_ASSERT_OK(stm_fs_provision_corvus_dataset(fs, 1, "home", "users/alice",
+                                                 11, 1000, 1000, &cc, &ds));
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds, 1, (const uint8_t *)"file", 4,
+                                    0600, 1000, 1000, &ino));
+    uint8_t bytes[4096];
+    memset(bytes, 0x5c, sizeof bytes);
+    STM_ASSERT_OK(stm_fs_write(fs, ds, ino, 0, bytes, sizeof bytes));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    stm_sync *sync = stm_fs_sync(fs);
+    bool sealed = false;
+    STM_ASSERT_OK(stm_sync_dataset_key_user_sealed(sync, ds, &sealed));
+    STM_ASSERT(sealed);
+    STM_ASSERT_OK(stm_sync_dataset_key_user_sealed(sync, 1, &sealed));
+    STM_ASSERT(!sealed);
+    sealed = true;
+    STM_ASSERT_OK(stm_sync_dataset_key_user_sealed(sync, ds + 1000u, &sealed));
+    STM_ASSERT(!sealed);
+
+    uint64_t snap = 0, rsnap = 0, clone = 77, probe = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, ds, "s", 1, &snap));
+    STM_ASSERT_ERR(stm_fs_create_clone(fs, 1, "c", snap, &clone),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_EQ(clone, 0u);
+    STM_ASSERT_ERR(stm_fs_lookup_child_dataset(fs, 1, "c", 1, &probe),
+                   STM_ENOENT);
+    /* No hold was taken: the snapshot deletes. */
+    STM_ASSERT_OK(stm_fs_delete_snapshot(fs, snap, NULL));
+    /* The root dataset's key is the pool's: its snapshot clones. */
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "r", 1, &rsnap));
+    STM_ASSERT_OK(stm_fs_create_clone(fs, 1, "c", rsnap, &clone));
+    STM_ASSERT(clone != 0);
+    STM_ASSERT_OK(stm_fs_lookup_child_dataset(fs, 1, "c", 1, &probe));
+    STM_ASSERT_EQ(probe, clone);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fake_corvus_stop(&fc);
+    unlink(g_tmp_path);
+    unlink(key_path);
+}
+
 /* ===================================================================== */
 /* T0.87: scrub's second look meets a dataset whose key was evicted      */
 /* ===================================================================== */

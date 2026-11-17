@@ -9583,6 +9583,22 @@ stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
         return s;
     }
 
+    /* The clone's own writes go under the key provisioned below, which
+     * the pool's wk or janus wraps. An origin whose key its user seals
+     * (corvus) would have that user's new data in the clone leave the
+     * seal, so it is refused before anything is minted. The origin is
+     * never a clone: a clone takes no snapshot. */
+    bool origin_sealed = false;
+    s = stm_sync_dataset_key_user_sealed(fs->sync, origin.dataset_id,
+                                         &origin_sealed);
+    if (s == STM_OK && origin_sealed) s = STM_ENOTSUPPORTED;
+    if (s != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return s;
+    }
+
     /* Mint the clone dataset entry. stm_dataset_create_clone refuses
      * STM_EINVAL on origin == about-to-be-allocated id (self-reference),
      * STM_ENOENT on parent-not-PRESENT, STM_EEXIST on sibling-name

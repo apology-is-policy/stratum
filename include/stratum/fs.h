@@ -1593,7 +1593,10 @@ stm_status stm_fs_provision_corvus_dataset(stm_fs *fs, uint64_t parent_id,
  * `clone.tla::CloneCreate` against existing actions.
  *
  * Wrap-key source: same posture as `stm_fs_create_dataset` — binds to
- * the mount-time keyfile / janus source (R45 P2-1 carry).
+ * the mount-time keyfile / janus source (R45 P2-1 carry). An origin
+ * snapshot whose dataset's key its user seals (corvus) is refused
+ * STM_ENOTSUPPORTED before anything is minted: the clone's key would be
+ * the pool's, and the user's new data in the clone would leave the seal.
  *
  * Rollback discipline (mirrors `stm_fs_create_dataset`'s post-
  * create-child + add-key sequence): if any post-`create_clone` step
@@ -1613,7 +1616,8 @@ stm_status stm_fs_provision_corvus_dataset(stm_fs *fs, uint64_t parent_id,
  * Returns STM_OK with `*out_id` set. STM_EINVAL on NULL args / zero
  * origin_snap_id / bad name / zero parent_id. STM_ENOENT if origin
  * snap is not PRESENT OR parent dataset is not PRESENT.
- * STM_EEXIST on sibling-name collision. Errors propagate from
+ * STM_EEXIST on sibling-name collision. STM_ENOTSUPPORTED for a
+ * user-sealed origin. Errors propagate from
  * `stm_snapshot_hold`, `stm_dataset_create_clone`,
  * `stm_dataset_index_set_engine_root`, and `stm_sync_add_dataset_key`.
  */
