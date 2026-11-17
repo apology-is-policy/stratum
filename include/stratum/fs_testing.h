@@ -208,6 +208,17 @@ void stm_fs_set_write_guard_hook_for_test(stm_fs *fs,
                                           void *arg);
 
 /*
+ * Call `fn` as stm_fs_write passes its locked-dataset check, before it
+ * takes fs->global, with the dataset and inode it writes. It holds no fs
+ * lock, so `fn` may call the fs (an evict, say). NULL restores it.
+ */
+typedef void (*stm_fs_write_admitted_hook)(uint64_t dataset_id, uint64_t ino,
+                                           void *arg);
+void stm_fs_set_write_admitted_hook_for_test(stm_fs *fs,
+                                             stm_fs_write_admitted_hook fn,
+                                             void *arg);
+
+/*
  * Call `fn` as the ENOSPC reclaim is about to take fs->txn exclusive
  * (locked false) and again once it holds it (locked true), with
  * fs->global and the writer's pin held. `fn` may not call the fs. NULL

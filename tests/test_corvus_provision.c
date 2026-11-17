@@ -23,6 +23,7 @@
 #include <stratum/ctl.h>
 #include <stratum/dataset.h>
 #include <stratum/fs.h>
+#include <stratum/fs_testing.h>
 #include <stratum/inode.h>
 #include <stratum/lp9.h>
 #include <stratum/stratumd.h>
@@ -789,6 +790,89 @@ STM_TEST(dek_nodes_report_system_owner) {
         stm_ctl_destroy(ctl);
     }
 
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fake_corvus_stop(&fc);
+    (void)unlink(token_path);
+    (void)unlink(g_tmp_path);
+}
+
+/* T0.92: a conn that dies while its evict fails leaves its key in RAM. Its
+ * lease stays, orphaned, so the key stays accounted for: the next lease
+ * operation retries the evict, and an explicit evict-dek answers the
+ * evict's error until it succeeds. Bob's buffered write that cannot drain
+ * (a forced EIO) makes his disconnect's evict fail. */
+STM_TEST(ctl_disconnect_whose_evict_fails_keeps_the_lease_for_retry) {
+    make_tmp("dekorphan");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    char token_path[256];
+    write_token_file(token_path, sizeof token_path, "dekorphan");
+    fake_corvus fc;
+    fake_corvus_start(&fc, "dekorphan", STM_CORVUS_STATUS_OK);
+    stm_fs *fs = provision_and_remount_locked(&fc, "dekorphan", token_path);
+    if (!fs) { fake_corvus_stop(&fc); return; }
+    stm_sync *sync = stm_fs_sync(fs);
+
+    stm_ctl *ctl = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &ctl));
+    STM_ASSERT_OK(stm_ctl_set_system_uid(ctl, SYS_UID));
+    STM_ASSERT_OK(stm_ctl_set_corvus_socket(ctl, fc.sock_path, 0, 0, 0));
+    uint64_t root = stm_ctl_root(ctl);
+    const stm_lp9_vops *v = stm_ctl_vops();
+    stm_ctl_conn *cb = NULL, *cn2 = NULL, *cn3 = NULL;
+    STM_ASSERT_OK(stm_ctl_conn_create(ctl, SYS_UID, SYS_GID, &cb));
+    STM_ASSERT_OK(ctl_drive_install(v, cb, root, 2u, TEST_TOKEN,
+                                    STM_CORVUS_TOKEN_LEN, 1u));
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 2u, 1, (const uint8_t *)"g", 1,
+                                    0600, 1000, 1000, &ino));
+    uint8_t b[4096];
+    memset(b, 0xB0, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 2u, ino, 0, b, sizeof b));
+
+    uint8_t dek[32];
+    stm_fs_fail_drains_for_test(fs, STM_EIO);
+    stm_ctl_conn_destroy(cb);                     /* the evict fails */
+    STM_ASSERT_OK(stm_sync_get_dek(sync, 2u, 0u, dek));
+    STM_ASSERT(!stm_fs_dataset_locked(fs, 2u));
+    /* A fresh conn's evict-dek retries, and answers the failure. */
+    STM_ASSERT_OK(stm_ctl_conn_create(ctl, SYS_UID, SYS_GID, &cn2));
+    STM_ASSERT_ERR(ctl_drive_evict(v, cn2, root, 2u, 1u), STM_EIO);
+    STM_ASSERT_OK(stm_sync_get_dek(sync, 2u, 0u, dek));
+
+    /* The drain can go through: the retry evicts the key. */
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    STM_ASSERT_OK(ctl_drive_evict(v, cn2, root, 2u, 2u));
+    STM_ASSERT_ERR(stm_sync_get_dek(sync, 2u, 0u, dek), STM_ENOENT);
+    STM_ASSERT(stm_fs_dataset_locked(fs, 2u));
+
+    /* Again, and this time the user comes back on another conn before the
+     * retry: the live lease takes the orphan over, and its own logout
+     * evicts. */
+    STM_ASSERT_OK(stm_ctl_conn_create(ctl, SYS_UID, SYS_GID, &cb));
+    STM_ASSERT_OK(ctl_drive_install(v, cb, root, 2u, TEST_TOKEN,
+                                    STM_CORVUS_TOKEN_LEN, 3u));
+    STM_ASSERT_OK(stm_fs_write(fs, 2u, ino, 0, b, sizeof b));
+    stm_fs_fail_drains_for_test(fs, STM_EIO);
+    stm_ctl_conn_destroy(cb);
+    STM_ASSERT_OK(stm_sync_get_dek(sync, 2u, 0u, dek));
+    STM_ASSERT_OK(stm_ctl_conn_create(ctl, SYS_UID, SYS_GID, &cn3));
+    STM_ASSERT_OK(ctl_drive_install(v, cn3, root, 2u, TEST_TOKEN,
+                                    STM_CORVUS_TOKEN_LEN, 4u));
+    /* The orphan holds no claim: the live lease's own evict-dek is the
+     * one that drains, and it reports the drain's failure. */
+    STM_ASSERT_ERR(ctl_drive_evict(v, cn3, root, 2u, 6u), STM_EIO);
+    STM_ASSERT_OK(stm_sync_get_dek(sync, 2u, 0u, dek));
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    stm_ctl_conn_destroy(cn3);
+    STM_ASSERT_ERR(stm_sync_get_dek(sync, 2u, 0u, dek), STM_ENOENT);
+    STM_ASSERT(stm_fs_dataset_locked(fs, 2u));
+    /* Nothing is left: a fresh evict-dek answers OK. */
+    STM_ASSERT_OK(ctl_drive_evict(v, cn2, root, 2u, 5u));
+
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_ctl_conn_destroy(cn2);
+    stm_ctl_destroy(ctl);
     STM_ASSERT_OK(stm_fs_unmount(fs));
     fake_corvus_stop(&fc);
     (void)unlink(token_path);

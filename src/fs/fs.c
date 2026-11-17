@@ -332,6 +332,8 @@ struct stm_fs {
     void *rollback_swap_hook_arg;
     stm_fs_write_guard_hook write_guard_hook;
     void *write_guard_hook_arg;
+    stm_fs_write_admitted_hook write_admitted_hook;
+    void *write_admitted_hook_arg;
     stm_fs_reclaim_hook reclaim_hook;
     void *reclaim_hook_arg;
     stm_fs_fresh_pin_hook fresh_pin_hook;
@@ -395,6 +397,19 @@ struct stm_fs {
 #define FS_GUARD_READ_LOCKLESS(fs) do {                                    \
     if (atomic_load_explicit(&(fs)->wedged, memory_order_acquire))         \
         return STM_EWEDGED;                                                \
+} while (0)
+
+/* A LOCKED dataset -- its CURRENT key sealed by its user and installed by
+ * no session -- is refused whole, as ZFS refuses a dataset whose key is
+ * not loaded: its names, small files, xattrs and symlinks sit in records
+ * the pool's own key opens, so only this refusal keeps them from a caller
+ * without the user's session. Lock-free, and it takes a short EBR pin, so
+ * the caller holds none. A race with an evict orders the op before the
+ * evict; the dirty-buffer insert asks again under fs->global, which the
+ * evict's drain excludes. */
+#define FS_GUARD_UNLOCKED_DATASET(fs, ds) do {                             \
+    if (stm_sync_dataset_locked((fs)->sync, (ds)))                         \
+        return STM_ELOCKED;                                                \
 } while (0)
 
 /* CF-4 C: wedge the fs while ALREADY holding fs->global (SH or EX). The
@@ -2381,6 +2396,17 @@ static stm_status fs_flush_all_locked(stm_fs *fs)
     return s;
 }
 
+/* Flush one dataset's buffered ranges, as fs_flush_all_locked. */
+static stm_status fs_flush_dataset_locked(stm_fs *fs, uint64_t ds)
+{
+    stm_status s = stm_dirty_buffer_drain_dataset(fs->dirty_buffer, ds,
+                                                      fs_flush_drain_cb, fs);
+    if (s == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
+        s = stm_dirty_buffer_drain_dataset(fs->dirty_buffer, ds,
+                                               fs_flush_drain_cb, fs);
+    return s;
+}
+
 /* The write path's sparse cutover, truncate's: keep only the inline prefix,
  * in one zero-padded block, and flip the inode to EXTENT; the write then
  * takes the EXTENT path. The dense transition writes every byte from 0 to
@@ -2468,12 +2494,16 @@ static stm_status fs_buffer_admit(void *user, uint64_t ds, uint64_t ino,
                                  extra_blocks, cover_lo, cover_hi);
 }
 
-/* A buffered insert, admitted on everything its drain will reserve. */
+/* A buffered insert, admitted on everything its drain will reserve. A
+ * range of a locked dataset would need a key no one holds to drain, so
+ * every whole-pool flush, and with it every commit, would fail; it is
+ * refused here, under the fs->global the evict's drain excludes. */
 static stm_status fs_buffer_insert_locked(stm_fs *fs, uint64_t ds,
                                           uint64_t ino, uint64_t off,
                                           uint64_t len, const void *data)
 {
     fs_buffer_insert_gap(fs, ds, ino);
+    if (stm_sync_dataset_locked(fs->sync, ds)) return STM_ELOCKED;
     return stm_dirty_buffer_insert_admitted(fs->dirty_buffer, ds, ino, off,
                                             len, data, fs_buffer_admit, fs);
 }
@@ -3073,6 +3103,11 @@ static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 {
     *out_written = 0;
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->write_admitted_hook)
+        fs->write_admitted_hook(dataset_id, ino, fs->write_admitted_hook_arg);
+#endif
 
     /* 9.7-impl-5: write to a snap-view inode is structurally forbidden. */
     if (fs_ino_is_synth(ino)) return STM_EROFS;
@@ -3179,6 +3214,7 @@ static stm_status fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * R57 P3-5 / R58 P3-1 uniform out-param contract. */
     if (out_read) *out_read = 0;
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
 
     /* 9.8-LF-3 port (split-branch):
      *   - synth-ino reads stay on fs->global SH (throwaway-engine
@@ -3522,6 +3558,7 @@ static stm_status fs_lookup(stm_fs *fs, uint64_t dataset_id,
                             struct stm_inode_value *out_child_iv)
 {
     if (!fs || !out_child_ino) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
     stm_status nv = fs_validate_dirent_name(name, name_len);
     if (nv != STM_OK) return nv;
@@ -3809,6 +3846,14 @@ void stm_fs_set_write_guard_hook_for_test(stm_fs *fs,
 {
     fs->write_guard_hook = fn;
     fs->write_guard_hook_arg = arg;
+}
+
+void stm_fs_set_write_admitted_hook_for_test(stm_fs *fs,
+                                             stm_fs_write_admitted_hook fn,
+                                             void *arg)
+{
+    fs->write_admitted_hook = fn;
+    fs->write_admitted_hook_arg = arg;
 }
 
 void stm_fs_set_reclaim_hook_for_test(stm_fs *fs, stm_fs_reclaim_hook fn,
@@ -4225,6 +4270,7 @@ static stm_status fs_create_file(stm_fs *fs, uint64_t dataset_id,
                                  struct stm_inode_value *out_child_iv)
 {
     if (!fs || !out_child_ino) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
     if (fs_ino_is_synth(parent_ino)) return STM_EROFS;  /* 9.7-impl-5 */
     stm_status nv = fs_validate_dirent_name(name, name_len);
@@ -4321,6 +4367,7 @@ stm_status stm_fs_create_anon(stm_fs *fs, uint64_t dataset_id,
     /* Uniform out-param contract: zero-init BEFORE arg validation. */
     if (out_child_ino) *out_child_ino = 0;
     if (!fs || !out_child_ino) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u) return STM_EINVAL;
     /* Same mode-bits contract as stm_fs_create_file. */
     uint32_t mtype = mode & (uint32_t)S_IFMT;
@@ -4410,6 +4457,7 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
                                   const uint8_t *name, uint8_t name_len)
 {
     if (!fs || !name) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || ino == 0u || parent_ino == 0u) return STM_EINVAL;
     /* 9.7-impl-5: refuse if either target is a snap-view inode. */
     if (fs_ino_is_synth(ino) || fs_ino_is_synth(parent_ino)) return STM_EROFS;
@@ -4603,6 +4651,7 @@ static stm_status fs_mkdir(stm_fs *fs, uint64_t dataset_id,
                            struct stm_inode_value *out_child_iv)
 {
     if (!fs || !out_child_ino) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
     if (fs_ino_is_synth(parent_ino)) return STM_EROFS;  /* 9.7-impl-5 */
     stm_status nv = fs_validate_dirent_name(name, name_len);
@@ -5083,6 +5132,7 @@ static stm_status fs_unlink(stm_fs *fs, uint64_t dataset_id,
                             const uint8_t *name, uint8_t name_len)
 {
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
     if (fs_ino_is_synth(parent_ino)) return STM_EROFS;  /* 9.7-impl-5 */
     stm_status nv = fs_validate_dirent_name(name, name_len);
@@ -5097,6 +5147,7 @@ static stm_status fs_rmdir(stm_fs *fs, uint64_t dataset_id,
                            const uint8_t *name, uint8_t name_len)
 {
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (fs_ino_is_synth(parent_ino)) return STM_EROFS;  /* 9.7-impl-5 */
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
     stm_status nv = fs_validate_dirent_name(name, name_len);
@@ -5114,6 +5165,7 @@ stm_status stm_fs_stat(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                           struct stm_inode_value *out_value)
 {
     if (!fs || !out_value) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
 
     /* 9.8-LF-3: wait-free read path. Atomic wedge check + EBR pin
@@ -5213,6 +5265,7 @@ static stm_status fs_chmod(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                            const uint64_t *gen, uint32_t mode)
 {
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
 
     /* 9.7-impl-5: snap-view inodes are read-only. */
@@ -5269,6 +5322,7 @@ static stm_status fs_chown(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                            const uint64_t *gen, uint32_t uid, uint32_t gid)
 {
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
 
@@ -5322,6 +5376,7 @@ static stm_status fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 {
     if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     /* R81 P3-6: ctime_nsec arg is now ignored (P8-POSIX-7a auto-stamps
      * ctime to "now"); skip its validation so weird values don't
@@ -5390,6 +5445,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
                           const uint8_t *dst_name, uint8_t dst_name_len)
 {
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || src_parent_ino == 0u || dst_parent_ino == 0u)
         return STM_EINVAL;
     /* 9.7-impl-5: any synth ino in src/dst → EROFS. */
@@ -5636,6 +5692,7 @@ static stm_status fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
                                  const uint8_t *dst_name, uint8_t dst_name_len)
 {
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || src_ino == 0u || dst_parent_ino == 0u)
         return STM_EINVAL;
     /* 9.7-impl-5: any synth ino → EROFS. */
@@ -5790,6 +5847,7 @@ static stm_status fs_symlink(stm_fs *fs, uint64_t dataset_id,
     if (out_child_ino) *out_child_ino = 0;
 
     if (!fs || !out_child_ino) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
     if (fs_ino_is_synth(parent_ino)) return STM_EROFS;  /* 9.7-impl-5 */
     stm_status nv = fs_validate_dirent_name(name, name_len);
@@ -5934,6 +5992,7 @@ static stm_status fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (out_len) *out_len = 0;
 
     if (!fs || !target_buf || !out_len) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     if (target_max == 0u) return STM_EINVAL;
 
@@ -6037,6 +6096,7 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                               const uint64_t *gen, uint64_t new_size)
 {
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
     if (new_size > STM_FS_FILE_MAX) return STM_EOVERFLOW;
@@ -6246,6 +6306,7 @@ stm_status stm_fs_add_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                 uint32_t seals)
 {
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
     /* Reject any out-of-mask bit so future format extensions can rely
@@ -6309,6 +6370,7 @@ stm_status stm_fs_get_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * defined value (0). */
     if (out_seals) *out_seals = 0;
     if (!fs || !out_seals) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     /* 9.7-impl-5 R166 P2-1: seal reads on snap-view not surfaced at
      * v1.0 — explicit STM_ENOTSUPPORTED. */
@@ -6358,6 +6420,7 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
     /* Uniform out-param contract — zero-init BEFORE arg validation. */
     if (out_handle) memset(out_handle, 0, sizeof *out_handle);
     if (!fs || !name || !out_handle) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
     /* 9.7-impl-5 R166 P2-3: refuse synth parent up-front for clarity.
      * The downstream `fs_load_parent_dir` against the live iidx
@@ -6522,6 +6585,7 @@ stm_status stm_fs_open_by_handle(stm_fs *fs,
      * post-mount (set in fs_new + never reassigned), so pool_uuid can
      * be read outside any rwlock. */
     FS_GUARD_READ_LOCKLESS(fs);
+    FS_GUARD_UNLOCKED_DATASET(fs, ds);
 
     /* R83 P2-1: cross-pool isolation. */
     {
@@ -6768,6 +6832,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
                             uint32_t flags)
 {
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || src_parent_ino == 0u || dst_parent_ino == 0u) {
         return STM_EINVAL;
     }
@@ -7465,6 +7530,7 @@ static stm_status fs_readdir(stm_fs *fs, uint64_t dataset_id,
     if (out_returned) *out_returned = 0;
 
     if (!fs || !cursor || !out_entries || !out_returned) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || dir_ino == 0u || parent_ino == 0u) return STM_EINVAL;
     if (max_entries == 0u) return STM_EINVAL;
     /* Reject unknown flag bits (forward-compat guard). */
@@ -7849,6 +7915,7 @@ static stm_status fs_setxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (out_replaced) *out_replaced = false;
 
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (!name) return STM_EINVAL;
     if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
     if (value_len > 0u && !value) return STM_EINVAL;
@@ -7938,6 +8005,7 @@ static stm_status fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (out_size) *out_size = 0;
 
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (!name || !out_size) return STM_EINVAL;
     if (value_max > 0u && !value_buf) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
@@ -8034,6 +8102,7 @@ static stm_status fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (out_total_len) *out_total_len = 0;
 
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (!out_total_len) return STM_EINVAL;
     if (buf_max > 0u && !name_buf) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
@@ -8269,6 +8338,7 @@ static stm_status fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 stm_status stm_fs_removexattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                  const uint8_t *name, uint8_t name_len) {
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (!name) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
@@ -8482,6 +8552,8 @@ static stm_status fs_reflink(stm_fs *fs,
                              const uint64_t *dst_gen)
 {
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, src_dataset_id);
+    FS_GUARD_UNLOCKED_DATASET(fs, dst_dataset_id);
     if (src_dataset_id == 0u || src_ino == 0u) return STM_EINVAL;
     if (dst_dataset_id == 0u || dst_ino == 0u) return STM_EINVAL;
     /* 9.7-impl-5: any synth ino → EROFS (dst write OR src read deferred). */
@@ -8584,6 +8656,8 @@ stm_status stm_fs_copy_file_range(stm_fs *fs,
     /* Uniform out-param contract. */
     if (out_copied) *out_copied = 0;
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, src_dataset_id);
+    FS_GUARD_UNLOCKED_DATASET(fs, dst_dataset_id);
     if (src_dataset_id == 0u || src_ino == 0u) return STM_EINVAL;
     if (dst_dataset_id == 0u || dst_ino == 0u) return STM_EINVAL;
     /* 9.7-impl-5: any synth ino → EROFS. */
@@ -8781,6 +8855,14 @@ stm_status stm_fs_migrate_policy_step(stm_fs *fs,
      * arbitrary new behavior the day this field becomes meaningful;
      * locking it down today keeps forward-compat clean. */
     if (params->_reserved0 != 0u) return STM_EINVAL;
+
+    /* stm_sync_migrate_to_cold refuses a user-sealed dataset: it has no
+     * candidates. */
+    bool sealed = false;
+    stm_status ss = stm_sync_dataset_key_user_sealed(fs->sync, dataset_id,
+                                                     &sealed);
+    if (ss != STM_OK) return ss;
+    if (sealed) return STM_OK;
 
     stm_fs_migrate_policy_stats local_stats = {0};
     stm_fs_migrate_policy_stats *stats = out_stats ? out_stats : &local_stats;
@@ -9329,8 +9411,22 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
         return STM_ECORRUPT;
     }
 
+    /* The child's key is the pool's (wk or janus). Under a parent its
+     * user seals it would hold that user's tree outside the seal, as ZFS
+     * refuses an unencrypted child of an encrypted parent. */
+    bool parent_sealed = false;
+    stm_status s = stm_sync_dataset_key_user_sealed(fs->sync, parent_id,
+                                                    &parent_sealed);
+    if (s == STM_OK && parent_sealed) s = STM_ENOTSUPPORTED;
+    if (s != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return s;
+    }
+
     uint64_t new_id = 0;
-    stm_status s = stm_dataset_create_child(didx, parent_id, name, &new_id);
+    s = stm_dataset_create_child(didx, parent_id, name, &new_id);
     if (s != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
@@ -9592,6 +9688,12 @@ stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
     s = stm_sync_dataset_key_user_sealed(fs->sync, origin.dataset_id,
                                          &origin_sealed);
     if (s == STM_OK && origin_sealed) s = STM_ENOTSUPPORTED;
+    /* Nor under a sealed parent, as stm_fs_create_dataset. */
+    bool parent_sealed = false;
+    if (s == STM_OK)
+        s = stm_sync_dataset_key_user_sealed(fs->sync, parent_id,
+                                             &parent_sealed);
+    if (s == STM_OK && parent_sealed) s = STM_ENOTSUPPORTED;
     if (s != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
@@ -10300,17 +10402,25 @@ stm_status stm_fs_install_dek(stm_fs *fs, uint64_t dataset_id,
     return s;
 }
 
+bool stm_fs_dataset_locked(stm_fs *fs, uint64_t dataset_id)
+{
+    return fs && stm_sync_dataset_locked(fs->sync, dataset_id);
+}
+
 stm_status stm_fs_evict_dek(stm_fs *fs, uint64_t dataset_id)
 {
     if (!fs) return STM_EINVAL;
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
-    /* D7-R4: encrypt outstanding buffered writes while their keys are still
+    /* D7-R4: encrypt this dataset's buffered writes while its key is still
      * installed. Otherwise logout strands a dirty range and every subsequent
      * whole-pool fsync fails ELOCKED, including unrelated Corvus persistence.
-     * EX excludes writers through drain + removal. A drain failure preserves
-     * the key and lease for retry; no new lock order or commit protocol. */
-    stm_status s = fs_flush_all_locked(fs);
+     * EX excludes writers through drain + removal, and the buffered insert
+     * refuses a locked dataset, so no range of it can follow. Only its own
+     * ranges: another dataset's unflushable range must not keep this key in
+     * RAM. A drain failure keeps the key and returns the error, for the
+     * caller to retry; no new lock order or commit protocol. */
+    stm_status s = fs_flush_dataset_locked(fs, dataset_id);
     if (s == STM_OK) s = stm_sync_evict_dek(fs->sync, dataset_id);
     pthread_rwlock_unlock(&fs->global);
     return s;
@@ -11961,6 +12071,7 @@ static stm_status fs_fallocate(stm_fs *fs,
                                   uint32_t flags)
 {
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
     if (len == 0u) return STM_EINVAL;
@@ -12267,6 +12378,7 @@ static stm_status fs_lock(stm_fs *fs,
                           uint64_t off, uint64_t len)
 {
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     /* 9.7-impl-5 R166 P2-2: advisory locks on snap-view inodes have
      * no semantic meaning — the snap is frozen. Refuse STM_EROFS. */
     if (fs_ino_is_synth(ino)) return STM_EROFS;
@@ -12315,6 +12427,7 @@ static stm_status fs_lock_test(stm_fs *fs,
     if (out_would_grant) *out_would_grant = false;
     if (out_conflict) memset(out_conflict, 0, sizeof *out_conflict);
     if (!fs || !out_would_grant) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     /* 9.7-impl-5 R166 P2-2: synth ino lock-test is meaningless. The
      * RO probe semantically is "would acquire succeed?" — and acquire
      * itself refuses STM_EROFS — so probe surfaces STM_EROFS too for
@@ -12836,6 +12949,7 @@ stm_status stm_fs_fadvise(stm_fs *fs,
     (void)len;
 
     if (!fs) return STM_EINVAL;
+    FS_GUARD_UNLOCKED_DATASET(fs, dataset_id);
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
 
     switch (advice) {

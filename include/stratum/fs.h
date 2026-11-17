@@ -2020,16 +2020,28 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
  * session token) and installs the plaintext DEK, lifting the dataset
  * out of the deferred-unwrap LOCKED posture. Reinstallation still proves
  * the token and live-key equality; CORVUS-only; RAM-only (no commit).
- * stm_fs_evict_dek drains buffered writes under EX before removing and
- * zeroing the DEK, returning the dataset to LOCKED. Drain failure preserves
- * the key and propagates the error; this operation is not a commit barrier. The /ctl/ install-dek / evict-dek
- * verbs (src/ctl/synfs.c) are the production drivers.
+ * stm_fs_evict_dek drains the dataset's own buffered writes under EX
+ * before taking the DEK out of RAM, returning the dataset to LOCKED. A
+ * drain failure keeps the key and propagates the error; another dataset's
+ * buffered writes play no part. This operation is not a commit barrier.
+ * The /ctl/ install-dek / evict-dek verbs (src/ctl/synfs.c) are the
+ * production drivers.
+ *
+ * While a dataset is LOCKED, every op on its files refuses with
+ * STM_ELOCKED: reads and writes, lookup, readdir, stat, the xattr and
+ * link ops, create, rename and unlink, locks, fadvise, open-by-handle,
+ * reflink and copy_file_range with it on either side. What still works
+ * is what needs nothing inside it: the dataset ops (lookup by name,
+ * snapshot, rollback, properties), unlock and lock release, and
+ * stm_fs_unlink_anon. stm_fs_dataset_locked asks whether a dataset is
+ * LOCKED; lock-free, it takes a short EBR pin, so the caller holds none.
  */
 STM_MUST_USE
 stm_status stm_fs_install_dek(stm_fs *fs, uint64_t dataset_id,
                                 const stm_corvus_mount_cfg *corvus);
 STM_MUST_USE
 stm_status stm_fs_evict_dek(stm_fs *fs, uint64_t dataset_id);
+bool stm_fs_dataset_locked(stm_fs *fs, uint64_t dataset_id);
 
 /*
  * TLY-A5-impl-2 / 9.7-impl-4: roll the dataset back to a snapshot.

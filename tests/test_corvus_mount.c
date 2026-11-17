@@ -33,7 +33,12 @@
 #include "tsock.h"
 
 #include <stratum/alloc.h>
+#include <stratum/9p.h>
 #include <stratum/fs.h>
+#include <stratum/fs_testing.h>
+#include <stratum/hash.h>
+#include <stratum/inode.h>
+#include <stratum/locks.h>
 #include <stratum/block.h>
 #include <stratum/corvus_client.h>
 #include <stratum/crypto.h>
@@ -1550,4 +1555,655 @@ STM_TEST(corvus_scrub_damage_reported_while_unlocked) {
 
 STM_TEST(corvus_scrub_second_look_after_logout_reports_nothing) {
     scrub_evict_case("scrubev", true);
+}
+
+/* ===================================================================== */
+/* T0.92: a LOCKED home is refused whole                                  */
+/* ===================================================================== */
+/* A user's home holds, beside its HOT extents, records the pool's own    */
+/* key opens: names, small files (inline), xattrs, symlink targets. Once  */
+/* its user logs out, every op on its files answers STM_ELOCKED. A        */
+/* pool-keyed sibling written the same way, one variable away, answers.   */
+
+typedef struct {
+    uint64_t ds;
+    uint64_t small, big, lnk, dir;
+} seal_tree;
+
+typedef struct {
+    char        key_path[300];
+    stm_fs     *fs;
+    fake_corvus fc;
+    stm_corvus_mount_cfg cc;
+    seal_tree   home, sib;
+} seal_pool;
+
+static const char SEAL_SECRET[] = "totp-seed=JBSWY3DPEHPK3PXP";
+
+static void seal_tree_fill(stm_fs *fs, seal_tree *t)
+{
+    STM_ASSERT_OK(stm_fs_create_file(fs, t->ds, 1, (const uint8_t *)"small", 5,
+                                    0600, 1000, 1000, &t->small));
+    STM_ASSERT_OK(stm_fs_write(fs, t->ds, t->small, 0, SEAL_SECRET,
+                               sizeof SEAL_SECRET - 1));
+    STM_ASSERT_OK(stm_fs_setxattr(fs, t->ds, t->small,
+                                  (const uint8_t *)"user.k", 6,
+                                  (const uint8_t *)"xv", 2, 0, NULL));
+    STM_ASSERT_OK(stm_fs_create_file(fs, t->ds, 1, (const uint8_t *)"big", 3,
+                                    0600, 1000, 1000, &t->big));
+    uint8_t b[4096];
+    memset(b, 0x5a, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, t->ds, t->big, 0, b, sizeof b));
+    STM_ASSERT_OK(stm_fs_symlink(fs, t->ds, 1, (const uint8_t *)"lnk", 3,
+                                 (const uint8_t *)"target", 6, 1000, 1000,
+                                 &t->lnk));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, t->ds, 1, (const uint8_t *)"dir", 3,
+                               0700, 1000, 1000, &t->dir));
+}
+
+static bool seal_pool_open(seal_pool *sp, const char *tag)
+{
+    memset(sp, 0, sizeof *sp);
+    make_tmp(tag);
+    snprintf(sp->key_path, sizeof sp->key_path, "%s.key", g_tmp_path);
+    unlink(sp->key_path);
+    STM_ASSERT_OK(stm_keyfile_generate(sp->key_path));
+    stm_fs_format_opts fo = {
+        .device_size_bytes = TEST_DEVICE_BYTES,
+        .bootstrap_size_bytes = TEST_BOOTSTRAP_BYTES,
+        .pool_uuid = {0xc0c0face, 0xfeed5454},
+        .device_uuid = {0x9090a0a0, 0xb0b0c0c3},
+        .keyfile_path = sp->key_path,
+    };
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fo));
+    stm_fs_mount_opts mo = {.keyfile_path = sp->key_path};
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mo, &sp->fs));
+    if (!sp->fs) return false;
+    fake_corvus_start(&sp->fc, tag, STM_CORVUS_STATUS_OK, NULL);
+    sp->cc = (stm_corvus_mount_cfg){.socket_path = sp->fc.sock_path,
+                                    .session_token = TEST_TOKEN};
+    STM_ASSERT_OK(stm_fs_provision_corvus_dataset(sp->fs, 1, "home",
+                                                 "users/alice", 11, 1000, 1000,
+                                                 &sp->cc, &sp->home.ds));
+    STM_ASSERT_OK(stm_fs_create_dataset(sp->fs, 1, "sib", &sp->sib.ds));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(sp->fs, sp->sib.ds, 0700, 1000,
+                                           1000, &r));
+    STM_ASSERT_EQ(r, 1u);
+    seal_tree_fill(sp->fs, &sp->home);
+    seal_tree_fill(sp->fs, &sp->sib);
+    STM_ASSERT_OK(stm_fs_commit(sp->fs));
+    return true;
+}
+
+/* Remount with the pool's key alone: no session. */
+static bool seal_pool_remount(seal_pool *sp)
+{
+    STM_ASSERT_OK(stm_fs_unmount(sp->fs));
+    sp->fs = NULL;
+    stm_fs_mount_opts mo = {.keyfile_path = sp->key_path};
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mo, &sp->fs));
+    return sp->fs != NULL;
+}
+
+static void seal_pool_close(seal_pool *sp)
+{
+    if (sp->fs) STM_ASSERT_OK(stm_fs_unmount(sp->fs));
+    sp->fs = NULL;
+    fake_corvus_stop(&sp->fc);
+    unlink(g_tmp_path);
+    unlink(sp->key_path);
+}
+
+#define SEAL_WANT(expr) do {                                              \
+    stm_status r_ = (expr);                                               \
+    if (locked) STM_ASSERT_ERR(r_, STM_ELOCKED);                          \
+    else        STM_ASSERT_OK(r_);                                        \
+} while (0)
+
+/* Every op on t's files: STM_ELOCKED when `locked`, else STM_OK. `h` is a
+ * handle to t's "small", made while t answered. */
+static void seal_ops(stm_fs *fs, const seal_tree *t,
+                     const stm_fs_file_handle *h, bool locked)
+{
+    const uint64_t ds = t->ds;
+    struct stm_inode_value iv;
+    uint64_t ino = 0, n_ino = 0, n2_ino = 0, anon = 0;
+    uint8_t buf[4096];
+    size_t got = 0;
+    uint32_t xs = 0;
+    size_t xl = 0;
+    bool grant = false, replaced = false;
+    uint32_t seals = 0;
+    uint64_t copied = 0;
+    stm_fs_file_handle h2;
+    stm_lock_conflict conflict;
+
+    /* Reads. */
+    SEAL_WANT(stm_fs_stat(fs, ds, t->small, &iv));
+    SEAL_WANT(stm_fs_lookup(fs, ds, 1, (const uint8_t *)"small", 5, &ino));
+    memset(buf, 0, sizeof buf);
+    SEAL_WANT(stm_fs_read(fs, ds, t->small, 0, buf, sizeof buf, &got));
+    if (!locked) {
+        STM_ASSERT_EQ(got, sizeof SEAL_SECRET - 1);
+        STM_ASSERT_MEM_EQ(buf, SEAL_SECRET, got);
+    } else {
+        STM_ASSERT_EQ(got, 0u);
+    }
+    SEAL_WANT(stm_fs_read(fs, ds, t->big, 0, buf, sizeof buf, &got));
+    SEAL_WANT(stm_fs_getxattr(fs, ds, t->small, (const uint8_t *)"user.k", 6,
+                              buf, sizeof buf, &xs));
+    SEAL_WANT(stm_fs_listxattr(fs, ds, t->small, buf, sizeof buf, &xl));
+    SEAL_WANT(stm_fs_readlink(fs, ds, t->lnk, buf, sizeof buf, &got));
+    {
+        uint64_t cursor = 0;
+        stm_fs_dirent_entry ents[8];
+        size_t ret = 0;
+        SEAL_WANT(stm_fs_readdir(fs, ds, 1, 1, 0, &cursor, ents, 8, &ret));
+    }
+    SEAL_WANT(stm_fs_get_seals(fs, ds, t->small, &seals));
+    SEAL_WANT(stm_fs_name_to_handle(fs, ds, 1, (const uint8_t *)"small", 5,
+                                    &h2));
+    SEAL_WANT(stm_fs_open_by_handle(fs, h, &ino));
+    SEAL_WANT(stm_fs_lock_test(fs, ds, t->small, 7u, STM_LOCK_EXCLUSIVE, 0, 1,
+                               &grant, &conflict));
+    SEAL_WANT(stm_fs_lock(fs, ds, t->small, 7u, STM_LOCK_EXCLUSIVE, 0, 1));
+    STM_ASSERT_OK(stm_fs_release_lock_owner(fs, 7u));
+
+    /* Writes. */
+    SEAL_WANT(stm_fs_write(fs, ds, t->small, 0, "x", 1));
+    memset(buf, 0x6b, sizeof buf);
+    SEAL_WANT(stm_fs_write(fs, ds, t->big, 0, buf, sizeof buf));
+    SEAL_WANT(stm_fs_truncate(fs, ds, t->big, 4096));
+    SEAL_WANT(stm_fs_fallocate(fs, ds, t->big, 0, 4096, 0));
+    SEAL_WANT(stm_fs_chmod(fs, ds, t->small, 0600));
+    SEAL_WANT(stm_fs_chown(fs, ds, t->small, 1000, 1000));
+    SEAL_WANT(stm_fs_utimens(fs, ds, t->small, 1, 0, 2, 0, 3, 0));
+    SEAL_WANT(stm_fs_setxattr(fs, ds, t->small, (const uint8_t *)"user.j", 6,
+                              (const uint8_t *)"v", 1, 0, &replaced));
+    SEAL_WANT(stm_fs_removexattr(fs, ds, t->small,
+                                 (const uint8_t *)"user.j", 6));
+    SEAL_WANT(stm_fs_fadvise(fs, ds, t->big, 0, 4096, STM_FS_FADV_WILLNEED));
+
+    /* The namespace. */
+    SEAL_WANT(stm_fs_create_file(fs, ds, 1, (const uint8_t *)"n", 1, 0600,
+                                 1000, 1000, &n_ino));
+    SEAL_WANT(stm_fs_create_file(fs, ds, 1, (const uint8_t *)"n2", 2, 0600,
+                                 1000, 1000, &n2_ino));
+    SEAL_WANT(stm_fs_add_seals(fs, ds, locked ? t->small : n2_ino,
+                               STM_FS_SEAL_SEAL));
+    SEAL_WANT(stm_fs_mkdir(fs, ds, 1, (const uint8_t *)"d2", 2, 0700, 1000,
+                           1000, &ino));
+    SEAL_WANT(stm_fs_symlink(fs, ds, 1, (const uint8_t *)"l2", 2,
+                             (const uint8_t *)"t", 1, 1000, 1000, &ino));
+    SEAL_WANT(stm_fs_link(fs, ds, 1, (const uint8_t *)"small", 5, 1,
+                          (const uint8_t *)"hard", 4));
+    SEAL_WANT(stm_fs_link_by_ino(fs, ds, t->small, 1,
+                                 (const uint8_t *)"hard2", 5));
+    SEAL_WANT(stm_fs_rename(fs, ds, 1, (const uint8_t *)"hard", 4, 1,
+                            (const uint8_t *)"hard3", 5, 0));
+    SEAL_WANT(stm_fs_unlink(fs, ds, 1, (const uint8_t *)"hard3", 5));
+    SEAL_WANT(stm_fs_rmdir(fs, ds, 1, (const uint8_t *)"d2", 2));
+    SEAL_WANT(stm_fs_create_anon(fs, ds, 0600, 1000, 1000, &anon));
+    SEAL_WANT(stm_fs_linkat_anon(fs, ds, locked ? t->small : anon, 1,
+                                 (const uint8_t *)"anon", 4));
+    SEAL_WANT(stm_fs_reflink(fs, ds, t->big, ds, locked ? t->small : n_ino));
+    SEAL_WANT(stm_fs_copy_file_range(fs, ds, t->big, 0, ds,
+                                     locked ? t->small : n2_ino, 0, 4096,
+                                     &copied));
+}
+
+STM_TEST(corvus_locked_home_refuses_every_file_op) {
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "sealops")) return;
+    stm_fs_file_handle h, hs;
+    STM_ASSERT_OK(stm_fs_name_to_handle(sp.fs, sp.home.ds, 1,
+                                        (const uint8_t *)"small", 5, &h));
+    STM_ASSERT_OK(stm_fs_name_to_handle(sp.fs, sp.sib.ds, 1,
+                                        (const uint8_t *)"small", 5, &hs));
+    STM_ASSERT(!stm_fs_dataset_locked(sp.fs, sp.home.ds));
+
+    uint64_t snap = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(sp.fs, sp.home.ds, "s", 1, &snap));
+    STM_ASSERT_OK(stm_fs_evict_dek(sp.fs, sp.home.ds));    /* logout */
+    STM_ASSERT(stm_fs_dataset_locked(sp.fs, sp.home.ds));
+    STM_ASSERT(!stm_fs_dataset_locked(sp.fs, sp.sib.ds));
+    STM_ASSERT(!stm_fs_dataset_locked(sp.fs, 1));
+    seal_ops(sp.fs, &sp.home, &h, true);
+    /* Below the fs, every key lookup passes over the locked slot: no
+     * read decrypts and no write encrypts with its empty key. */
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    uint8_t blk[4096], dek[32];
+    size_t got = 0;
+    memset(blk, 0x11, sizeof blk);
+    STM_ASSERT_ERR(stm_sync_read_extent(sync, sp.home.ds, sp.home.big, 0, blk,
+                                        sizeof blk, &got), STM_ELOCKED);
+    STM_ASSERT_ERR(stm_sync_write_extent(sync, sp.home.ds, sp.home.big, 0,
+                                         blk, sizeof blk), STM_ELOCKED);
+    STM_ASSERT_ERR(stm_sync_get_dek(sync, sp.home.ds, 0, dek), STM_ENOENT);
+    STM_ASSERT_ERR(stm_sync_get_dek_or_locked(sync, sp.home.ds, 0, dek),
+                   STM_ELOCKED);
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_ERR(stm_send_init(sync, sp.home.ds, 0, snap, &sh),
+                   STM_ELOCKED);
+    STM_ASSERT(sh == NULL);
+    seal_ops(sp.fs, &sp.sib, &hs, false);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+
+    /* Remounted with no session, the home mounts locked. */
+    if (!seal_pool_remount(&sp)) { seal_pool_close(&sp); return; }
+    STM_ASSERT(stm_fs_dataset_locked(sp.fs, sp.home.ds));
+    STM_ASSERT(!stm_fs_dataset_locked(sp.fs, sp.sib.ds));
+    seal_ops(sp.fs, &sp.home, &h, true);
+
+    /* Its user logs in: the home answers, with what it held. */
+    STM_ASSERT_OK(stm_fs_install_dek(sp.fs, sp.home.ds, &sp.cc));
+    STM_ASSERT(!stm_fs_dataset_locked(sp.fs, sp.home.ds));
+    seal_ops(sp.fs, &sp.home, &h, false);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    seal_pool_close(&sp);
+}
+
+/* A write that passed the check just before its user's logout, and buffers
+ * after it, would leave a range only that user's key can drain: every
+ * commit of every dataset would then fail. The insert refuses it. */
+typedef struct {
+    stm_fs  *fs;
+    uint64_t ds;
+    int      fired;
+    stm_status evict_rc;
+} seal_admit_ctx;
+
+static void seal_admit_evict(uint64_t ds, uint64_t ino, void *arg)
+{
+    seal_admit_ctx *c = arg;
+    (void)ino;
+    if (ds != c->ds || c->fired++ != 0) return;
+    c->evict_rc = stm_fs_evict_dek(c->fs, ds);
+}
+
+static void seal_admit_leg(seal_pool *sp, uint64_t ino)
+{
+    seal_admit_ctx c = {sp->fs, sp->home.ds, 0, STM_EINVAL};
+    stm_fs_set_write_admitted_hook_for_test(sp->fs, seal_admit_evict, &c);
+    uint8_t a[4096];
+    memset(a, 0xa5, sizeof a);
+    STM_ASSERT_ERR(stm_fs_write(sp->fs, sp->home.ds, ino, 0, a, sizeof a),
+                   STM_ELOCKED);
+    stm_fs_set_write_admitted_hook_for_test(sp->fs, NULL, NULL);
+    STM_ASSERT_EQ(c.fired, 1);
+    STM_ASSERT_OK(c.evict_rc);
+    STM_ASSERT(stm_fs_dataset_locked(sp->fs, sp->home.ds));
+    /* Another user's write commits. */
+    uint8_t b[4096];
+    memset(b, 0xb6, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(sp->fs, sp->sib.ds, sp->sib.big, 0, b,
+                               sizeof b));
+    STM_ASSERT_OK(stm_fs_commit(sp->fs));
+}
+
+STM_TEST(corvus_write_racing_logout_leaves_the_pool_committable) {
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "sealrace")) return;
+    uint64_t late = 0;
+    STM_ASSERT_OK(stm_fs_create_file(sp.fs, sp.home.ds, 1,
+                                     (const uint8_t *)"late", 4, 0600, 1000,
+                                     1000, &late));
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    /* An empty file's first block: the inline -> extent step buffers it. */
+    seal_admit_leg(&sp, late);
+    /* An extent file's overwrite: the buffered arm. */
+    STM_ASSERT_OK(stm_fs_install_dek(sp.fs, sp.home.ds, &sp.cc));
+    seal_admit_leg(&sp, sp.home.big);
+
+    /* The pool unmounts clean, and holds what was written. */
+    if (!seal_pool_remount(&sp)) { seal_pool_close(&sp); return; }
+    uint8_t got[4096], want[4096];
+    size_t n = 0;
+    memset(want, 0xb6, sizeof want);
+    STM_ASSERT_OK(stm_fs_read(sp.fs, sp.sib.ds, sp.sib.big, 0, got,
+                              sizeof got, &n));
+    STM_ASSERT_EQ(n, sizeof got);
+    STM_ASSERT_MEM_EQ(got, want, sizeof got);
+    STM_ASSERT_OK(stm_fs_install_dek(sp.fs, sp.home.ds, &sp.cc));
+    memset(want, 0x5a, sizeof want);
+    STM_ASSERT_OK(stm_fs_read(sp.fs, sp.home.ds, sp.home.big, 0, got,
+                              sizeof got, &n));
+    STM_ASSERT_EQ(n, sizeof got);
+    STM_ASSERT_MEM_EQ(got, want, sizeof got);
+    struct stm_inode_value iv;
+    STM_ASSERT_OK(stm_fs_stat(sp.fs, sp.home.ds, late, &iv));
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), 0u);
+    seal_pool_close(&sp);
+}
+
+/* A logout drains its own dataset's buffered writes, and only those: an
+ * unflushable range of another dataset does not keep its key in RAM, and
+ * an unflushable range of its own does. */
+STM_TEST(corvus_logout_drains_only_its_own_dataset) {
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "sealdrain")) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    uint8_t dek[32];
+    uint8_t a[4096], b[4096];
+    memset(a, 0xa7, sizeof a);
+    memset(b, 0xc7, sizeof b);
+
+    STM_ASSERT_OK(stm_fs_write(sp.fs, sp.sib.ds, sp.sib.big, 0, b, sizeof b));
+    stm_fs_fail_drains_for_test(sp.fs, STM_EIO);
+    STM_ASSERT_OK(stm_fs_evict_dek(sp.fs, sp.home.ds));
+    STM_ASSERT(stm_fs_dataset_locked(sp.fs, sp.home.ds));
+    STM_ASSERT_ERR(stm_sync_get_dek_or_locked(sync, sp.home.ds, 0, dek),
+                   STM_ELOCKED);
+
+    STM_ASSERT_OK(stm_fs_install_dek(sp.fs, sp.home.ds, &sp.cc));
+    STM_ASSERT_OK(stm_fs_write(sp.fs, sp.home.ds, sp.home.big, 0, a,
+                               sizeof a));
+    STM_ASSERT_ERR(stm_fs_evict_dek(sp.fs, sp.home.ds), STM_EIO);
+    STM_ASSERT(!stm_fs_dataset_locked(sp.fs, sp.home.ds));
+    STM_ASSERT_OK(stm_sync_get_dek(sync, sp.home.ds, 0, dek));
+
+    stm_fs_fail_drains_for_test(sp.fs, STM_OK);
+    STM_ASSERT_OK(stm_fs_evict_dek(sp.fs, sp.home.ds));
+    STM_ASSERT(stm_fs_dataset_locked(sp.fs, sp.home.ds));
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+
+    if (!seal_pool_remount(&sp)) { seal_pool_close(&sp); return; }
+    uint8_t got[4096];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(sp.fs, sp.sib.ds, sp.sib.big, 0, got,
+                              sizeof got, &n));
+    STM_ASSERT_EQ(n, sizeof got);
+    STM_ASSERT_MEM_EQ(got, b, sizeof got);
+    STM_ASSERT_OK(stm_fs_install_dek(sp.fs, sp.home.ds, &sp.cc));
+    STM_ASSERT_OK(stm_fs_read(sp.fs, sp.home.ds, sp.home.big, 0, got,
+                              sizeof got, &n));
+    STM_ASSERT_EQ(n, sizeof got);
+    STM_ASSERT_MEM_EQ(got, a, sizeof got);
+    seal_pool_close(&sp);
+}
+
+/* The cold tier seals its chunks with the pool's key. A home's file never
+ * goes there: not by fadvise, a migrate, the policy or a receive. The
+ * sibling's file, one variable away, does. */
+/* Send `src` whole and receive it into `dst`; the first failing status,
+ * and in *failed_type the type of the record it failed on. */
+static stm_status seal_send_recv(stm_sync *sync, uint64_t src, uint64_t dst,
+                                 uint32_t *failed_type)
+{
+    *failed_type = 0;
+    stm_send_handle *sh = NULL;
+    stm_recv_handle *rh = NULL;
+    stm_status rc = stm_send_init(sync, src, 0, 0, &sh);
+    if (rc != STM_OK) return rc;
+    rc = stm_recv_init(sync, dst, &rh);
+    if (rc != STM_OK) { stm_send_close(sh); return rc; }
+    size_t cap = 1u << 16;
+    uint8_t *buf = malloc(cap);
+    for (int guard = 0; buf && guard < 4096; guard++) {
+        size_t len = 0, need = 0;
+        stm_status sn = stm_send_next(sh, buf, cap, &len, &need);
+        if (sn == STM_ENOENT) { rc = stm_recv_finish(rh); break; }
+        if (sn == STM_ERANGE && need > cap) {
+            free(buf);
+            cap = need;
+            buf = malloc(cap);
+            continue;
+        }
+        if (sn != STM_OK) { rc = sn; break; }
+        rc = stm_recv_apply(rh, buf, len);
+        if (rc != STM_OK) {
+            *failed_type = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8)
+                         | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+            break;
+        }
+    }
+    if (!buf) rc = STM_ENOMEM;
+    free(buf);
+    stm_recv_close(rh);
+    stm_send_close(sh);
+    return rc;
+}
+
+static uint8_t seal_extent_kind(stm_fs *fs, uint64_t ds, uint64_t ino)
+{
+    stm_extent_record e;
+    memset(&e, 0, sizeof e);
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(stm_fs_sync(fs)),
+                                       ds, ino, 0, &e));
+    return (uint8_t)e.kind;
+}
+
+STM_TEST(corvus_sealed_home_never_moves_to_the_cold_tier) {
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "sealcold")) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const uint64_t home = sp.home.ds, sib = sp.sib.ds;
+
+    STM_ASSERT_EQ(seal_extent_kind(sp.fs, home, sp.home.big),
+                  STM_EXTENT_KIND_HOT);
+    STM_ASSERT_OK(stm_fs_fadvise(sp.fs, home, sp.home.big, 0, 4096,
+                                 STM_FS_FADV_DONTNEED));
+    STM_ASSERT_ERR(stm_fs_migrate_to_cold(sp.fs, home, sp.home.big),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_ERR(stm_sync_migrate_to_cold(sync, home, sp.home.big),
+                   STM_ENOTSUPPORTED);
+    stm_fs_migrate_policy_params pp;
+    memset(&pp, 0, sizeof pp);
+    stm_fs_migrate_policy_stats ps;
+    STM_ASSERT_OK(stm_fs_migrate_policy_step(sp.fs, home, &pp, &ps));
+    STM_ASSERT_EQ(ps.inos_migrated, 0u);
+    STM_ASSERT_OK(ps.last_err);
+    STM_ASSERT_EQ(seal_extent_kind(sp.fs, home, sp.home.big),
+                  STM_EXTENT_KIND_HOT);
+
+    uint8_t plain[4096];
+    memset(plain, 0x3c, sizeof plain);
+    stm_blake3_hash hh;
+    stm_blake3(plain, sizeof plain, &hh);
+    uint64_t rh = 0, rs = 0;
+    STM_ASSERT_OK(stm_fs_create_file(sp.fs, home, 1, (const uint8_t *)"rcv", 3,
+                                     0600, 1000, 1000, &rh));
+    STM_ASSERT_OK(stm_fs_create_file(sp.fs, sib, 1, (const uint8_t *)"rcv", 3,
+                                     0600, 1000, 1000, &rs));
+    STM_ASSERT_ERR(stm_sync_recv_cold_extent(sync, home, rh, 0, sizeof plain,
+                                             hh.bytes, plain, sizeof plain),
+                   STM_ENOTSUPPORTED);
+    /* The control, then a reference to the chunk it interned. */
+    STM_ASSERT_OK(stm_sync_recv_cold_extent(sync, sib, rs, 0, sizeof plain,
+                                            hh.bytes, plain, sizeof plain));
+    STM_ASSERT_ERR(stm_sync_recv_cold_extent_ref(sync, home, rh, 0,
+                                                 sizeof plain, hh.bytes),
+                   STM_ENOTSUPPORTED);
+    uint64_t rs2 = 0;
+    STM_ASSERT_OK(stm_fs_create_file(sp.fs, sib, 1, (const uint8_t *)"rcv2", 4,
+                                     0600, 1000, 1000, &rs2));
+    STM_ASSERT_OK(stm_sync_recv_cold_extent_ref(sync, sib, rs2, 0,
+                                                sizeof plain, hh.bytes));
+    STM_ASSERT_OK(stm_fs_fadvise(sp.fs, sib, sp.sib.big, 0, 4096,
+                                 STM_FS_FADV_DONTNEED));
+    STM_ASSERT_EQ(seal_extent_kind(sp.fs, sib, sp.sib.big),
+                  STM_EXTENT_KIND_COLD);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+
+    /* A stream with a cold file, received into the home, stops at its
+     * first CHUNK record, before the chunk lands; into a pool-keyed
+     * dataset it goes through. */
+    uint64_t sib2 = 0, r2 = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(sp.fs, 1, "sib2", &sib2));
+    STM_ASSERT_OK(stm_fs_init_dataset_root(sp.fs, sib2, 0700, 1000, 1000, &r2));
+    uint32_t failed_type = 0;
+    STM_ASSERT_ERR(seal_send_recv(sync, sib, home, &failed_type),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_EQ(failed_type, (uint32_t)STM_SEND_REC_CHUNK);
+    STM_ASSERT_OK(seal_send_recv(sync, sib, sib2, &failed_type));
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+
+    /* Logged out, and remounted with no session, the home's file reads
+     * nothing; the sibling's cold file reads. */
+    uint8_t got[4096];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_evict_dek(sp.fs, home));
+    STM_ASSERT_ERR(stm_fs_read(sp.fs, home, sp.home.big, 0, got, sizeof got,
+                               &n), STM_ELOCKED);
+    if (!seal_pool_remount(&sp)) { seal_pool_close(&sp); return; }
+    STM_ASSERT_ERR(stm_fs_read(sp.fs, home, sp.home.big, 0, got, sizeof got,
+                               &n), STM_ELOCKED);
+    STM_ASSERT_OK(stm_fs_read(sp.fs, sib, sp.sib.big, 0, got, sizeof got, &n));
+    STM_ASSERT_EQ(n, sizeof got);
+    seal_pool_close(&sp);
+}
+
+/* A pool-keyed dataset under a home would hold that user's tree outside the
+ * seal. Refused, made directly or as a clone, logged in or out; nothing is
+ * minted. Under the sibling, both are made. */
+STM_TEST(corvus_pool_keyed_child_of_a_sealed_home_is_refused) {
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "sealkid")) return;
+    const uint64_t home = sp.home.ds, sib = sp.sib.ds;
+    uint64_t snap = 0, id = 77, probe = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(sp.fs, sib, "s", 1, &snap));
+
+    STM_ASSERT_ERR(stm_fs_create_dataset(sp.fs, home, "kid", &id),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_ERR(stm_fs_create_clone(sp.fs, home, "kc", snap, &id),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_EQ(id, 0u);
+    STM_ASSERT_OK(stm_fs_evict_dek(sp.fs, home));
+    STM_ASSERT_ERR(stm_fs_create_dataset(sp.fs, home, "kid", &id),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_ERR(stm_fs_create_clone(sp.fs, home, "kc", snap, &id),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_ERR(stm_fs_lookup_child_dataset(sp.fs, home, "kid", 3, &probe),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_lookup_child_dataset(sp.fs, home, "kc", 2, &probe),
+                   STM_ENOENT);
+    /* No id was spent: the next dataset is the sibling's successor. */
+    STM_ASSERT_OK(stm_fs_create_dataset(sp.fs, sib, "kid", &id));
+    STM_ASSERT_EQ(id, sib + 1u);
+    STM_ASSERT_OK(stm_fs_create_clone(sp.fs, sib, "kc", snap, &id));
+    STM_ASSERT_EQ(id, sib + 2u);
+    seal_pool_close(&sp);
+}
+
+/* The 9P server's `ds:<name>` attach: a locked home is refused, and a fid
+ * attached before the logout reads nothing after it. Both answer EACCES. */
+static void seal_p9_pack_u16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static void seal_p9_pack_u32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static uint32_t seal_p9_load_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
+}
+
+static uint32_t seal_p9_finish(uint8_t *req, uint8_t *p, uint8_t type,
+                               uint16_t tag)
+{
+    uint32_t sz = (uint32_t)(p - req);
+    seal_p9_pack_u32(req, sz);
+    req[4] = type;
+    seal_p9_pack_u16(req + 5, tag);
+    return sz;
+}
+
+/* Tversion, then Tattach of `aname` at fid 100; the reply's type, and the
+ * Rlerror ecode in *ecode. */
+static uint8_t seal_p9_attach(stm_9p_server *s, const char *aname,
+                              uint32_t *ecode)
+{
+    uint8_t req[256], resp[256];
+    uint32_t rlen = 0;
+    uint8_t *p = req + 7;
+    seal_p9_pack_u32(p, STM_9P_MSIZE_DEFAULT); p += 4;
+    seal_p9_pack_u16(p, 8); p += 2;
+    memcpy(p, "9P2000.L", 8); p += 8;
+    uint32_t sz = seal_p9_finish(req, p, STM_9P_TVERSION, STM_9P_NOTAG);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RVERSION);
+    p = req + 7;
+    seal_p9_pack_u32(p, 100u); p += 4;
+    seal_p9_pack_u32(p, STM_9P_NOFID); p += 4;
+    seal_p9_pack_u16(p, 0); p += 2;
+    uint16_t alen = (uint16_t)strlen(aname);
+    seal_p9_pack_u16(p, alen); p += 2;
+    memcpy(p, aname, alen); p += alen;
+    seal_p9_pack_u32(p, (uint32_t)-1); p += 4;
+    sz = seal_p9_finish(req, p, STM_9P_TATTACH, 1);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    *ecode = resp[4] == STM_9P_RLERROR ? seal_p9_load_u32(resp + 7) : 0u;
+    return resp[4];
+}
+
+/* Tgetattr on fid 100; the reply's type, and the Rlerror ecode. */
+static uint8_t seal_p9_getattr(stm_9p_server *s, uint32_t *ecode)
+{
+    uint8_t req[64], resp[512];
+    uint32_t rlen = 0;
+    uint8_t *p = req + 7;
+    seal_p9_pack_u32(p, 100u); p += 4;
+    seal_p9_pack_u32(p, (uint32_t)STM_9P_GETATTR_INO); p += 4;
+    seal_p9_pack_u32(p, 0); p += 4;
+    uint32_t sz = seal_p9_finish(req, p, STM_9P_TGETATTR, 2);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    *ecode = resp[4] == STM_9P_RLERROR ? seal_p9_load_u32(resp + 7) : 0u;
+    return resp[4];
+}
+
+static stm_9p_server *seal_p9_server(stm_fs *fs)
+{
+    stm_9p_server *s = NULL;
+    STM_ASSERT_OK(stm_9p_server_create(fs, 1u, 0, 0, STM_9P_MSIZE_DEFAULT,
+                                       &s));
+    return s;
+}
+
+STM_TEST(corvus_9p_attach_of_a_locked_home_is_refused) {
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "sealp9")) return;
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(sp.fs, 1, 0755, 0, 0, &r));
+    uint32_t ec = 0;
+
+    stm_9p_server *before = seal_p9_server(sp.fs);
+    STM_ASSERT_EQ(seal_p9_attach(before, "ds:home", &ec), STM_9P_RATTACH);
+    STM_ASSERT_EQ(seal_p9_getattr(before, &ec), STM_9P_RGETATTR);
+
+    STM_ASSERT_OK(stm_fs_evict_dek(sp.fs, sp.home.ds));     /* logout */
+    STM_ASSERT_EQ(seal_p9_getattr(before, &ec), STM_9P_RLERROR);
+    STM_ASSERT_EQ(ec, STM_9P_ECODE_EACCES);
+    stm_9p_server_destroy(before);
+
+    stm_9p_server *after = seal_p9_server(sp.fs);
+    STM_ASSERT_EQ(seal_p9_attach(after, "ds:home", &ec), STM_9P_RLERROR);
+    STM_ASSERT_EQ(ec, STM_9P_ECODE_EACCES);
+    stm_9p_server_destroy(after);
+    stm_9p_server *ctl_s = seal_p9_server(sp.fs);
+    STM_ASSERT_EQ(seal_p9_attach(ctl_s, "ds:sib", &ec), STM_9P_RATTACH);
+    STM_ASSERT_EQ(seal_p9_getattr(ctl_s, &ec), STM_9P_RGETATTR);
+    stm_9p_server_destroy(ctl_s);
+
+    if (!seal_pool_remount(&sp)) { seal_pool_close(&sp); return; }
+    stm_9p_server *cold = seal_p9_server(sp.fs);
+    STM_ASSERT_EQ(seal_p9_attach(cold, "ds:home", &ec), STM_9P_RLERROR);
+    STM_ASSERT_EQ(ec, STM_9P_ECODE_EACCES);
+    stm_9p_server_destroy(cold);
+    /* Its user logs in: the attach goes through. */
+    STM_ASSERT_OK(stm_fs_install_dek(sp.fs, sp.home.ds, &sp.cc));
+    stm_9p_server *back = seal_p9_server(sp.fs);
+    STM_ASSERT_EQ(seal_p9_attach(back, "ds:home", &ec), STM_9P_RATTACH);
+    STM_ASSERT_EQ(seal_p9_getattr(back, &ec), STM_9P_RGETATTR);
+    stm_9p_server_destroy(back);
+    seal_pool_close(&sp);
 }

@@ -308,6 +308,16 @@ static stm_status apply_chunk(stm_recv_handle *h,
      * sender dedupes by hash and emits each unique chunk once. */
     if (chunks_seen_contains(h, claimed_hash)) return STM_ECORRUPT;
 
+    /* The CAS seals a chunk with the pool's key, which opens with no
+     * session; a target its user seals takes no chunk, before any byte of
+     * it lands (stm_sync_recv_cold_extent refuses such a target too). */
+    bool sealed = false;
+    stm_status ss = stm_sync_dataset_key_user_sealed(h->sync,
+                                                     h->target_dataset_id,
+                                                     &sealed);
+    if (ss != STM_OK) return ss;
+    if (sealed) return STM_ENOTSUPPORTED;
+
     /* Reserve chunks_seen slot BEFORE the sync call so a successful
      * intern has a place to land; a failed intern means we don't
      * commit to the slot. */

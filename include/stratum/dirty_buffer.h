@@ -337,6 +337,16 @@ stm_status stm_dirty_buffer_drain_all(stm_dirty_buffer *buf,
                                           void *user);
 
 /*
+ * Drain every inode of `dataset_id`, and no other. Semantics, return and
+ * concurrency as drain_all.
+ */
+STM_MUST_USE
+stm_status stm_dirty_buffer_drain_dataset(stm_dirty_buffer *buf,
+                                              uint64_t dataset_id,
+                                              stm_dirty_buffer_drain_cb cb,
+                                              void *user);
+
+/*
  * Drop every buffered range for (dataset_id, ino) WITHOUT flushing.
  * Used by stm_fs_unlink / stm_fs_truncate-to-zero — the inode is going
  * away (or its extents are being dropped), so the buffered plaintext

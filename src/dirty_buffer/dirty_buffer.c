@@ -937,9 +937,10 @@ stm_status stm_dirty_buffer_drain_ino(stm_dirty_buffer *buf,
     return rc;
 }
 
-stm_status stm_dirty_buffer_drain_all(stm_dirty_buffer *buf,
-                                          stm_dirty_buffer_drain_cb cb,
-                                          void *user)
+/* Drain every inode, or only `dataset_id`'s when `one` is set. */
+static stm_status drain_inodes(stm_dirty_buffer *buf, bool one,
+                               uint64_t dataset_id,
+                               stm_dirty_buffer_drain_cb cb, void *user)
 {
     if (!buf || !cb) return STM_EINVAL;
     pthread_mutex_lock(&buf->mu);
@@ -950,6 +951,7 @@ stm_status stm_dirty_buffer_drain_all(stm_dirty_buffer *buf,
         stm_dbuf_inode *e = buf->buckets[b];
         while (e) {
             stm_dbuf_inode *next = e->bucket_next;
+            if (one && e->dataset_id != dataset_id) { e = next; continue; }
             stm_status rc = drain_inode_coalesced_locked(buf, e, cb, user);
             if (e->head == NULL) {
                 destroy_inode_locked(buf, e);
@@ -961,6 +963,21 @@ stm_status stm_dirty_buffer_drain_all(stm_dirty_buffer *buf,
     }
     pthread_mutex_unlock(&buf->mu);
     return first_err;
+}
+
+stm_status stm_dirty_buffer_drain_all(stm_dirty_buffer *buf,
+                                          stm_dirty_buffer_drain_cb cb,
+                                          void *user)
+{
+    return drain_inodes(buf, false, 0u, cb, user);
+}
+
+stm_status stm_dirty_buffer_drain_dataset(stm_dirty_buffer *buf,
+                                              uint64_t dataset_id,
+                                              stm_dirty_buffer_drain_cb cb,
+                                              void *user)
+{
+    return drain_inodes(buf, true, dataset_id, cb, user);
 }
 
 void stm_dirty_buffer_drop_ino(stm_dirty_buffer *buf,

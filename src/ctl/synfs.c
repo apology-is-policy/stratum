@@ -486,11 +486,18 @@ typedef struct ctl_session {
  * conn installed a dataset's runtime DEK so only that conn may evict it
  * and the last lease release auto-evicts it. `owner` is a bare identity pointer --
  * compared, never dereferenced -- kept stale-free by clearing every
- * lease a conn owns under dek_mu before that conn is freed. */
+ * lease a conn owns under dek_mu before that conn is freed.
+ *
+ * An `orphan` is a lease whose conn died while the evict failed: the key is
+ * still in RAM and no conn owns it. It stays in the table so the key stays
+ * accounted for; every lease operation retries its evict, and a live lease
+ * for the same dataset (its user back) takes it over. */
 typedef struct {
     bool                   active;
+    bool                   orphan;
+    stm_status             orphan_rc;   /* the last failed evict */
     uint64_t               dataset_id;
-    const struct stm_ctl_conn *owner;
+    const struct stm_ctl_conn *owner;   /* NULL for an orphan */
 } ctl_dek_lease;
 
 struct stm_ctl {
@@ -618,6 +625,32 @@ static bool ctl_caller_is_system(const stm_ctl_conn *cn)
     return cn->caller_uid == cn->ctl->system_uid;
 }
 
+/* Caller holds dek_mu. Removing one lease must not evict another's key. An
+ * orphan holds no claim on the key; it only waits for the evict. */
+static bool ctl_dek_other_lease(stm_ctl *c, int slot)
+{
+    for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++)
+        if (i != slot && c->dek_leases[i].active &&
+            !c->dek_leases[i].orphan &&
+            c->dek_leases[i].dataset_id == c->dek_leases[slot].dataset_id)
+            return true;
+    return false;
+}
+
+/* Caller holds dek_mu. Retry every orphan's evict. */
+static void ctl_dek_reap_orphans(stm_ctl *c)
+{
+    if (!c->fs) return;
+    for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {
+        ctl_dek_lease *l = &c->dek_leases[i];
+        if (!l->active || !l->orphan) continue;
+        stm_status rc = ctl_dek_other_lease(c, i) ? STM_OK :
+            stm_fs_evict_dek(c->fs, l->dataset_id);
+        if (rc == STM_OK) *l = (ctl_dek_lease){0};
+        else              l->orphan_rc = rc;
+    }
+}
+
 /* D7: one authenticated lease per (connection,dataset), not a singleton
  * dataset owner. A new connection always proves UNWRAP authority, including
  * an already-unlocked dataset. Existing bounded I/O stays under dek_mu;
@@ -629,6 +662,7 @@ static stm_status ctl_dek_install(stm_ctl_conn *cn, uint64_t dataset_id,
     if (!c->corvus_socket_set) return STM_EINVAL;  /* no UNWRAP socket */
 
     pthread_mutex_lock(&c->dek_mu);
+    ctl_dek_reap_orphans(c);
 
     int free_slot = -1;
     for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {
@@ -664,24 +698,22 @@ static stm_status ctl_dek_install(stm_ctl_conn *cn, uint64_t dataset_id,
     return rc;
 }
 
-/* Caller holds dek_mu. Removing one lease must not evict another's key. */
-static bool ctl_dek_other_lease(stm_ctl *c, int slot)
-{
-    for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++)
-        if (i != slot && c->dek_leases[i].active &&
-            c->dek_leases[i].dataset_id == c->dek_leases[slot].dataset_id)
-            return true;
-    return false;
-}
-
+/* An orphan of the dataset that the reap could not clear answers with its
+ * evict's error: the key is still in RAM. */
 static stm_status ctl_dek_evict(stm_ctl_conn *cn, uint64_t dataset_id)
 {
     stm_ctl *c = cn->ctl;
     pthread_mutex_lock(&c->dek_mu);
+    ctl_dek_reap_orphans(c);
     bool foreign = false;
+    stm_status orphan_rc = STM_OK;
     for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {
         if (!c->dek_leases[i].active || c->dek_leases[i].dataset_id != dataset_id)
             continue;
+        if (c->dek_leases[i].orphan) {
+            orphan_rc = c->dek_leases[i].orphan_rc;
+            continue;
+        }
         if (c->dek_leases[i].owner != cn) { foreign = true; continue; }
         stm_status rc = ctl_dek_other_lease(c, i) ? STM_OK :
             stm_fs_evict_dek(c->fs, dataset_id);
@@ -690,7 +722,8 @@ static stm_status ctl_dek_evict(stm_ctl_conn *cn, uint64_t dataset_id)
         return rc;
     }
     pthread_mutex_unlock(&c->dek_mu);
-    return foreign ? STM_EACCES : STM_OK;
+    if (foreign) return STM_EACCES;
+    return orphan_rc;
 }
 
 /* TLY-A5b #826c: first-login home provisioning. SYSTEM-only (gated at
@@ -777,6 +810,7 @@ static stm_status ctl_provision_dek(stm_ctl_conn *cn, uint64_t parent,
         .n_retries          = c->corvus_n_retries,
     };
     pthread_mutex_lock(&c->dek_mu);
+    ctl_dek_reap_orphans(c);
     int free_slot = -1;
     for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++)
         if (!c->dek_leases[i].active) { free_slot = i; break; }
@@ -4302,18 +4336,24 @@ void stm_ctl_conn_destroy(stm_ctl_conn *cn)
     /* TLY-A5b F7 connection-binding: auto-evict every DEK this conn
      * installed (logout-via-disconnect, or a dropped login session).
      * Done under dek_mu BEFORE free(cn) so no lease retains the about-
-     * to-be-freed `cn` identity pointer; cleared unconditionally (the
-     * conn is dying -- best-effort eviction, but the lease MUST go). */
+     * to-be-freed `cn` identity pointer. A failed evict leaves the key in
+     * RAM, so its lease stays, as an orphan, and is retried. */
     pthread_mutex_lock(&ctl->dek_mu);
     for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {
-        if (!ctl->dek_leases[i].active || ctl->dek_leases[i].owner != cn)
-            continue;
+        ctl_dek_lease *l = &ctl->dek_leases[i];
+        if (!l->active || l->owner != cn) continue;
+        stm_status rc = STM_OK;
         if (ctl->fs && !ctl_dek_other_lease(ctl, i))
-            (void)stm_fs_evict_dek(ctl->fs, ctl->dek_leases[i].dataset_id);
-        ctl->dek_leases[i].active     = false;
-        ctl->dek_leases[i].dataset_id = 0;
-        ctl->dek_leases[i].owner      = NULL;
+            rc = stm_fs_evict_dek(ctl->fs, l->dataset_id);
+        l->owner = NULL;
+        if (rc == STM_OK) {
+            *l = (ctl_dek_lease){0};
+        } else {
+            l->orphan    = true;
+            l->orphan_rc = rc;
+        }
     }
+    ctl_dek_reap_orphans(ctl);
     pthread_mutex_unlock(&ctl->dek_mu);
 
     free(cn);

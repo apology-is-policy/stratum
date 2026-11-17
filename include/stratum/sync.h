@@ -920,6 +920,16 @@ stm_status stm_sync_dataset_key_user_sealed(stm_sync *s, uint64_t dataset_id,
                                             bool *out_sealed);
 
 /*
+ * Whether `dataset_id` is LOCKED: its CURRENT key is sealed by its user
+ * and no session has installed it (the mount had no token for it, or
+ * stm_sync_evict_dek took it out). False for every other dataset, a
+ * dataset with no key included. Lock-free (a short EBR pin over the
+ * published DEK map), so the caller must hold no EBR pin; a thread with
+ * no EBR handle takes s->lock instead.
+ */
+bool stm_sync_dataset_locked(stm_sync *s, uint64_t dataset_id);
+
+/*
  * TLY-A3-keyslot-wrap: add a new dataset's key via the corvus WRAP
  * verb — the provisioning-time counterpart of stm_sync_add_dataset_key
  * for a corvus-encrypted dataset.
@@ -1035,11 +1045,12 @@ size_t stm_sync_dek_count(const stm_sync *s);
  * if the dataset has no CURRENT keyslot; the typed corvus errors
  * (STM_ECORVUSAUTH / STM_ECORVUSPERM / ...) on an UNWRAP rejection.
  *
- * stm_sync_evict_dek removes + zeroes the dataset's DEK, returning it to
- * the LOCKED posture (a subsequent read/write yields STM_ELOCKED).
- * Idempotent (already-evicted -> STM_OK); CORVUS-only (evicting a local
- * dataset's DEK would leave it permanently unreadable -- no runtime
- * re-install path exists for the keyfile/janus sources).
+ * stm_sync_evict_dek takes the dataset's DEK out of RAM, returning it to
+ * the LOCKED posture (a subsequent read/write yields STM_ELOCKED, and
+ * stm_sync_dataset_locked answers true). STM_ENOMEM leaves the key
+ * installed. Idempotent (already-evicted -> STM_OK); CORVUS-only
+ * (evicting a local dataset's DEK would leave it permanently unreadable
+ * -- no runtime re-install path exists for the keyfile/janus sources).
  */
 STM_MUST_USE
 stm_status stm_sync_install_dek(stm_sync *s, uint64_t dataset_id,

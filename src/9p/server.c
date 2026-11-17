@@ -376,6 +376,7 @@ static uint32_t status_to_errno(stm_status s)
     case STM_ENOENT:           return STM_9P_ECODE_ENOENT;
     case STM_EEXIST:           return STM_9P_ECODE_EEXIST;
     case STM_EACCES:           return STM_9P_ECODE_EACCES;
+    case STM_ELOCKED:          return STM_9P_ECODE_EACCES; /* key not installed */
     case STM_EBUSY:            return STM_9P_ECODE_EBUSY;
     case STM_EAGAIN:           return STM_9P_ECODE_EAGAIN;
     case STM_ENODEV:           return STM_9P_ECODE_ENODEV;
@@ -1241,8 +1242,8 @@ static stm_status h_attach(stm_9p_server *s,
          * a separate dataset with its own DEK). The proxy's --datasets-allowed
          * gates which aname a connection may request (the I-1 user-vs-user
          * boundary); the child dataset's 0700 owner + its installed DEK are the
-         * other two access gates (an un-unlocked dataset's root stat fails ->
-         * the attach is inert). */
+         * other two access gates (a locked dataset refuses the attach,
+         * STM_ELOCKED, below). */
         aname_kind = ANAME_DATASET;
     } else if (aname && alen >= 1u && aname[0] == '/') {
         aname_kind = ANAME_ABS_PATH;
@@ -1275,10 +1276,12 @@ static stm_status h_attach(stm_9p_server *s,
         }
     } else if (aname_kind == ANAME_DATASET) {
         /* Resolve `ds:<name>` -> the child dataset id under the root, then
-         * bind the connection root to THAT dataset's root inode (ino==1). The
-         * root-inode stat reads the child dataset -- which requires its DEK be
-         * installed, so an un-provisioned / locked home attach fails here (the
-         * third access gate). The lookup + the stat are separate locked steps
+         * bind the connection root to THAT dataset's root inode (ino==1). A
+         * LOCKED dataset (a user-sealed home whose user is logged out) is
+         * refused here, STM_ELOCKED: the third access gate. Its records open
+         * with the pool's key, so a stat alone would answer; the fs refuses
+         * every op on it as well, so a fid attached before the logout gets
+         * ELOCKED too. The lookup + the check + the stat are separate steps
          * (not one critical section); a concurrent destroy of child_ds in the
          * window only makes the stat fail -> clean attach abort. Dataset ids are
          * monotonic + never reused, so the resolved child_ds can never alias a
@@ -1290,6 +1293,11 @@ static stm_status h_attach(stm_9p_server *s,
         if (rc != STM_OK) {
             fid_release_locked(s, f);
             return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+        }
+        if (stm_fs_dataset_locked(s->fs, child_ds)) {
+            fid_release_locked(s, f);
+            return reply_rlerror_status(resp, resp_cap, resp_len, tag,
+                                        STM_ELOCKED);
         }
         struct stm_inode_value root_iv;
         rc = stm_fs_stat(s->fs, child_ds, 1u, &root_iv);
