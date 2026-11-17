@@ -2702,4 +2702,251 @@ STM_TEST(send_of_a_record_naming_a_freed_block_is_refused) {
     testpool_teardown(&src);
 }
 
+/* Every record of a stream, into nowhere: the first failure, or STM_OK at
+ * its end. */
+static stm_status hold_drain(stm_send_handle *sh)
+{
+    size_t cap = (size_t)1 << 20;
+    uint8_t *buf = malloc(cap);
+    if (!buf) return STM_ENOMEM;
+    stm_status rc = STM_EIO;
+    for (int i = 0; i < 4096; i++) {
+        size_t out_len = 0, needed = 0;
+        stm_status sn = stm_send_next(sh, buf, cap, &out_len, &needed);
+        if (sn == STM_ENOENT) { rc = STM_OK; break; }
+        if (sn != STM_OK) { rc = sn; break; }
+    }
+    free(buf);
+    return rc;
+}
+
+/* The refusal above holds only while nothing has the block again. A record
+ * naming a block another write was given since is pinned on that write's
+ * run, and the stream fails its tag check: closed, never the other write's
+ * bytes. */
+STM_TEST(send_of_a_record_naming_a_given_out_block_fails_closed) {
+    testpool src; testpool_setup(&src, "hgo_src", POOL_UUID_SRC);
+    uint8_t a[4096];
+    memset(a, 0xAD, sizeof a);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    const uint64_t old = hold_rec(&src, 1).paddrs[0];
+    uint64_t len = 0;
+    STM_ASSERT_OK(stm_alloc_lookup(hold_alloc(&src, old), old, &len, NULL));
+    STM_ASSERT_OK(stm_alloc_free(hold_alloc(&src, old), old, 0u));
+    hold_commit2(&src);
+    const uint64_t took = hold_take(&src, old, len);
+    STM_ASSERT_EQ(took, old);
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0, 0, &sh));
+    if (sh) STM_ASSERT_ERR(hold_drain(sh), STM_EBADTAG);
+    stm_send_close(sh);
+    /* The record still names the block: the reservation stays, out of the
+     * next write's way. */
+    hold_expect_none_left(&src);
+    testpool_teardown(&src);
+}
+
+/* A snapshot deleted after init found it and before the collect, its tree
+ * still whole: the barrier keeps the blocks the delete frees, and the send
+ * streams the snapshot as found. The delete, its two commits and a write
+ * asking for the snapshot's block all run in the seam before the collect. */
+typedef struct {
+    testpool *src;
+    uint64_t  snap;
+    uint64_t  old;
+    uint64_t  len;
+    uint64_t  took;
+    int       fired;
+} hold_late_ctx;
+
+static void hold_late_hook(void *arg, int stage)
+{
+    hold_late_ctx *c = arg;
+    if (stage != STM_SEND_INIT_HOOK_BEFORE_COLLECT) return;
+    c->fired++;
+    size_t freed = 0;
+    STM_ASSERT_OK(stm_fs_delete_snapshot(c->src->fs, c->snap, &freed));
+    hold_commit2(c->src);
+    c->len  = hold_expect_waiting(c->src, c->old);
+    c->took = hold_take(c->src, c->old, c->len);
+}
+
+STM_TEST(send_of_a_snapshot_deleted_after_its_lookup_streams_it) {
+    testpool src; testpool_setup(&src, "hdl_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "hdl_tgt", POOL_UUID_TGT);
+    uint8_t a[4096], b[4096];
+    memset(a, 0xA2, sizeof a);
+    memset(b, 0xB3, sizeof b);
+    hold_late_ctx c = { .src = &src };
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    c.old = hold_rec(&src, 1).paddrs[0];
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "s", 1, &c.snap));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, b, sizeof b));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    STM_ASSERT(hold_rec(&src, 1).paddrs[0] != c.old);
+
+    stm_send_set_init_hook_for_test(hold_late_hook, &c);
+    stm_send_handle *sh = NULL;
+    stm_status is = stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0, c.snap, &sh);
+    stm_send_set_init_hook_for_test(NULL, NULL);
+    STM_ASSERT_EQ(c.fired, 1);
+    STM_ASSERT_OK(is);
+    STM_ASSERT(c.took != c.old);
+    if (is == STM_OK && sh) hold_stream_to(sh, &tgt);
+    send_expect(&tgt, 1, a, "the snapshot, deleted after init found it");
+    stm_send_close(is == STM_OK ? sh : NULL);
+    hold_untake(&src, c.took);
+    hold_expect_released(&src, c.old, c.len);
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* A rollback deletes every snapshot newer than its target and frees what
+ * only they and the old tree named. A send of a newer snapshot beside it
+ * either found the snapshot before the rollback took it out of the index,
+ * and keeps its blocks, or finds it gone: never a snapshot whose blocks are
+ * already freed. From the rollback's seam after its reclaim, the send runs
+ * on its own thread and would wait before its pins while the rollback
+ * commits, one more commit sweeps, and a write asks for the block; it finds
+ * the snapshot gone. Started before the rollback instead (the control), it
+ * found the snapshot first, keeps the block through all of that, and
+ * streams. */
+#include <pthread.h>
+#include <time.h>
+
+typedef struct {
+    testpool       *src;
+    uint64_t        snap2;
+    stm_status      init_rc;
+    stm_status      stream_rc;
+    bool            started;
+    bool            at_pins;
+    bool            released;
+    bool            done;
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    pthread_t       th;
+} rb_send_ctx;
+
+/* Waits, 60 s at most, for *a or *b (b may be NULL); returns whether one came. */
+static bool rb_wait(rb_send_ctx *c, const bool *a, const bool *b)
+{
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += 60;
+    pthread_mutex_lock(&c->mu);
+    while (!*a && !(b && *b))
+        if (pthread_cond_timedwait(&c->cv, &c->mu, &until) != 0) break;
+    bool got = *a || (b && *b);
+    pthread_mutex_unlock(&c->mu);
+    return got;
+}
+
+static void rb_set(rb_send_ctx *c, bool *flag)
+{
+    pthread_mutex_lock(&c->mu);
+    *flag = true;
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+}
+
+static void rb_send_pins_hook(void *arg, int stage)
+{
+    rb_send_ctx *c = arg;
+    if (stage != STM_SEND_INIT_HOOK_BEFORE_PINS) return;
+    rb_set(c, &c->at_pins);
+    (void)rb_wait(c, &c->released, NULL);
+}
+
+static void *rb_send_thread(void *arg)
+{
+    rb_send_ctx *c = arg;
+    stm_send_handle *sh = NULL;
+    c->init_rc = stm_send_init(stm_fs_sync_for_test(c->src->fs), 1, 0, c->snap2, &sh);
+    c->stream_rc = (c->init_rc == STM_OK && sh) ? hold_drain(sh) : c->init_rc;
+    stm_send_close(c->init_rc == STM_OK ? sh : NULL);
+    rb_set(c, &c->done);
+    return NULL;
+}
+
+/* Returns once the send waits before its pins, or has finished. */
+static void rb_send_start(void *arg)
+{
+    rb_send_ctx *c = arg;
+    if (pthread_create(&c->th, NULL, rb_send_thread, c) != 0) return;
+    c->started = true;
+    (void)rb_wait(c, &c->at_pins, &c->done);
+}
+
+static void rb_send_case(const char *tag, bool from_seam)
+{
+    testpool src; testpool_setup(&src, tag, POOL_UUID_SRC);
+    uint8_t a[4096], z[4096];
+    memset(a, 0xA3, sizeof a);
+    memset(z, 0x3D, sizeof z);
+    rb_send_ctx c;
+    memset(&c, 0, sizeof c);
+    c.src = &src;
+    pthread_mutex_init(&c.mu, NULL);
+    pthread_cond_init(&c.cv, NULL);
+    uint64_t s1 = 0;
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 2, 0, z, sizeof z));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "s1", 1, &s1));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    const uint64_t old = hold_rec(&src, 1).paddrs[0];
+    uint64_t len = 0;
+    STM_ASSERT_OK(stm_alloc_lookup(hold_alloc(&src, old), old, &len, NULL));
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "s2", 2, &c.snap2));
+
+    stm_send_set_init_hook_for_test(rb_send_pins_hook, &c);
+    if (from_seam) {
+        stm_fs_set_rollback_reclaimed_hook_for_test(src.fs, rb_send_start, &c);
+    } else {
+        rb_send_start(&c);
+        STM_ASSERT(c.at_pins);
+    }
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(src.fs, 1, s1, false));
+    stm_fs_set_rollback_reclaimed_hook_for_test(src.fs, NULL, NULL);
+    STM_ASSERT(c.started);
+    stm_snapshot_entry e;
+    STM_ASSERT_ERR(stm_snapshot_lookup(stm_sync_snapshot_index(stm_fs_sync_for_test(src.fs)),
+                                       c.snap2, &e), STM_ENOENT);
+    /* The rollback freed the block in its commit; one more sweeps it,
+     * unless a hold keeps it. */
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    const uint64_t took = hold_take(&src, old, len);
+    rb_set(&c, &c.released);
+    if (c.started) pthread_join(c.th, NULL);
+    stm_send_set_init_hook_for_test(NULL, NULL);
+    stm_test_info("rollback beside a send (%s): init %d, stream %d, the block %s",
+                  from_seam ? "from the seam" : "found first", (int)c.init_rc,
+                  (int)c.stream_rc, took == old ? "given out" : "kept");
+    if (from_seam) {
+        STM_ASSERT_ERR(c.init_rc, STM_ENOENT);
+        STM_ASSERT_EQ(took, old);
+        hold_untake(&src, took);
+    } else {
+        STM_ASSERT_OK(c.init_rc);
+        STM_ASSERT_OK(c.stream_rc);
+        STM_ASSERT(took != old);
+        hold_untake(&src, took);
+        hold_expect_released(&src, old, len);
+    }
+    pthread_cond_destroy(&c.cv);
+    pthread_mutex_destroy(&c.mu);
+    testpool_teardown(&src);
+}
+
+STM_TEST(send_of_a_snapshot_a_rollback_deletes_finds_it_gone) {
+    rb_send_case("hrb_seam", true);
+}
+
+STM_TEST(send_of_a_snapshot_found_before_a_rollback_keeps_its_blocks) {
+    rb_send_case("hrb_first", false);
+}
+
 STM_TEST_MAIN("send_recv")

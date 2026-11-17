@@ -326,6 +326,8 @@ struct stm_fs {
     void *rename_walk_hook_arg;
     stm_fs_rollback_committed_hook rollback_committed_hook;
     void *rollback_committed_hook_arg;
+    stm_fs_rollback_reclaimed_hook rollback_reclaimed_hook;
+    void *rollback_reclaimed_hook_arg;
     stm_fs_write_guard_hook write_guard_hook;
     void *write_guard_hook_arg;
     stm_fs_reclaim_hook reclaim_hook;
@@ -3781,6 +3783,14 @@ void stm_fs_set_rollback_committed_hook_for_test(stm_fs *fs,
 {
     fs->rollback_committed_hook = fn;
     fs->rollback_committed_hook_arg = arg;
+}
+
+void stm_fs_set_rollback_reclaimed_hook_for_test(stm_fs *fs,
+                                                 stm_fs_rollback_reclaimed_hook fn,
+                                                 void *arg)
+{
+    fs->rollback_reclaimed_hook = fn;
+    fs->rollback_reclaimed_hook_arg = arg;
 }
 
 void stm_fs_set_write_guard_hook_for_test(stm_fs *fs,
@@ -10345,9 +10355,11 @@ static int fs_rb_paddr_cmp(const void *a, const void *b)
  *
  * Every block reachable-from-old-live-but-not-from-`s` was allocated
  * AFTER `s` (incremental COW only ever writes fresh paddrs), so no older
- * snapshot can reference it. A newer snapshot can, and the caller deletes
- * every newer snapshot in this same rollback: a cloned or held one
- * refuses it before the first destructive step.
+ * snapshot can reference it. A newer snapshot can: the caller took every
+ * newer snapshot out of the index before this runs
+ * (fs_rollback_detach_newer_snaps) and does not call this if one would not
+ * go; a cloned or held one refuses the rollback before the first
+ * destructive step.
  *
  * BEST-EFFORT: any walk / collect / per-paddr free failure leaves the
  * unreclaimed remainder LEAKED — a space cost, never a corruption (a
@@ -10971,11 +10983,65 @@ static void fs_rollback_reclaim_cleared_dead_list_garbage(
     free(dead_cold);
 }
 
-/* 9.7-impl-4d: reclaim the NEWER-SNAPSHOT-CASCADE tier — for each PRESENT
- * snapshot newer than the rollback target, delete it via
- * stm_snapshot_delete and reclaim the surviving (case-(b)) garbage in its
- * three dead-lists. The garbage is the third `to_free` term in
- * dead_list.tla::Rollback: `newer_dead \ s_view`.
+/* A newer snapshot a rollback took out of the index, with the three lists its
+ * delete handed back; `gone` false if the delete refused, and it kept them. */
+typedef struct {
+    bool      gone;
+    uint64_t *paddrs;
+    size_t    n_paddrs;
+    uint8_t  *cold;
+    size_t    n_cold;
+    uint64_t *boot;
+    size_t    n_boot;
+} fs_rb_detached;
+
+/* Take every newer snapshot out of the index, before the rollback frees
+ * anything. The reclaim frees blocks only the old tree and these snapshots
+ * name, and a send finds a snapshot's records only while the snapshot is in
+ * the index: a send that found one began its hold before this, so what the
+ * reclaim frees waits for it (sync.h, send holds); one that looks after this
+ * finds it gone. Returns whether every one went. `out` (n entries) gets the
+ * lists for fs_rollback_reclaim_newer_snap_cascade; NULL drops them, a leak.
+ * Caller holds fs->global EX. */
+static bool fs_rollback_detach_newer_snaps(stm_snapshot_index *sidx,
+                                           const uint64_t *ids, size_t n,
+                                           fs_rb_detached *out)
+{
+    bool all = true;
+    for (size_t i = 0; i < n; i++) {
+        fs_rb_detached d;
+        memset(&d, 0, sizeof d);
+        stm_status del = stm_snapshot_delete_past_rollback(sidx, ids[i],
+                &d.paddrs, &d.n_paddrs, &d.cold, &d.n_cold, &d.boot, &d.n_boot);
+        d.gone = (del == STM_OK);
+        if (!d.gone) all = false;
+        if (out) {
+            out[i] = d;
+        } else {
+            free(d.paddrs);
+            free(d.cold);
+            free(d.boot);
+        }
+    }
+    return all;
+}
+
+static void fs_rb_detached_free(fs_rb_detached *d, size_t n)
+{
+    if (!d) return;
+    for (size_t i = 0; i < n; i++) {
+        free(d[i].paddrs);
+        free(d[i].cold);
+        free(d[i].boot);
+    }
+    free(d);
+}
+
+/* 9.7-impl-4d: reclaim the NEWER-SNAPSHOT-CASCADE tier -- for each snapshot
+ * newer than the rollback target, which fs_rollback_detach_newer_snaps took
+ * out of the index before the rollback freed anything, reclaim the
+ * surviving (case-(b)) garbage in its three dead-lists. The garbage is the
+ * third `to_free` term in dead_list.tla::Rollback: `newer_dead \ s_view`.
  *
  * WHY NEWER SNAPS' DEAD-LISTS HOLD CASE-(a) ENTRIES (not just garbage)
  * — same shape as 4c-iii's target-side argument lifted one chain link:
@@ -11028,29 +11094,19 @@ static void fs_rollback_reclaim_cleared_dead_list_garbage(
  * SAFETY (load-bearing): identical posture as the 4b/4c/4c-ii/4c-iii
  * tiers — best-effort, walk-must-complete, NEVER over-deref / over-free.
  * If a walk fails the corresponding tier is skipped entirely (no partial
- * filtering — that would risk freeing case-(a) survivors). If a per-snap
- * stm_snapshot_delete fails THAT SNAP's reclaim is skipped; the
- * remaining snaps in the cascade still process. Leaked paddrs / cold
+ * filtering -- that would risk freeing case-(a) survivors). If a per-snap
+ * delete refused, THAT SNAP's reclaim is skipped (and the caller skipped
+ * 4b/4c/4c-ii/4c-iii); the remaining snaps still process. Leaked paddrs / cold
  * refcounts are a space cost, never a corruption — a leaked paddr stays
  * ALLOCATED so the AEAD-nonce (paddr, write_gen) pair stays unique.
  *
- * R165 P2-1 — CASCADE-FAILURE LATENT CORRUPTION WINDOW (forward-compat):
- * 4b/4c/4c-ii already ran by the time this helper executes. They freed
- * `OLD ∖ s_target.view` paddrs — which INCLUDES paddrs that a newer
- * snap `s_a` references in its frozen tree (a paddr allocated post-s_
- * target but pre-s_a is in s_a.view AND in OLD-live ∖ s_target.view,
- * so 4b/4c freed it). The cascade's `stm_snapshot_delete` of s_a must
- * succeed for s_a's frozen tree to disappear; if it fails best-effort,
- * s_a stays PRESENT and its tree references freed paddrs. The rollback
- * commit advances gen → after the next commit those paddrs become
- * REUSABLE → any later read of s_a's frozen tree decrypts with a stale
- * `(paddr, write_gen)` pair → AEAD verify fails → STM_ECORRUPT on
- * any access to s_a. No nonce REUSE (each (paddr, write_gen) is
- * still unique), but s_a is silently CORRUPTED. Unreachable today: the
- * only delete failures are STM_EBUSY on a hold or a clone, and the
- * caller pre-validates both under fs->global EX. A new delete failure
- * mode has to extend that pre-validate, or move the cascade before
- * 4b/4c/4c-ii (the spec's order).
+ * The snapshots left the index before 4b/4c/4c-ii (the spec's order), in
+ * fs_rollback_detach_newer_snaps. Those tiers free `OLD \ s_target.view`,
+ * which includes blocks a newer snapshot's frozen tree names, and a send
+ * finds that tree's records only while the snapshot is in the index. A
+ * delete that refused (only a hold or a clone, which the caller refuses
+ * first under fs->global EX) makes the caller skip those tiers: that
+ * snapshot's tree never names a freed block.
  *
  * AGGREGATION (cold tier only): newer snaps' cold dead-lists are
  * accumulated into a single agg_cold buffer (one realloc-growth pass),
@@ -11082,12 +11138,12 @@ static void fs_rollback_reclaim_newer_snap_cascade(
         stm_dataset_index *didx,
         stm_extent_index *eidx,
         uint64_t dataset_id,
-        const uint64_t *newer_snap_ids,
+        const fs_rb_detached *detached,
         size_t n_newer,
         uint64_t old_paddr, uint64_t old_gen, const uint8_t old_csum[32],
         uint64_t snap_paddr, uint64_t snap_gen, const uint8_t snap_csum[32])
 {
-    if (n_newer == 0) return;
+    if (n_newer == 0 || !detached) return;
 
     uint64_t free_gen = stm_sync_current_gen(fs->sync);
 
@@ -11159,29 +11215,14 @@ static void fs_rollback_reclaim_newer_snap_cascade(
 
     /* ---------- Per-snap delete + boot/data reclaim ------------------- */
     for (size_t i = 0; i < n_newer; i++) {
-        uint64_t sid = newer_snap_ids[i];
-
-        uint64_t *freed_paddrs = NULL;
-        size_t    freed_n      = 0;
-        uint8_t  *cold_hashes  = NULL;
-        size_t    cold_n       = 0;
-        uint64_t *freed_boot   = NULL;
-        size_t    freed_boot_n = 0;
-
-        stm_status del = stm_snapshot_delete_past_rollback(sidx, sid,
-                                                &freed_paddrs, &freed_n,
-                                                &cold_hashes, &cold_n,
-                                                &freed_boot, &freed_boot_n);
-        if (del != STM_OK) {
-            /* Best-effort: this snap stays present + retains its dead-
-             * lists; the other newer snaps' reclaims still proceed.
-             * stm_snapshot_delete already zeroed the out buffers on
-             * non-OK return; defensive free is harmless. */
-            free(freed_paddrs);
-            free(cold_hashes);
-            free(freed_boot);
-            continue;
-        }
+        /* A snapshot whose delete refused kept its lists. */
+        if (!detached[i].gone) continue;
+        const uint64_t *freed_paddrs = detached[i].paddrs;
+        size_t          freed_n      = detached[i].n_paddrs;
+        const uint8_t  *cold_hashes  = detached[i].cold;
+        size_t          cold_n       = detached[i].n_cold;
+        const uint64_t *freed_boot   = detached[i].boot;
+        size_t          freed_boot_n = detached[i].n_boot;
 
         /* Boot tier (engine NODE paddrs / stm_bootstrap_free): filter
          * vs s.view's bootstrap paddr set. */
@@ -11271,9 +11312,6 @@ static void fs_rollback_reclaim_newer_snap_cascade(
             }
         }
 
-        free(freed_paddrs);
-        free(cold_hashes);
-        free(freed_boot);
     }
 
     /* ---------- Cold tier post-loop counted subtraction --------------- */
@@ -11615,6 +11653,18 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         return s;
     }
 
+    /* Every newer snapshot leaves the index before the first free below: its
+     * frozen tree names blocks the reclaim frees (fs_rollback_detach_newer_snaps).
+     * The counts above only went down to what the view names, never to zero.
+     * If one would not go, the reclaim is skipped and its blocks leak. */
+    fs_rb_detached *detached = NULL;
+    bool newer_gone = true;
+    if (n_newer > 0) {
+        detached = calloc(n_newer, sizeof *detached);
+        newer_gone = fs_rollback_detach_newer_snaps(sidx, newer_ids, n_newer,
+                                                    detached);
+    }
+
     /* Reclaim the post-snapshot divergence — blocks reachable from the
      * pre-rollback live tree but not from the snapshot's frozen tree.
      * FOUR tiers run here:
@@ -11642,7 +11692,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * dead_list.tla::Rollback's `to_free` minus the `newer_dead \ s_view`
      * term — which the impl-4d newer-snapshot cascade picks up after the
      * newer-snapshot refusal lifts. */
-    if (have_old_root) {
+    if (have_old_root && newer_gone) {
         fs_rollback_reclaim_diverged_nodes(fs, didx, dataset_id,
                 de_old.di_tree_root, de_old.di_root_gen, de_old.di_root_csum,
                 entry.tree_root_paddr, entry.root_gen, entry.root_csum);
@@ -11686,6 +11736,10 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
                 entry.tree_root_paddr, entry.root_gen, entry.root_csum);
     }
     free(view_data.v);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->rollback_reclaimed_hook)
+        fs->rollback_reclaimed_hook(fs->rollback_reclaimed_hook_arg);
+#endif
 
     /* Clear the target snapshot's dead-lists. MOVED here from
      * pre-reclaim (impl-4 original position) at 9.7-impl-4c-iii: the
@@ -11711,6 +11765,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
          * fs->global EX. Defensive — the in-RAM triple is swapped but
          * not durable, crash-equivalent inconsistent state → wedge
          * (R154 Q2). */
+        fs_rb_detached_free(detached, n_newer);
         free(newer_ids);
         fs_mark_wedged_locked(fs);
         pthread_rwlock_unlock(&fs->global);
@@ -11719,8 +11774,9 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
 
     /* 9.7-impl-4d: newer-snapshot CASCADE. With the target's tier 4b/4c/
      * 4c-ii/4c-iii reclaim + clear_dead_lists already done, iterate the
-     * newer-than-target PRESENT snapshots collected earlier. Each is
-     * deleted via stm_snapshot_delete_past_rollback, whose lists come here
+     * newer-than-target snapshots, out of the index since before the
+     * reclaim (fs_rollback_detach_newer_snaps). Each was deleted via
+     * stm_snapshot_delete_past_rollback, whose lists come here
      * and do not move to the older neighbour; its three dead-lists are
      * filtered by `\ s_view` (boot/data set-difference; cold per-hash counted
      * subtraction against snap_unique) and survivors reclaimed. Best-
@@ -11735,10 +11791,12 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
                                                   : (const uint8_t[32]){0};
         fs_rollback_reclaim_newer_snap_cascade(
                 fs, sidx, didx, eidx_n,
-                dataset_id, newer_ids, n_newer,
+                dataset_id, detached, n_newer,
                 old_paddr_n, old_gen_n, old_csum_n,
                 entry.tree_root_paddr, entry.root_gen, entry.root_csum);
     }
+    fs_rb_detached_free(detached, n_newer);
+    detached = NULL;
     free(newer_ids);
     newer_ids = NULL;
 

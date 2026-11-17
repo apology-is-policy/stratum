@@ -426,17 +426,22 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen);
  * Holds, in RAM only: a reader that copied records outside the sync lock
  * (a send) keeps their runs from the sweep while it reads them. Neither
  * kind changes a refcount, the tree or anything durable: a held run stays
- * PENDING (refcount 0), the first commit after its last hold goes sweeps
- * it, and a crash drops every hold.
+ * PENDING (refcount 0) and is swept as it would have been without the
+ * hold, by the later of the second commit after its free and the first
+ * after its last hold goes; a crash drops every hold.
  *
  * A barrier keeps every run that goes PENDING after it is raised, by the
  * order of the frees under the allocator's lock (not by their free_gen,
  * which the evacuation paths stamp below the current gen), until it is
  * dropped. A pin keeps the run that starts at `paddr` while its count is
- * above zero; two readers can pin one run.
+ * above zero; two readers can pin one run. A pin keeps whatever run
+ * starts there: it cannot tell the run a reader's record named from a
+ * later write's at the same start.
  *
- * stm_alloc_pin: STM_ENOENT if no run starts at `paddr`; a PENDING run
- * can be pinned. STM_ERANGE at the count's ceiling.
+ * stm_alloc_pin: STM_EINVAL for a NULL allocator or a paddr on another
+ * device; STM_ENOENT if no run starts at `paddr` (a PENDING run can be
+ * pinned); STM_ECORRUPT for a malformed tree entry; STM_ERANGE at the
+ * count's ceiling.
  * stm_alloc_unpin: STM_ENOENT if the run is not pinned.
  * stm_alloc_barrier_drop: STM_ENOENT for a token not raised here.
  */

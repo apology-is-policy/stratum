@@ -36,9 +36,24 @@
 \*     barrier keeps by free_gen, which frees stamped with the
 \*     authoritative gen (the evacuation paths; AuthStampedFrees) get
 \*     past.
+\*     SendBlocksKept rests on DeindexBeforeFree, an obligation on the
+\*     code: a range's last free comes only after every tree a send
+\*     reads has dropped the record naming it, or in one sync-lock hold
+\*     with that drop. Every stm_alloc_free path de-indexes first; a
+\*     rollback takes the newer snapshots out of the index before its
+\*     reclaim. A fourth buggy cfg lets a last free come while a tree
+\*     still names the range (`stale`), and SendBlocksKept fails: the
+\*     free precedes the barrier, the collect then finds the record.
 \*
 \* What this spec does NOT model (deferred to other specs and code):
 \*
+\*   - Of the send: one send at a time (pins are counted per run in
+\*     the code, and barriers listed); the trees and the snapshot index
+\*     (a record is a range some owner holds, or one in `stale`); the
+\*     allocator serial that tells a replaced allocator; pins keyed by
+\*     a run's start block, which cannot tell a record's run from
+\*     another write's at the same start (a record naming a block given
+\*     out again fails at the tag check, not at the pin).
 \*   - MVCC reader safety across allocator updates: concurrency.tla
 \*     proves EBR reader-safety for the delta-chain substrate; that
 \*     applies verbatim when allocator operations are layered on it.
@@ -71,7 +86,8 @@ CONSTANTS
     AuthStampedFrees,       \* a free may stamp the gen before the current
     SweepHonoursPins,       \* FALSE: the sweep ignores a send's pins
     SweepHonoursBarrier,    \* FALSE: the sweep ignores a send's barrier
-    BarrierByOrder          \* FALSE: the barrier keeps by free_gen
+    BarrierByOrder,         \* FALSE: the barrier keeps by free_gen
+    DeindexBeforeFree       \* FALSE: a last free may come while a tree names the range
 
 ASSUME /\ Ranges  # {}
        /\ Owners  # {}
@@ -82,6 +98,7 @@ ASSUME /\ Ranges  # {}
        /\ SweepHonoursPins \in BOOLEAN
        /\ SweepHonoursBarrier \in BOOLEAN
        /\ BarrierByOrder \in BOOLEAN
+       /\ DeindexBeforeFree \in BOOLEAN
 
 States == {"FREE", "ALLOCATED", "PENDING"}
 
@@ -101,11 +118,14 @@ VARIABLES
     phase,         \* the send: "idle", "collecting" (barrier up), "holding"
     collected,     \* ranges the send's records name
     late,          \* ranges that went PENDING while the barrier was up
-    barrier_gen    \* current_gen when the barrier went up
+    barrier_gen,   \* current_gen when the barrier went up
+    stale          \* ranges a tree still names after their last free
 
-send_vars == <<phase, collected, late, barrier_gen>>
+\* What the send reads and keeps; the allocator's own actions leave it.
+send_vars == <<phase, collected, late, barrier_gen, stale>>
 vars == <<state, owns, free_gen, current_gen, durable_gen,
-          written, last_sealed, reused, phase, collected, late, barrier_gen>>
+          written, last_sealed, reused, phase, collected, late, barrier_gen,
+          stale>>
 
 \* --------------------------------------------------------------------------
 \* Helpers.
@@ -144,6 +164,7 @@ Init ==
     /\ collected   = {}
     /\ late        = {}
     /\ barrier_gen = 0
+    /\ stale       = {}
 
 \* --------------------------------------------------------------------------
 \* Actions.
@@ -216,9 +237,14 @@ Unref(r, o) ==
                      /\ \E g \in Stamps : free_gen' = [free_gen EXCEPT ![r] = g]
                      /\ late' = IF phase = "collecting" THEN late \cup {r}
                                                         ELSE late
+                     /\ \E still_named \in BOOLEAN :
+                          stale' = IF still_named /\ ~DeindexBeforeFree
+                                      /\ written[r]
+                                     THEN stale \cup {r} ELSE stale
                 ELSE /\ UNCHANGED state
                      /\ UNCHANGED free_gen
                      /\ UNCHANGED late
+                     /\ UNCHANGED stale
     /\ UNCHANGED <<current_gen, durable_gen, written, last_sealed, reused,
                    phase, collected, barrier_gen>>
 
@@ -246,11 +272,21 @@ Commit ==
                            THEN 0 ELSE free_gen[r]]
     /\ UNCHANGED <<owns, written, last_sealed, reused, send_vars>>
 
+\* Deindex(r) -- the tree that still named r after its last free drops
+\* the record (only where DeindexBeforeFree is FALSE).
+Deindex(r) ==
+    /\ r \in stale
+    /\ stale' = stale \ {r}
+    /\ UNCHANGED <<state, owns, free_gen, current_gen, durable_gen, written,
+                   last_sealed, reused, phase, collected, late, barrier_gen>>
+
 \* The send (stm_send_init, stm_send_close). Begin raises the barrier;
 \* Collect copies a published record, which names a written range some
 \* owner holds (Unreserve, which skips PENDING, cannot take a written
-\* range); Pin pins what was collected and drops the barrier; End drops
-\* the pins.
+\* range), or one a tree still names after its last free while it is
+\* still PENDING (a record naming a FREE range has no run to pin, and the
+\* code refuses it); Pin pins what was collected and drops the barrier;
+\* End drops the pins.
 SendBegin ==
     /\ phase = "idle"
     /\ phase' = "collecting"
@@ -258,29 +294,29 @@ SendBegin ==
     /\ late' = {}
     /\ barrier_gen' = current_gen
     /\ UNCHANGED <<state, owns, free_gen, current_gen, durable_gen, written,
-                   last_sealed, reused>>
+                   last_sealed, reused, stale>>
 
 SendCollect(r) ==
     /\ phase = "collecting"
-    /\ state[r] = "ALLOCATED"
-    /\ written[r]
+    /\ \/ state[r] = "ALLOCATED" /\ written[r]
+       \/ r \in stale /\ state[r] = "PENDING"
     /\ collected' = collected \cup {r}
     /\ UNCHANGED <<state, owns, free_gen, current_gen, durable_gen, written,
-                   last_sealed, reused, phase, late, barrier_gen>>
+                   last_sealed, reused, phase, late, barrier_gen, stale>>
 
 SendPin ==
     /\ phase = "collecting"
     /\ phase' = "holding"
     /\ late' = {}
     /\ UNCHANGED <<state, owns, free_gen, current_gen, durable_gen, written,
-                   last_sealed, reused, collected, barrier_gen>>
+                   last_sealed, reused, collected, barrier_gen, stale>>
 
 SendEnd ==
     /\ phase = "holding"
     /\ phase' = "idle"
     /\ collected' = {}
     /\ UNCHANGED <<state, owns, free_gen, current_gen, durable_gen, written,
-                   last_sealed, reused, late, barrier_gen>>
+                   last_sealed, reused, late, barrier_gen, stale>>
 
 \* --------------------------------------------------------------------------
 \* Next / Spec.
@@ -295,6 +331,7 @@ Next ==
     \/ Commit
     \/ SendBegin
     \/ \E r \in Ranges                   : SendCollect(r)
+    \/ \E r \in Ranges                   : Deindex(r)
     \/ SendPin
     \/ SendEnd
 
@@ -361,6 +398,7 @@ TypeOK ==
     /\ collected   \subseteq Ranges
     /\ late        \subseteq Ranges
     /\ barrier_gen \in 0..MaxGen+1
+    /\ stale       \subseteq Ranges
 
 Invariants ==
     /\ TypeOK

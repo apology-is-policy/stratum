@@ -105,8 +105,9 @@ uint64_t   stm_alloc_pending_unheld_blocks(const stm_alloc *a);
 A send copies records by value outside the sync lock and reads their
 blocks for as long as its handle lives; these keep those blocks from
 the sweep. Neither kind changes a refcount, the tree or anything
-durable: a held run stays PENDING, the first commit after its last
-hold sweeps it, and a crash drops every hold.
+durable: a held run stays PENDING and is swept as it would have been
+without the hold, by the later of the second commit after its free and
+the first after its last hold goes; a crash drops every hold.
 
 - A **barrier** keeps every entry that goes PENDING after it is
   raised. Each PENDING entry carries a sequence number taken under the
@@ -118,7 +119,9 @@ hold sweeps it, and a crash drops every hold.
 - A **pin** keeps the run that starts at `paddr`, counted (two sends
   can pin one run), in a second in-RAM B-tree keyed like the
   allocation tree. A PENDING run can be pinned; a block with no run
-  starting at it cannot (`STM_ENOENT`).
+  starting at it cannot (`STM_ENOENT`). A pin keeps whatever run starts
+  there, and cannot tell the run a record named from a later write's at
+  the same start.
 - The serial tells a replaced allocator (a device removed and attached
   again) from the one a hold was taken on.
 - `stm_alloc_pending_unheld_blocks` is what a pair of commits would
@@ -135,15 +138,26 @@ barriers dropped; the pins dropped at `stm_send_close`. What makes the
 barrier enough: a run goes PENDING only after the record naming it has
 left every tree a send reads from (the write path drops a replaced
 record then frees its blocks; a snapshot delete removes the snapshot
-before it frees its dead list), or in one hold of the sync lock with
-it. A run freed before the barrier therefore belongs to no record the
-collect can find. The exception is the evacuation defect (records never
-rehomed): such a record names a block that may already be swept, and
-the send refuses it.
+before it frees its dead list; a rollback takes every newer snapshot
+out of the index before it reclaims what the old tree and they held),
+or in one hold of the sync lock with it. A run freed before the barrier
+therefore belongs to no record the collect can find. `allocator.tla`
+states this as `DeindexBeforeFree`, and its buggy cfg (a free while a
+tree still names the range) breaks `SendBlocksKept`. The exceptions are
+the evacuation defect (T0.89: records never rehomed) and a rejoined
+device's stale allocator (T0.90): such a record names a block that may
+already be swept. The send refuses it while no run starts there; once
+another write has the block, the pin lands on that write's run and the
+stream's tag check refuses it instead.
 
-The hold keeps data blocks, not tree nodes (the bootstrap tier). Only
-a snapshot send reads nodes from disk, in its collect, and that scan
-holds the dataset index's lock throughout: a commit gets as far as
+The hold keeps data blocks, not tree nodes (the bootstrap tier). A
+live send's collect walks the live engine, which loads nodes from disk
+as it goes, holding the extent index's lock and the engine's serial
+lock throughout: a commit's flush takes the serial lock, and a
+rollback's walks of the old tree, which come before its frees, take the
+extent index's lock, so no node the walk can reach is freed before it
+ends. A snapshot send reads the snapshot's nodes from disk, in its
+collect, and that scan holds the dataset index's lock throughout: a commit gets as far as
 `stm_dataset_index_commit` and waits there, and a node a snapshot
 delete frees meanwhile is stamped with the current gen, that commit's
 target, not below `reuse_below_gen`, so no reserve (forced or not)

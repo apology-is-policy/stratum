@@ -321,18 +321,23 @@ typedef struct stm_send_handle stm_send_handle;
  *   STM_ENOMEM on allocation failure.
  *   STM_EBUSY, a transient: a COLD extent's CAS record or a key was
  *     dropped between the collect and its lookup (retry).
- *   STM_ENOENT also if the snapshot named was deleted before init
- *     had read its tree.
+ *   STM_ENOENT also if the snapshot named was deleted after init
+ *     found it and its tree could not then be read whole (its nodes
+ *     given out again): as if the delete had come first. A tree read
+ *     whole streams as found.
  *   STM_ECORRUPT if a collected record names no block the pool's
- *     allocators hold, among others.
+ *     allocators hold, among others. Best-effort: a block given out
+ *     again since is pinned on the new write's run, and the stream
+ *     fails its tag check instead (STM_EBADTAG from stm_send_next).
  *
  * Point in time: the stream is the records init collected, whatever
  * is written, overwritten or deleted (snapshots included) after. Their
  * blocks are kept for the handle's life by an in-RAM hold
  * (stm_sync_send_hold_begin): writers and commits go on, and a block
- * they free waits, PENDING, until stm_send_close; the first commit
- * after it reclaims it. So a long send keeps the space its source has
- * since freed. Nothing is persisted: a crash drops the hold with the
+ * they free waits, PENDING, until stm_send_close, and is then
+ * reclaimed as it would have been without the hold: by the later of
+ * the second commit after its free and the first after the close. So a
+ * long send keeps the space its source has since freed. Nothing is persisted: a crash drops the hold with the
  * handle.
  *
  * Lifetime: `sync` must outlive the handle. Send does not mutate

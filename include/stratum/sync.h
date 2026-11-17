@@ -297,11 +297,18 @@ uint64_t stm_sync_pending_free_blocks(stm_sync *s);
  * and a pin per run it was handed until end. In RAM only.
  *
  * begin raises the barriers before the send looks anything up: a run
- * that goes PENDING after begin waits, so a record found after begin
- * still has its blocks when pin comes. pin takes the replicas of one
- * record (a HOT extent's paddrs, a CAS chunk's): STM_OK if at least one
- * was pinned; STM_ECORRUPT if none was (no attached allocator up since
- * begin holds a run starting at any of them). settle drops the barriers
+ * that goes PENDING after begin waits. A run goes PENDING only after the
+ * record naming it has left every tree a send reads, or in one s->lock
+ * hold with that (the code's obligation; allocator.tla's
+ * DeindexBeforeFree), so a record found after begin still has its blocks
+ * when pin comes. pin takes the replicas of one record (a HOT extent's
+ * paddrs, a CAS chunk's): STM_OK if at least one was pinned;
+ * STM_ECORRUPT if none was (no attached allocator up since begin holds a
+ * run starting at any of them: blocks freed under their record, as an
+ * evacuation step frees what it moved (T0.89), or on a device attached
+ * or replaced after begin (T0.90)). That refusal is best-effort: a block
+ * given out again since is pinned on the new write's run, and the
+ * stream's tag check refuses it. settle drops the barriers
  * once every run is pinned. end drops what is left and frees the hold;
  * a NULL hold is a no-op. Each takes s->lock (then the allocators'
  * locks), never while the caller holds the extent index's.
