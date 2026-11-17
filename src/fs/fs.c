@@ -343,6 +343,8 @@ struct stm_fs {
     stm_fs_buffer_insert_hook buffer_insert_hook;
     void *buffer_insert_hook_arg;
     stm_status fail_drains;
+    void (*promote_step_hook)(uint64_t ino, uint64_t got, void *arg);
+    void *promote_step_hook_arg;
     bool inline_in_sealed_for_test;
     bool clone_of_sealed_for_test;
 #endif
@@ -2115,6 +2117,7 @@ static stm_status fs_write_covering_split_locked(stm_fs *fs, uint64_t ds,
     stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
     uint64_t a_end = a_off + a_len;
     uint64_t cur = a_off;
+    uint64_t promoted_at = UINT64_MAX;
     *out_done = cur;
     while (cur < a_end) {
         uint64_t remain    = a_end - cur;
@@ -2135,7 +2138,18 @@ static stm_status fs_write_covering_split_locked(stm_fs *fs, uint64_t ds,
                  * index layer does not itself enforce. A corrupt oversized
                  * record (surfaced past AEAD) would break it; fail closed,
                  * matching stm_sync_truncate's posture (sync.c). */
-                if (e.len > REC) return STM_ECORRUPT;
+                if (e.len > REC) {
+                    /* A COLD record the cold tier made before it capped
+                     * its chunks at REC: promoted, it is pieces of at most
+                     * REC, and this split runs again over them. */
+                    if (e.kind != STM_EXTENT_KIND_COLD || promoted_at == e.off)
+                        return STM_ECORRUPT;
+                    stm_status pz = stm_sync_promote_cold_at(fs->sync, ds,
+                                                             ino, e.off);
+                    if (pz != STM_OK) return pz;
+                    promoted_at = e.off;
+                    continue;
+                }
                 if (e.off > cur && e.off < piece_end) piece_end = e.off;
             } else if (ls != STM_ENOENT) {
                 return ls;
@@ -3907,6 +3921,17 @@ void stm_fs_set_buffer_insert_hook_for_test(stm_fs *fs,
 {
     fs->buffer_insert_hook = fn;
     fs->buffer_insert_hook_arg = arg;
+}
+
+void stm_fs_set_promote_step_hook_for_test(stm_fs *fs,
+                                           void (*fn)(uint64_t ino,
+                                                      uint64_t got,
+                                                      void *arg),
+                                           void *arg)
+{
+    if (!fs) return;
+    fs->promote_step_hook = fn;
+    fs->promote_step_hook_arg = arg;
 }
 
 void stm_fs_fail_drains_for_test(stm_fs *fs, stm_status fail)
@@ -9216,6 +9241,14 @@ stm_status stm_fs_promote_to_hot(stm_fs *fs,
 /* One file's COLD extents to HOT, at most `budget` bytes, a step at a time,
  * under fs->global SH and the inode's pin. No reclaim on STM_ENOSPC: it
  * drains and commits the whole pool, which a login must not do. */
+/* The errors that stop the login promote's pass: the pool's or the
+ * dataset's, which the next file would meet too. */
+static bool fs_promote_err_stops(stm_status e)
+{
+    return e == STM_ENOSPC || e == STM_ELOCKED || e == STM_EWEDGED ||
+           e == STM_EROFS || e == STM_ENOMEM;
+}
+
 static stm_status fs_promote_ino_bounded(stm_fs *fs, uint64_t ds, uint64_t ino,
                                          uint64_t budget, uint64_t *out_done,
                                          bool *out_more)
@@ -9224,29 +9257,48 @@ static stm_status fs_promote_ino_bounded(stm_fs *fs, uint64_t ds, uint64_t ino,
     *out_more = false;
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) return STM_EINVAL;
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_WRITE(fs);
-    stm_inode_handle *h = NULL;
-    stm_status rc = stm_inode_pin(iidx, ds, ino, &h);
-    if (rc != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
-        return rc;
-    }
-    rc = fs_flush_ino_locked(fs, ds, ino);
-    while (rc == STM_OK && *out_done < budget) {
+    stm_status rc = STM_OK, soft = STM_OK;
+    while (*out_done < budget) {
         uint64_t step = budget - *out_done;
         if (step > FS_PROMOTE_STEP_BYTES) step = FS_PROMOTE_STEP_BYTES;
         uint64_t got = 0;
         bool more = false;
-        rc = stm_sync_promote_to_hot_bounded(fs->sync, ds, ino, step,
-                                             &got, &more);
+        /* fs->global SH and the pin per step, so a commit or a logout waits
+         * for one step, not the file's share. A reused ino between steps is
+         * another file of the same dataset, whose COLD extents the pass
+         * moves too. */
+        pthread_rwlock_rdlock(&fs->global);
+        FS_GUARD_WRITE(fs);
+        stm_inode_handle *h = NULL;
+        rc = stm_inode_pin(iidx, ds, ino, &h);
+        if (rc != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            break;
+        }
+        /* The raw drain, not fs_flush_ino_locked: its reclaim on
+         * STM_ENOSPC drains and commits the whole pool, which a login must
+         * not do. Its ENOSPC stops the pass. */
+        rc = stm_dirty_buffer_drain_ino(fs->dirty_buffer, ds, ino,
+                                        fs_flush_drain_cb, fs);
+        if (rc == STM_OK)
+            rc = stm_sync_promote_to_hot_bounded(fs->sync, ds, ino, step,
+                                                 &got, &more);
+        stm_inode_unpin(iidx, h);
+        pthread_rwlock_unlock(&fs->global);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+        if (fs->promote_step_hook)
+            fs->promote_step_hook(ino, got, fs->promote_step_hook_arg);
+#endif
         *out_done += got;
         *out_more = more;
-        if (!more || got == 0u) break;
+        if (rc != STM_OK && !fs_promote_err_stops(rc)) {
+            /* An extent of this file failed and was passed over. */
+            if (soft == STM_OK) soft = rc;
+            rc = STM_OK;
+        }
+        if (rc != STM_OK || !more || got == 0u) break;
     }
-    stm_inode_unpin(iidx, h);
-    pthread_rwlock_unlock(&fs->global);
-    return rc;
+    return rc != STM_OK ? rc : soft;
 }
 
 stm_status stm_fs_promote_sealed_cold(stm_fs *fs, uint64_t dataset_id,
@@ -9305,18 +9357,15 @@ stm_status stm_fs_promote_sealed_cold(stm_fs *fs, uint64_t dataset_id,
                                                 max_bytes - st->bytes_promoted,
                                                 &done, &more);
         st->bytes_promoted += done;
-        if (one == STM_OK && !more) {
-            if (done != 0u) st->inos_promoted++;
-            continue;
-        }
+        if (done != 0u) st->inos_promoted++;
+        if (one == STM_OK && !more) continue;
         if (one == STM_OK) break;          /* the budget ran out in this file */
         if (one == STM_ENOENT) continue;   /* unlinked since the collect */
         if (st->last_err == STM_OK) {
             st->last_err     = one;
             st->last_err_ino = cands[i].ino;
         }
-        if (one == STM_ENOSPC || one == STM_ELOCKED || one == STM_EWEDGED ||
-            one == STM_EROFS || one == STM_ENOMEM) {
+        if (fs_promote_err_stops(one)) {
             rc = one;
             break;
         }

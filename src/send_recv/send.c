@@ -330,8 +330,10 @@ stm_status stm_send_init(stm_sync *sync,
     if (!sync || !out_handle) return STM_EINVAL;
     if (dataset_id == 0) return STM_EINVAL;
     *out_handle = NULL;
-    /* Read before the lock check and every key copy below, so an evict
-     * after either moves it. */
+    /* Read before the lock check and every key copy below. An evict
+     * publishes the locked slot before it moves the count, so an evict
+     * this read missed shows the dataset locked to the check below, and
+     * one that lands after moves the count past it. */
     uint64_t evict_seq0 = stm_sync_dek_evict_seq(sync);
     /* As ZFS refuses a non-raw send of a dataset whose key is not loaded.
      * An extent's key would refuse below, but a locked dataset may hold no

@@ -293,6 +293,18 @@ void stm_fs_set_buffer_insert_hook_for_test(stm_fs *fs,
 void stm_fs_fail_drains_for_test(stm_fs *fs, stm_status fail);
 
 /*
+ * The login promote's seam: invoked after each step of one file's move
+ * (stm_fs_promote_sealed_cold), with no lock held, given the file and the
+ * bytes the step moved. A hook may log out or commit. Pass fn=NULL to
+ * clear.
+ */
+void stm_fs_set_promote_step_hook_for_test(stm_fs *fs,
+                                           void (*fn)(uint64_t ino,
+                                                      uint64_t got,
+                                                      void *arg),
+                                           void *arg);
+
+/*
  * Let a user-sealed dataset's regular files keep their bytes inline, as
  * files made before that rule did: creates leave them INLINE and writes do
  * not cut them over. false restores the rule.

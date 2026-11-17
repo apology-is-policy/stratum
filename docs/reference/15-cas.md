@@ -1235,6 +1235,18 @@ unlock: two 12 MiB files with 4 KiB content shift produce
 near-identical CAS chunks (cas_total ≤ 1.4 × per_file_chunk_count
 where the no-dedup baseline would be 2 × per_file_chunk_count).
 
+**Chunks capped at the recordsize (T0.94)**: the cross-extent path
+splits every chunk longer than `STM_FS_RECORDSIZE_MAX` (8 MiB) after
+the 4 KiB rounding (`cap_chunk_boundaries`), so each COLD record a
+migrate makes fits a HOT extent and a send's CHUNK record. Before, the
+chunker's 32 MiB maximum let a record reach the encoding's 16 MiB - 1
+limit, and a pool may still hold such records. The promote moves one
+back as up to four HOT extents of at most the recordsize, in one index
+step (`stm_extent_promote_swap_to_hot_pieces`); the covering write and
+truncate promote one (`stm_sync_promote_cold_at`) before they rewrite
+part of it. A send of one still fails `STM_ECORRUPT` at the CHUNK
+record's 8 MiB body cap.
+
 **Test override**: `<stratum/sync_testing.h>::stm_sync_set_cdc_
 params_for_test(s, params)` (gated by `STRATUM_BUILD_TESTING_HOOKS`)
 swaps the embedded chunker under `s->lock`. Tests use

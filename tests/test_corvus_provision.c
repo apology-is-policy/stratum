@@ -19,6 +19,7 @@
 #include "tsock.h"
 #include "test_fs_common.h"
 
+#include <stratum/block_inject.h>
 #include <stratum/corvus_client.h>
 #include <stratum/ctl.h>
 #include <stratum/dataset.h>
@@ -512,9 +513,26 @@ static uint8_t ctl_extent_kind(stm_fs *fs, uint64_t ds, uint64_t ino)
     return (uint8_t)e.kind;
 }
 
+/* The ctl's /events log, read whole into body (NUL-terminated). */
+static void ctl_read_events(const stm_lp9_vops *v, stm_ctl_conn *cn,
+                            uint64_t root, char *body, size_t cap)
+{
+    body[0] = 0;
+    stm_lp9_qid q;
+    STM_ASSERT_OK(v->walk(cn, root, "events", 6, &q));
+    STM_ASSERT_OK(v->lopen(cn, 9u, q.path, STM_LP9_O_RDONLY));
+    uint32_t len = (uint32_t)cap - 1u;
+    STM_ASSERT_OK(v->read(cn, 9u, q.path, 0, body, &len));
+    body[len < cap ? len : cap - 1u] = 0;
+    v->clunk(cn, 9u, q.path);
+}
+
 /* A home file an older pool left in the cold tier (the seam puts it there):
  * the install alone leaves it cold; a login through /ctl, which follows the
- * install with the promote once the lease is published, moves it back. */
+ * install with the promote once the lease is published, moves it back. A
+ * login whose move fails (its first write fails) stands, the file left cold,
+ * and the ctl logs what could not move; the login that moved everything
+ * logged nothing. */
 STM_TEST(dek_login_via_ctl_moves_a_cold_home_file_back) {
     make_tmp("dekprom");
     stm_fs_format_opts fopts = default_format_opts();
@@ -561,6 +579,30 @@ STM_TEST(dek_login_via_ctl_moves_a_cold_home_file_back) {
     STM_ASSERT_OK(stm_fs_read(fs, 2u, f, 0, got, sizeof got, &n));
     STM_ASSERT_EQ(n, sizeof got);
     STM_ASSERT_MEM_EQ(got, blk, sizeof got);
+    static char ev[8192];
+    ctl_read_events(v, cn, root, ev, sizeof ev);
+    STM_ASSERT(strstr(ev, "login promote of dataset 2:") == NULL);
+
+    uint64_t f2 = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 2u, 1u, (const uint8_t *)"f2", 2,
+                                     0600, 1000, 1000, &f2));
+    STM_ASSERT_OK(stm_fs_write(fs, 2u, f2, 0, blk, sizeof blk));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_sync_set_cas_admits_sealed_for_test(sync, true);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 2u, f2));
+    stm_sync_set_cas_admits_sealed_for_test(sync, false);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(ctl_drive_evict(v, cn, root, 2u, 2u));
+    stm_bdev *d = stm_fs_bdev_for_test(fs);
+    uint32_t fired = stm_bdev_inject_fired_count(d);
+    stm_bdev_inject_fail_after(d, 1);
+    STM_ASSERT_OK(ctl_drive_install(v, cn, root, 2u,
+                                      TEST_TOKEN, STM_CORVUS_TOKEN_LEN, 3u));
+    stm_bdev_inject_fail_after(d, 0);
+    STM_ASSERT_EQ(stm_bdev_inject_fired_count(d), fired + 1u);
+    STM_ASSERT_EQ(ctl_extent_kind(fs, 2u, f2), STM_EXTENT_KIND_COLD);
+    ctl_read_events(v, cn, root, ev, sizeof ev);
+    STM_ASSERT(strstr(ev, "login promote of dataset 2:") != NULL);
     stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(ctl);
     STM_ASSERT_OK(stm_fs_commit(fs));

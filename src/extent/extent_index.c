@@ -2297,6 +2297,93 @@ stm_status stm_extent_promote_swap_to_hot(stm_extent_index *idx,
     return ps;
 }
 
+stm_status stm_extent_promote_swap_to_hot_pieces(stm_extent_index *idx,
+                                                 uint64_t dataset_id,
+                                                 uint64_t ino,
+                                                 uint64_t off, uint64_t len,
+                                                 const stm_extent_hot_piece *pieces,
+                                                 size_t n_pieces,
+                                                 uint8_t n_replicas,
+                                                 uint64_t gen, uint64_t key_id,
+                                                 uint64_t origin_dataset_id,
+                                                 uint64_t origin_ino,
+                                                 uint64_t origin_off,
+                                                 uint64_t link_gen,
+                                                 uint8_t out_content_hash[STM_EXTENT_HASH_LEN])
+{
+    if (!out_content_hash) return STM_EINVAL;
+    memset(out_content_hash, 0, STM_EXTENT_HASH_LEN);
+    if (!idx || !pieces) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+    if (origin_dataset_id == 0 || origin_ino == 0) return STM_EINVAL;
+    if (len == 0 || n_pieces < 1u || n_pieces > 16u) return STM_EINVAL;
+    if (n_replicas < 1 || n_replicas > STM_EXTENT_MAX_REPLICAS) return STM_EINVAL;
+    if (off > UINT64_MAX - len) return STM_EOVERFLOW;
+    if (origin_off > UINT64_MAX - len) return STM_EINVAL;
+    uint64_t sum = 0;
+    for (size_t p = 0; p < n_pieces; p++) {
+        if (pieces[p].len == 0 || pieces[p].len > len - sum) return STM_EINVAL;
+        sum += pieces[p].len;
+        for (uint8_t i = 0; i < n_replicas; i++) {
+            if (pieces[p].paddrs[i] == 0) return STM_EINVAL;
+            for (size_t q = p; q < n_pieces; q++) {
+                for (uint8_t j = 0; j < n_replicas; j++) {
+                    if (q == p && j <= i) continue;
+                    if (pieces[p].paddrs[i] == pieces[q].paddrs[j])
+                        return STM_EINVAL;
+                }
+            }
+        }
+    }
+    if (sum != len) return STM_EINVAL;
+    must_lock(&idx->lock);
+    if (idx->ds_idx == NULL) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    if (gen > idx->current_txg)      { must_unlock(&idx->lock); return STM_EINVAL; }
+    if (link_gen > idx->current_txg) { must_unlock(&idx->lock); return STM_EINVAL; }
+    stm_extent_record src;
+    bool found = false;
+    stm_status gs = ex_engine_get(idx, dataset_id, ino, off, &src, &found);
+    if (gs != STM_OK) { must_unlock(&idx->lock); return gs; }
+    if (!found) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    if (src.len != len || src.kind != STM_EXTENT_KIND_COLD) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    memcpy(out_content_hash, src.content_hash, STM_EXTENT_HASH_LEN);
+    uint64_t at = 0;
+    stm_status ps = STM_OK;
+    for (size_t p = 0; p < n_pieces; p++) {
+        stm_extent_record hot_rec = {
+            .dataset_id = dataset_id, .ino = ino,
+            .off = off + at, .len = pieces[p].len,
+            .kind       = STM_EXTENT_KIND_HOT,
+            .n_replicas = n_replicas,
+            .gen        = gen,
+            .key_id     = key_id,
+            .origin_dataset_id = origin_dataset_id,
+            .origin_ino        = origin_ino,
+            .origin_off        = origin_off + at,
+            .link_gen          = link_gen,
+        };
+        for (uint8_t r = 0; r < n_replicas; r++)
+            hot_rec.paddrs[r] = pieces[p].paddrs[r];
+        ps = ex_engine_put(idx, &hot_rec);
+        if (ps != STM_OK) {
+            if (p > 0) ps = STM_EWEDGED;
+            break;
+        }
+        at += pieces[p].len;
+    }
+    must_unlock(&idx->lock);
+    return ps;
+}
+
 stm_status stm_extent_record_promote_read_hit(stm_extent_index *idx,
                                                 uint64_t dataset_id,
                                                 uint64_t ino,

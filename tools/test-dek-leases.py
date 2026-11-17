@@ -20,6 +20,7 @@ shim=r'''
 #include <stddef.h>
 #include <assert.h>
 #include <pthread.h>
+#include <string.h>
 typedef int stm_status;
 enum { STM_OK, STM_EINVAL, STM_EACCES, STM_ENOSPC };
 #define STM_CTL_DEK_LEASE_MAX 64
@@ -39,6 +40,9 @@ static stm_status stm_fs_evict_dek(void *fs,uint64_t ds) {
  (void)fs;(void)ds;evictions++;return eviction_result;
 }
 /* The login's promote runs outside dek_mu, once the lease is published. */
+typedef struct {uint64_t inos_visited,inos_eligible,inos_promoted,bytes_promoted;
+ stm_status last_err; uint64_t last_err_ino;} stm_fs_promote_policy_stats;
+static void stm_ctl_log_event(stm_ctl *c,const char *fmt,...) {(void)c;(void)fmt;}
 #define CTL_LOGIN_PROMOTE_BYTES 32u
 static stm_ctl *g_ctl; static int promotes;
 static stm_status stm_fs_promote_sealed_cold(void *fs,uint64_t ds,uint64_t max,void *st) {
@@ -113,7 +117,7 @@ mutants={
  'no-orphan-retry':('    if (!c->fs) return;\n    for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {\n        ctl_dek_lease *l','    if (1) return;\n    for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {\n        ctl_dek_lease *l'),
  'no-install-takeover':('            if (c->dek_leases[i].active && c->dek_leases[i].orphan &&\n                c->dek_leases[i].dataset_id == dataset_id)','            if (0)'),
  'evict-hides-orphan':('            orphan_rc = c->dek_leases[i].orphan_rc;','            (void)orphan_rc;'),
- 'no-login-promote':('    if (rc == STM_OK) {\n        stm_status ps','    if (0) {\n        stm_status ps'),
+ 'no-login-promote':('    if (rc == STM_OK) {\n        stm_fs_promote_policy_stats pst;','    if (0) {\n        stm_fs_promote_policy_stats pst;'),
  'promote-under-dek-mu':('        stm_status ps = stm_fs_promote_sealed_cold(','        pthread_mutex_lock(&c->dek_mu);\n        stm_status ps = stm_fs_promote_sealed_cold('),
 }
 # The proof-skipping mutant keeps the call syntactically available but unreachable.

@@ -807,6 +807,41 @@ stm_status stm_extent_promote_swap_to_hot(stm_extent_index *idx,
                                             uint8_t out_content_hash[STM_EXTENT_HASH_LEN]);
 
 /*
+ * A HOT piece that replaces part of a COLD record
+ * (stm_extent_promote_swap_to_hot_pieces).
+ */
+typedef struct {
+    uint64_t len;
+    uint64_t paddrs[STM_EXTENT_MAX_REPLICAS];
+} stm_extent_hot_piece;
+
+/*
+ * As stm_extent_promote_swap_to_hot, for a COLD record longer than a HOT
+ * extent may be: it is replaced by n_pieces HOT records (1..16), back to
+ * back from `off`, whose lens sum to `len`; piece i's origin_off is
+ * origin_off plus the lens before it, and every piece has n_replicas
+ * paddrs, all distinct. The first piece replaces the COLD record under its
+ * key and the rest are inserted after it, so a failure inserting one after
+ * the first answers STM_EWEDGED with the index holding a prefix of the
+ * pieces and not the record: the caller wedges and leaves every piece's
+ * blocks allocated. Any other refusal changes nothing.
+ */
+STM_MUST_USE
+stm_status stm_extent_promote_swap_to_hot_pieces(stm_extent_index *idx,
+                                                 uint64_t dataset_id,
+                                                 uint64_t ino,
+                                                 uint64_t off, uint64_t len,
+                                                 const stm_extent_hot_piece *pieces,
+                                                 size_t n_pieces,
+                                                 uint8_t n_replicas,
+                                                 uint64_t gen, uint64_t key_id,
+                                                 uint64_t origin_dataset_id,
+                                                 uint64_t origin_ino,
+                                                 uint64_t origin_off,
+                                                 uint64_t link_gen,
+                                                 uint8_t out_content_hash[STM_EXTENT_HASH_LEN]);
+
+/*
  * P7-CAS-11: bump the read counter on the COLD extent record at
  * (`dataset_id`, `ino`, `off`). Called by the sync layer's COLD-read
  * path (stm_sync_read_extent_locked's COLD branch) after every

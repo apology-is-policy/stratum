@@ -710,10 +710,19 @@ static stm_status ctl_dek_install(stm_ctl_conn *cn, uint64_t dataset_id,
      * back under the home's key. After the lease and outside dek_mu, so no
      * other login or logout waits on it. Best effort: the login stands. */
     if (rc == STM_OK) {
+        stm_fs_promote_policy_stats pst;
+        memset(&pst, 0, sizeof pst);
         stm_status ps = stm_fs_promote_sealed_cold(c->fs, dataset_id,
                                                    CTL_LOGIN_PROMOTE_BYTES,
-                                                   NULL);
-        (void)ps;
+                                                   &pst);
+        /* What could not move stays cold, under the pool's key: logged. */
+        if (ps != STM_OK || pst.last_err != STM_OK)
+            stm_ctl_log_event(c,
+                "login promote of dataset %llu: rc %d, %llu bytes moved, "
+                "last error %d at ino %llu",
+                (unsigned long long)dataset_id, (int)ps,
+                (unsigned long long)pst.bytes_promoted, (int)pst.last_err,
+                (unsigned long long)pst.last_err_ino);
     }
     return rc;
 }

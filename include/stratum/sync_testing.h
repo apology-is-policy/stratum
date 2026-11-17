@@ -142,6 +142,23 @@ void stm_sync_set_read_prefetch_hook_for_test(stm_sync *s,
 void stm_sync_set_cas_admits_sealed_for_test(stm_sync *s, bool on);
 
 /*
+ * on=true lets the cold tier make chunks longer than the recordsize, as it
+ * did before it capped them, so a test can build the records an older pool
+ * holds. on=false restores the cap.
+ */
+void stm_sync_set_cold_chunks_uncapped_for_test(stm_sync *s, bool on);
+
+/*
+ * The evict's seam: invoked by stm_sync_evict_dek after it publishes the
+ * map that shows the evict and before it moves the evict count, with
+ * s->lock HELD (a hook must not take it; a thread it starts that does
+ * waits for the evict to finish). Pass hook=NULL to clear.
+ */
+void stm_sync_set_evict_published_hook_for_test(stm_sync *s,
+                                                void (*hook)(void *ctx),
+                                                void *ctx);
+
+/*
  * Scrub's stale-record seam: invoked by the production verify
  * callback (stm_sync_scrub_install_production_cb) after it has taken
  * its extent record by value and resolved the record's key, and

@@ -527,7 +527,8 @@ than `Tfadvise`.
 plaintext; bcachefs and APFS have no dedup. Stratum dedups across datasets with the hashes hidden from a disk reader. **The price is that migrating a dataset to cold removes
 the DEK from reads**, so a holder of the pool key can read it. A user-sealed dataset's data never goes to the cold tier, a locked dataset's cold extents (which an older pool may hold) are refused
 whole, and so are a clone's cold records whose origin is a locked dataset; each login moves a share of a home's cold extents back to
-the hot tier under its key.
+the hot tier under its key (a record it cannot read stays, and is logged), and no promote puts a record that another, user-sealed
+dataset wrote under a different key.
 
 **Recorded ratios:** see section 17.
 

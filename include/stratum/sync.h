@@ -912,9 +912,13 @@ stm_status stm_sync_rotate_dataset_key(stm_sync *s,
  * Whether `dataset_id`'s CURRENT key is sealed by its user (corvus,
  * STM_KS_WRAPPER_CORVUS): `*out_sealed` is true if so, false for any other
  * wrapper and for a dataset with no CURRENT key. A dataset with a slot in
- * the DEK map is answered from it, lock-free (a short EBR pin, so the
- * caller must hold none; a dataset's keys all share one wrapper class);
- * any other takes s->lock and asks the keyschema. Returns STM_EINVAL on
+ * the DEK map is answered from its first slot's class, lock-free (a short
+ * EBR pin, so the caller must hold none); any other takes s->lock and asks
+ * the keyschema. A dataset's keys share one class, except in a pool where
+ * a library caller rotated a user-sealed dataset's key under the pool's
+ * wrapper before rotation refused that: there an older key's slot may
+ * answer true for a CURRENT key that is not sealed, which errs toward
+ * refusing. Returns STM_EINVAL on
  * NULL, or the keyschema's error (STM_ECORRUPT for two CURRENT keys).
  */
 STM_MUST_USE
@@ -942,7 +946,11 @@ uint64_t stm_sync_dek_evict_seq(stm_sync *s);
 /*
  * Whether `dataset_id` is locked, or an evict has taken its key out of the
  * map after stm_sync_dek_evict_seq read `seq`. Lock-free, as
- * stm_sync_dataset_locked, and the caller must hold no EBR pin.
+ * stm_sync_dataset_locked, and the caller must hold no EBR pin. An evict
+ * publishes the map that shows it before it moves the count, so a reader
+ * that reads the count and then asks the lock misses no evict: one whose
+ * count it read shows the dataset locked, one after moves the count past
+ * `seq`.
  */
 bool stm_sync_dataset_evicted_since(stm_sync *s, uint64_t dataset_id,
                                     uint64_t seq);
@@ -1977,6 +1985,20 @@ STM_MUST_USE
 stm_status stm_sync_promote_to_hot_bounded(stm_sync *s, uint64_t dataset_id,
                                            uint64_t ino, uint64_t max_bytes,
                                            uint64_t *out_bytes, bool *out_more);
+
+/*
+ * Promote the COLD record covering `off` of (dataset_id, ino), if one does:
+ * STM_OK for a HOT record or a hole, which it leaves. A record longer than
+ * the recordsize (the cold tier made them before it capped its chunks at
+ * it) goes back as several HOT extents of at most the recordsize, in one
+ * index step. The covering write and truncate use it to split such a
+ * record before they rewrite part of it. A record whose origin is another,
+ * user-sealed dataset is refused (STM_ENOTSUPPORTED): its bytes would go
+ * under this dataset's key. Errors as stm_sync_promote_to_hot's.
+ */
+STM_MUST_USE
+stm_status stm_sync_promote_cold_at(stm_sync *s, uint64_t dataset_id,
+                                    uint64_t ino, uint64_t off);
 
 /*
  * P7-CAS-11: candidate descriptor for the promote policy step.

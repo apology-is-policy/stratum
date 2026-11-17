@@ -2535,28 +2535,35 @@ stm_status stm_fs_promote_policy_step(stm_fs *fs,
  * A pool written before the cold tier refused sealed data may hold a
  * user-sealed dataset's extents in the CAS, under the pool's key. With the
  * dataset's key installed, this moves its COLD extents to HOT under that
- * key until it has moved `max_bytes` (each file it reaches moves one extent
- * at least, so it may pass that by less than one extent); the next call
- * takes up what is left.
+ * key until it has moved `max_bytes`; the next call takes up what is left.
+ * It moves a file a step at a time, each step about 1 MiB, or one record
+ * when that is larger (an older pool's cold record may be up to 16 MiB; it
+ * goes back as HOT extents of at most the recordsize), so a pass may pass
+ * max_bytes by less than one record. A record that fails -- unreadable, or
+ * first written by another, user-sealed dataset -- is passed over and stays
+ * cold. out_stats->inos_promoted counts the files it moved bytes of.
  * The /ctl/ driver calls it after each login's install, once the lease is
- * published, outside its lease lock.
+ * published, outside its lease lock, and logs what could not move.
  *
  * Cost: a dataset that is not user-sealed, or that holds no COLD extent,
  * costs a scan of its extents that stops at the first COLD one (no sort,
  * under s->lock). One that holds some is then collected whole under
- * fs->global SH, and its files moved one at a time under SH and the
- * file's pin, at most 1 MiB per hold of s->lock. It writes, and does not
- * commit: STM_ENOSPC stops it, with no reclaim.
+ * fs->global SH, and its files moved a step at a time, each step under SH,
+ * the file's pin and one hold of s->lock, so a commit or a logout waits
+ * for one step. It writes, and does not commit. It drains a file's buffered
+ * writes before moving it, without the reclaim (which drains and commits
+ * the whole pool): a drain's STM_ENOSPC stops it.
  *
  * Returns STM_OK when nothing was due or the pass ran (to its end or to
  * the budget; out_stats says what moved, last_err the first failure of a
  * file, which the pass passes over). Stops with STM_ENOSPC when the pool
  * would keep less free than a sixteenth of its data blocks after twice
- * the pass's bytes (checked after the collect) or a write found it full, STM_ELOCKED if the
- * dataset is locked or became so, STM_EWEDGED / STM_EROFS / STM_ENOMEM.
- * STM_EINVAL on NULL fs, dataset 0 or max_bytes 0. A snapshot taken while
- * a file was COLD keeps that copy in the CAS until it is deleted, and a
- * chunk another dataset shares stays in the CAS for it.
+ * the pass's bytes (checked after the collect) or a write or a drain found
+ * it full, STM_ELOCKED if the dataset is locked or became so,
+ * STM_EWEDGED / STM_EROFS / STM_ENOMEM. STM_EINVAL on NULL fs, dataset 0
+ * or max_bytes 0. A snapshot taken while a file was COLD keeps that copy
+ * in the CAS until it is deleted, and a chunk another dataset shares stays
+ * in the CAS for it.
  */
 STM_MUST_USE
 stm_status stm_fs_promote_sealed_cold(stm_fs *fs, uint64_t dataset_id,
