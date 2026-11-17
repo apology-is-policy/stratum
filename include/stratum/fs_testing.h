@@ -187,6 +187,17 @@ void stm_fs_set_rollback_data_freed_hook_for_test(stm_fs *fs,
                                                   void *arg);
 
 /*
+ * Call `fn` in a snapshot rollback just before it swaps the dataset's root
+ * (stm_extent_index_set_engine_root), after its first commit and its floor
+ * raise. Under fs->global EX and no other lock; `fn` may not call the fs.
+ * NULL restores it.
+ */
+typedef void (*stm_fs_rollback_swap_hook)(void *arg);
+void stm_fs_set_rollback_swap_hook_for_test(stm_fs *fs,
+                                            stm_fs_rollback_swap_hook fn,
+                                            void *arg);
+
+/*
  * Call `fn` as stm_fs_write passes its wedge check under fs->global SH,
  * before it pins the inode, with the inode it writes. `fn` may not call
  * the fs. NULL restores it.

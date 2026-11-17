@@ -328,6 +328,8 @@ struct stm_fs {
     void *rollback_committed_hook_arg;
     stm_fs_rollback_data_freed_hook rollback_data_freed_hook;
     void *rollback_data_freed_hook_arg;
+    stm_fs_rollback_swap_hook rollback_swap_hook;
+    void *rollback_swap_hook_arg;
     stm_fs_write_guard_hook write_guard_hook;
     void *write_guard_hook_arg;
     stm_fs_reclaim_hook reclaim_hook;
@@ -3791,6 +3793,14 @@ void stm_fs_set_rollback_data_freed_hook_for_test(stm_fs *fs,
 {
     fs->rollback_data_freed_hook = fn;
     fs->rollback_data_freed_hook_arg = arg;
+}
+
+void stm_fs_set_rollback_swap_hook_for_test(stm_fs *fs,
+                                            stm_fs_rollback_swap_hook fn,
+                                            void *arg)
+{
+    fs->rollback_swap_hook = fn;
+    fs->rollback_swap_hook_arg = arg;
 }
 
 void stm_fs_set_write_guard_hook_for_test(stm_fs *fs,
@@ -10357,7 +10367,7 @@ static int fs_rb_paddr_cmp(const void *a, const void *b)
  * AFTER `s` (incremental COW only ever writes fresh paddrs), so no older
  * snapshot can reference it. A newer snapshot can: the caller took every
  * newer snapshot out of the index before this runs
- * (fs_rollback_detach_newer_snaps) and does not call this if one would not
+ * (fs_rollback_detach_newer_snaps) and stops, wedged, if one would not
  * go; a cloned or held one refuses the rollback before the first
  * destructive step.
  *
@@ -11000,9 +11010,9 @@ typedef struct {
  * name, and a send finds a snapshot's records only while the snapshot is in
  * the index: a send that found one began its hold before this, so what the
  * reclaim frees waits for it (sync.h, send holds); one that looks after this
- * finds it gone. Returns whether every one went. `out` (n entries) gets the
- * lists for fs_rollback_reclaim_newer_snap_cascade. Caller holds fs->global
- * EX. */
+ * finds it gone. Returns whether every one went; if one did not, the caller
+ * stops, wedged. `out` (n entries) gets the lists for
+ * fs_rollback_reclaim_newer_snap_cascade. Caller holds fs->global EX. */
 static bool fs_rollback_detach_newer_snaps(stm_snapshot_index *sidx,
                                            const uint64_t *ids, size_t n,
                                            fs_rb_detached *out)
@@ -11089,8 +11099,8 @@ static void fs_rb_detached_free(fs_rb_detached *d, size_t n)
  * tiers — best-effort, walk-must-complete, NEVER over-deref / over-free.
  * If a walk fails the corresponding tier is skipped entirely (no partial
  * filtering -- that would risk freeing case-(a) survivors). If a per-snap
- * delete refused, the caller calls neither this nor 4b/4c/4c-ii/4c-iii (see
- * below). Leaked paddrs / cold
+ * delete refused, the caller stops, wedged, before this and 4b/4c/4c-ii/
+ * 4c-iii (see below). Leaked paddrs / cold
  * refcounts are a space cost, never a corruption — a leaked paddr stays
  * ALLOCATED so the AEAD-nonce (paddr, write_gen) pair stays unique.
  *
@@ -11098,13 +11108,16 @@ static void fs_rb_detached_free(fs_rb_detached *d, size_t n)
  * fs_rollback_detach_newer_snaps. Those tiers free `OLD \ s_target.view`,
  * which includes blocks a newer snapshot's frozen tree names, and a send
  * finds that tree's records only while the snapshot is in the index. If any
- * delete refused, neither those tiers nor this one run, and their blocks
- * leak: a block in two snapshots' views goes on the newer one's list, so a
- * list here may hold a block a snapshot still in the index names, and this
- * filter is by the target's view alone. Only a hold or a clone refuses a
+ * delete refused, the caller wedges before any tier runs (crash-equivalent:
+ * nothing after its first commit is durable). It cannot go on: a refused
+ * snapshot keeps its lists, and they name blocks the swap made live again
+ * (a block the target and it both name, dropped by the live tree while it
+ * was the most recent snapshot, is on its list), so an overwrite of one
+ * finds it listed already, and its later delete moves them to a list whose
+ * delete frees them under the live tree. Only a hold or a clone refuses a
  * delete today, and the caller refuses both before its first destructive
- * step, under fs->global EX. A new refusal mode has to be refused there too:
- * here it only leaks.
+ * step, under fs->global EX. A new refusal mode has to be refused there too,
+ * or every rollback it meets wedges.
  *
  * AGGREGATION (cold tier only): newer snaps' cold dead-lists are
  * accumulated into a single agg_cold buffer (one realloc-growth pass),
@@ -11643,6 +11656,10 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * dataset's live engine holding that lock and no EBR pin, outside the
      * fs, and the set retires that engine. */
     stm_extent_index *eidx_swap = stm_sync_extent_index(fs->sync);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->rollback_swap_hook)
+        fs->rollback_swap_hook(fs->rollback_swap_hook_arg);
+#endif
     s = eidx_swap
         ? stm_extent_index_set_engine_root(eidx_swap, dataset_id,
                                            entry.tree_root_paddr,
@@ -11681,10 +11698,21 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
     /* Every newer snapshot leaves the index before the first free below: its
      * frozen tree names blocks the reclaim frees (fs_rollback_detach_newer_snaps).
      * The counts above only went down to what the view names, never to zero.
-     * If one would not go, nothing below frees, the reclaim nor the cascade,
-     * and their blocks leak. */
+     * If one would not go, stop here, wedged: its lists name blocks the swap
+     * made live again, which its later delete would free. Nothing since the
+     * first commit is durable and nothing above freed, so the wedge is
+     * crash-equivalent: a remount finds the dataset and every snapshot as
+     * that commit left them. */
     bool newer_gone = n_newer == 0
         || fs_rollback_detach_newer_snaps(sidx, newer_ids, n_newer, detached);
+    if (!newer_gone) {
+        free(view_data.v);
+        fs_rb_detached_free(detached, n_newer);
+        free(newer_ids);
+        fs_mark_wedged_locked(fs);
+        pthread_rwlock_unlock(&fs->global);
+        return STM_EBUSY;
+    }
 
     /* Reclaim the post-snapshot divergence — blocks reachable from the
      * pre-rollback live tree but not from the snapshot's frozen tree.
@@ -11713,7 +11741,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * dead_list.tla::Rollback's `to_free` minus the `newer_dead \ s_view`
      * term — which the impl-4d newer-snapshot cascade picks up after the
      * newer-snapshot refusal lifts. */
-    if (have_old_root && newer_gone) {
+    if (have_old_root) {
         fs_rollback_reclaim_diverged_nodes(fs, didx, dataset_id,
                 de_old.di_tree_root, de_old.di_root_gen, de_old.di_root_csum,
                 entry.tree_root_paddr, entry.root_gen, entry.root_csum);
@@ -11804,7 +11832,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * effort per snap — a fail on one snap leaves the others reclaimed.
      * Runs BEFORE the commit so every per-snap delete + every reclaim
      * frees / derefs in the SAME atomic commit as the swap. */
-    if (n_newer > 0 && newer_gone) {
+    if (n_newer > 0) {
         stm_extent_index *eidx_n = stm_sync_extent_index(fs->sync);
         uint64_t old_paddr_n   = have_old_root ? de_old.di_tree_root  : 0;
         uint64_t old_gen_n     = have_old_root ? de_old.di_root_gen   : 0;

@@ -33,11 +33,13 @@ void stm_extent_set_paddr_walk_hook_for_test(stm_extent_paddr_walk_hook fn,
                                              void *arg);
 
 /*
- * Called by a serial walk that collects a dataset's live records
- * (stm_extent_iter_ds and the per-ino iteration) for every record it
- * visits, holding the extent index's lock and the engine's serial lock, so
- * a test can park the walk inside the live engine. NULL clears it. Set it
- * only while no walk runs.
+ * Called from the extent index's collect callback for every record it
+ * visits: by stm_extent_iter_ds's serial walk of a dataset's live engine
+ * (the extent index's lock and the engine's serial lock held, no EBR pin),
+ * by the per-ino collect (an EBR pin, no serial lock) and by
+ * stm_extent_iter_ds_at's scan of a captured tree. A test parks a walk
+ * inside the live engine with it. NULL clears it. Set it only while no walk
+ * runs.
  */
 typedef void (*stm_extent_serial_walk_hook)(uint64_t dataset_id, void *arg);
 void stm_extent_set_serial_walk_hook_for_test(stm_extent_serial_walk_hook fn,

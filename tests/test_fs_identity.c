@@ -1705,15 +1705,16 @@ STM_TEST(fs_a_link_from_a_dead_name_is_absent_whatever_its_ino_became) {
     reuse_fs_done(fs);
 }
 
-/* The scrub's extent lookup holds no fs->global, so a rollback can retire a
- * dataset's engine while the lookup walks it: the walk's EBR pin is what
- * keeps the retired engine alive until the walk leaves. */
+/* The scrub's paddr walk holds no fs->global; inside a dataset's engine it
+ * holds the extent index's lock and an EBR pin. A rollback's root swap takes
+ * that lock, so it waits for the walk; a retire no lock fences is outlived by
+ * the pin, which keeps the engine until the walk leaves. */
 typedef struct {
     pthread_mutex_t          mu;
     pthread_cond_t           cv;
     bool                     paused, resume;
     const stm_btree_engine  *watched;
-    atomic_bool              retired, freed;
+    atomic_bool              retired, freed, at_swap;
 } scrub_walk_gate;
 
 static void scrub_walk_park(uint64_t dataset_id, void *arg)
@@ -1735,6 +1736,12 @@ static void scrub_walk_engine_note(const stm_btree_engine *eng, bool freed,
     scrub_walk_gate *g = arg;
     if (eng != g->watched) return;
     atomic_store(freed ? &g->freed : &g->retired, true);
+}
+
+static void scrub_walk_at_swap(void *arg)
+{
+    scrub_walk_gate *g = arg;
+    atomic_store(&g->at_swap, true);
 }
 
 typedef struct { stm_fs *fs; uint64_t snap; stm_status rc; } scrub_walk_arg;
@@ -1771,8 +1778,12 @@ static void scrub_walk_start_late(void *arg)
     scrub_walk_late *l = arg;
     if (pthread_create(&l->wt, NULL, scrub_walk_lookup, l->wa) != 0) return;
     l->started = true;
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += 60;
     pthread_mutex_lock(&l->g->mu);
-    while (!l->g->paused) pthread_cond_wait(&l->g->cv, &l->g->mu);
+    while (!l->g->paused)
+        if (pthread_cond_timedwait(&l->g->cv, &l->g->mu, &until) != 0) break;
     pthread_mutex_unlock(&l->g->mu);
 }
 
@@ -1825,6 +1836,7 @@ static void scrub_walk_case(const char *tag, bool by_rollback)
     g.watched = eng;
     atomic_store(&g.retired, false);
     atomic_store(&g.freed, false);
+    atomic_store(&g.at_swap, false);
     stm_btree_engine_set_lifecycle_hook_for_test(scrub_walk_engine_note, &g);
     stm_extent_set_paddr_walk_hook_for_test(scrub_walk_park, &g);
 
@@ -1836,11 +1848,15 @@ static void scrub_walk_case(const char *tag, bool by_rollback)
     if (by_rollback) {
         stm_fs_set_rollback_committed_hook_for_test(fs, scrub_walk_start_late,
                                                     &late);
+        stm_fs_set_rollback_swap_hook_for_test(fs, scrub_walk_at_swap, &g);
         rb_started = pthread_create(&rt, NULL, scrub_walk_rollback, &ra) == 0;
         STM_ASSERT_TRUE(rb_started);
         STM_ASSERT_TRUE(rb_started && scrub_walk_wait_paused(&g));
-        /* The swap is the rollback's next step; unfenced, it retires the
-         * engine under the walk within this second. */
+        for (int i = 0; i < 60000 && !atomic_load(&g.at_swap); i++)
+            usleep(1000);
+        STM_ASSERT_TRUE(atomic_load(&g.at_swap));
+        /* The rollback is at its swap; unfenced, it retires the engine
+         * under the walk at once. */
         for (int i = 0; i < 1000 && !atomic_load(&g.retired); i++)
             usleep(1000);
         STM_ASSERT_TRUE(!atomic_load(&g.retired));
@@ -1871,6 +1887,7 @@ static void scrub_walk_case(const char *tag, bool by_rollback)
     if (late.started) pthread_join(late.wt, NULL);
     if (rb_started) pthread_join(rt, NULL);
     stm_fs_set_rollback_committed_hook_for_test(fs, NULL, NULL);
+    stm_fs_set_rollback_swap_hook_for_test(fs, NULL, NULL);
     stm_extent_set_paddr_walk_hook_for_test(NULL, NULL);
     STM_ASSERT_ERR(wa.rc, STM_ENOENT);
     if (by_rollback) {

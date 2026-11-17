@@ -797,9 +797,10 @@ stm_status stm_dataset_index_get_engine_pinned(stm_dataset_index *idx,
  * there from the most recent successful commit). After return the next
  * stm_dataset_index_get_engine for this dataset re-opens at the triple.
  *
- * Used by the 1c-ii..1c-v module-cutover paths (post-commit teardown of
- * a dropped-from-cache engine) AND by stm_fs_rollback_snapshot which
- * needs to drop the in-RAM tree so the swapped triple's open governs.
+ * No production caller; the rollback swaps through
+ * stm_extent_index_set_engine_root. It takes idx's lock only, not the
+ * extent index's, so a serial walk of the extent index may be inside the
+ * engine it retires.
  *
  * Refusals:
  *   - NULL idx (STM_EINVAL).
@@ -844,7 +845,10 @@ stm_status stm_dataset_index_close_engine(stm_dataset_index *idx,
  *     a caller-sequencing bug; a legitimate caller holds the fs-wide
  *     write lock with no commit in flight.
  *
- * Concurrency: takes idx's lock.
+ * Concurrency: takes idx's lock only. A serial walk of the extent index
+ * walks the live engine under the extent index's lock and no EBR pin, and
+ * this retires that engine: a caller that may race one (the rollback) sets
+ * through stm_extent_index_set_engine_root.
  */
 STM_MUST_USE
 stm_status stm_dataset_index_set_engine_root(stm_dataset_index *idx,

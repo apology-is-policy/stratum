@@ -155,9 +155,9 @@ live send's collect walks the live engine, which loads nodes from disk
 as it goes, holding the extent index's lock and the engine's serial
 lock throughout, and no EBR pin: a commit's flush takes the serial
 lock; a rollback swaps the dataset's root, which retires that engine,
-under the extent index's lock (`stm_extent_index_set_engine_root`), and
-its walks of the old tree, which come before its frees, take that lock
-too. So neither the engine nor a node the walk can reach is freed before
+under the extent index's lock (`stm_extent_index_set_engine_root`),
+before any of its frees, and a walk begun after the swap reads the
+rolled-back tree, which no tier of the rollback frees. So neither the engine nor a node the walk can reach is freed before
 it ends. A snapshot send reads the snapshot's nodes from disk, in its
 collect, and that scan holds the dataset index's lock throughout: a commit gets as far as
 `stm_dataset_index_commit` and waits there, and a node a snapshot

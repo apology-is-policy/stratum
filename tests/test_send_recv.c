@@ -3001,38 +3001,61 @@ static void rb_refusal_case(const char *tag, bool refuse)
     rr_ctx c = { .src = &src, .snap = s2, .fired = 0 };
     if (refuse)
         stm_fs_set_rollback_committed_hook_for_test(src.fs, rr_hold_hook, &c);
-    STM_ASSERT_OK(stm_fs_rollback_snapshot(src.fs, 1, s1, false));
+    const stm_status rb = stm_fs_rollback_snapshot(src.fs, 1, s1, false);
     stm_fs_set_rollback_committed_hook_for_test(src.fs, NULL, NULL);
     STM_ASSERT_EQ(c.fired, refuse ? 1 : 0);
     stm_snapshot_entry e;
-    STM_ASSERT_ERR(stm_snapshot_lookup(sidx, s3, &e), STM_ENOENT);
-    rc = 99;
-    STM_ASSERT_OK(stm_alloc_lookup(hold_alloc(&src, x), x, NULL, &rc));
-    stm_test_info("rollback with s2's delete %s: x counted %u",
-                  refuse ? "refused" : "made", rc);
     if (refuse) {
+        /* Refused at the detach: it stops wedged and writes nothing more. */
+        STM_ASSERT_ERR(rb, STM_EBUSY);
+        STM_ASSERT_ERR(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a),
+                       STM_EWEDGED);
+        STM_ASSERT_ERR(stm_fs_commit(src.fs), STM_EWEDGED);
+        STM_ASSERT_OK(stm_fs_unmount(src.fs));
+        src.fs = NULL;
+        stm_fs_mount_opts mo = { .read_only = false,
+                                 .keyfile_path = src.keyfile };
+        STM_ASSERT_OK(stm_fs_mount(src.path, &mo, &src.fs));
+        if (!src.fs) return;
+        sidx = stm_sync_snapshot_index(stm_fs_sync_for_test(src.fs));
+        /* As the first commit left it: every snapshot, the hold made after
+         * that commit gone, x on s3's list and counted once, ino 1 b. */
         STM_ASSERT_OK(stm_snapshot_lookup(sidx, s2, &e));
-        STM_ASSERT_EQ(rc, 1u);
-        /* Two commits sweep nothing of it, and s2 still sends whole. */
-        STM_ASSERT_OK(stm_fs_commit(src.fs));
-        STM_ASSERT_OK(stm_fs_commit(src.fs));
+        STM_ASSERT_EQ(e.hold_count, 0u);
+        STM_ASSERT_OK(stm_snapshot_lookup(sidx, s3, &e));
+        dl = NULL;
+        ndl = 0;
+        on3 = false;
+        STM_ASSERT_OK(stm_snapshot_dead_list_get(sidx, s3, &dl, &ndl));
+        for (size_t i = 0; i < ndl; i++)
+            if (dl[i] == x) on3 = true;
+        free(dl);
+        STM_ASSERT(on3);
         rc = 99;
         STM_ASSERT_OK(stm_alloc_lookup(hold_alloc(&src, x), x, NULL, &rc));
         STM_ASSERT_EQ(rc, 1u);
-        stm_send_handle *sh = NULL;
-        STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0, s2,
-                                    &sh));
-        STM_ASSERT_OK(hold_drain(sh));
-        stm_send_close(sh);
-        STM_ASSERT_OK(stm_snapshot_release(sidx, s2));
+        uint8_t got[4096];
+        size_t n = 0;
+        STM_ASSERT_OK(stm_fs_read(src.fs, 1, 1, 0, got, sizeof got, &n));
+        STM_ASSERT_EQ(n, sizeof got);
+        STM_ASSERT(memcmp(got, b, sizeof b) == 0);
+        /* Made again with nothing held, it goes through. */
+        STM_ASSERT_OK(stm_fs_rollback_snapshot(src.fs, 1, s1, false));
     } else {
-        STM_ASSERT_ERR(stm_snapshot_lookup(sidx, s2, &e), STM_ENOENT);
-        STM_ASSERT_EQ(rc, 0u);
+        STM_ASSERT_OK(rb);
     }
+    STM_ASSERT_ERR(stm_snapshot_lookup(sidx, s3, &e), STM_ENOENT);
+    STM_ASSERT_ERR(stm_snapshot_lookup(sidx, s2, &e), STM_ENOENT);
+    rc = 99;
+    STM_ASSERT_OK(stm_alloc_lookup(hold_alloc(&src, x), x, NULL, &rc));
+    stm_test_info("rollback with s2's delete %s: x counted %u",
+                  refuse ? "refused, then made after a remount" : "made",
+                  rc);
+    STM_ASSERT_EQ(rc, 0u);
     testpool_teardown(&src);
 }
 
-STM_TEST(rollback_whose_newer_delete_refuses_frees_nothing_a_present_snapshot_names) {
+STM_TEST(rollback_whose_newer_delete_refuses_wedges_and_remounts_as_it_was) {
     rb_refusal_case("hrr_refuse", true);
 }
 
@@ -3045,8 +3068,8 @@ STM_TEST(rollback_cascade_frees_a_newer_list_block_the_view_lacks) {
  * index's lock and no EBR pin, outside the fs. A rollback of the dataset
  * retires that engine at its root swap; it waits for the walk to end, so the
  * engine is never retired, and then freed, under it. The send starts from the
- * rollback's post-commit seam, before the swap, and parks at its first record;
- * the swap is the rollback's next step. */
+ * rollback's post-commit seam and parks at its first record; the test then
+ * waits for the rollback to reach the seam just before its swap. */
 #include <stratum/btree_engine_testing.h>
 #include <stratum/dataset.h>
 #include <stratum/extent_testing.h>
@@ -3055,7 +3078,7 @@ typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     bool in_walk, release, retired, retired_in_walk, retired_before_walk;
-    bool send_started, send_done, rb_started;
+    bool send_started, send_done, rb_started, at_swap;
     const void *live;
     testpool *src;
     uint64_t s1;
@@ -3133,6 +3156,13 @@ static void lw_committed_hook(void *arg)
     (void)lw_wait(c, &c->in_walk, &c->send_done, 60);
 }
 
+/* On the rollback thread, just before the swap. */
+static void lw_swap_hook(void *arg)
+{
+    lw_ctx *c = arg;
+    lw_set(c, &c->at_swap);
+}
+
 static void *lw_rb_thread(void *arg)
 {
     lw_ctx *c = arg;
@@ -3165,10 +3195,12 @@ STM_TEST(rollback_waits_for_a_live_send_walking_the_engine_it_retires) {
     stm_btree_engine_set_lifecycle_hook_for_test(lw_life_hook, &c);
     stm_extent_set_serial_walk_hook_for_test(lw_walk_hook, &c);
     stm_fs_set_rollback_committed_hook_for_test(src.fs, lw_committed_hook, &c);
+    stm_fs_set_rollback_swap_hook_for_test(src.fs, lw_swap_hook, &c);
     if (pthread_create(&c.th_rb, NULL, lw_rb_thread, &c) == 0)
         c.rb_started = true;
     const bool in_walk = c.rb_started && lw_wait(&c, &c.in_walk, NULL, 60);
-    /* Unfenced, the swap retires the engine within this second. */
+    const bool at_swap = in_walk && lw_wait(&c, &c.at_swap, NULL, 60);
+    /* The rollback is at its swap: unfenced, it retires the engine at once. */
     (void)lw_wait(&c, &c.retired, NULL, 1);
     pthread_mutex_lock(&c.mu);
     const bool retired_in_walk = c.retired_in_walk;
@@ -3178,14 +3210,18 @@ STM_TEST(rollback_waits_for_a_live_send_walking_the_engine_it_retires) {
     if (c.rb_started) pthread_join(c.th_rb, NULL);
     if (c.send_started) pthread_join(c.th_send, NULL);
     stm_fs_set_rollback_committed_hook_for_test(src.fs, NULL, NULL);
+    stm_fs_set_rollback_swap_hook_for_test(src.fs, NULL, NULL);
     stm_extent_set_serial_walk_hook_for_test(NULL, NULL);
     stm_btree_engine_set_lifecycle_hook_for_test(NULL, NULL);
-    stm_test_info("live send beside a rollback: parked %d, engine retired "
+    stm_test_info("live send beside a rollback: parked %d, at its swap %d, "
+                  "engine retired "
                   "before the walk %d, under it %d, at all %d; rollback %d, "
-                  "init %d, stream %d", (int)in_walk, (int)retired_before_walk,
+                  "init %d, stream %d", (int)in_walk, (int)at_swap,
+                  (int)retired_before_walk,
                   (int)retired_in_walk, (int)c.retired, (int)c.rb_rc,
                   (int)c.init_rc, (int)c.stream_rc);
     STM_ASSERT(in_walk);
+    STM_ASSERT(at_swap);
     STM_ASSERT(!retired_before_walk);
     STM_ASSERT(!retired_in_walk);
     STM_ASSERT(c.retired);

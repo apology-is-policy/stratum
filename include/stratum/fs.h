@@ -2045,7 +2045,10 @@ stm_status stm_fs_evict_dek(stm_fs *fs, uint64_t dataset_id);
  * remount can ask again.
  *
  * A newer snapshot that is held, or that a clone depends on, refuses STM_EBUSY
- * before anything is drained.
+ * before anything is drained. One whose delete refused only after the swap
+ * (none can today: those are the only refusals) answers STM_EBUSY wedged,
+ * crash-equivalent: a remount finds the dataset and its snapshots as the
+ * first commit left them.
  *
  * The CONSULTATION GATE is load-bearing — it composes against
  * `specs/snapshot.tla::RollbackBlockedIffCompromised`:
