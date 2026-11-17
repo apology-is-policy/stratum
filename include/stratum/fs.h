@@ -439,6 +439,11 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
  * Atomicity: alloc inode → link in parent dirent. On link failure,
  * the inode is freed before returning.
  *
+ * In a user-sealed dataset the file starts EXTENT-kind, as does an
+ * stm_fs_create_anon one: its bytes, however few, go to extents under the
+ * dataset's key, never inline in the inode, which the pool's key seals. A
+ * write to an older inline file there moves its bytes out first.
+ *
  * Refusals: same as stm_fs_lookup, plus:
  *   - NULL out_child_ino (STM_EINVAL).
  *   - mode S_IFMT bits set to a non-S_IFREG type (STM_EINVAL).
@@ -2019,7 +2024,14 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
  * the corvus key agent named by `corvus` (socket + the login-forwarded
  * session token) and installs the plaintext DEK, lifting the dataset
  * out of the deferred-unwrap LOCKED posture. Reinstallation still proves
- * the token and live-key equality; CORVUS-only; RAM-only (no commit).
+ * the token and live-key equality; CORVUS-only; the install itself is
+ * RAM-only (no commit). Then, unless the CAS is empty, every COLD-bearing
+ * file of the dataset is promoted to HOT under its key: a pool written
+ * before the cold tier refused sealed data may hold them in the CAS, under
+ * the pool's key. Best effort: a failure leaves the rest COLD (refused while
+ * LOCKED) for the next install, and the install's result stands. A snapshot
+ * taken while a file was COLD keeps that copy in the CAS until it is
+ * deleted.
  * stm_fs_evict_dek drains the dataset's own buffered writes under EX
  * before taking the DEK out of RAM, returning the dataset to LOCKED. A
  * drain failure keeps the key and propagates the error. Another dataset's

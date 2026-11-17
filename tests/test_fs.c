@@ -7680,6 +7680,55 @@ STM_TEST(fs_p7cas11_promote_min_read_count_blocks) {
     unlink(g_key_path);
 }
 
+STM_TEST(fs_p7cas11_promote_no_recency_filter_takes_an_unread_file) {
+    /* min_recency_txgs 0 is no recency filter: a COLD file never read, its
+     * migration commits behind, is promoted with min_read_count 0 (the
+     * one-shot mass promote). The control, one variable away: a one-txg
+     * window leaves it. */
+    make_tmp("p7cas11_no_recency");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0xC7, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    for (int leg = 0; leg < 2; leg++) {
+        bool window = (leg == 0);
+        stm_fs_promote_policy_params params = {
+            .min_read_count   = 0u,
+            .min_recency_txgs = window ? 1u : 0u,
+        };
+        stm_fs_promote_policy_stats stats = {0};
+        STM_ASSERT_OK(stm_fs_promote_policy_step(fs, 1, &params, &stats));
+        STM_ASSERT_EQ(stats.inos_visited,  1u);
+        STM_ASSERT_EQ(stats.inos_eligible, window ? 0u : 1u);
+        STM_ASSERT_EQ(stats.inos_promoted, window ? 0u : 1u);
+        memset(&rec, 0, sizeof rec);
+        STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+        STM_ASSERT_EQ((int)rec.kind, window ? (int)STM_EXTENT_KIND_COLD
+                                            : (int)STM_EXTENT_KIND_HOT);
+    }
+
+    uint8_t buf[4096];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_EQ(got, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, buf, sizeof plain);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(fs_p7cas11_promote_to_hot_persists_across_mount) {
     /* After promote + unmount + remount, the new HOT extent's
      * content reads back unchanged. Validates the v21 encode/decode

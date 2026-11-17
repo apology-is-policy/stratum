@@ -40,6 +40,7 @@
 #include <stratum/inode.h>
 #include <stratum/locks.h>
 #include <stratum/block.h>
+#include <stratum/block_inject.h>
 #include <stratum/corvus_client.h>
 #include <stratum/crypto.h>
 #include <stratum/dataset.h>
@@ -2404,4 +2405,239 @@ STM_TEST(corvus_snapshot_read_racing_logout_answers_locked) {
     stm_bdev_close(d);
     fake_corvus_stop(&fc);
     unlink(g_tmp_path);
+}
+
+/* ===================================================================== */
+/* T0.94: a home's file bytes out of the pool key's reach                 */
+/* ===================================================================== */
+
+/* Whether the m bytes at pat occur in the n bytes at p. */
+static bool seal_has(const void *p, size_t n, const void *pat, size_t m)
+{
+    const uint8_t *b = p;
+    for (size_t i = 0; m <= n && i <= n - m; i++)
+        if (memcmp(b + i, pat, m) == 0) return true;
+    return false;
+}
+
+/* An inode as the pool's key alone reads it: the index, under no gate. */
+static void seal_raw_inode(stm_fs *fs, uint64_t ds, uint64_t ino,
+                           struct stm_inode_value *iv)
+{
+    memset(iv, 0, sizeof *iv);
+    STM_ASSERT_OK(stm_inode_lookup(stm_sync_inode_index(stm_fs_sync(fs)), ds,
+                                   ino, iv));
+}
+
+/* A home's small file, made and written as the sibling's is, keeps its bytes
+ * in an extent under the home's key: remounted with the pool's key alone,
+ * its inode shows none of them. The sibling's inode, one variable away,
+ * shows them, so the probe reads what the pool's key reveals. An O_TMPFILE
+ * likewise. */
+STM_TEST(corvus_home_file_bytes_never_sit_in_its_inode) {
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "sealinl")) return;
+    seal_tree *ts[2] = {&sp.home, &sp.sib};
+    static const char TMP[] = "anon-secret=7d1e5c";
+    for (int i = 0; i < 2; i++) {
+        bool sealed = (i == 0);
+        uint64_t anon = 0, fresh = 0;
+        struct stm_inode_value iv;
+        /* Made so, before any write could cut it over. */
+        STM_ASSERT_OK(stm_fs_create_file(sp.fs, ts[i]->ds, 1,
+                                         (const uint8_t *)"fresh", 5, 0600,
+                                         1000, 1000, &fresh));
+        seal_raw_inode(sp.fs, ts[i]->ds, fresh, &iv);
+        STM_ASSERT_EQ(iv.si_data_kind,
+                      sealed ? STM_DATA_EXTENT : STM_DATA_INLINE);
+        STM_ASSERT_OK(stm_fs_create_anon(sp.fs, ts[i]->ds, 0600, 1000, 1000,
+                                         &anon));
+        seal_raw_inode(sp.fs, ts[i]->ds, anon, &iv);
+        STM_ASSERT_EQ(iv.si_data_kind,
+                      sealed ? STM_DATA_EXTENT : STM_DATA_INLINE);
+        STM_ASSERT_OK(stm_fs_write(sp.fs, ts[i]->ds, anon, 0, TMP,
+                                   sizeof TMP - 1));
+        seal_raw_inode(sp.fs, ts[i]->ds, anon, &iv);
+        STM_ASSERT_EQ(iv.si_data_kind,
+                      sealed ? STM_DATA_EXTENT : STM_DATA_INLINE);
+        STM_ASSERT(seal_has(&iv, sizeof iv, TMP, sizeof TMP - 1) == !sealed);
+        uint8_t buf[64];
+        size_t got = 0;
+        memset(buf, 0, sizeof buf);
+        STM_ASSERT_OK(stm_fs_read(sp.fs, ts[i]->ds, anon, 0, buf, sizeof buf,
+                                  &got));
+        STM_ASSERT_EQ(got, sizeof TMP - 1);
+        STM_ASSERT_MEM_EQ(buf, TMP, got);
+    }
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    if (!seal_pool_remount(&sp)) return;
+    for (int i = 0; i < 2; i++) {
+        bool sealed = (i == 0);
+        struct stm_inode_value iv;
+        seal_raw_inode(sp.fs, ts[i]->ds, ts[i]->small, &iv);
+        STM_ASSERT_EQ(iv.si_data_kind,
+                      sealed ? STM_DATA_EXTENT : STM_DATA_INLINE);
+        STM_ASSERT_EQ(stm_load_le64(iv.si_size), sizeof SEAL_SECRET - 1);
+        STM_ASSERT(seal_has(&iv, sizeof iv, SEAL_SECRET,
+                            sizeof SEAL_SECRET - 1) == !sealed);
+    }
+    seal_pool_close(&sp);
+}
+
+/* A home's small file from before that rule keeps its bytes inline (the seam
+ * makes one, the sibling's alike). Its next write moves it out whole: the old
+ * bytes and the new go under the home's key and read back intact, and the
+ * inode keeps none. The sibling's stays inline. */
+STM_TEST(corvus_write_to_an_older_inline_home_file_moves_it_out) {
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "sealold")) return;
+    seal_tree *ts[2] = {&sp.home, &sp.sib};
+    uint8_t a[40], b[10], want[50];
+    memset(a, 'A', sizeof a);
+    memset(b, 'B', sizeof b);
+    memcpy(want, a, sizeof a);
+    memcpy(want + sizeof a, b, sizeof b);
+    uint64_t old[2] = {0, 0};
+    stm_fs_set_inline_in_sealed_for_test(sp.fs, true);
+    for (int i = 0; i < 2; i++) {
+        STM_ASSERT_OK(stm_fs_create_file(sp.fs, ts[i]->ds, 1,
+                                         (const uint8_t *)"old", 3, 0600,
+                                         1000, 1000, &old[i]));
+        STM_ASSERT_OK(stm_fs_write(sp.fs, ts[i]->ds, old[i], 0, a, sizeof a));
+        struct stm_inode_value iv;
+        seal_raw_inode(sp.fs, ts[i]->ds, old[i], &iv);
+        STM_ASSERT_EQ(iv.si_data_kind, STM_DATA_INLINE);
+        STM_ASSERT(seal_has(&iv, sizeof iv, a, sizeof a));
+    }
+    stm_fs_set_inline_in_sealed_for_test(sp.fs, false);
+    for (int i = 0; i < 2; i++) {
+        bool sealed = (i == 0);
+        STM_ASSERT_OK(stm_fs_write(sp.fs, ts[i]->ds, old[i], sizeof a, b,
+                                   sizeof b));
+        struct stm_inode_value iv;
+        seal_raw_inode(sp.fs, ts[i]->ds, old[i], &iv);
+        STM_ASSERT_EQ(iv.si_data_kind,
+                      sealed ? STM_DATA_EXTENT : STM_DATA_INLINE);
+        STM_ASSERT(seal_has(&iv, sizeof iv, a, sizeof a) == !sealed);
+        STM_ASSERT_EQ(stm_load_le64(iv.si_size), sizeof want);
+        uint8_t got[64];
+        size_t n = 0;
+        memset(got, 0, sizeof got);
+        STM_ASSERT_OK(stm_fs_read(sp.fs, ts[i]->ds, old[i], 0, got,
+                                  sizeof got, &n));
+        STM_ASSERT_EQ(n, sizeof want);
+        STM_ASSERT_MEM_EQ(got, want, n);
+    }
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    seal_pool_close(&sp);
+}
+
+/* The cold tier's residue in a pool written before it refused sealed data: a
+ * home's file in the CAS, under the pool's key (the seam puts it there). The
+ * login moves it back to the hot tier under the home's key; the sibling's
+ * cold file, one variable away, stays. A login whose move fails (the move's
+ * first write fails) stands: the file stays cold, read while logged in and
+ * refused once locked, and the next login moves it. */
+STM_TEST(corvus_login_moves_a_homes_legacy_cold_file_to_the_hot_tier) {
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "sealprom")) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    stm_bdev *d = stm_fs_bdev_for_test(sp.fs);
+    uint8_t want[4096], got[4096];
+    memset(want, 0x5a, sizeof want);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(sp.fs, sp.sib.ds, sp.sib.big));
+    for (int round = 0; round < 2; round++) {
+        bool fail = (round == 1);
+        stm_sync_set_cas_admits_sealed_for_test(sync, true);
+        STM_ASSERT_OK(stm_fs_migrate_to_cold(sp.fs, sp.home.ds, sp.home.big));
+        stm_sync_set_cas_admits_sealed_for_test(sync, false);
+        STM_ASSERT_EQ(seal_extent_kind(sp.fs, sp.home.ds, sp.home.big),
+                      STM_EXTENT_KIND_COLD);
+        STM_ASSERT_OK(stm_fs_commit(sp.fs));
+        STM_ASSERT_OK(stm_fs_evict_dek(sp.fs, sp.home.ds));      /* logout */
+        uint32_t fired = stm_bdev_inject_fired_count(d);
+        if (fail) stm_bdev_inject_fail_after(d, 1);
+        STM_ASSERT_OK(stm_fs_install_dek(sp.fs, sp.home.ds, &sp.cc));
+        stm_bdev_inject_fail_after(d, 0);
+        STM_ASSERT_EQ(stm_bdev_inject_fired_count(d),
+                      fired + (fail ? 1u : 0u));
+        STM_ASSERT_EQ(seal_extent_kind(sp.fs, sp.home.ds, sp.home.big),
+                      fail ? STM_EXTENT_KIND_COLD : STM_EXTENT_KIND_HOT);
+        STM_ASSERT_EQ(seal_extent_kind(sp.fs, sp.sib.ds, sp.sib.big),
+                      STM_EXTENT_KIND_COLD);
+        memset(got, 0, sizeof got);
+        STM_ASSERT_OK(stm_fs_read(sp.fs, sp.home.ds, sp.home.big, 0, got,
+                                  sizeof got, &n));
+        STM_ASSERT_MEM_EQ(got, want, sizeof got);
+    }
+    STM_ASSERT_OK(stm_fs_evict_dek(sp.fs, sp.home.ds));
+    STM_ASSERT_ERR(stm_sync_read_extent(sync, sp.home.ds, sp.home.big, 0, got,
+                                        sizeof got, &n), STM_ELOCKED);
+    STM_ASSERT_OK(stm_fs_install_dek(sp.fs, sp.home.ds, &sp.cc));
+    STM_ASSERT_EQ(seal_extent_kind(sp.fs, sp.home.ds, sp.home.big),
+                  STM_EXTENT_KIND_HOT);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    seal_pool_close(&sp);
+}
+
+/* A send opened before the logout stops at it: the home's next record
+ * answers STM_ELOCKED, and every call after, and the handle's keys are wiped.
+ * So does a stream of a pool-keyed clone of the home (a pool written before
+ * such clones were refused may hold one; the seam makes it), whose shared
+ * extents read under the home's key. The sibling's stream, opened alike, one
+ * variable away, runs to its end with its keys. */
+STM_TEST(corvus_send_opened_before_logout_stops_at_it) {
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "sealsend")) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    uint64_t snap = 0, clone = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(sp.fs, sp.home.ds, "s", 1, &snap));
+    stm_fs_set_clone_of_sealed_for_test(sp.fs, true);
+    STM_ASSERT_OK(stm_fs_create_clone(sp.fs, 1, "c", snap, &clone));
+    stm_fs_set_clone_of_sealed_for_test(sp.fs, false);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    uint64_t ds[3] = {sp.home.ds, clone, sp.sib.ds};
+    stm_send_handle *sh[3] = {NULL, NULL, NULL};
+    size_t cap = (size_t)1 << 16;
+    uint8_t *buf = malloc(cap);
+    STM_ASSERT(buf != NULL);
+    for (int i = 0; i < 3; i++) {
+        size_t n = 0, need = 0;
+        STM_ASSERT_OK(stm_send_init(sync, ds[i], 0, 0, &sh[i]));
+        STM_ASSERT(!stm_send_keys_wiped_for_test(sh[i]));
+        STM_ASSERT_OK(stm_send_next(sh[i], buf, cap, &n, &need));  /* HEADER */
+        STM_ASSERT_OK(stm_send_next(sh[i], buf, cap, &n, &need));
+    }
+    STM_ASSERT_OK(stm_fs_evict_dek(sp.fs, sp.home.ds));            /* logout */
+    for (int i = 0; i < 3; i++) {
+        bool stops = (i < 2);
+        size_t n = 0, need = 0;
+        int records = 0;
+        stm_status r;
+        while ((r = stm_send_next(sh[i], buf, cap, &n, &need)) == STM_OK)
+            records++;
+        if (stops) {
+            STM_ASSERT_ERR(r, STM_ELOCKED);
+            STM_ASSERT_EQ(records, 0);
+            STM_ASSERT_ERR(stm_send_next(sh[i], buf, cap, &n, &need),
+                           STM_ELOCKED);
+            STM_ASSERT(stm_send_keys_wiped_for_test(sh[i]));
+        } else {
+            STM_ASSERT_ERR(r, STM_ENOENT);
+            STM_ASSERT(records > 0);
+            STM_ASSERT(!stm_send_keys_wiped_for_test(sh[i]));
+        }
+    }
+    /* A stopped stream stays stopped across the next login. */
+    STM_ASSERT_OK(stm_fs_install_dek(sp.fs, sp.home.ds, &sp.cc));
+    for (int i = 0; i < 3; i++) {
+        size_t n = 0, need = 0;
+        if (i < 2)
+            STM_ASSERT_ERR(stm_send_next(sh[i], buf, cap, &n, &need),
+                           STM_ELOCKED);
+        stm_send_close(sh[i]);
+    }
+    free(buf);
+    seal_pool_close(&sp);
 }

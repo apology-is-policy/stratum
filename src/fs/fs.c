@@ -343,6 +343,8 @@ struct stm_fs {
     stm_fs_buffer_insert_hook buffer_insert_hook;
     void *buffer_insert_hook_arg;
     stm_status fail_drains;
+    bool inline_in_sealed_for_test;
+    bool clone_of_sealed_for_test;
 #endif
 };
 
@@ -585,6 +587,26 @@ static void fs_buffer_insert_gap(stm_fs *fs, uint64_t dataset_id,
  * extents (extents_changed), a failure leaves them under the old inode, so
  * the fs wedges before the op's span ends and no commit makes that durable.
  * The caller holds fs->global and the inode's pin. */
+/* A regular file of a user-sealed dataset keeps no bytes in its inode: the
+ * pool's metadata key seals inodes, and every mount unwraps it with no
+ * session. Its bytes go to extents, under the dataset's own key. */
+static stm_status fs_regular_bytes_sealed(stm_fs *fs, uint64_t ds, bool *out)
+{
+    *out = false;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->inline_in_sealed_for_test) return STM_OK;
+#endif
+    return stm_sync_dataset_key_user_sealed(fs->sync, ds, out);
+}
+
+/* An empty EXTENT-kind value, as the write path's cutover leaves it. */
+static void fs_iv_make_extent(struct stm_inode_value *iv)
+{
+    iv->si_data_kind = STM_DATA_EXTENT;
+    iv->si_data_len  = 0;
+    memset(&iv->si_data, 0, sizeof iv->si_data);
+}
+
 static stm_status fs_data_iset_locked(stm_fs *fs, stm_inode_index *iidx,
                                       uint64_t ds, uint64_t ino,
                                       const struct stm_inode_value *iv,
@@ -2571,12 +2593,21 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
 
     /* A write starting past the inline prefix's block, or ending past a
      * recordsize, cuts the file over sparsely and takes the EXTENT path.
+     * So does any write to an inline file of a user-sealed dataset (made
+     * before its files began EXTENT-kind, or by an O_TMPFILE create whose
+     * stamp did not land): the prefix and the write go under its key.
      * After the cutover the only extent is the prefix block, which an
      * unaligned write starting in it covers anyway, so the cover is the
      * write's own blocks: one the covering write would refuse (not block-
      * aligned, over four recordsizes) is refused here, the kind unchanged. */
+    bool sealed_cut = false;
+    if (kind == STM_DATA_INLINE) {
+        stm_status ss = fs_regular_bytes_sealed(fs, ds, &sealed_cut);
+        if (ss != STM_OK) return ss;
+    }
     if (kind == STM_DATA_INLINE &&
-        (off >= 4096u || end_off > (uint64_t)STM_FS_RECORDSIZE_MAX)) {
+        (sealed_cut || off >= 4096u ||
+         end_off > (uint64_t)STM_FS_RECORDSIZE_MAX)) {
         uint64_t c_lo = off & ~(uint64_t)4095u;
         uint64_t c_hi = (end_off + 4095u) & ~(uint64_t)4095u;
         bool aligned = off % 4096u == 0u && (uint64_t)len % 4096u == 0u;
@@ -3883,6 +3914,16 @@ void stm_fs_fail_drains_for_test(stm_fs *fs, stm_status fail)
     fs->fail_drains = fail;
 }
 
+void stm_fs_set_inline_in_sealed_for_test(stm_fs *fs, bool on)
+{
+    fs->inline_in_sealed_for_test = on;
+}
+
+void stm_fs_set_clone_of_sealed_for_test(stm_fs *fs, bool on)
+{
+    fs->clone_of_sealed_for_test = on;
+}
+
 void stm_fs_set_fresh_pin_hook_for_test(stm_fs *fs, stm_fs_fresh_pin_hook fn,
                                         void *arg)
 {
@@ -4161,6 +4202,18 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
         return ps;
     }
 
+    /* Asked before the alloc, so a refusal has nothing to roll back. */
+    bool sealed_bytes = false;
+    if (child_mode_type == (uint32_t)S_IFREG) {
+        stm_status ss = fs_regular_bytes_sealed(fs, dataset_id,
+                                                &sealed_bytes);
+        if (ss != STM_OK) {
+            stm_inode_unpin(iidx, h_parent);
+            fs_txn_unlock_global(fs, &tx);
+            return ss;
+        }
+    }
+
     fs_txn_begin(fs, &tx);
     /* Allocate the new inode. The wrapper composes file-type bits
      * over caller-supplied permission bits; if the caller passed
@@ -4228,6 +4281,7 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
      * no other writer can race with the allocator's published state
      * for this child). */
     fs_stamp_create_times(&cv);
+    if (sealed_bytes) fs_iv_make_extent(&cv);
     stm_status ts = stm_inode_set(iidx, dataset_id, child_ino, &cv);
     if (ts != STM_OK) {
         stm_inode_unpin(iidx, h_child);
@@ -4399,6 +4453,13 @@ stm_status stm_fs_create_anon(stm_fs *fs, uint64_t dataset_id,
         return STM_EINVAL;
     }
 
+    bool sealed_bytes = false;
+    stm_status ss = fs_regular_bytes_sealed(fs, dataset_id, &sealed_bytes);
+    if (ss != STM_OK) {
+        fs_txn_unlock_global(fs, &tx);
+        return ss;
+    }
+
     fs_txn_begin(fs, &tx);
     uint64_t new_ino = 0;
     stm_status as = stm_inode_alloc_anon(iidx, dataset_id, effective_mode,
@@ -4426,6 +4487,9 @@ stm_status stm_fs_create_anon(stm_fs *fs, uint64_t dataset_id,
     stm_status ls = stm_inode_lookup(iidx, dataset_id, new_ino, &iv);
     if (ls == STM_OK) {
         fs_stamp_create_times(&iv);
+        /* Should this set fail, the file stays INLINE, and its first
+         * write cuts it over. */
+        if (sealed_bytes) fs_iv_make_extent(&iv);
         /* stm_inode_set's writer-side guards exempt orphan records
          * (ORPHAN flag set + nlink=0) from the FREED⇔nlink≥1 check —
          * see the inode.c R71 P1-1 / P8-POSIX-7a-anon symmetry. */
@@ -9170,11 +9234,13 @@ stm_status stm_fs_promote_policy_step(stm_fs *fs,
     FS_GUARD_WRITE(fs);
 
     uint64_t cur_gen = stm_sync_current_gen(fs->sync);
-    /* Saturating subtraction for the recency cutoff. */
-    uint64_t cutoff = (params->min_recency_txgs >= cur_gen)
+    /* min_recency_txgs == 0 is "no recency filter": cutoff 0, which any
+     * last_read_gen, a never-read extent's 0 included, meets. Otherwise the
+     * saturating cur_gen - min_recency_txgs. */
+    uint64_t cutoff = (params->min_recency_txgs == 0u ||
+                       params->min_recency_txgs >= cur_gen)
                         ? 0u
                         : (cur_gen - params->min_recency_txgs);
-    /* min_recency_txgs == 0 → "no recency filter" → cutoff = 0. */
 
     stm_sync_promote_candidate *cands = NULL;
     size_t   n_cands       = 0u;
@@ -9687,6 +9753,9 @@ stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
     bool origin_sealed = false;
     s = stm_sync_dataset_key_user_sealed(fs->sync, origin.dataset_id,
                                          &origin_sealed);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->clone_of_sealed_for_test) origin_sealed = false;
+#endif
     if (s == STM_OK && origin_sealed) s = STM_ENOTSUPPORTED;
     /* Nor under a sealed parent, as stm_fs_create_dataset. */
     bool parent_sealed = false;
@@ -10391,6 +10460,23 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
  * UNWRAP round-trip runs under EX -- acceptable because the /ctl/ driver
  * already serializes DEK lifecycle ops on its own lease lock and logins
  * are console-paced (see src/ctl/synfs.c). */
+/* A pool written before the cold tier refused sealed data may hold a sealed
+ * dataset's extents in the CAS, under the pool's key. With the dataset's key
+ * back, every COLD-bearing file of it moves to the hot tier, under that key.
+ * Best effort: a failure leaves the rest where it was, refused whole while
+ * the dataset is locked, for the next install to retry; the login stands. A
+ * pool whose CAS is empty holds no COLD extent, and is not walked. */
+static void fs_promote_sealed_cold(stm_fs *fs, uint64_t dataset_id)
+{
+    size_t chunks = 0;
+    stm_status cs = stm_cas_count(stm_sync_cas_index(fs->sync), &chunks);
+    if (cs != STM_OK || chunks == 0u) return;
+    stm_fs_promote_policy_params every = {0};
+    stm_fs_promote_policy_stats st;
+    stm_status ps = stm_fs_promote_policy_step(fs, dataset_id, &every, &st);
+    (void)ps;
+}
+
 stm_status stm_fs_install_dek(stm_fs *fs, uint64_t dataset_id,
                                 const stm_corvus_mount_cfg *corvus)
 {
@@ -10399,6 +10485,7 @@ stm_status stm_fs_install_dek(stm_fs *fs, uint64_t dataset_id,
     FS_GUARD_WRITE(fs);
     stm_status s = stm_sync_install_dek(fs->sync, dataset_id, corvus);
     pthread_rwlock_unlock(&fs->global);
+    if (s == STM_OK) fs_promote_sealed_cold(fs, dataset_id);
     return s;
 }
 

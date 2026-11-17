@@ -377,6 +377,9 @@ stm_status stm_send_init(stm_sync *sync,
  *   STM_ERANGE — out_cap too small; *out_len_needed advises.
  *   STM_EBADTAG / STM_EIO / STM_EPROTOCOL on internal verify failures
  *     (couldn't decrypt a source extent — corruption mid-send).
+ *   STM_ELOCKED -- a dataset the stream reads was locked (its user logged
+ *     out) after init: the handle's keys are wiped, and every later call
+ *     answers the same. Only stm_send_close remains.
  */
 STM_MUST_USE
 stm_status stm_send_next(stm_send_handle *h,
@@ -396,6 +399,8 @@ void stm_send_close(stm_send_handle *h);
 #define STM_SEND_INIT_HOOK_BEFORE_PINS    1
 void stm_send_set_init_hook_for_test(void (*hook)(void *ctx, int stage),
                                      void *ctx);
+/* True once the handle captured keys and every byte of them is zero. */
+bool stm_send_keys_wiped_for_test(const stm_send_handle *h);
 #endif
 
 /* ========================================================================= */

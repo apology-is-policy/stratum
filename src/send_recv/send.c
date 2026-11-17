@@ -141,6 +141,10 @@ struct stm_send_handle {
 
     /* The blocks the stream reads, kept until close (stm_sync_send_hold_*). */
     stm_sync_send_hold *hold;
+
+    /* A dataset the stream reads was locked after init: the keys are
+     * wiped, and every later record answers STM_ELOCKED. */
+    bool               revoked;
 };
 
 #ifdef STRATUM_BUILD_TESTING_HOOKS
@@ -157,6 +161,33 @@ void stm_send_set_init_hook_for_test(void (*hook)(void *ctx, int stage),
     do { if (g_send_init_hook) g_send_init_hook(g_send_init_hook_ctx, (stage)); } while (0)
 #else
 #define SEND_INIT_HOOK(stage) do { } while (0)
+#endif
+
+/* The captured keys must not outlive a logout. Asked before each record, of
+ * the sent dataset and of every dataset a captured key belongs to (a clone's
+ * shared extents keep their origin's key); a record already being built when
+ * the evict lands finishes, as a read in flight does. Callers hold no pin. */
+static bool send_revoked(stm_send_handle *h)
+{
+    if (h->revoked) return true;
+    bool locked = stm_sync_dataset_locked(h->sync, h->dataset_id);
+    for (size_t i = 0; !locked && i < h->n_deks; i++)
+        locked = stm_sync_dataset_locked(h->sync, h->deks[i].dataset_id);
+    if (!locked) return false;
+    if (h->deks) stm_ct_memzero(h->deks, h->cap_deks * sizeof *h->deks);
+    h->revoked = true;
+    return true;
+}
+
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+bool stm_send_keys_wiped_for_test(const stm_send_handle *h)
+{
+    const uint8_t *p = (const uint8_t *)h->deks;
+    size_t n = h->cap_deks * sizeof *h->deks;
+    uint8_t acc = 0;
+    for (size_t i = 0; i < n; i++) acc |= p[i];
+    return h->n_deks > 0 && acc == 0;
+}
 #endif
 
 static void send_handle_free(stm_send_handle *h)
@@ -895,6 +926,7 @@ stm_status stm_send_next(stm_send_handle *h,
      *   n_chunk_plan+1..n_chunk_plan+n_extents       → EXTENT(c-n_chunk_plan-1)
      *   n_chunk_plan+n_extents+1                     → END
      *   ≥ n_chunk_plan+n_extents+2                   → STM_ENOENT */
+    if (send_revoked(h)) return STM_ELOCKED;
     size_t end_cursor = h->n_chunk_plan + h->n_extents + 1u;
     if (h->cursor > end_cursor) return STM_ENOENT;
 

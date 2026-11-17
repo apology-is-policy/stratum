@@ -293,6 +293,19 @@ void stm_fs_set_buffer_insert_hook_for_test(stm_fs *fs,
 void stm_fs_fail_drains_for_test(stm_fs *fs, stm_status fail);
 
 /*
+ * Let a user-sealed dataset's regular files keep their bytes inline, as
+ * files made before that rule did: creates leave them INLINE and writes do
+ * not cut them over. false restores the rule.
+ */
+void stm_fs_set_inline_in_sealed_for_test(stm_fs *fs, bool on);
+
+/*
+ * Let a clone be made of a user-sealed origin, as pools made before that
+ * refusal may hold. The sealed-parent refusal still holds.
+ */
+void stm_fs_set_clone_of_sealed_for_test(stm_fs *fs, bool on);
+
+/*
  * How many times, process-wide, a thread inside a span of fs->txn took a
  * blocking inode pin or a second span or left an op with its span still
  * held, or a thread outside one made a namespace mutation (a dirent's
