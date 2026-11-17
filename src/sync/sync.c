@@ -864,7 +864,7 @@ static bool sync_dek_slot_alive(stm_sync *s, stm_ebr_thread *ebr,
 /* Insert (dataset_id, key_id, dek) via COW: fill the staged map (or
  * allocate one) with old slots + the new slot, publish, retire the old
  * map. A NULL dek inserts a locked slot. Caller holds s->lock.
- * Infallible after a successful sync_dek_grow(s, count+1) — the fill
+ * Infallible after a successful sync_dek_grow(s, count+1) -- the fill
  * is pure memcpy. */
 static stm_status sync_dek_insert(stm_sync *s,
                                     uint64_t dataset_id, uint64_t key_id,
