@@ -4535,8 +4535,6 @@ stm_status stm_ctl_attach_scrub(stm_ctl *c, struct stm_scrub *scrub)
 void stm_ctl_destroy(stm_ctl *c)
 {
     if (!c) return;
-    /* Before event_mu goes: the fs is unmounted after the ctl. */
-    if (c->fs) stm_fs_set_event_sink(c->fs, NULL, c);
     /* P9.5-PARALLEL-1: wait until every live stm_ctl_conn has been
      * destroyed before tearing the shared state down. Detached /ctl/
      * workers may still be inside a vops dispatch reading c->fs /
@@ -4549,6 +4547,17 @@ void stm_ctl_destroy(stm_ctl *c)
     while (c->worker_count > 0)
         pthread_cond_wait(&c->worker_cv, &c->worker_mu);
     pthread_mutex_unlock(&c->worker_mu);
+    /* TLY-A5b: worker_count==0 (waited above) means every conn was
+     * destroyed and released its leases. Orphans may remain (a disconnect
+     * whose evict failed): retry them once more. One that still fails is
+     * dropped with its key in RAM until the fs unmounts, whose close wipes
+     * every DEK. Before the sink goes: an evict drains the home, and a run
+     * it drops is logged. */
+    pthread_mutex_lock(&c->dek_mu);
+    ctl_dek_reap_orphans(c);
+    pthread_mutex_unlock(&c->dek_mu);
+    /* Before event_mu goes: the fs is unmounted after the ctl. */
+    if (c->fs) stm_fs_set_event_sink(c->fs, NULL, c);
     /* P9-CTL-1d-events: release the event log buffer. Zero before
      * free — the log may contain operationally-sensitive context
      * (uids, dataset names, etc.) that an attacker recovering freed
@@ -4564,14 +4573,6 @@ void stm_ctl_destroy(stm_ctl *c)
     pthread_cond_destroy(&c->worker_cv);
     pthread_mutex_destroy(&c->worker_mu);
     pthread_mutex_destroy(&c->event_mu);
-    /* TLY-A5b: worker_count==0 (waited above) means every conn was
-     * destroyed and released its leases. Orphans may remain (a disconnect
-     * whose evict failed): retry them once more. One that still fails is
-     * dropped with its key in RAM until the fs unmounts, whose close wipes
-     * every DEK. */
-    pthread_mutex_lock(&c->dek_mu);
-    ctl_dek_reap_orphans(c);
-    pthread_mutex_unlock(&c->dek_mu);
     pthread_mutex_destroy(&c->dek_mu);
     free(c);
 }

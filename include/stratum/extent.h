@@ -817,8 +817,9 @@ typedef struct {
 
 /*
  * As stm_extent_promote_swap_to_hot, for a COLD record longer than a HOT
- * extent may be: it is replaced by n_pieces HOT records (1..16), back to
- * back from `off`, whose lens sum to `len`; piece i's origin_off is
+ * extent may be, or one a fragmented pool writes back in shorter runs: it
+ * is replaced by n_pieces HOT records (at least one, each at least a byte),
+ * back to back from `off`, whose lens sum to `len`; piece i's origin_off is
  * origin_off plus the lens before it, and every piece has n_replicas
  * paddrs, all distinct. The first piece replaces the COLD record under its
  * key and the rest are inserted after it, so a failure inserting one after

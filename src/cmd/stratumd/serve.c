@@ -2220,6 +2220,13 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts, const int *
         close(ctl_fd);
         stm_unix_listen_closed(opts->ctl_socket_path);
     }
+    /* A run the last flush drops is logged while the ctl's event sink is
+     * in: commit before the ctl goes. The unmount's own commit writes what
+     * is left and answers STM_EIO for a drop no fsync reported. */
+    if (fs) {
+        stm_status frc = stm_fs_commit(fs);
+        (void)frc;
+    }
     if (ctl) stm_ctl_destroy(ctl);
     if (scrub) stm_scrub_close(scrub);
     stm_status urc = stm_fs_unmount(fs);

@@ -117,6 +117,24 @@
 (* BuggyDropSilently drops without recording: the invariant fires. Inode  *)
 (* incarnations (si_gen) are not modelled; the C tests carry them.        *)
 (*                                                                          *)
+(* The fs owes at most MaxReports reports: a drop for a new inode into a   *)
+(* full table evicts another inode's report and tells the event sink,      *)
+(* which is that inode's report (its runs leave `lost`).                    *)
+(* BuggyEvictSilently evicts without it: DroppedIsReported fires.          *)
+(* Transition(ino) is an inline file's cutover: its committed bytes (here  *)
+(* an extent at offset 0) go back into the buffer as a HELD run, the       *)
+(* committed copy gone. held[ino] is the end of the held bytes (the C      *)
+(* dirty buffer's held_end), cleared by a Flush of the inode; `taken` the  *)
+(* seqs of the bytes taken. A drop refuses a run starting below held[ino]; *)
+(* HeldIsNeverDropped checks that range guard against the seqs (a split    *)
+(* remnant keeps its seq), and BuggyDropHeld, the guard off, fires it. A   *)
+(* file cuts over once (`cut`).                                             *)
+(* ReadHidesFlushOrder compares the read with the state that survived: a   *)
+(* dropped run is gone from both sides, so DroppedIsReported, not the      *)
+(* read, answers for it. Per-open-file sampling (errseq) is not modelled:  *)
+(* the first Fsync here takes the report; the C tests carry the per-fid    *)
+(* shape and the seen entries the table keeps.                             *)
+(*                                                                          *)
 (***************************************************************************)
 
 EXTENDS Naturals, FiniteSets
@@ -131,7 +149,10 @@ CONSTANTS
     GlobalCapBlocks,
     BuggyReadSkipsBuffer,
     BuggyFlushReusesPaddr,
-    BuggyDropSilently
+    BuggyDropSilently,
+    MaxReports,
+    BuggyDropHeld,
+    BuggyEvictSilently
 
 ASSUME MaxInos          \in (Nat \ {0})
 ASSUME MaxOff           \in (Nat \ {0})
@@ -143,6 +164,9 @@ ASSUME GlobalCapBlocks  \in (Nat \ {0})
 ASSUME BuggyReadSkipsBuffer       \in BOOLEAN
 ASSUME BuggyFlushReusesPaddr      \in BOOLEAN
 ASSUME BuggyDropSilently          \in BOOLEAN
+ASSUME MaxReports       \in (Nat \ {0})
+ASSUME BuggyDropHeld              \in BOOLEAN
+ASSUME BuggyEvictSilently         \in BOOLEAN
 
 InoIds  == 1..MaxInos
 Offsets == 0..(MaxOff - 1)
@@ -173,10 +197,13 @@ VARIABLES
     current_txg,    \* 0..MaxTxg, monotonic
     next_seq,       \* 1..MaxSeq+1 -- next writer's seq stamp
     write_errors,   \* SUBSET InoIds -- inodes owed an fsync error report
-    lost            \* SUBSET BufRange -- ghost: dropped runs not yet reported
+    lost,           \* SUBSET BufRange -- ghost: dropped runs not yet reported
+    held,           \* [InoIds -> 0..MaxOff] -- end of a cutover's held bytes
+    taken,          \* SUBSET Seqs -- ghost: seqs a cutover took from committed
+    cut             \* SUBSET InoIds -- files that have cut over
 
 vars == <<buffer, committed, durable_disk, used_paddrs, current_txg, next_seq,
-          write_errors, lost>>
+          write_errors, lost, held, taken, cut>>
 
 (***************************************************************************)
 (* Helpers.                                                                  *)
@@ -216,6 +243,9 @@ Init ==
     /\ next_seq      = 1
     /\ write_errors  = {}
     /\ lost          = {}
+    /\ held          = [i \in InoIds |-> 0]
+    /\ taken         = {}
+    /\ cut           = {}
 
 (***************************************************************************)
 (* BufferedWrite — add a range to the buffer.                                *)
@@ -263,7 +293,7 @@ BufferedWrite(ino, off, len) ==
                 {[ino |-> ino, off |-> off, len |-> len, seq |-> next_seq]}
     /\ next_seq' = next_seq + 1
     /\ UNCHANGED <<committed, durable_disk, used_paddrs, current_txg,
-                   write_errors, lost>>
+                   write_errors, lost, held, taken, cut>>
 
 (***************************************************************************)
 (* DirectWrite — large-and-aligned write that bypasses the buffer.          *)
@@ -295,7 +325,8 @@ DirectWrite(ino, off, len, p) ==
                   paddr |-> p, gen |-> current_txg, src_seq |-> next_seq]}
     /\ used_paddrs' = used_paddrs \union {p}
     /\ next_seq' = next_seq + 1
-    /\ UNCHANGED <<durable_disk, current_txg, write_errors, lost>>
+    /\ UNCHANGED <<durable_disk, current_txg, write_errors, lost, held,
+                   taken, cut>>
 
 (***************************************************************************)
 (* Flush — drain ALL buffered ranges for one inode into `committed`.        *)
@@ -325,7 +356,9 @@ Flush(ino) ==
            IN  /\ committed' = (committed \ comm_overlap) \union new_extents
                /\ used_paddrs' = used_paddrs \union { pmap[b] : b \in to_drain }
                /\ buffer' = buffer \ to_drain
-    /\ UNCHANGED <<durable_disk, current_txg, next_seq, write_errors, lost>>
+    /\ held' = [held EXCEPT ![ino] = 0]
+    /\ UNCHANGED <<durable_disk, current_txg, next_seq, write_errors, lost,
+                   taken, cut>>
 
 (***************************************************************************)
 (* Commit — promote `committed` to `durable_disk`. Models a successful     *)
@@ -342,7 +375,7 @@ Commit ==
     /\ durable_disk' = committed
     /\ current_txg' = current_txg + 1
     /\ UNCHANGED <<buffer, committed, used_paddrs, next_seq, write_errors,
-                   lost>>
+                   lost, held, taken, cut>>
 
 (***************************************************************************)
 (* Crash — power loss. Buffer goes to /dev/null; in-RAM `committed` that   *)
@@ -355,23 +388,56 @@ Crash ==
     /\ committed' = durable_disk
     /\ write_errors' = {}
     /\ lost' = {}
-    /\ UNCHANGED <<durable_disk, used_paddrs, current_txg, next_seq>>
+    /\ held' = [i \in InoIds |-> 0]
+    /\ taken' = {}
+    /\ UNCHANGED <<durable_disk, used_paddrs, current_txg, next_seq, cut>>
 
 (***************************************************************************)
 (* FlushFails -- the drain cannot write run r of ino (its record failed its *)
 (* integrity check): r leaves the buffer unwritten, so the inode's other   *)
 (* runs and every other inode still flush and Commit stays reachable; the *)
 (* inode is owed a report. committed is unchanged: the record keeps its   *)
-(* old bytes.                                                               *)
+(* old bytes. A run starting below held[ino] is never dropped. A new       *)
+(* inode's report into a full table evicts another's, by event.            *)
 (***************************************************************************)
 FlushFails(ino, r) ==
     /\ r \in BufferedFor(ino)
+    /\ \/ BuggyDropHeld
+       \/ r.off >= held[ino]
     /\ buffer' = buffer \ {r}
-    /\ lost' = lost \union {r}
-    /\ write_errors' = IF BuggyDropSilently THEN write_errors
-                                            ELSE write_errors \union {ino}
+    /\ IF BuggyDropSilently
+         THEN /\ write_errors' = write_errors
+              /\ lost' = lost \union {r}
+         ELSE IF ino \in write_errors \/ Cardinality(write_errors) < MaxReports
+         THEN /\ write_errors' = write_errors \union {ino}
+              /\ lost' = lost \union {r}
+         ELSE \E v \in write_errors :
+              /\ write_errors' = (write_errors \ {v}) \union {ino}
+              /\ lost' = IF BuggyEvictSilently
+                           THEN lost \union {r}
+                           ELSE { x \in lost : x.ino # v } \union {r}
     /\ UNCHANGED <<committed, durable_disk, used_paddrs, current_txg,
-                   next_seq>>
+                   next_seq, held, taken, cut>>
+
+(***************************************************************************)
+(* Transition -- an inline file cuts over: its committed bytes leave the   *)
+(* committed state and wait in the buffer as a held run.                    *)
+(***************************************************************************)
+Transition(ino) ==
+    /\ ino \in InoIds \ cut
+    /\ \E e \in CommittedFor(ino) :
+        /\ e.off = 0
+        /\ ~\E b \in BufferedFor(ino) : RangesOverlap(b.off, b.len, e.off, e.len)
+        /\ InodeBufBytes(ino) + e.len <= InodeCapBlocks
+        /\ GlobalBufBytes + e.len <= GlobalCapBlocks
+        /\ committed' = committed \ {e}
+        /\ buffer' = buffer \union
+              {[ino |-> ino, off |-> 0, len |-> e.len, seq |-> e.src_seq]}
+        /\ held' = [held EXCEPT ![ino] = e.len]
+        /\ taken' = taken \union {e.src_seq}
+    /\ cut' = cut \union {ino}
+    /\ UNCHANGED <<durable_disk, used_paddrs, current_txg, next_seq,
+                   write_errors, lost>>
 
 (***************************************************************************)
 (* Fsync -- the file's fsync answers its error, once: the report is taken.  *)
@@ -381,7 +447,7 @@ Fsync(ino) ==
     /\ write_errors' = write_errors \ {ino}
     /\ lost' = { r \in lost : r.ino # ino }
     /\ UNCHANGED <<buffer, committed, durable_disk, used_paddrs, current_txg,
-                   next_seq>>
+                   next_seq, held, taken, cut>>
 
 (***************************************************************************)
 (* Top-level Next.                                                           *)
@@ -394,6 +460,7 @@ Next ==
     \/ \E ino \in InoIds : Flush(ino)
     \/ \E ino \in InoIds : \E r \in buffer : FlushFails(ino, r)
     \/ \E ino \in InoIds : Fsync(ino)
+    \/ \E ino \in InoIds : Transition(ino)
     \/ Commit
     \/ Crash
 
@@ -445,6 +512,9 @@ TypeOK ==
     /\ next_seq     \in 1..(MaxSeq + 1)
     /\ write_errors \subseteq InoIds
     /\ lost         \subseteq BufRange
+    /\ held         \in [InoIds -> 0..MaxOff]
+    /\ taken        \subseteq Seqs
+    /\ cut          \subseteq InoIds
 
 (* ReadHidesFlushOrder — Read returns the latest writer-issued seq         *)
 (* regardless of whether it's in buffer or committed.                       *)
@@ -494,9 +564,20 @@ DurableUsedPaddrs ==
 DroppedIsReported ==
     \A r \in lost : r.ino \in write_errors
 
+(* ReportsBounded -- the fs owes at most MaxReports reports.               *)
+ReportsBounded ==
+    Cardinality(write_errors) <= MaxReports
+
+(* HeldIsNeverDropped -- no dropped run carries bytes a cutover took from *)
+(* the committed state.                                                    *)
+HeldIsNeverDropped ==
+    \A r \in lost : r.seq \notin taken
+
 Invariants ==
     /\ TypeOK
     /\ DroppedIsReported
+    /\ ReportsBounded
+    /\ HeldIsNeverDropped
     /\ ReadHidesFlushOrder
     /\ FlushPaddrFreshness
     /\ PaddrUniquenessAcrossCommitted

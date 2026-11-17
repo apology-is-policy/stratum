@@ -1153,11 +1153,10 @@ STM_TEST(fs_a_file_ends_at_the_largest_file_size) {
     reuse_fs_done(fs);
 }
 
-/* An unaligned write to an inline file whose cover passes four
- * recordsizes answers ERANGE with the file as it was, kind included; one
- * whose cover is exactly four recordsizes lands, and so does an aligned
- * one past the bound (it splits without a cover). */
-STM_TEST(fs_an_inline_file_refuses_a_cover_past_the_bound_before_its_cutover) {
+/* A write to an inline file over four recordsizes cuts it over and lands
+ * whole, unaligned (the direct write goes a recordsize at a time) or
+ * aligned (it splits without a cover). */
+STM_TEST(fs_an_inline_file_takes_a_write_over_4_recordsizes_at_its_cutover) {
     const uint64_t MIB = 1024u * 1024u, REC = STM_FS_RECORDSIZE_MAX;
     make_tmp("inline_cover_bound");
     stm_fs_format_opts fopts = default_format_opts();
@@ -1183,24 +1182,15 @@ STM_TEST(fs_an_inline_file_refuses_a_cover_past_the_bound_before_its_cutover) {
     memset(big, 0x9D, (size_t)(4u * REC + 4096u));
 
     /* [4097, 4097 + 4 REC): its blocks span 4 REC + 4 KiB. */
-    STM_ASSERT_ERR(stm_fs_write(fs, 1, f, 4097u, big, (size_t)(4u * REC)),
-                   STM_ERANGE);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 4097u, big, (size_t)(4u * REC)));
     struct stm_inode_value v = {0};
     STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v));
-    STM_ASSERT_EQ(v.si_data_kind, STM_DATA_INLINE);
-    STM_ASSERT_EQ(stm_load_le64(v.si_size), (uint64_t)6);
-    STM_ASSERT_EQ(mid_op_byte(fs, f, 0), (uint8_t)'p');
-
-    /* One byte shorter: exactly 4 REC of blocks. */
-    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 4097u, big,
-                               (size_t)(4u * REC - 1u)));
-    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v));
     STM_ASSERT_EQ(v.si_data_kind, STM_DATA_EXTENT);
-    STM_ASSERT_EQ(stm_load_le64(v.si_size), 4096u + 4u * REC);
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), 4097u + 4u * REC);
     STM_ASSERT_EQ(mid_op_byte(fs, f, 0), (uint8_t)'p');
     STM_ASSERT_EQ(mid_op_byte(fs, f, 4096u), 0x00);
     STM_ASSERT_EQ(mid_op_byte(fs, f, 4097u), 0x9D);
-    STM_ASSERT_EQ(mid_op_byte(fs, f, 4080u + 4u * REC), 0x9D);
+    STM_ASSERT_EQ(mid_op_byte(fs, f, 4096u + 4u * REC), 0x9D);
 
     STM_ASSERT_OK(stm_fs_write(fs, 1, g, 4096u, big,
                                (size_t)(4u * REC + 4096u)));

@@ -26,6 +26,7 @@
 #include <stratum/alloc.h>
 #include <stratum/block.h>
 #include <stratum/block_inject.h>
+#include <stratum/cas.h>
 #include <stratum/crypto.h>
 #include <stratum/extent.h>
 #include <stratum/hash.h>
@@ -33,6 +34,7 @@
 #include <stratum/pool.h>
 #include <stratum/super.h>
 #include <stratum/sync.h>
+#include <stratum/sync_testing.h>
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -3028,6 +3030,123 @@ STM_TEST(sync_multi_a_send_hold_needs_one_replica_held) {
     stm_sync_send_hold_end(s, h);
     STM_ASSERT_OK(stm_sync_commit(s));
     STM_ASSERT_ERR(stm_alloc_lookup(a0, e.paddrs[0], NULL, NULL), STM_ENOENT);
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+
+/* Replica 1 fails its check and device 0 does not answer replica 0's read:
+ * the read answers the device's error, which is not the record's own, so
+ * a drain keeps its run. With every replica read and bad, it is. */
+STM_TEST(sync_multi_read_answers_a_device_error_over_a_bad_replica) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "r4rep", bds, as, &pool, &s);
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)(i * 7u);
+    STM_ASSERT_OK(stm_sync_write_extent(s, 1u, 1u, 0u, plain, sizeof plain));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_extent_record e;
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(s), 1u, 1u, 0u, &e));
+    STM_ASSERT_EQ((int)e.n_replicas, 2);
+    const uint16_t d0 = stm_paddr_device(e.paddrs[0]);
+    const uint16_t d1 = stm_paddr_device(e.paddrs[1]);
+    uint8_t junk[2u * STM_UB_SIZE];
+    memset(junk, 0x5a, sizeof junk);
+    STM_ASSERT_OK(stm_bdev_write(bds[d1], stm_paddr_offset(e.paddrs[1]) *
+                                 (uint64_t)STM_UB_SIZE, junk, sizeof junk));
+    STM_ASSERT_OK(stm_bdev_fsync(bds[d1]));
+    stm_sync_force_locked_read_for_test(s, true);
+    uint8_t back[4096];
+    size_t got = 0;
+    bool bad = true;
+    stm_sync_dcache_drain_for_test(s);
+    STM_ASSERT_OK(stm_sync_read_extent_ex(s, 1u, 1u, 0u, back, sizeof back,
+                                          &got, &bad));
+    STM_ASSERT(!bad);
+    STM_ASSERT(memcmp(back, plain, sizeof plain) == 0);
+    stm_sync_dcache_drain_for_test(s);
+    stm_bdev_inject_read_fail_after(bds[d0], 1);
+    STM_ASSERT_ERR(stm_sync_read_extent_ex(s, 1u, 1u, 0u, back, sizeof back,
+                                           &got, &bad), STM_EIO);
+    STM_ASSERT(!bad);
+    STM_ASSERT_EQ(stm_bdev_inject_read_fired_count(bds[d0]), 1u);
+    STM_ASSERT_OK(stm_bdev_write(bds[d0], stm_paddr_offset(e.paddrs[0]) *
+                                 (uint64_t)STM_UB_SIZE, junk, sizeof junk));
+    STM_ASSERT_OK(stm_bdev_fsync(bds[d0]));
+    stm_sync_dcache_drain_for_test(s);
+    STM_ASSERT_ERR(stm_sync_read_extent_ex(s, 1u, 1u, 0u, back, sizeof back,
+                                           &got, &bad), STM_EBADTAG);
+    STM_ASSERT(bad);
+    stm_sync_force_locked_read_for_test(s, false);
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* A COLD record's chunk, read and promoted, with one replica's device
+ * failing and the other's tag: the device error, not a bad record; with
+ * both tags failing, a bad record. */
+STM_TEST(sync_multi_cold_read_and_promote_answer_a_device_error_over_a_bad_replica) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "r4crep", bds, as, &pool, &s);
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)(i * 5u + 1u);
+    STM_ASSERT_OK(stm_sync_write_extent(s, 1u, 1u, 0u, plain, sizeof plain));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_sync_migrate_to_cold(s, 1u, 1u));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_extent_record e;
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(s), 1u, 1u, 0u, &e));
+    STM_ASSERT_EQ(e.kind, STM_EXTENT_KIND_COLD);
+    stm_cas_record cr;
+    memset(&cr, 0, sizeof cr);
+    STM_ASSERT_OK(stm_cas_lookup(stm_sync_cas_index(s), e.content_hash, &cr));
+    STM_ASSERT_EQ((int)cr.n_replicas, 2);
+    if (cr.n_replicas != 2u) { teardown_mirror_pool(bds, as, pool, s); return; }
+    const uint16_t d0 = stm_paddr_device(cr.paddrs[0]);
+    const uint16_t d1 = stm_paddr_device(cr.paddrs[1]);
+    uint8_t junk[2u * STM_UB_SIZE];
+    memset(junk, 0x5a, sizeof junk);
+    STM_ASSERT_OK(stm_bdev_write(bds[d1], stm_paddr_offset(cr.paddrs[1]) *
+                                 (uint64_t)STM_UB_SIZE, junk, sizeof junk));
+    STM_ASSERT_OK(stm_bdev_fsync(bds[d1]));
+    stm_sync_force_locked_read_for_test(s, true);
+    uint8_t back[4096];
+    size_t got = 0;
+    bool bad = true;
+    stm_sync_dcache_drain_for_test(s);
+    STM_ASSERT_OK(stm_sync_read_extent_ex(s, 1u, 1u, 0u, back, sizeof back,
+                                          &got, &bad));
+    STM_ASSERT(!bad);
+    STM_ASSERT(memcmp(back, plain, sizeof plain) == 0);
+    stm_sync_dcache_drain_for_test(s);
+    stm_bdev_inject_read_fail_after(bds[d0], 1);
+    bad = true;
+    STM_ASSERT_ERR(stm_sync_read_extent_ex(s, 1u, 1u, 0u, back, sizeof back,
+                                           &got, &bad), STM_EIO);
+    STM_ASSERT(!bad);
+    STM_ASSERT_EQ(stm_bdev_inject_read_fired_count(bds[d0]), 1u);
+    stm_sync_dcache_drain_for_test(s);
+    stm_bdev_inject_read_fail_after(bds[d0], 1);
+    bad = true;
+    STM_ASSERT_ERR(stm_sync_promote_cold_at(s, 1u, 1u, 0u, &bad), STM_EIO);
+    STM_ASSERT(!bad);
+    STM_ASSERT_EQ(stm_bdev_inject_read_fired_count(bds[d0]), 2u);
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(s), 1u, 1u, 0u, &e));
+    STM_ASSERT_EQ(e.kind, STM_EXTENT_KIND_COLD);
+    STM_ASSERT_OK(stm_bdev_write(bds[d0], stm_paddr_offset(cr.paddrs[0]) *
+                                 (uint64_t)STM_UB_SIZE, junk, sizeof junk));
+    STM_ASSERT_OK(stm_bdev_fsync(bds[d0]));
+    stm_sync_dcache_drain_for_test(s);
+    STM_ASSERT_ERR(stm_sync_read_extent_ex(s, 1u, 1u, 0u, back, sizeof back,
+                                           &got, &bad), STM_EBADTAG);
+    STM_ASSERT(bad);
+    bad = false;
+    stm_status ps = stm_sync_promote_cold_at(s, 1u, 1u, 0u, &bad);
+    STM_ASSERT(ps == STM_EBADTAG || ps == STM_ECORRUPT);
+    STM_ASSERT(bad);
+    stm_sync_force_locked_read_for_test(s, false);
     teardown_mirror_pool(bds, as, pool, s);
 }
 

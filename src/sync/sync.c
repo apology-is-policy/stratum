@@ -7480,7 +7480,18 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
                                                        const stm_extent_record *rec_in,
                                                        uint64_t off,
                                                        void *buf, size_t len,
-                                                       size_t *out_read);
+                                                       size_t *out_read,
+                                                       bool *rec_bad);
+
+/* A failure that is the record's own: its bytes fail their check on every
+ * replica that was read, its content entry is gone or does not match it,
+ * or the key it names is missing. Not one of the pool's metadata (an index
+ * or content-index node), a device, or a locked dataset. */
+static stm_status sync_rec_bad(bool *rec_bad, stm_status e)
+{
+    if (rec_bad) *rec_bad = true;
+    return e;
+}
 
 /* #343 decrypted-extent cache helpers. Caller holds s->lock. */
 
@@ -7873,7 +7884,8 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
                                                  uint64_t dataset_id, uint64_t ino,
                                                  uint64_t off, void *buf,
                                                  size_t len, size_t *out_read,
-                                                 bool count_for_promotion) {
+                                                 bool count_for_promotion,
+                                                 bool *rec_bad) {
     stm_extent_record rec;
     uint64_t hole_end = UINT64_MAX;
     stm_status ls = stm_extent_lookup_or_next(s->extent_idx, dataset_id, ino,
@@ -7923,7 +7935,8 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
      * LIVE extent_idx for the LIVE (ds, ino, off) — meaningless on
      * a frozen snap-view read. */
     stm_status ds = sync_decrypt_extent_record_locked(s, &rec, off,
-                                                        buf, len, out_read);
+                                                        buf, len, out_read,
+                                                        rec_bad);
     if (ds != STM_OK) return ds;
 
     /* P7-CAS-11: bump the per-COLD-extent read-frequency counter
@@ -8049,7 +8062,8 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
                                                uint64_t slice_off,
                                                size_t slice_len,
                                                void *buf,
-                                               size_t *out_read) {
+                                               size_t *out_read,
+                                               bool *rec_bad) {
     stm_extent_record rec = *rec_in;
 
 #ifdef STRATUM_BUILD_TESTING_HOOKS
@@ -8067,11 +8081,14 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
         if (!s->cas_idx) return STM_ECORRUPT;
         stm_cas_record cas_rec;
         stm_status cs = stm_cas_lookup(s->cas_idx, rec.content_hash, &cas_rec);
-        if (cs == STM_ENOENT) return STM_ECORRUPT;        /* dangling */
+        if (cs == STM_ENOENT)                             /* dangling */
+            return sync_rec_bad(rec_bad, STM_ECORRUPT);
         if (cs != STM_OK)     return cs;
-        if (cas_rec.length != rec.len) return STM_ECORRUPT;
+        if (cas_rec.length != rec.len)
+            return sync_rec_bad(rec_bad, STM_ECORRUPT);
         if (cas_rec.n_replicas < 1
-            || cas_rec.n_replicas > STM_CAS_MAX_REPLICAS) return STM_ECORRUPT;
+            || cas_rec.n_replicas > STM_CAS_MAX_REPLICAS)
+            return sync_rec_bad(rec_bad, STM_ECORRUPT);
 
         stm_aead_mode cmode = STM_AEAD_AEGIS256;
         size_t ctag_len = stm_aead_tag_len(cmode);
@@ -8108,16 +8125,24 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
             memcpy(cnonce + 24, u1_le.v, 8);
         }
 
-        stm_status clast_err = STM_EBADTAG;
+        /* The bytes fail their check only when every replica read was
+         * checked and failed: one the device did not answer may be good. */
+        stm_status clast_err = STM_EBADTAG, cdev_err = STM_OK;
         bool decrypted = false;
         for (uint8_t i = 0; i < cas_rec.n_replicas && !decrypted; i++) {
             uint16_t dev = stm_paddr_device(cas_rec.paddrs[i]);
             stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
-            if (!bd) { clast_err = STM_EINVAL; continue; }
+            if (!bd) {
+                if (cdev_err == STM_OK) cdev_err = STM_EINVAL;
+                continue;
+            }
             uint64_t byte_off = stm_paddr_offset(cas_rec.paddrs[i])
                                   * (uint64_t)STM_UB_SIZE;
             stm_status rs = stm_bdev_read(bd, byte_off, ccbuf, ctotal);
-            if (rs != STM_OK) { clast_err = rs; continue; }
+            if (rs != STM_OK) {
+                if (cdev_err == STM_OK) cdev_err = rs;
+                continue;
+            }
 
             size_t pt_out = 0;
             stm_status ds = stm_aead_decrypt(cmode, s->metadata_key,
@@ -8145,7 +8170,8 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
         if (!decrypted) {
             stm_ct_memzero(cpbuf, rec.len);
             free(cpbuf);
-            return clast_err;
+            if (cdev_err != STM_OK) return cdev_err;
+            return sync_rec_bad(rec_bad, clast_err);
         }
         memcpy(buf, (uint8_t *)cpbuf + slice_off, slice_len);
         /* Visible at birth: COLD decrypts under the pool-wide
@@ -8161,7 +8187,7 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
     }
 
     if (rec.n_replicas < 1 || rec.n_replicas > STM_EXTENT_MAX_REPLICAS)
-        return STM_ECORRUPT;
+        return sync_rec_bad(rec_bad, STM_ECORRUPT);
 
     /* P7-10: resolve the DEK by the extent's stamped key_id (NOT
      * the dataset's CURRENT — old extents written before a rotation
@@ -8213,7 +8239,8 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
         stm_status missing = sync_dek_missing_locked(s, rec.origin_dataset_id,
                                                      rec.key_id, STM_ECORRUPT);
         if (ebr) pthread_mutex_unlock(&s->lock);
-        return missing;
+        return missing == STM_ECORRUPT ? sync_rec_bad(rec_bad, missing)
+                                       : missing;
     }
 
     /* R36 P1-3: hardcode AEGIS-256 — see write path for rationale. */
@@ -8263,15 +8290,21 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
      * Nonce is canonical (replicas[0], gen) regardless of which
      * replica we sourced bytes from — the cipher was computed once
      * with that nonce at write time and replicated bytewise. */
-    stm_status last_err = STM_EBADTAG;
+    stm_status last_err = STM_EBADTAG, dev_err = STM_OK;
     bool decrypted = false;
     for (uint8_t i = 0; i < rec.n_replicas && !decrypted; i++) {
         uint16_t dev = stm_paddr_device(rec.paddrs[i]);
         stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
-        if (!bd) { last_err = STM_EINVAL; continue; }
+        if (!bd) {
+            if (dev_err == STM_OK) dev_err = STM_EINVAL;
+            continue;
+        }
         uint64_t byte_off = stm_paddr_offset(rec.paddrs[i]) * (uint64_t)STM_UB_SIZE;
         stm_status rs = stm_bdev_read(bd, byte_off, cbuf, total_bytes);
-        if (rs != STM_OK) { last_err = rs; continue; }
+        if (rs != STM_OK) {
+            if (dev_err == STM_OK) dev_err = rs;
+            continue;
+        }
 
         size_t pt_out = 0;
         stm_status ds = stm_extent_decrypt(mode, dek,
@@ -8290,7 +8323,8 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
     if (!decrypted) {
         stm_ct_memzero(pbuf, rec.len);
         free(pbuf);
-        return last_err;
+        if (dev_err != STM_OK) return dev_err;
+        return sync_rec_bad(rec_bad, last_err);
     }
 
     memcpy(buf, (uint8_t *)pbuf + slice_off, slice_len);
@@ -8342,7 +8376,8 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
                                                        const stm_extent_record *rec_in,
                                                        uint64_t off,
                                                        void *buf, size_t len,
-                                                       size_t *out_read) {
+                                                       size_t *out_read,
+                                                       bool *rec_bad) {
     uint64_t slice_off = 0;
     size_t   slice_len = 0;
     stm_status bs = sync_slice_bounds(rec_in, off, len,
@@ -8368,12 +8403,22 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
     }
 
     return sync_extent_fetch_decrypt(s, /*ebr=*/NULL, rec_in,
-                                       slice_off, slice_len, buf, out_read);
+                                       slice_off, slice_len, buf, out_read,
+                                       rec_bad);
 }
 
 stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                    uint64_t off, void *buf, size_t len,
                                    size_t *out_read) {
+    return stm_sync_read_extent_ex(s, dataset_id, ino, off, buf, len, out_read,
+                                   NULL);
+}
+
+stm_status stm_sync_read_extent_ex(stm_sync *s, uint64_t dataset_id,
+                                   uint64_t ino, uint64_t off, void *buf,
+                                   size_t len, size_t *out_read,
+                                   bool *out_record_bad) {
+    if (out_record_bad) *out_record_bad = false;
     if (!s || !buf || !out_read) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     if (len == 0) { *out_read = 0; return STM_OK; }
@@ -8471,7 +8516,8 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                 rc = STM_OK;
             } else {
                 rc = sync_extent_fetch_decrypt(s, ebr, &rec, slice_off,
-                                                 slice_len, buf, out_read);
+                                                 slice_len, buf, out_read,
+                                                 NULL);
                 /* The record is a copy, and the pin it was taken under has
                  * been left: an overwrite may have replaced it since, and
                  * what it names been retired after it (its key pruned by a
@@ -8510,7 +8556,8 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
 
     stm_status rc = stm_sync_read_extent_locked(s, dataset_id, ino,
                                                    off, buf, len, out_read,
-                                                   /*count_for_promotion=*/true);
+                                                   /*count_for_promotion=*/true,
+                                                   out_record_bad);
     pthread_mutex_unlock(&s->lock);
     return rc;
 }
@@ -8548,7 +8595,8 @@ static stm_status stm_sync_read_extent_at_snap_locked(stm_sync *s,
         return STM_OK;
     }
     if (ls != STM_OK) return ls;
-    return sync_decrypt_extent_record_locked(s, &rec, off, buf, len, out_read);
+    return sync_decrypt_extent_record_locked(s, &rec, off, buf, len, out_read,
+                                             NULL);
 }
 
 stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
@@ -8618,7 +8666,7 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
             return STM_OK;
         }
         return sync_extent_fetch_decrypt(s, ebr, &rec, slice_off,
-                                           slice_len, buf, out_read);
+                                           slice_len, buf, out_read, NULL);
     }
 
     pthread_mutex_lock(&s->lock);
@@ -8692,7 +8740,8 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
  * sustained truncate workloads slow scrub-step throughput.
  */
 static stm_status promote_one_extent_locked(stm_sync *s,
-                                              const stm_extent_record *C);
+                                              const stm_extent_record *C,
+                                              bool *rec_bad);
 
 stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                 uint64_t size, bool *out_changed)
@@ -8722,7 +8771,7 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                              new_size - 1u, &big);
         if (bs == STM_OK && big.kind == STM_EXTENT_KIND_COLD &&
             big.len > STM_FS_RECORDSIZE_MAX && big.off + big.len > new_size)
-            bs = promote_one_extent_locked(s, &big);
+            bs = promote_one_extent_locked(s, &big, NULL);
         if (bs != STM_OK && bs != STM_ENOENT) {
             pthread_mutex_unlock(&s->lock);
             return bs;
@@ -8886,7 +8935,7 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         stm_status rs = stm_sync_read_extent_locked(s, dataset_id, ino,
                                                        rec.off, plain,
                                                        rec.len, &got,
-                                                       /*count_for_promotion=*/false);
+                                                       /*count_for_promotion=*/false, NULL);
         if (rs != STM_OK) {
             stm_ct_memzero(plain, rec.len);
             free(plain);
@@ -9799,7 +9848,7 @@ static stm_status migrate_one_extent_locked(stm_sync *s,
     stm_status rs = stm_sync_read_extent_locked(s, E->dataset_id, E->ino,
                                                    E->off, plain,
                                                    E->len, &got,
-                                                   /*count_for_promotion=*/false);
+                                                   /*count_for_promotion=*/false, NULL);
     if (rs != STM_OK || got != E->len) {
         stm_status err = (rs != STM_OK) ? rs : STM_EIO;
         stm_ct_memzero(plain, E->len);
@@ -10087,7 +10136,7 @@ static stm_status migrate_whole_ino_locked(stm_sync *s,
                                                        e->off,
                                                        (uint8_t *)concat + concat_pos,
                                                        e->len, &got,
-                                                       /*count_for_promotion=*/false);
+                                                       /*count_for_promotion=*/false, NULL);
         if (rs != STM_OK || got != e->len) {
             stm_status err = (rs != STM_OK) ? rs : STM_EIO;
             stm_ct_memzero(concat, total_len);
@@ -10708,8 +10757,8 @@ stm_status stm_sync_recv_cold_chunk_release(stm_sync *s,
  * Step 5+ failures don't trigger rollback (state mutated). On STM_OK
  * the cold record is gone and the hot record is live.
  */
-/* A COLD record goes back as at most this many HOT pieces of the
- * recordsize; the cold tier stores records up to 16 MiB. */
+/* The longest COLD record the promote takes, in recordsizes; the cold tier
+ * stores records up to 16 MiB. */
 #define SYNC_PROMOTE_PIECES_MAX 4u
 
 static void promote_free_pieces_locked(stm_sync *s,
@@ -10723,78 +10772,68 @@ static void promote_free_pieces_locked(stm_sync *s,
                                      s->current_gen);
 }
 
-/* Reserve, encrypt under dek and write one HOT piece of C's plaintext, at
- * C->off + poff. On failure its own blocks are freed and paddrs left 0. */
-static stm_status promote_write_piece_locked(stm_sync *s,
-                                             const stm_extent_record *C,
-                                             const uint8_t dek[32],
-                                             const uint8_t *plain,
-                                             uint64_t poff, uint64_t plen,
-                                             size_t n_replicas,
-                                             uint64_t *paddrs)
+/* Write [poff, poff + plen) of C's plaintext as HOT pieces through the
+ * write path's reservation: one run, or pieces where no free run holds it
+ * (sync_write_reserve_pieces_locked), each under its own tag. Appends them
+ * to *pieces. On failure what this call reserved or wrote is freed, and
+ * the pieces appended before it are the caller's. */
+static stm_status promote_write_part_locked(stm_sync *s,
+                                            const stm_extent_record *C,
+                                            const uint8_t *plain,
+                                            uint64_t poff, uint64_t plen,
+                                            stm_extent_hot_piece **pieces,
+                                            size_t *n_pieces, size_t *cap,
+                                            uint64_t *key_id,
+                                            size_t *n_replicas)
 {
-    stm_aead_mode mode = STM_AEAD_AEGIS256;
-    size_t tag_len = stm_aead_tag_len(mode);
-    size_t hot_total = (size_t)plen + tag_len;
-    uint64_t nblocks = (hot_total + STM_UB_SIZE - 1u) / STM_UB_SIZE;
-    size_t reserved = 0;
-    stm_status rc = STM_OK;
-    for (size_t i = 0; i < n_replicas && rc == STM_OK; i++) {
-        if (i >= STM_POOL_DEVICES_MAX || s->allocs[i] == NULL) {
-            rc = STM_EINVAL;
-            break;
+    sync_write_reservation res;
+    stm_status rs = sync_write_reserve_locked(s, C->dataset_id, C->off + poff,
+                                              (size_t)plen, false, &res);
+    if (rs != STM_OK) return rs;
+    if (res.n_replicas > STM_EXTENT_MAX_REPLICAS) {
+        sync_write_unreserve_locked(s, false, &res);
+        stm_ct_memzero(res.dek, sizeof res.dek);
+        return STM_EINVAL;
+    }
+    if (*n_pieces + res.n_pieces > *cap) {
+        size_t ncap = (*n_pieces + res.n_pieces) * 2u;
+        stm_extent_hot_piece *np = realloc(*pieces, ncap * sizeof *np);
+        if (!np) {
+            sync_write_unreserve_locked(s, false, &res);
+            stm_ct_memzero(res.dek, sizeof res.dek);
+            return STM_ENOMEM;
         }
-        rc = sync_alloc_reserve_locked(s, s->allocs[i], nblocks, 0, &paddrs[i]);
-        if (rc == STM_OK) reserved++;
+        *pieces = np;
+        *cap = ncap;
     }
-    void *hot_cbuf = NULL;
-    if (rc == STM_OK) {
-        hot_cbuf = malloc(hot_total);
-        if (!hot_cbuf) rc = STM_ENOMEM;
+    rs = sync_write_encrypt_store(s, C->dataset_id, C->ino, C->off + poff,
+                                  plain + poff, &res);
+    if (rs != STM_OK) {
+        sync_write_reserve_rollback(s, &res);
+        return rs;
     }
-    if (rc == STM_OK) {
-        stm_ad_extent ad;
-        memset(&ad, 0, sizeof ad);
-        ad.magic        = STM_AD_MAGIC_EXTENT;
-        ad.version      = STM_AD_VERSION_EXTENT;
-        ad.pool_uuid[0] = s->pool_uuid[0];
-        ad.pool_uuid[1] = s->pool_uuid[1];
-        ad.dataset_id   = C->dataset_id;
-        ad.ino          = C->ino;
-        ad.offset       = C->off + poff;
-        ad.content_kind = 0;
-        size_t out_len = 0;
-        rc = stm_extent_encrypt(mode, dek, paddrs[0], s->current_gen,
-                                &ad, plain, (size_t)plen,
-                                hot_cbuf, hot_total, &out_len);
+    const sync_write_piece *wp = sync_write_pieces(&res);
+    for (size_t k = 0; k < res.n_pieces; k++) {
+        stm_extent_hot_piece *hp = &(*pieces)[(*n_pieces)++];
+        memset(hp, 0, sizeof *hp);
+        hp->len = wp[k].len;
+        for (size_t j = 0; j < res.n_replicas; j++)
+            hp->paddrs[j] = wp[k].replicas[j];
     }
-    for (size_t i = 0; i < n_replicas && rc == STM_OK; i++) {
-        stm_bdev *bd = stm_pool_device_bdev(s->pool,
-                                            stm_paddr_device(paddrs[i]));
-        if (!bd) {
-            rc = STM_EINVAL;
-            break;
-        }
-        rc = stm_bdev_write(bd, stm_paddr_offset(paddrs[i]) * (uint64_t)STM_UB_SIZE,
-                            hot_cbuf, hot_total);
-    }
-    free(hot_cbuf);
-    if (rc != STM_OK) {
-        for (size_t j = 0; j < reserved; j++) {
-            (void)stm_alloc_free(s->allocs[j], paddrs[j], s->current_gen);
-            paddrs[j] = 0u;
-        }
-    }
-    return rc;
+    *key_id = res.enc_key_id;
+    *n_replicas = res.n_replicas;
+    sync_write_release(&res);
+    return STM_OK;
 }
 
 static stm_status promote_one_extent_locked(stm_sync *s,
-                                              const stm_extent_record *C)
+                                              const stm_extent_record *C,
+                                              bool *rec_bad)
 {
     if (C->kind != STM_EXTENT_KIND_COLD) return STM_EINVAL;
     if (C->len == 0u ||
         C->len > SYNC_PROMOTE_PIECES_MAX * (uint64_t)STM_FS_RECORDSIZE_MAX)
-        return STM_ECORRUPT;
+        return sync_rec_bad(rec_bad, STM_ECORRUPT);
     if ((C->off % STM_UB_SIZE) != 0u) return STM_EINVAL;
     if ((C->len % STM_UB_SIZE) != 0u) return STM_EINVAL;
     /* A record another dataset first wrote, user-sealed, would go under
@@ -10814,10 +10853,12 @@ static stm_status promote_one_extent_locked(stm_sync *s,
      * promote anyway — the bump would be wasted). */
     stm_cas_record cas_rec;
     stm_status ls = stm_cas_lookup(s->cas_idx, C->content_hash, &cas_rec);
-    if (ls != STM_OK) return (ls == STM_ENOENT) ? STM_ECORRUPT : ls;
-    if (cas_rec.length != C->len) return STM_ECORRUPT;
+    if (ls == STM_ENOENT) return sync_rec_bad(rec_bad, STM_ECORRUPT);
+    if (ls != STM_OK) return ls;
+    if (cas_rec.length != C->len) return sync_rec_bad(rec_bad, STM_ECORRUPT);
     if (cas_rec.n_replicas < 1
-        || cas_rec.n_replicas > STM_CAS_MAX_REPLICAS) return STM_ECORRUPT;
+        || cas_rec.n_replicas > STM_CAS_MAX_REPLICAS)
+        return sync_rec_bad(rec_bad, STM_ECORRUPT);
 
     stm_aead_mode cmode = STM_AEAD_AEGIS256;
     size_t ctag_len = stm_aead_tag_len(cmode);
@@ -10852,16 +10893,22 @@ static stm_status promote_one_extent_locked(stm_sync *s,
             memcpy(cnonce + 24, u1_le.v, 8);
         }
 
-        stm_status last_err = STM_EBADTAG;
+        stm_status last_err = STM_EBADTAG, dev_err = STM_OK;
         bool decrypted = false;
         for (uint8_t i = 0; i < cas_rec.n_replicas && !decrypted; i++) {
             uint16_t dev = stm_paddr_device(cas_rec.paddrs[i]);
             stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
-            if (!bd) { last_err = STM_EINVAL; continue; }
+            if (!bd) {
+                if (dev_err == STM_OK) dev_err = STM_EINVAL;
+                continue;
+            }
             uint64_t byte_off = stm_paddr_offset(cas_rec.paddrs[i])
                                   * (uint64_t)STM_UB_SIZE;
             stm_status rs = stm_bdev_read(bd, byte_off, cold_cbuf, cold_total);
-            if (rs != STM_OK) { last_err = rs; continue; }
+            if (rs != STM_OK) {
+                if (dev_err == STM_OK) dev_err = rs;
+                continue;
+            }
             size_t pt_out = 0;
             stm_status ds = stm_aead_decrypt(cmode, s->metadata_key,
                                                 cnonce,
@@ -10878,53 +10925,39 @@ static stm_status promote_one_extent_locked(stm_sync *s,
         if (!decrypted) {
             stm_ct_memzero(plain, C->len);
             free(plain);
-            return last_err;
+            if (dev_err != STM_OK) return dev_err;
+            return sync_rec_bad(rec_bad, last_err);
         }
     }
 
-    /* Steps 2-5, per piece: a HOT extent is at most the recordsize, so a
-     * longer record (the cold tier made them before it capped its chunks)
-     * goes back as several, back to back, in one index step. The CURRENT
-     * DEK first, so a locked dataset reserves nothing. The HOT extent's
-     * identity (origin_*) is the LIVE position, not the cold record's
-     * origin: its ciphertext is fresh, under that identity. */
+    /* Steps 2-5: a HOT extent is at most the recordsize, so a longer
+     * record (the cold tier made them before it capped its chunks) goes
+     * back as several parts of at most the recordsize, back to back, in
+     * one index step. Each part is reserved and written as a write is:
+     * one run, or pieces on a pool whose free runs are shorter, which the
+     * dirty buffer's charge factor pays for as it does a drain's. The
+     * reservation resolves the CURRENT DEK first, so a locked dataset
+     * reserves nothing. The HOT extent's identity (origin_*) is the LIVE
+     * position, not the cold record's origin: its ciphertext is fresh,
+     * under that identity. */
     const uint64_t REC = (uint64_t)STM_FS_RECORDSIZE_MAX;
-    size_t n_pieces = (size_t)((C->len + REC - 1u) / REC);
-    size_t n_replicas = sync_desired_replica_count_locked(s);
-    if (n_replicas < 1 || n_replicas > STM_EXTENT_MAX_REPLICAS ||
-        stm_aead_tag_len(STM_AEAD_AEGIS256) == 0u) {
-        stm_ct_memzero(plain, C->len);
-        free(plain);
-        return STM_EINVAL;
-    }
+    size_t n_parts = (size_t)((C->len + REC - 1u) / REC);
+    stm_extent_hot_piece *pieces = NULL;
+    size_t n_pieces = 0, cap = 0, n_replicas = 0;
     uint64_t enc_key_id = 0u;
-    uint8_t  dek[32];
-    stm_status rks = sync_resolve_current_dek_locked(s, C->dataset_id,
-                                                     &enc_key_id, dek);
-    if (rks != STM_OK) {
-        stm_ct_memzero(plain, C->len);
-        free(plain);
-        return rks;
-    }
-    stm_extent_hot_piece pieces[SYNC_PROMOTE_PIECES_MAX];
-    memset(pieces, 0, sizeof pieces);
-    size_t written = 0;
     stm_status ws = STM_OK;
-    for (size_t pc = 0; pc < n_pieces && ws == STM_OK; pc++) {
+    for (size_t pc = 0; pc < n_parts && ws == STM_OK; pc++) {
         uint64_t poff = (uint64_t)pc * REC;
         uint64_t plen = (C->len - poff < REC) ? C->len - poff : REC;
-        pieces[pc].len = plen;
-        ws = promote_write_piece_locked(s, C, dek,
-                                        (const uint8_t *)plain + poff,
-                                        poff, plen, n_replicas,
-                                        pieces[pc].paddrs);
-        if (ws == STM_OK) written++;
+        ws = promote_write_part_locked(s, C, (const uint8_t *)plain, poff,
+                                       plen, &pieces, &n_pieces, &cap,
+                                       &enc_key_id, &n_replicas);
     }
     stm_ct_memzero(plain, C->len);
     free(plain);
-    stm_ct_memzero(dek, sizeof dek);
     if (ws != STM_OK) {
-        promote_free_pieces_locked(s, pieces, written, n_replicas);
+        promote_free_pieces_locked(s, pieces, n_pieces, n_replicas);
+        free(pieces);
         return ws;
     }
     /* The swap. link_gen = current_gen so incremental send sees the
@@ -10958,12 +10991,15 @@ static stm_status promote_one_extent_locked(stm_sync *s,
         /* The index holds some pieces and not the record: their blocks
          * stay allocated, and the handle takes nothing more. */
         sync_wedge_locked(s);
+        free(pieces);
         return ms;
     }
     if (ms != STM_OK) {
         promote_free_pieces_locked(s, pieces, n_pieces, n_replicas);
+        free(pieces);
         return ms;
     }
+    free(pieces);
     /* Step 6: the dropped record's reference, which a snapshot naming the record
      * still needs. Failure here is best-effort (cas_idx in unexpected state); the
      * new HOT record stays live either way. STM_ENOENT means the entry was
@@ -10999,11 +11035,14 @@ static bool promote_collect_cb(const stm_extent_record *e, void *cx) {
 }
 
 /* The errors that stop a bounded promote: the pool's or the dataset's,
- * which the next extent would meet too. */
+ * which the next extent would meet too. The promote reserves as a write
+ * does, in pieces where no run holds a part, so its STM_ENOSPC is the
+ * pool's room. STM_ENOMEM is not here: a big record takes two buffers its
+ * size, which a smaller one after it may not need. */
 static bool sync_promote_err_stops(stm_status e)
 {
     return e == STM_ENOSPC || e == STM_ELOCKED || e == STM_EWEDGED ||
-           e == STM_EROFS || e == STM_ENOMEM;
+           e == STM_EROFS;
 }
 
 /* max_bytes 0: every COLD extent of the ino, past a failed one, the first
@@ -11048,7 +11087,7 @@ static stm_status sync_promote_ino(stm_sync *s, uint64_t dataset_id,
             out->more = true;
             break;
         }
-        stm_status pe = promote_one_extent_locked(s, r);
+        stm_status pe = promote_one_extent_locked(s, r, NULL);
         if (pe != STM_OK && max_bytes != 0u && sync_promote_err_stops(pe)) {
             promote_err = pe;
             out->more = true;
@@ -11091,8 +11130,10 @@ stm_status stm_sync_promote_to_hot_bounded(stm_sync *s, uint64_t dataset_id,
 }
 
 stm_status stm_sync_promote_cold_at(stm_sync *s, uint64_t dataset_id,
-                                    uint64_t ino, uint64_t off)
+                                    uint64_t ino, uint64_t off,
+                                    bool *out_record_bad)
 {
+    if (out_record_bad) *out_record_bad = false;
     if (!s || dataset_id == 0 || ino == 0) return STM_EINVAL;
     pthread_mutex_lock(&s->lock);
     if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
@@ -11103,7 +11144,7 @@ stm_status stm_sync_promote_cold_at(stm_sync *s, uint64_t dataset_id,
                                          &rec);
     if (rc == STM_ENOENT) rc = STM_OK;
     else if (rc == STM_OK && rec.kind == STM_EXTENT_KIND_COLD)
-        rc = promote_one_extent_locked(s, &rec);
+        rc = promote_one_extent_locked(s, &rec, out_record_bad);
     pthread_mutex_unlock(&s->lock);
     return rc;
 }

@@ -106,10 +106,27 @@ const stm_bdev_caps *stm_bdev_caps_of(const stm_bdev *d)
     return d ? &d->caps : NULL;
 }
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+static inline bool inject_read_should_fail(stm_bdev *d)
+{
+    if (atomic_load_explicit(&d->inject_read_countdown,
+                             memory_order_relaxed) <= 0)
+        return false;
+    if (atomic_fetch_sub_explicit(&d->inject_read_countdown, 1,
+                                  memory_order_relaxed) != 1)
+        return false;
+    atomic_fetch_add_explicit(&d->inject_read_fired, 1, memory_order_relaxed);
+    return true;
+}
+#endif
+
 stm_status stm_bdev_read(stm_bdev *d, uint64_t offset, void *buf, size_t len)
 {
     if (!d || !buf) return STM_EINVAL;
     if (len == 0) return STM_OK;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (inject_read_should_fail(d)) return STM_EIO;
+#endif
     return d->ops->read(d, offset, buf, len);
 }
 
@@ -257,6 +274,20 @@ uint32_t stm_bdev_inject_fired_count(const stm_bdev *d)
 {
     if (!d) return 0;
     return (uint32_t)atomic_load_explicit(&d->inject_fired, memory_order_relaxed);
+}
+
+void stm_bdev_inject_read_fail_after(stm_bdev *d, int64_t n_reads)
+{
+    if (!d) return;
+    int_fast64_t v = (n_reads > 0) ? (int_fast64_t)n_reads : 0;
+    atomic_store_explicit(&d->inject_read_countdown, v, memory_order_relaxed);
+}
+
+uint32_t stm_bdev_inject_read_fired_count(const stm_bdev *d)
+{
+    if (!d) return 0;
+    return (uint32_t)atomic_load_explicit(&d->inject_read_fired,
+                                          memory_order_relaxed);
 }
 
 void stm_bdev_iouring_fail_submit_for_test(stm_bdev *d, int errnum, unsigned count)

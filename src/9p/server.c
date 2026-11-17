@@ -156,6 +156,8 @@ typedef struct p9_fid {
     bool        is_open;
     uint32_t    open_flags;     /* Linux O_* from Tlopen */
     uint64_t    open_iounit;    /* per-fid iounit reported in Rlopen */
+    uint64_t    werr_since;     /* errseq sample (stm_fs_fsync_since),
+                                 * taken at Tlopen / Tlcreate */
 
     /* Connection-namespace path. The canonical absolute path this fid
      * points at WITHIN THE CLIENT'S NAMESPACE (not necessarily the
@@ -1788,6 +1790,7 @@ static int walk_bind_locked(stm_9p_server *s, p9_fid *f,
         nf->is_open    = false;
         nf->open_flags = 0;
         nf->open_iounit = 0;
+        nf->werr_since = 0;
     }
 
     nf->dataset_id  = cur->ds;
@@ -2340,6 +2343,9 @@ phase_c:
         f->is_open     = true;
         f->open_flags  = flags;
         f->open_iounit = iounit;
+        /* werr_mu is a leaf; with the gen given no inode lock is taken. */
+        f->werr_since  = stm_fs_write_error_sample(s->fs, ds, ino,
+                                                   f->cached_gen);
     }
     fid_unpin_locked(s, f);
     if (ecode)
@@ -2931,6 +2937,8 @@ phase_c:
         f->is_open      = true;
         f->open_flags   = flags;
         f->open_iounit  = iounit;
+        f->werr_since   = stm_fs_write_error_sample(s->fs, ds, new_ino,
+                                                    new_gen);
         if (new_ns) {
             free(f->ns_path);
             f->ns_path     = new_ns;
@@ -3710,13 +3718,18 @@ static stm_status h_fsync(stm_9p_server *s,
      * full-lock stall in the pre-CF-2b server. */
     fid_pin_locked(f);
     const uint64_t ds = f->dataset_id, ino = f->ino, gen = f->cached_gen;
+    uint64_t since = f->werr_since;
     phase_b_enter(s, STM_9P_TFSYNC, tag);
 
-    /* (b) unlocked. */
-    stm_status rc = stm_fs_fsync(s->fs, ds, ino, &gen);
+    /* (b) unlocked. The fid's own errseq sample: every fid open before a
+     * dropped run hears of it once (Linux's per-file errseq). */
+    stm_status rc = stm_fs_fsync_since(s->fs, ds, ino, &gen, &since);
 
-    /* (c) no fid mutation; unpin. */
+    /* (c) the sample moves forward only, for this binding; unpin. */
     must_lock(&s->lock);
+    if (f->kind == P9_FID_NODE && f->dataset_id == ds && f->ino == ino &&
+        since > f->werr_since)
+        f->werr_since = since;
     fid_unpin_locked(s, f);
     if (rc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);

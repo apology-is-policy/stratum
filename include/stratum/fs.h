@@ -301,25 +301,47 @@ stm_status stm_fs_free(stm_fs *fs, uint64_t paddr, uint64_t free_gen);
  * record keeps its old bytes, the file's next stm_fs_fsync answers
  * STM_EIO, and the event sink hears of it. The flushes before a
  * truncate, reflink, migrate and the write path's own buffer-full flush
- * drop such a run the same way. Any other flush error (STM_ENOSPC, a
- * device's STM_EIO, STM_ENOMEM, STM_ERANGE for a cover that records off
- * the block grid widen past 4 x recordsize) keeps the bytes buffered and
- * fails the commit. */
+ * drop such a run the same way. So is one whose cover meets records off
+ * the block grid (which only a crafted stream received before they were
+ * refused can make) where it cannot rewrite them: a split point or a
+ * cover past 4 x recordsize. Only a failure that is one of the file's own
+ * records drops a run: one of the pool's metadata (an index node, the
+ * allocator, the keys), a device (a replica the device did not answer
+ * makes the read answer that device error), STM_ENOSPC or STM_ENOMEM
+ * keeps the bytes buffered and fails the commit, and so does any failure
+ * of a run holding bytes an inline file's committed state keeps nowhere
+ * else (its first write past the inline cap). */
 STM_MUST_USE
 stm_status stm_fs_commit(stm_fs *fs);
 
-/* fsync(2) for one file: stm_fs_commit, then STM_EIO once if a flush
- * since the file's last fsync dropped a run of its buffered bytes (see
- * stm_fs_commit). gen names the incarnation (a 9P fid's cached si_gen);
- * NULL names the live one, so a reused inode number never inherits its
- * predecessor's error. A commit error wins and keeps the report for the
- * next fsync. Like Linux's errseq, the report is made once: a second
- * fsync answers STM_OK although the bytes stay lost. The reports live in
- * RAM, up to 256 files (the oldest goes, with an event, past that); an
- * unmount or a crash forgets them. */
+/* fsync(2) for one file: stm_fs_commit, then STM_EIO if a flush dropped a
+ * run of its buffered bytes (see stm_fs_commit) that no fsync has
+ * reported yet; the report is then seen. gen names the incarnation (a 9P
+ * fid's cached si_gen); NULL names the live one, so a reused inode number
+ * never inherits its predecessor's error. A commit error wins and keeps
+ * the report. A caller with an open file's errseq sample uses
+ * stm_fs_fsync_since. The reports live in RAM, up to 256 files; past
+ * that a new one evicts, with an event, the oldest an fsync made, else
+ * the oldest. A crash forgets them, and an unmount answers STM_EIO when
+ * one no fsync saw is left. */
 STM_MUST_USE
 stm_status stm_fs_fsync(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                         const uint64_t *gen);
+
+/* fsync(2) through one open file, as Linux's errseq: STM_EIO if a flush
+ * dropped a run of the incarnation after *since was sampled
+ * (stm_fs_write_error_sample, when the file was opened), then *since moves
+ * to it. So every open file that predates a drop hears of it once, from
+ * its own fsync, and one opened after it was reported does not. */
+STM_MUST_USE
+stm_status stm_fs_fsync_since(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              const uint64_t *gen, uint64_t *since);
+
+/* The errseq sample an open of incarnation (dataset_id, ino, gen) keeps for
+ * stm_fs_fsync_since: what it has already seen. A drop no fsync has
+ * reported yet is still reported to an opener after it (errseq_sample). */
+uint64_t stm_fs_write_error_sample(stm_fs *fs, uint64_t dataset_id,
+                                   uint64_t ino, uint64_t gen);
 
 /* The fs's operational events (one line each, no newline): a flush that
  * dropped a file's run. The sink is called under the fs's locks, so it
@@ -384,10 +406,6 @@ void stm_fs_set_event_sink(stm_fs *fs, stm_fs_event_sink fn, void *ctx);
  *   - STM_EOVERFLOW if the write passes STM_FS_FILE_MAX (pwrite: if it
  *     starts at or past it).
  *   - STM_ENOSPC when the pool has no room.
- *   - STM_ERANGE (write) when the write is not block-aligned and its
- *     cover, the blocks it touches plus the extents it partly overlaps,
- *     passes 4 * STM_FS_RECORDSIZE_MAX; nothing is written. Only an
- *     in-process caller can ask that much: a 9P count is bounded by msize.
  *   - (write to an inline file) the keyschema's error (STM_ECORRUPT for
  *     two CURRENT keys) when it is asked whether a dataset with no key in
  *     RAM is user-sealed.
@@ -2587,7 +2605,8 @@ stm_status stm_fs_promote_policy_step(stm_fs *fs,
  * dataset at once the later to finish sets it. It moves a file a step at
  * a time, each step trying about 1 MiB of records, or one record when that
  * is larger (an older pool's cold record may be up to 16 MiB; it goes back
- * as HOT extents of at most the recordsize), so a pass may pass max_bytes
+ * as HOT extents of at most the recordsize, in shorter pieces where the
+ * pool has no free run that long), so a pass may pass max_bytes
  * by less than one record. out_stats->inos_promoted counts the files it
  * moved bytes of.
  * The /ctl/ driver calls it after each login's install, once the lease is
@@ -2608,7 +2627,9 @@ stm_status stm_fs_promote_policy_step(stm_fs *fs,
  * would keep less free than a sixteenth of its data blocks after twice
  * the pass's bytes (checked after the collect) or a write or a drain found
  * it full, STM_ELOCKED if the dataset is locked or became so,
- * STM_EWEDGED / STM_EROFS / STM_ENOMEM. STM_EINVAL on NULL fs, dataset 0
+ * STM_EWEDGED / STM_EROFS, or STM_ENOMEM when it cannot collect the
+ * dataset's records (a record's own STM_ENOMEM is a failure it passes
+ * over). STM_EINVAL on NULL fs, dataset 0
  * or max_bytes 0. A snapshot taken while a file was COLD keeps that copy
  * in the CAS until it is deleted, and a chunk another dataset shares stays
  * in the CAS for it.

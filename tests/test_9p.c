@@ -6987,3 +6987,77 @@ STM_TEST(p9_fsync_answers_eio_once_for_a_dropped_run) {
     unlink(g_tmp_path);
     unlink(g_key_path);
 }
+
+/* Every fid open on a file before a run of it is dropped hears of it once,
+ * from its own Tfsync (Linux's per-file errseq); a fid opened after a
+ * Tfsync reported it does not. A fid whose file was unlinked since still
+ * hears of the incarnation it opened. */
+STM_TEST(p9_fsync_reports_a_dropped_run_to_every_fid_open_before_it) {
+    make_tmp("9p_fsync_fids");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t g = mk_file(fs, root, "g");
+    uint8_t *z = malloc(4096);
+    memset(z, 'z', 4096);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 0, z, 4096));
+    free(z);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 102, "g");
+    walk_to(s, 100, 103, "g");
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0, sz = 0;
+    sz = build_tlopen(req, 2, 102, 2u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOPEN);
+    sz = build_tlopen(req, 3, 103, 2u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOPEN);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 100, "dropped!", 8));
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    uint16_t tag = 10;
+    const uint32_t fids[4] = { 102, 103, 102, 103 };
+    const uint8_t want[4] = { STM_9P_RLERROR, STM_9P_RLERROR,
+                              STM_9P_RFSYNC, STM_9P_RFSYNC };
+    for (unsigned i = 0; i < 4u; i++) {
+        sz = build_tfsync(req, tag++, fids[i], 0);
+        STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+        STM_ASSERT_EQ(resp[4], want[i]);
+        if (want[i] == STM_9P_RLERROR)
+            STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EIO);
+    }
+    walk_to(s, 100, 104, "g");
+    sz = build_tlopen(req, tag++, 104, 2u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_tfsync(req, tag++, 104, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RFSYNC);
+    /* A second drop, then g unlinked: fid 102 still names g's incarnation. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 200, "dropped!", 8));
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    sz = build_tunlinkat(req, tag++, 100, "g", 0u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RUNLINKAT);
+    sz = build_tfsync(req, tag++, 102, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EIO);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    (void)stm_fs_unmount(fs);   /* fids 103 and 104 never saw the second */
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}

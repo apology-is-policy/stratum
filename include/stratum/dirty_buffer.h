@@ -168,6 +168,23 @@ stm_status stm_dirty_buffer_insert_admitted(stm_dirty_buffer *buf,
                                             void *admit_user);
 
 /*
+ * stm_dirty_buffer_insert_admitted that also marks the inode's buffered
+ * bytes below `hold_end` as ones the file keeps nowhere else (an inline
+ * file's first write past the inline cap moves its committed bytes here
+ * and empties the inode), in the same hold of buf->mu, so no drain sees
+ * them unmarked. A drain callback must not drop a run that meets them
+ * (stm_dirty_buffer_view_holds); the mark goes when a drain's write takes
+ * them. hold_end 0 marks nothing.
+ */
+STM_MUST_USE
+stm_status stm_dirty_buffer_insert_held(stm_dirty_buffer *buf,
+                                        uint64_t dataset_id, uint64_t ino,
+                                        uint64_t off, uint64_t len,
+                                        const void *data,
+                                        stm_dirty_buffer_admit_fn admit,
+                                        void *admit_user, uint64_t hold_end);
+
+/*
  * The pool's hold on the buffered blocks. Every insert takes the charge it
  * adds, net of the charges it supersedes, through `reserve` with the insert
  * itself; STM_ENOSPC from `reserve` refuses the insert and leaves the
@@ -260,6 +277,14 @@ typedef struct stm_dirty_buffer_drain_view stm_dirty_buffer_drain_view;
  */
 void stm_dirty_buffer_view_overlay(const stm_dirty_buffer_drain_view *view,
                                    uint64_t off, uint64_t len, void *dst);
+
+/*
+ * From a drain callback: whether the run starting at `off` meets bytes the
+ * inode holds (stm_dirty_buffer_insert_held). A run starts at the inode's lowest
+ * buffered byte.
+ */
+bool stm_dirty_buffer_view_holds(const stm_dirty_buffer_drain_view *view,
+                                 uint64_t off);
 
 /*
  * Per-run callback passed to drain_ino / drain_all: writes the run

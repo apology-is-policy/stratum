@@ -1407,6 +1407,22 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                    size_t *out_read);
 
 /*
+ * As stm_sync_read_extent; on a failure, *out_record_bad (when non-NULL)
+ * says whether it is the record's own: its bytes failed their check on
+ * every replica read (a replica a device did not answer makes the read
+ * answer that device error instead), its content entry is gone or does
+ * not match it, or the key it names is missing. A failure of the pool's
+ * metadata (an index or content-index node), a device, or a locked
+ * dataset leaves it false. A covering write's drain drops its run only on
+ * such a failure (fs).
+ */
+STM_MUST_USE
+stm_status stm_sync_read_extent_ex(stm_sync *s, uint64_t dataset_id,
+                                   uint64_t ino, uint64_t off, void *buf,
+                                   size_t len, size_t *out_read,
+                                   bool *out_record_bad);
+
+/*
  * 9.7-impl-5b: snap-view EXTENT-mode file content read.
  *
  * Looks up the EXTENT record covering `(ino, off)` inside the FROZEN
@@ -1998,7 +2014,7 @@ typedef struct stm_sync_promote_step {
  * extent that fails is passed over and counts as tried, so the next step,
  * from `out->next`, does not try it again; an error the next extent would
  * meet too (the pool's or the dataset's: STM_ENOSPC, STM_ELOCKED,
- * STM_EWEDGED, STM_EROFS, STM_ENOMEM) stops the step and is returned,
+ * STM_EWEDGED, STM_EROFS) stops the step and is returned,
  * else the first error. STM_OK with nothing tried for an ino with no COLD
  * extent there. STM_EINVAL on NULL, dataset or ino 0, or max_bytes 0.
  */
@@ -2013,14 +2029,18 @@ stm_status stm_sync_promote_to_hot_bounded(stm_sync *s, uint64_t dataset_id,
  * STM_OK for a HOT record or a hole, which it leaves. A record longer than
  * the recordsize (the cold tier made them before it capped its chunks at
  * it) goes back as several HOT extents of at most the recordsize, in one
- * index step. The covering write and truncate use it to split such a
- * record before they rewrite part of it. A record whose origin is another,
- * user-sealed dataset is refused (STM_ENOTSUPPORTED): its bytes would go
- * under this dataset's key. Errors as stm_sync_promote_to_hot's.
+ * index step. Each part is reserved as a write is: one run, or pieces
+ * where no free run holds it. The covering write and truncate use it to
+ * split such a record before they rewrite part of it. A record whose
+ * origin is another, user-sealed dataset is refused (STM_ENOTSUPPORTED):
+ * its bytes would go under this dataset's key. Errors as
+ * stm_sync_promote_to_hot's; *out_record_bad (when non-NULL) as
+ * stm_sync_read_extent_ex's, for the record's read.
  */
 STM_MUST_USE
 stm_status stm_sync_promote_cold_at(stm_sync *s, uint64_t dataset_id,
-                                    uint64_t ino, uint64_t off);
+                                    uint64_t ino, uint64_t off,
+                                    bool *out_record_bad);
 
 /*
  * P7-CAS-11: candidate descriptor for the promote policy step.

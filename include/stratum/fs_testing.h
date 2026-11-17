@@ -292,6 +292,10 @@ void stm_fs_set_buffer_insert_hook_for_test(stm_fs *fs,
  */
 void stm_fs_fail_drains_for_test(stm_fs *fs, stm_status fail);
 
+/* As stm_fs_fail_drains_for_test, after the next `skip` drain writes run. */
+void stm_fs_fail_drains_after_for_test(stm_fs *fs, stm_status fail,
+                                       uint32_t skip);
+
 /* Whether an event sink (stm_fs_set_event_sink) is installed. */
 bool stm_fs_event_sink_for_test(stm_fs *fs);
 

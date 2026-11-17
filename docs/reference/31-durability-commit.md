@@ -294,15 +294,18 @@ redundancy guarantees).
 ## 31.6 fsync / Tsync semantics
 
 `h_sync` (`src/9p/server.c`) maps `Tsync` → `stm_fs_commit` → a full pool-wide
-commit. `h_fsync` maps `Tfsync` -> `stm_fs_fsync(ds, ino, the fid's gen)`: the
-same pool-wide commit (an extent write is durable only after a pool commit),
-then `STM_EIO` once if a flush since the file's last fsync dropped a run of its
-buffered bytes because the record under it failed its integrity check (26,
-Error paths). A commit error wins and keeps the report. As with Linux's errseq
-the report is made once, so a retried fsync answers OK over the lost bytes. The
-reports live in RAM, for 256 files at most; an unmount or a crash forgets them.
-A clean unmount (`stm_fs_unmount`) performs a final commit unless the fs is
-read-only or wedged.
+commit. `h_fsync` maps `Tfsync` -> `stm_fs_fsync_since(ds, ino, the fid's gen,
+the fid's sample)`: the same pool-wide commit (an extent write is durable only
+after a pool commit), then `STM_EIO` if a flush dropped a run of the file's
+buffered bytes after the fid's sample (26, Error paths), and the sample moves
+to it. A fid samples at Tlopen and Tlcreate (`stm_fs_write_error_sample`), so,
+as with Linux's errseq, every fid open before a drop hears of it once, from its
+own fsync, and one opened after an fsync reported it does not; a retried fsync
+through the same fid answers OK over the lost bytes. A commit error wins and
+keeps the report. The reports live in RAM, for 256 files at most; a crash
+forgets them. A clean unmount (`stm_fs_unmount`) performs a final commit unless
+the fs is read-only or wedged, and answers `STM_EIO` when a report no fsync saw
+is left.
 
 ---
 

@@ -45,6 +45,11 @@ struct stm_bdev;
 void     stm_bdev_inject_fail_after(struct stm_bdev *d, int64_t n_ops);
 uint32_t stm_bdev_inject_fired_count(const struct stm_bdev *d);
 
+/* The same for stm_bdev_read: the n-th read after this answers STM_EIO
+ * without reading. Fires only in a build with testing hooks. */
+void     stm_bdev_inject_read_fail_after(struct stm_bdev *d, int64_t n_reads);
+uint32_t stm_bdev_inject_read_fired_count(const struct stm_bdev *d);
+
 /*
  * Area G bench instrumentation. stm_bdev_io_stats reports the running per-op I/O accounting:
  * total state-changing writes, total bytes written to the device, and

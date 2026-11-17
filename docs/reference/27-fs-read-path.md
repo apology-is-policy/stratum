@@ -97,8 +97,10 @@ next extent's start, `stm_extent_lookup_or_next`, so a record that starts inside
 block is read from its start, and reads each extent to its end or the span's),
 then `memcpy` the `[off - a_off, +want)` slice into `buf`.
 The buffered path calls it instead of the single-extent read (the prior `memset`
-is dropped — the `memcpy` fully fills `buf`). A `4 * recordsize` scratch cap
-(parity with the write RMW) bounds the alloc.
+is dropped -- the `memcpy` fully fills `buf`). It fills a piece
+at a time, each at most a recordsize of scratch, so a read of any length takes
+it (X8: a `4 * recordsize` cap answered `STM_ERANGE` to a read over 32 MiB of a
+file holding buffered bytes; `fs_read_over_4_recordsizes_of_a_file_with_buffered_bytes_answers_whole`).
 
 ## Spec cross-reference
 
@@ -125,24 +127,21 @@ is dropped — the `memcpy` fully fills `buf`). A `4 * recordsize` scratch cap
 ## Error paths
 
 - `STM_ECORRUPT` — INLINE `si_data_len` exceeds the inline cap.
-- `STM_ERANGE` -- the buffered path's scratch span exceeds `4 * recordsize` --
-  defensive, unreachable via 9P (iounit-clamped). The non-buffered path reads
-  into the caller's buffer and does not answer it.
 - `STM_ECORRUPT` -- a piece answered no bytes, or the write side's span met a
   record it should hold whole reaching outside it, or a hole's next start at or
   before it: an index the read cannot trust. Defensive; none is reachable while
   the lookups keep their contract.
 - `STM_ECORRUPT` on the write side's cover: its split would end a piece at an
   off-grid record's start, a chain of off-grid records widens it past
-  `4 * recordsize`, or a record over the recordsize at an edge is not COLD or
+  `4 * recordsize` (checked before every step, the last included), or a
+  record over the recordsize at an edge is not COLD or
   is off the grid (an older pool's COLD one is promoted, to pieces of at most
   the recordsize, and the cover looks again). A drain drops the run and
   reports it at the file's next fsync (T0.97); a direct write answers it.
-- `STM_ERANGE` on the write side: a direct write whose widened cover passes
-  `4 * recordsize` (a library call; a 9P write is clamped to its iounit). A
-  drain's run is at most a recordsize, and its cover, with any record over the
-  recordsize at its edges promoted first, stays under 3 recordsizes plus
-  rounding.
+- No `STM_ERANGE` on the write side for a length: a direct write goes a
+  recordsize at a time (X7) and a drain's run is at most a recordsize, so a
+  cover, with any record over the recordsize at its edges promoted first,
+  stays under 3 recordsizes plus rounding.
 - Any sync-layer error after the first piece: the read answers the bytes before
   it instead (STM_OK, short).
 - `STM_ENOMEM` — scratch alloc.

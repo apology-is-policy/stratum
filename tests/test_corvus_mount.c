@@ -3758,7 +3758,7 @@ STM_TEST(corvus_clone_of_a_home_cannot_promote_its_shared_cold_record) {
         if (leg == 1) STM_ASSERT_OK(stm_fs_evict_dek(sp.fs, sp.home.ds));
         STM_ASSERT_ERR(stm_sync_promote_to_hot(sync, clone[0], sp.home.big),
                        STM_ENOTSUPPORTED);
-        STM_ASSERT_ERR(stm_sync_promote_cold_at(sync, clone[0], sp.home.big, 0),
+        STM_ASSERT_ERR(stm_sync_promote_cold_at(sync, clone[0], sp.home.big, 0, NULL),
                        STM_ENOTSUPPORTED);
         stm_extent_record r;
         memset(&r, 0, sizeof r);
@@ -3926,7 +3926,7 @@ STM_TEST(corvus_promote_whose_second_piece_insert_fails_wedges) {
     seal_ext_sum e = seal_extents(sp.fs, sp.sib.ds, f);
     STM_ASSERT(e.big_len > STM_FS_RECORDSIZE_MAX);
     stm_extent_fail_next_put_for_test(stm_sync_extent_index(sync), 2u, STM_ENOMEM);
-    stm_status pr = stm_sync_promote_cold_at(sync, sp.sib.ds, f, e.big_off);
+    stm_status pr = stm_sync_promote_cold_at(sync, sp.sib.ds, f, e.big_off, NULL);
     stm_extent_fail_next_put_for_test(stm_sync_extent_index(sync), 0u, STM_OK);
     STM_ASSERT_ERR(pr, STM_EWEDGED);
     STM_ASSERT(stm_fs_commit(sp.fs) != STM_OK);
@@ -3952,7 +3952,7 @@ STM_TEST(corvus_promote_whose_second_piece_write_fails_frees_the_first) {
     STM_ASSERT_OK(stm_fs_stats_get(sp.fs, &a));
     struct stm_bdev *d = stm_fs_bdev_for_test(sp.fs);
     stm_bdev_inject_fail_after(d, 2);
-    stm_status pr = stm_sync_promote_cold_at(sync, sp.sib.ds, f, e.big_off);
+    stm_status pr = stm_sync_promote_cold_at(sync, sp.sib.ds, f, e.big_off, NULL);
     stm_bdev_inject_fail_after(d, 0);
     STM_ASSERT(pr != STM_OK);
     STM_ASSERT_EQ(seal_extent_kind_at(sp.fs, sp.sib.ds, f, e.big_off),
@@ -4269,4 +4269,344 @@ STM_TEST(corvus_direct_write_over_a_whole_big_cold_record_promotes_it) {
 
 STM_TEST(corvus_direct_write_over_a_big_cold_record_failing_part_way_keeps_its_tail) {
     r3_direct_over_big(true);
+}
+
+/* After the first piece's device write: the second piece's fails. */
+static void r4_fail_second_piece(void *ctx)
+{
+    (void)ctx;
+    if (++g_r3_writes == 1)
+        stm_bdev_inject_fail_after(stm_fs_bdev_for_test(g_r3_fs), 1);
+}
+
+/* r3_direct_over_big's file, named `name`: *c is its cold record over the
+ * recordsize at 22212608, and old holds every byte. */
+static uint64_t r4_cold_file(seal_pool *sp, const char *name, uint8_t *old,
+                             size_t LEN, stm_extent_record *c)
+{
+    stm_sync *sync = stm_fs_sync(sp->fs);
+    const uint64_t ds = sp->sib.ds;
+    r3_noise17(old, LEN);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(sp->fs, ds, 1, (const uint8_t *)name,
+                                     (uint8_t)strlen(name), 0600, 1000, 1000, &f));
+    for (size_t k = 0; k < LEN; k += (size_t)4 << 20)
+        STM_ASSERT_OK(stm_fs_write(sp->fs, ds, f, k, old + k, (size_t)4 << 20));
+    STM_ASSERT_OK(stm_fs_commit(sp->fs));
+    stm_sync_set_cold_chunks_uncapped_for_test(sync, true);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(sp->fs, ds, f));
+    stm_sync_set_cold_chunks_uncapped_for_test(sync, false);
+    STM_ASSERT_OK(stm_fs_commit(sp->fs));
+    memset(c, 0, sizeof *c);
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(sync), ds, f,
+                                       22212608u, c));
+    STM_ASSERT_EQ(c->kind, STM_EXTENT_KIND_COLD);
+    STM_ASSERT_EQ(c->off, 22212608u);
+    STM_ASSERT(c->len > STM_FS_RECORDSIZE_MAX);
+    return f;
+}
+
+/* After a remount, [r0, r0 + rn) of `name` reads as want does. */
+static void r4_cold_check(seal_pool *sp, const char *name, const uint8_t *want,
+                          uint64_t r0, uint64_t rn)
+{
+    uint8_t *got = malloc((size_t)rn);
+    STM_ASSERT(got != NULL);
+    if (got && seal_pool_remount(sp)) {
+        uint64_t f2 = 0;
+        STM_ASSERT_OK(stm_fs_lookup(sp->fs, sp->sib.ds, 1, (const uint8_t *)name,
+                                    (uint8_t)strlen(name), &f2));
+        r3_read_all(sp->fs, sp->sib.ds, f2, r0, got, (size_t)rn);
+        STM_ASSERT(memcmp(got, want + r0, (size_t)rn) == 0);
+    }
+    free(got);
+}
+
+/* A direct write from C's last block on past it: the cover's lower edge is
+ * inside C, so the edge promotes C and the first piece replaces only C's
+ * last piece. The piece after it fails. However much of the write lands
+ * (none, if the device error meets the first write past C's start), every
+ * byte it did not land keeps its old bytes, C's among them. */
+STM_TEST(corvus_direct_write_from_inside_a_big_cold_record_failing_part_way_keeps_it) {
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, "r4dirin", UINT64_C(1) << 30,
+                           UINT64_C(128) << 20)) return;
+    const size_t LEN = (size_t)64 << 20;
+    const uint64_t REC = STM_FS_RECORDSIZE_MAX;
+    uint8_t *old = malloc(LEN), *want = malloc(LEN);
+    STM_ASSERT(old != NULL && want != NULL);
+    if (!old || !want) { free(old); free(want); seal_pool_close(&sp); return; }
+    stm_extent_record c;
+    uint64_t f = r4_cold_file(&sp, "i64", old, LEN, &c);
+    const uint64_t lo = c.off + c.len - 4096u, hi = lo + 2u * REC;
+    STM_ASSERT(hi <= LEN);
+    if (hi > LEN) { free(old); free(want); seal_pool_close(&sp); return; }
+    memcpy(want, old, LEN);
+    memset(want + lo, 'D', (size_t)(hi - lo));
+    size_t wrote = 0;
+    g_r3_writes = 0;
+    g_r3_fs = sp.fs;
+    stm_sync_set_write_phase2_hook_for_test(stm_fs_sync(sp.fs),
+                                            r4_fail_second_piece, NULL);
+    stm_status ws = stm_fs_pwrite(sp.fs, sp.sib.ds, f, lo, want + lo,
+                                  (size_t)(hi - lo), &wrote);
+    stm_sync_set_write_phase2_hook_for_test(stm_fs_sync(sp.fs), NULL, NULL);
+    STM_ASSERT_EQ(stm_bdev_inject_fired_count(stm_fs_bdev_for_test(sp.fs)), 1u);
+    STM_ASSERT((ws == STM_OK && wrote > 0u && wrote < hi - lo) ||
+               (ws == STM_EIO && wrote == 0u));
+    memcpy(want + lo + wrote, old + lo + wrote, (size_t)(hi - lo - wrote));
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    STM_ASSERT_OK(stm_fs_fsync(sp.fs, sp.sib.ds, f, NULL));
+    r4_cold_check(&sp, "i64", want, c.off, hi - c.off);
+    free(old);
+    free(want);
+    seal_pool_close(&sp);
+}
+
+/* A buffered write over the last block before C and C's first block: the
+ * cover's upper edge is inside C, so the edge promotes C and the run's
+ * pieces end at C's first piece. A second run, near the file's end, makes
+ * the third piece, which fails; the commit after it lands that run. C's
+ * blocks past its first keep their old bytes. */
+STM_TEST(corvus_buffered_write_ending_inside_a_big_cold_record_keeps_its_tail) {
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, "r4bufin", UINT64_C(1) << 30,
+                           UINT64_C(128) << 20)) return;
+    const size_t LEN = (size_t)64 << 20;
+    uint8_t *old = malloc(LEN), *want = malloc(LEN);
+    STM_ASSERT(old != NULL && want != NULL);
+    if (!old || !want) { free(old); free(want); seal_pool_close(&sp); return; }
+    stm_extent_record c;
+    uint64_t f = r4_cold_file(&sp, "u64", old, LEN, &c);
+    memcpy(want, old, LEN);
+    const uint64_t lo = c.off - 4096u, far = LEN - 4096u;
+    memset(want + lo, 'U', 8192u);
+    memset(want + far, 'V', 100u);
+    STM_ASSERT_OK(stm_fs_write(sp.fs, sp.sib.ds, f, lo, want + lo, 8192u));
+    STM_ASSERT_OK(stm_fs_write(sp.fs, sp.sib.ds, f, far, want + far, 100u));
+    g_r3_writes = 0;
+    g_r3_fs = sp.fs;
+    stm_sync_set_write_phase2_hook_for_test(stm_fs_sync(sp.fs),
+                                            r3_fail_third_piece, NULL);
+    STM_ASSERT_ERR(stm_fs_commit(sp.fs), STM_EIO);
+    stm_sync_set_write_phase2_hook_for_test(stm_fs_sync(sp.fs), NULL, NULL);
+    STM_ASSERT_EQ(stm_bdev_inject_fired_count(stm_fs_bdev_for_test(sp.fs)), 1u);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    STM_ASSERT_OK(stm_fs_fsync(sp.fs, sp.sib.ds, f, NULL));
+    r4_cold_check(&sp, "u64", want, lo - STM_FS_RECORDSIZE_MAX,
+                  c.len + 2u * STM_FS_RECORDSIZE_MAX);
+    free(old);
+    free(want);
+    seal_pool_close(&sp);
+}
+
+/* ========================================================================= */
+/* Review round 4: an older pool's big COLD record on a fragmented pool.      */
+/* ========================================================================= */
+
+/* Cut the pool's free space into 1024-block holes: no free run holds one
+ * promote part of the recordsize (2049 blocks with its tag). */
+static void r4_fragment(stm_sync *sync)
+{
+    stm_alloc *al = stm_sync_alloc(sync, 0);
+    static uint64_t pas[8192];
+    size_t n = 0;
+    stm_alloc_set_guarded(al, false);
+    while (n < 8192u && stm_alloc_reserve(al, 1024u, 0, &pas[n]) == STM_OK)
+        n++;
+    for (size_t i = 0; i < n; i += 2)
+        STM_ASSERT_OK(stm_alloc_unreserve(al, pas[i]));
+    uint64_t pa = 0;
+    STM_ASSERT_ERR(stm_alloc_reserve(al, 2049u, 0, &pa), STM_ENOSPC);
+    stm_alloc_set_guarded(al, true);
+}
+
+/* A file whose first record is an older pool's COLD record over the
+ * recordsize (the migrate uncapped); *a is that record. */
+static uint64_t r4_big_file(seal_pool *sp, uint64_t ds, bool home,
+                            uint8_t *all, size_t LEN, stm_extent_record *a)
+{
+    stm_sync *sync = stm_fs_sync(sp->fs);
+    r3_noise17(all, LEN);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(sp->fs, ds, 1, (const uint8_t *)"b64", 3,
+                                     0600, 1000, 1000, &f));
+    for (size_t k = 0; k < LEN; k += (size_t)4 << 20)
+        STM_ASSERT_OK(stm_fs_write(sp->fs, ds, f, k, all + k, (size_t)4 << 20));
+    STM_ASSERT_OK(stm_fs_commit(sp->fs));
+    stm_sync_set_cold_chunks_uncapped_for_test(sync, true);
+    if (home) stm_sync_set_cas_admits_sealed_for_test(sync, true);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(sp->fs, ds, f));
+    if (home) stm_sync_set_cas_admits_sealed_for_test(sync, false);
+    stm_sync_set_cold_chunks_uncapped_for_test(sync, false);
+    STM_ASSERT_OK(stm_fs_commit(sp->fs));
+    STM_ASSERT_OK(stm_fs_commit(sp->fs));
+    memset(a, 0, sizeof *a);
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(sync), ds, f, 0, a));
+    STM_ASSERT_EQ(a->kind, STM_EXTENT_KIND_COLD);
+    STM_ASSERT(a->len > STM_FS_RECORDSIZE_MAX);
+    return f;
+}
+
+/* A 10-byte buffered write near the end of the big record on a fragmented
+ * pool: the drain's promote writes the record back in pieces, the commit
+ * succeeds, and another file's write commits after it. `pend`: blocks a
+ * commit freed wait to be swept, so a failing flush would reclaim. In a
+ * home the logout after it locks the home. */
+static void r4_frag_edge(bool home, bool pend)
+{
+    seal_pool sp;
+    const char *tag = home ? "r4fragh" : (pend ? "r4fragp" : "r4frag");
+    if (!seal_pool_open_sz(&sp, tag, UINT64_C(1) << 30, UINT64_C(128) << 20))
+        return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const uint64_t ds = home ? sp.home.ds : sp.sib.ds;
+    const size_t LEN = (size_t)64 << 20;
+    uint8_t *all = malloc(LEN);
+    STM_ASSERT(all != NULL);
+    if (!all) { seal_pool_close(&sp); return; }
+    stm_extent_record a;
+    uint64_t f = r4_big_file(&sp, ds, home, all, LEN, &a);
+    r4_fragment(sync);
+    if (pend) {
+        uint64_t p = 0;
+        STM_ASSERT_OK(stm_fs_create_file(sp.fs, ds, 1, (const uint8_t *)"p", 1,
+                                         0600, 1000, 1000, &p));
+        static uint8_t pb[256u << 10];
+        memset(pb, 'p', sizeof pb);
+        STM_ASSERT_OK(stm_fs_write(sp.fs, ds, p, 0, pb, sizeof pb));
+        STM_ASSERT_OK(stm_fs_commit(sp.fs));
+        STM_ASSERT_OK(stm_fs_write(sp.fs, ds, p, 0, pb, sizeof pb));
+        STM_ASSERT_OK(stm_fs_commit(sp.fs));
+        STM_ASSERT(stm_sync_pending_free_blocks(sync) > 0u);
+    }
+    const uint64_t at = a.off + a.len - 100u;
+    STM_ASSERT_OK(stm_fs_write(sp.fs, ds, f, at, "wwwwwwwwww", 10));
+    memcpy(all + at, "wwwwwwwwww", 10);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    stm_fs_stats fst;
+    memset(&fst, 0, sizeof fst);
+    STM_ASSERT_OK(stm_fs_stats_get(sp.fs, &fst));
+    STM_ASSERT(!fst.wedged);
+    /* Back as HOT records, more than the two parts a run would hold. */
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    unsigned n = 0;
+    for (uint64_t o = a.off; o < a.off + a.len; ) {
+        stm_extent_record e;
+        memset(&e, 0, sizeof e);
+        STM_ASSERT_OK(stm_extent_lookup_at(eidx, ds, f, o, &e));
+        STM_ASSERT_EQ(e.kind, STM_EXTENT_KIND_HOT);
+        if (e.len == 0u) break;
+        o = e.off + e.len;
+        n++;
+    }
+    STM_ASSERT(n > 2u);
+    uint8_t *got = malloc((size_t)a.len);
+    STM_ASSERT(got != NULL);
+    if (got) {
+        r3_read_all(sp.fs, ds, f, a.off, got, (size_t)a.len);
+        STM_ASSERT(memcmp(got, all + a.off, (size_t)a.len) == 0);
+        free(got);
+    }
+    if (home) {
+        STM_ASSERT_OK(stm_fs_evict_dek(sp.fs, ds));
+        STM_ASSERT(stm_fs_dataset_locked(sp.fs, ds));
+        uint8_t b[16];
+        size_t nb = 0;
+        STM_ASSERT_ERR(stm_fs_read(sp.fs, ds, f, 0, b, sizeof b, &nb),
+                       STM_ELOCKED);
+    } else {
+        uint64_t g = 0;
+        STM_ASSERT_OK(stm_fs_create_file(sp.fs, ds, 1, (const uint8_t *)"g", 1,
+                                         0600, 1000, 1000, &g));
+        STM_ASSERT_OK(stm_fs_write(sp.fs, ds, g, 0, "other", 5));
+        STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    }
+    free(all);
+    seal_pool_close(&sp);
+}
+
+STM_TEST(corvus_write_into_a_big_cold_record_on_a_fragmented_pool_commits) {
+    r4_frag_edge(false, false);
+}
+
+STM_TEST(corvus_write_into_a_big_cold_record_on_a_fragmented_pool_with_frees_pending_commits) {
+    r4_frag_edge(false, true);
+}
+
+STM_TEST(corvus_logout_after_a_write_into_a_big_cold_record_on_a_fragmented_pool_locks_the_home) {
+    r4_frag_edge(true, false);
+}
+
+/* A login pass on a fragmented pool moves a file of an older pool's big
+ * COLD record and the file of small records after it. */
+STM_TEST(corvus_login_promote_on_a_fragmented_pool_moves_a_big_record_and_what_follows) {
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, "r4starve", UINT64_C(1) << 30,
+                           UINT64_C(128) << 20)) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const uint64_t ds = sp.home.ds;
+    const size_t LEN = (size_t)64 << 20;
+    uint8_t *all = malloc(LEN);
+    STM_ASSERT(all != NULL);
+    if (!all) { seal_pool_close(&sp); return; }
+    stm_extent_record a;
+    uint64_t big = r4_big_file(&sp, ds, true, all, LEN, &a);
+    free(all);
+    uint64_t small = seal_sparse_cold_file(sp.fs, ds, "r4small", 4,
+                                           (size_t)256 << 10, 0x61);
+    STM_ASSERT(big < small);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    r4_fragment(sync);
+    stm_fs_promote_policy_stats st;
+    memset(&st, 0, sizeof st);
+    STM_ASSERT_OK(stm_fs_promote_sealed_cold(sp.fs, ds, (uint64_t)128 << 20, &st));
+    STM_ASSERT_EQ(st.last_err, STM_OK);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record e;
+    memset(&e, 0, sizeof e);
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, ds, big, a.off, &e));
+    STM_ASSERT_EQ(e.kind, STM_EXTENT_KIND_HOT);
+    memset(&e, 0, sizeof e);
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, ds, small, 0, &e));
+    STM_ASSERT_EQ(e.kind, STM_EXTENT_KIND_HOT);
+    seal_pool_close(&sp);
+}
+
+/* A pass the pool stops in a file (here its raw drain's STM_ENOSPC) starts
+ * the next pass in that file, not past it. */
+STM_TEST(corvus_login_promote_resumes_in_the_file_a_pool_error_stopped_it_in) {
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, "r4stop", UINT64_C(256) << 20,
+                           UINT64_C(64) << 20)) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const uint64_t ds = sp.home.ds;
+    const size_t P = (size_t)256 << 10;
+    uint64_t fa = seal_sparse_cold_file(sp.fs, ds, "ra", 4, P, 0x61);
+    uint64_t fb = seal_sparse_cold_file(sp.fs, ds, "rb", 4, P, 0x62);
+    STM_ASSERT(fa < fb);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    STM_ASSERT_OK(stm_fs_write(sp.fs, ds, fa, 10, "dirty", 5));
+    stm_fs_fail_drains_for_test(sp.fs, STM_ENOSPC);
+    stm_fs_promote_policy_stats st;
+    memset(&st, 0, sizeof st);
+    STM_ASSERT_ERR(stm_fs_promote_sealed_cold(sp.fs, ds, 4u * P, &st),
+                   STM_ENOSPC);
+    STM_ASSERT_EQ(st.bytes_promoted, 0u);
+    stm_fs_fail_drains_for_test(sp.fs, STM_OK);
+    memset(&st, 0, sizeof st);
+    STM_ASSERT_OK(stm_fs_promote_sealed_cold(sp.fs, ds, 4u * P, &st));
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    for (unsigned k = 0; k < 4u; k++) {
+        stm_extent_record e;
+        memset(&e, 0, sizeof e);
+        uint64_t o = (uint64_t)k * 2u * P;
+        if (stm_extent_lookup_at(eidx, ds, fa, o, &e) != STM_OK) {
+            o = (uint64_t)k * P;
+            STM_ASSERT_OK(stm_extent_lookup_at(eidx, ds, fa, o, &e));
+        }
+        STM_ASSERT_EQ(e.kind, STM_EXTENT_KIND_HOT);
+    }
+    (void)fb;
+    seal_pool_close(&sp);
 }

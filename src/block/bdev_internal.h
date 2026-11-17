@@ -51,6 +51,10 @@ struct stm_bdev {
      * exercises the backend a deployment really uses. */
     atomic_int_fast64_t        inject_countdown;
     atomic_uint_fast32_t       inject_fired;
+    /* The same for reads (stm_bdev_inject_read_fail_after); checked only in
+     * a build with testing hooks. */
+    atomic_int_fast64_t        inject_read_countdown;
+    atomic_uint_fast32_t       inject_read_fired;
 
     /* Per-op accounting, relaxed, read by bench_commit and the tests. */
     atomic_uint_fast64_t       io_writes;

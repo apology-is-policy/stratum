@@ -2316,26 +2316,35 @@ stm_status stm_extent_promote_swap_to_hot_pieces(stm_extent_index *idx,
     if (!idx || !pieces) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     if (origin_dataset_id == 0 || origin_ino == 0) return STM_EINVAL;
-    if (len == 0 || n_pieces < 1u || n_pieces > 16u) return STM_EINVAL;
+    if (len == 0 || n_pieces < 1u) return STM_EINVAL;
     if (n_replicas < 1 || n_replicas > STM_EXTENT_MAX_REPLICAS) return STM_EINVAL;
     if (off > UINT64_MAX - len) return STM_EOVERFLOW;
     if (origin_off > UINT64_MAX - len) return STM_EINVAL;
+    /* Each piece holds a byte at least, so n_pieces <= len. */
     uint64_t sum = 0;
     for (size_t p = 0; p < n_pieces; p++) {
         if (pieces[p].len == 0 || pieces[p].len > len - sum) return STM_EINVAL;
         sum += pieces[p].len;
-        for (uint8_t i = 0; i < n_replicas; i++) {
+        for (uint8_t i = 0; i < n_replicas; i++)
             if (pieces[p].paddrs[i] == 0) return STM_EINVAL;
-            for (size_t q = p; q < n_pieces; q++) {
-                for (uint8_t j = 0; j < n_replicas; j++) {
-                    if (q == p && j <= i) continue;
-                    if (pieces[p].paddrs[i] == pieces[q].paddrs[j])
-                        return STM_EINVAL;
-                }
-            }
-        }
     }
     if (sum != len) return STM_EINVAL;
+    /* No block in two places: every paddr, flattened and sorted. */
+    size_t total = n_pieces * (size_t)n_replicas;
+    uint64_t *flat = malloc(total * sizeof *flat);
+    if (!flat) return STM_ENOMEM;
+    size_t fi = 0;
+    for (size_t p = 0; p < n_pieces; p++)
+        for (uint8_t i = 0; i < n_replicas; i++)
+            flat[fi++] = pieces[p].paddrs[i];
+    qsort(flat, total, sizeof *flat, ex_u64_cmp);
+    for (size_t i = 1; i < total; i++) {
+        if (flat[i] == flat[i - 1]) {
+            free(flat);
+            return STM_EINVAL;
+        }
+    }
+    free(flat);
     must_lock(&idx->lock);
     if (idx->ds_idx == NULL) {
         must_unlock(&idx->lock);

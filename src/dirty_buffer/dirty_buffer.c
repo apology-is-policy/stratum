@@ -86,6 +86,8 @@ typedef struct stm_dbuf_inode {
     uint64_t                footprint_blocks; /* ranges' and covers' charges */
     stm_dbuf_range         *head;    /* sorted by off, ascending */
     stm_dbuf_cover         *covers;
+    uint64_t                held_end; /* bytes below it only here
+                                       * (stm_dirty_buffer_insert_held) */
     struct stm_dbuf_inode  *bucket_next;
 } stm_dbuf_inode;
 
@@ -379,7 +381,8 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
                                         uint64_t extra_blocks,
                                         uint64_t max_footprint_blocks,
                                         stm_dirty_buffer_admit_fn admit,
-                                        void *admit_user)
+                                        void *admit_user,
+                                        uint64_t hold_end)
 {
     if (!buf || !data) return STM_EINVAL;
     if (extra_blocks > (uint64_t)UINT32_MAX) return STM_EINVAL;
@@ -614,6 +617,7 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
     buf->total_footprint_blocks += added_footprint;
     if (removed_footprint > added_footprint && buf->release)
         buf->release(buf->res_user, removed_footprint - added_footprint);
+    if (hold_end > e->held_end) e->held_end = hold_end;
 
     pthread_mutex_unlock(&buf->mu);
     return STM_OK;
@@ -637,7 +641,7 @@ stm_status stm_dirty_buffer_insert(stm_dirty_buffer *buf,
      * counters are maintained regardless, so a later bounded insert sees a
      * correct total. */
     return dbuf_insert_bounded(buf, dataset_id, ino, off, len, data,
-                                0u, UINT64_MAX, NULL, NULL);
+                                0u, UINT64_MAX, NULL, NULL, 0u);
 }
 
 stm_status stm_dirty_buffer_insert_bounded(stm_dirty_buffer *buf,
@@ -649,7 +653,7 @@ stm_status stm_dirty_buffer_insert_bounded(stm_dirty_buffer *buf,
 {
     return dbuf_insert_bounded(buf, dataset_id, ino, off, len, data,
                                 extra_blocks, max_footprint_blocks,
-                                NULL, NULL);
+                                NULL, NULL, 0u);
 }
 
 stm_status stm_dirty_buffer_insert_admitted(stm_dirty_buffer *buf,
@@ -661,7 +665,19 @@ stm_status stm_dirty_buffer_insert_admitted(stm_dirty_buffer *buf,
 {
     if (!admit) return STM_EINVAL;
     return dbuf_insert_bounded(buf, dataset_id, ino, off, len, data,
-                                0u, UINT64_MAX, admit, admit_user);
+                                0u, UINT64_MAX, admit, admit_user, 0u);
+}
+
+stm_status stm_dirty_buffer_insert_held(stm_dirty_buffer *buf,
+                                        uint64_t dataset_id, uint64_t ino,
+                                        uint64_t off, uint64_t len,
+                                        const void *data,
+                                        stm_dirty_buffer_admit_fn admit,
+                                        void *admit_user, uint64_t hold_end)
+{
+    if (!admit) return STM_EINVAL;
+    return dbuf_insert_bounded(buf, dataset_id, ino, off, len, data,
+                                0u, UINT64_MAX, admit, admit_user, hold_end);
 }
 
 void stm_dirty_buffer_set_charge_factor(stm_dirty_buffer *buf,
@@ -792,6 +808,13 @@ void stm_dirty_buffer_view_overlay(const stm_dirty_buffer_drain_view *view,
     overlay_locked(view->e, off, off + len, (uint8_t *)dst);
 }
 
+bool stm_dirty_buffer_view_holds(const stm_dirty_buffer_drain_view *view,
+                                 uint64_t off)
+{
+    return view && off < view->e->held_end;
+}
+
+
 /* Drops the first `cut` bytes of a range whose head a drain wrote. The
  * charge stays: the rest lies inside the cover it was taken for. Caller
  * holds buf->mu. */
@@ -894,6 +917,9 @@ static stm_status drain_inode_coalesced_locked(stm_dirty_buffer *buf,
             return crc;
         }
         if (upto < run_start + run_len) upto = run_start + run_len;
+        /* A run starts at the lowest buffered byte, so one that took up to
+         * held_end wrote every held byte (the callback drops none). */
+        if (upto >= e->held_end) e->held_end = 0;
 
         /* Pop what the write took: the run, and every later byte below
          * upto. A range crossing upto keeps its tail. */
