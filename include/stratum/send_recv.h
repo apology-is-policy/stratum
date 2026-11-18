@@ -261,7 +261,10 @@ typedef enum {
  * layer corresponds to one extent's worth of bytes; the next lift
  * (cross-extent FastCDC at write time) deliberately keeps a single
  * cap on both surfaces — an extent and a CHUNK both ship at most
- * STM_SEND_CHUNK_PLAIN_MAX bytes. */
+ * STM_SEND_CHUNK_PLAIN_MAX bytes. An older pool's COLD record may be
+ * longer (its migrate did not cap chunks at the recordsize): the send
+ * cuts it where a capped migrate would (its start + k x 8 MiB), and
+ * each piece goes as a COLD record with its own CHUNK and hash. */
 #define STM_SEND_CHUNK_PLAIN_MAX (8u * 1024u * 1024u)
 /* END body length (BLAKE3 csum). */
 #define STM_SEND_END_BODY_LEN    32u
@@ -319,6 +322,9 @@ typedef struct stm_send_handle stm_send_handle;
  *   STM_ENOENT if the dataset doesn't exist or a referenced snap
  *     doesn't exist as PRESENT.
  *   STM_ENOMEM on allocation failure.
+ *   STM_EBADTAG / STM_EIO if a COLD record longer than
+ *     STM_SEND_CHUNK_PLAIN_MAX cannot be read: init reads each such
+ *     chunk once, to hash the pieces it streams as (see that constant).
  *   STM_EBUSY, a transient: a COLD extent's CAS record or a key was
  *     dropped between the collect and its lookup (retry).
  *   STM_ELOCKED if the dataset is locked (a logout under way shows it
@@ -369,8 +375,11 @@ stm_status stm_send_init(stm_sync *sync,
  *
  * Stream order:
  *   1st call: HEADER record.
- *   subsequent calls: EXTENT records, one per extent in the snapshot
- *     range (in (ino, off) ascending order across the whole dataset).
+ *   then CHUNK records, one per distinct COLD chunk (each piece of a
+ *     COLD record over STM_SEND_CHUNK_PLAIN_MAX counts as one);
+ *   then EXTENT records, one per extent in the snapshot range, a
+ *     long COLD record's pieces one each (in (ino, off) ascending
+ *     order across the whole dataset).
  *   final call: END record (carries the running BLAKE3 csum).
  *   after END is emitted, returns STM_ENOENT.
  *
@@ -408,6 +417,8 @@ void stm_send_set_init_hook_for_test(void (*hook)(void *ctx, int stage),
                                      void *ctx);
 /* True once the handle captured keys and every byte of them is zero. */
 bool stm_send_keys_wiped_for_test(const stm_send_handle *h);
+/* True while the handle holds a long COLD record's decrypted chunk. */
+bool stm_send_parent_held_for_test(const stm_send_handle *h);
 #endif
 
 /* ========================================================================= */

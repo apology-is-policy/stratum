@@ -4306,6 +4306,84 @@ static uint64_t r4_cold_file(seal_pool *sp, const char *name, uint8_t *old,
     return f;
 }
 
+/* X5: a send of a home holding an older pool's cold record over the wire
+ * cap holds that record's decrypted chunk while its pieces' CHUNKs go. A
+ * logout stops the stream (STM_ELOCKED) and wipes the chunk with the keys;
+ * the sibling's stream, one variable away, keeps its chunk across the
+ * home's logout, and lets it go once its CHUNKs end. */
+STM_TEST(corvus_a_send_at_logout_wipes_a_long_cold_records_bytes) {
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, "x5wipe", UINT64_C(1) << 30,
+                           UINT64_C(128) << 20)) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const size_t LEN = (size_t)24 << 20;
+    uint8_t *all = malloc(LEN);
+    size_t cap = STM_SEND_RECORD_MAX_LEN;
+    uint8_t *rec = malloc(cap);
+    STM_ASSERT(all != NULL && rec != NULL);
+    if (!all || !rec) { free(all); free(rec); seal_pool_close(&sp); return; }
+    r3_noise17(all, LEN);
+    const uint64_t ds[2] = {sp.home.ds, sp.sib.ds};
+    stm_send_handle *sh[2] = {NULL, NULL};
+    for (int i = 0; i < 2; i++) {
+        uint64_t f = 0;
+        STM_ASSERT_OK(stm_fs_create_file(sp.fs, ds[i], 1, (const uint8_t *)"x5",
+                                         2, 0600, 1000, 1000, &f));
+        for (size_t k = 0; k < LEN; k += (size_t)4 << 20)
+            STM_ASSERT_OK(stm_fs_write(sp.fs, ds[i], f, k, all + k,
+                                       (size_t)4 << 20));
+        STM_ASSERT_OK(stm_fs_commit(sp.fs));
+        stm_sync_set_cold_chunks_uncapped_for_test(sync, true);
+        stm_sync_set_cas_admits_sealed_for_test(sync, true);
+        STM_ASSERT_OK(stm_fs_migrate_to_cold(sp.fs, ds[i], f));
+        stm_sync_set_cas_admits_sealed_for_test(sync, false);
+        stm_sync_set_cold_chunks_uncapped_for_test(sync, false);
+        STM_ASSERT_OK(stm_fs_commit(sp.fs));
+        stm_extent_record a;
+        memset(&a, 0, sizeof a);
+        STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(sync), ds[i],
+                                           f, 0, &a));
+        STM_ASSERT_EQ(a.kind, STM_EXTENT_KIND_COLD);
+        STM_ASSERT(a.len > STM_SEND_CHUNK_PLAIN_MAX);
+
+        size_t n = 0, need = 0;
+        STM_ASSERT_OK(stm_send_init(sync, ds[i], 0, 0, &sh[i]));
+        if (!sh[i]) continue;
+        STM_ASSERT_OK(stm_send_next(sh[i], rec, cap, &n, &need));  /* HEADER */
+        STM_ASSERT_OK(stm_send_next(sh[i], rec, cap, &n, &need));
+        STM_ASSERT_EQ(rec[0], (uint8_t)STM_SEND_REC_CHUNK);
+        STM_ASSERT(stm_send_parent_held_for_test(sh[i]));
+    }
+    STM_ASSERT_OK(stm_fs_evict_dek(sp.fs, sp.home.ds));            /* logout */
+    for (int i = 0; i < 2 && sh[0] && sh[1]; i++) {
+        size_t n = 0, need = 0;
+        stm_status r = stm_send_next(sh[i], rec, cap, &n, &need);
+        if (i == 0) {
+            STM_ASSERT_ERR(r, STM_ELOCKED);
+            STM_ASSERT(!stm_send_parent_held_for_test(sh[i]));
+            STM_ASSERT(stm_send_keys_wiped_for_test(sh[i]));
+            continue;
+        }
+        STM_ASSERT_OK(r);
+        STM_ASSERT(stm_send_parent_held_for_test(sh[i]));
+        while (r == STM_OK && rec[0] == (uint8_t)STM_SEND_REC_CHUNK)
+            r = stm_send_next(sh[i], rec, cap, &n, &need);
+        STM_ASSERT_OK(r);
+        STM_ASSERT_EQ(rec[0], (uint8_t)STM_SEND_REC_EXTENT);
+        STM_ASSERT(!stm_send_parent_held_for_test(sh[i]));
+        while ((r = stm_send_next(sh[i], rec, cap, &n, &need)) == STM_OK)
+            ;
+        STM_ASSERT_ERR(r, STM_ENOENT);
+    }
+    for (int i = 0; i < 2; i++)
+        if (sh[i]) stm_send_close(sh[i]);
+    STM_ASSERT_OK(stm_fs_install_dek(sp.fs, sp.home.ds, &sp.cc));
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    free(all);
+    free(rec);
+    seal_pool_close(&sp);
+}
+
 /* After a remount, [r0, r0 + rn) of `name` reads as want does. */
 static void r4_cold_check(seal_pool *sp, const char *name, const uint8_t *want,
                           uint64_t r0, uint64_t rn)

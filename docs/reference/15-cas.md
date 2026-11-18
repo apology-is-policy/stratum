@@ -994,6 +994,18 @@ Sender-side plan (send.c):
   cold-extent count which is application-bounded. Switch to a
   hash-table when streams routinely exceed ~10k unique cold
   chunks.
+- A COLD record longer than `STM_SEND_CHUNK_PLAIN_MAX` (an older
+  pool's whole-file migrate did not cap its chunks at the 8 MiB
+  recordsize; such records reach 16 MiB) is cut at send_init,
+  after the pins, where a capped migrate cuts (its start + k x
+  8 MiB): each piece becomes its own COLD EXTENT carrying the
+  BLAKE3 hash of its bytes, and the plan is made again over the
+  pieces, so a piece equal to another chunk of the stream ships
+  once. Init decrypts each distinct such chunk once to hash its
+  pieces; the CHUNK records decrypt it once more and slice it,
+  holding its bytes in the handle until the CHUNKs end (a
+  revocation wipes them). No wire change: the receiver sees
+  ordinary CHUNK and COLD EXTENT records.
 
 Receiver-side dispatch (recv.c):
 

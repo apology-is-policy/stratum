@@ -50,8 +50,9 @@ typedef struct {
     stm_fs      *fs;
 } testpool;
 
-static void testpool_setup(testpool *p, const char *tag,
-                              const uint64_t pool_uuid[2])
+static void testpool_setup_sz(testpool *p, const char *tag,
+                              const uint64_t pool_uuid[2],
+                              uint64_t dev_bytes)
 {
     snprintf(p->path,    sizeof p->path,    "/tmp/stm_v2_sr_%s_%d.bin",
              tag, (int)getpid());
@@ -63,7 +64,7 @@ static void testpool_setup(testpool *p, const char *tag,
     STM_ASSERT_OK(stm_keyfile_generate(p->keyfile));
 
     stm_fs_format_opts fopts = {
-        .device_size_bytes    = DEV_BYTES,
+        .device_size_bytes    = dev_bytes,
         .bootstrap_size_bytes = BS_BYTES,
         .pool_uuid            = { pool_uuid[0], pool_uuid[1] },
         .device_uuid          = { 0xCC, 0xDD },
@@ -73,6 +74,12 @@ static void testpool_setup(testpool *p, const char *tag,
 
     stm_fs_mount_opts mopts = { .read_only = false, .keyfile_path = p->keyfile };
     STM_ASSERT_OK(stm_fs_mount(p->path, &mopts, &p->fs));
+}
+
+static void testpool_setup(testpool *p, const char *tag,
+                              const uint64_t pool_uuid[2])
+{
+    testpool_setup_sz(p, tag, pool_uuid, DEV_BYTES);
 }
 
 static void testpool_teardown(testpool *p)
@@ -3255,6 +3262,228 @@ STM_TEST(rollback_waits_for_a_live_send_walking_the_engine_it_retires) {
     pthread_cond_destroy(&c.cv);
     pthread_mutex_destroy(&c.mu);
     testpool_teardown(&src);
+}
+
+/* ------------------------------------------------------------------ */
+/* X5: a COLD record longer than the wire's CHUNK cap.                 */
+/* ------------------------------------------------------------------ */
+
+/* An older pool's cold tier: CDC chunks uncapped, records up to 16 MiB. */
+#define X5_LEN ((size_t)40 << 20)
+
+static void x5_noise(uint8_t *p, size_t n)
+{
+    uint64_t x = 0x9E3779B97F4A7C15ull * 17u + 12345u;
+    for (size_t j = 0; j + 8u <= n; j += 8u) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        memcpy(p + j, &x, 8);
+    }
+}
+
+typedef struct {
+    uint64_t ino;
+    size_t   n, n_cold, n_over;
+    uint64_t max_len, next_off;
+    bool     contiguous;
+} x5_census;
+
+static bool x5_census_cb(const stm_extent_record *e, void *ctx)
+{
+    x5_census *c = ctx;
+    if (e->ino != c->ino) return true;
+    if (e->off != c->next_off) c->contiguous = false;
+    c->next_off = e->off + e->len;
+    c->n++;
+    if (e->kind == STM_EXTENT_KIND_COLD) c->n_cold++;
+    if (e->len > STM_SEND_CHUNK_PLAIN_MAX) c->n_over++;
+    if (e->len > c->max_len) c->max_len = e->len;
+    return true;
+}
+
+static x5_census x5_count(stm_fs *fs, uint64_t ino)
+{
+    x5_census c;
+    memset(&c, 0, sizeof c);
+    c.ino = ino;
+    c.contiguous = true;
+    stm_extent_index *eidx = stm_sync_extent_index(stm_fs_sync_for_test(fs));
+    STM_ASSERT_OK(stm_extent_iter_ds(eidx, 1, x5_census_cb, &c));
+    return c;
+}
+
+static void x5_write_file(stm_fs *fs, uint64_t ino, const uint8_t *all)
+{
+    for (size_t k = 0; k < X5_LEN; k += (size_t)4 << 20)
+        STM_ASSERT_OK(stm_fs_write(fs, 1, ino, k, all + k, (size_t)4 << 20));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+}
+
+static void x5_migrate(stm_fs *fs, uint64_t ino, bool uncapped)
+{
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_sync_set_cold_chunks_uncapped_for_test(sync, uncapped);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, ino));
+    stm_sync_set_cold_chunks_uncapped_for_test(sync, false);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+}
+
+/* These files have no inode (nor does a received one), so a read answers
+ * one extent or one hole a call: read on from the count. */
+static void x5_check_file(stm_fs *fs, uint64_t ino, const uint8_t *want)
+{
+    uint8_t *got = malloc(X5_LEN);
+    STM_ASSERT(got != NULL);
+    if (!got) return;
+    size_t done = 0;
+    while (done < X5_LEN) {
+        size_t n = 0;
+        stm_status rs = stm_fs_read(fs, 1, ino, done, got + done,
+                                    X5_LEN - done, &n);
+        STM_ASSERT_OK(rs);
+        if (rs != STM_OK || n == 0u) break;
+        done += n;
+    }
+    STM_ASSERT_EQ(done, X5_LEN);
+    STM_ASSERT(done == X5_LEN && memcmp(got, want, X5_LEN) == 0);
+    free(got);
+}
+
+static void x5_send(testpool *src, testpool *tgt)
+{
+    stm_send_handle *sh = NULL;
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src->fs), 1, 0, 0, &sh));
+    STM_ASSERT_OK(stm_recv_init(stm_fs_sync_for_test(tgt->fs), 1, &rh));
+    if (sh && rh) STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+    if (sh) stm_send_close(sh);
+    if (rh) stm_recv_close(rh);
+}
+
+/* Before, the send answered STM_ECORRUPT at the record (the wire caps a
+ * CHUNK at 8 MiB). Now it streams pieces of at most 8 MiB, each a COLD
+ * record with its own CHUNK, so the target holds a modern pool's records
+ * and reads the same bytes, after a remount too. */
+STM_TEST(x5_a_cold_record_over_the_wire_cap_sends_in_pieces) {
+    testpool src; testpool_setup_sz(&src, "x5_piece", POOL_UUID_SRC,
+                                    UINT64_C(128) << 20);
+    testpool tgt; testpool_setup_sz(&tgt, "x5_piece_tgt", POOL_UUID_TGT,
+                                    UINT64_C(128) << 20);
+    uint8_t *all = malloc(X5_LEN);
+    STM_ASSERT(all != NULL);
+    if (all) {
+        x5_noise(all, X5_LEN);
+        x5_write_file(src.fs, 1, all);
+        x5_migrate(src.fs, 1, true);
+        x5_census s = x5_count(src.fs, 1);
+        stm_test_info("x5 source: %zu records, %zu over the cap, longest %llu",
+                      s.n, s.n_over, (unsigned long long)s.max_len);
+        STM_ASSERT(s.n_over >= 2u);
+        STM_ASSERT_EQ(s.n_cold, s.n);
+        x5_check_file(src.fs, 1, all);
+
+        /* The parent's bytes stay in the handle while its pieces'
+         * CHUNKs go (the first is A's first piece), not past them. */
+        {
+            stm_send_handle *sh = NULL;
+            STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0,
+                                        0, &sh));
+            uint8_t *rec = malloc(STM_SEND_RECORD_MAX_LEN);
+            STM_ASSERT(rec != NULL);
+            if (sh && rec) {
+                size_t n = 0, need = 0;
+                STM_ASSERT_OK(stm_send_next(sh, rec, STM_SEND_RECORD_MAX_LEN,
+                                            &n, &need));
+                STM_ASSERT(!stm_send_parent_held_for_test(sh));
+                STM_ASSERT_OK(stm_send_next(sh, rec, STM_SEND_RECORD_MAX_LEN,
+                                            &n, &need));
+                STM_ASSERT_EQ(rec[0], (uint8_t)STM_SEND_REC_CHUNK);
+                STM_ASSERT(stm_send_parent_held_for_test(sh));
+                stm_status r;
+                while ((r = stm_send_next(sh, rec, STM_SEND_RECORD_MAX_LEN,
+                                          &n, &need)) == STM_OK &&
+                       rec[0] == (uint8_t)STM_SEND_REC_CHUNK)
+                    ;
+                STM_ASSERT_OK(r);
+                STM_ASSERT_EQ(rec[0], (uint8_t)STM_SEND_REC_EXTENT);
+                STM_ASSERT(!stm_send_parent_held_for_test(sh));
+            }
+            free(rec);
+            if (sh) stm_send_close(sh);
+        }
+
+        x5_send(&src, &tgt);
+
+        x5_census t = x5_count(tgt.fs, 1);
+        STM_ASSERT_EQ(t.n_over, (size_t)0);
+        STM_ASSERT_EQ(t.n_cold, t.n);
+        STM_ASSERT(t.contiguous);
+        STM_ASSERT_EQ(t.next_off, (uint64_t)X5_LEN);
+        STM_ASSERT(t.n > s.n);
+        x5_check_file(tgt.fs, 1, all);
+
+        STM_ASSERT_OK(stm_fs_commit(tgt.fs));
+        STM_ASSERT_OK(stm_fs_unmount(tgt.fs));
+        tgt.fs = NULL;
+        stm_fs_mount_opts mopts = { .read_only = false,
+                                    .keyfile_path = tgt.keyfile };
+        STM_ASSERT_OK(stm_fs_mount(tgt.path, &mopts, &tgt.fs));
+        if (tgt.fs) x5_check_file(tgt.fs, 1, all);
+        free(all);
+    }
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* The same bytes in three files, one migrated capped and two uncapped: the
+ * uncapped files' pieces are the capped file's chunks (a piece ends where
+ * the cap would have cut), and a stream carries one CHUNK per hash, so
+ * the target holds each chunk once. A plan that did not dedupe the
+ * pieces would send a CHUNK twice, which the receiver refuses. The
+ * third file's records are the second's, cut once. */
+STM_TEST(x5_pieces_share_chunks_with_a_capped_copy_of_the_same_bytes) {
+    testpool src; testpool_setup_sz(&src, "x5_dedup", POOL_UUID_SRC,
+                                    UINT64_C(512) << 20);
+    testpool tgt; testpool_setup_sz(&tgt, "x5_dedup_tgt", POOL_UUID_TGT,
+                                    UINT64_C(128) << 20);
+    uint8_t *all = malloc(X5_LEN);
+    STM_ASSERT(all != NULL);
+    if (all) {
+        x5_noise(all, X5_LEN);
+        x5_write_file(src.fs, 1, all);
+        x5_write_file(src.fs, 2, all);
+        x5_write_file(src.fs, 3, all);
+        x5_migrate(src.fs, 1, false);
+        x5_migrate(src.fs, 2, true);
+        x5_migrate(src.fs, 3, true);
+        x5_census a = x5_count(src.fs, 1);
+        x5_census b = x5_count(src.fs, 2);
+        stm_test_info("x5 source: capped %zu records, uncapped %zu (%zu over)",
+                      a.n, b.n, b.n_over);
+        STM_ASSERT_EQ(a.n_over, (size_t)0);
+        STM_ASSERT(b.n_over >= 1u);
+        STM_ASSERT(a.n > b.n);
+
+        x5_send(&src, &tgt);
+
+        x5_census ta = x5_count(tgt.fs, 1);
+        x5_census tb = x5_count(tgt.fs, 2);
+        x5_census tc = x5_count(tgt.fs, 3);
+        STM_ASSERT_EQ(ta.n, a.n);
+        STM_ASSERT_EQ(tb.n, a.n);
+        STM_ASSERT_EQ(tc.n, a.n);
+        STM_ASSERT_EQ(tb.n_cold, tb.n);
+        STM_ASSERT_EQ(tc.n_cold, tc.n);
+        size_t n_cas = 0;
+        STM_ASSERT_OK(stm_cas_count(
+            stm_sync_cas_index(stm_fs_sync_for_test(tgt.fs)), &n_cas));
+        STM_ASSERT_EQ(n_cas, a.n);
+        x5_check_file(tgt.fs, 1, all);
+        x5_check_file(tgt.fs, 2, all);
+        x5_check_file(tgt.fs, 3, all);
+        free(all);
+    }
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
 }
 
 STM_TEST_MAIN("send_recv")

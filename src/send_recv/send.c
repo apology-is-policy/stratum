@@ -32,6 +32,7 @@
 #include <stratum/cas.h>
 #include <stratum/crypto.h>
 #include <stratum/extent.h>
+#include <stratum/fs.h>
 #include <stratum/hash.h>
 #include <stratum/pool.h>
 #include <stratum/snapshot.h>
@@ -83,7 +84,19 @@ typedef struct {
      * (NOT gen) so reflinked records created in window (S_from, S_to]
      * are included even when their AEAD gen predates S_from. */
     uint64_t link_gen;
+    /* A piece of a COLD record longer than the wire's CHUNK cap: its
+     * content_hash is the piece's, and its CHUNK reads the parent's
+     * chunk (the cas_* fields) at piece_off. parent_len 0: no piece. */
+    uint64_t parent_len;
+    uint64_t piece_off;
+    uint8_t  parent_hash[STM_EXTENT_HASH_LEN];
 } send_extent_meta;
+
+/* A capped migrate cuts a chunk at its start + k x the recordsize; a
+ * piece ends where it would have, and fits one CHUNK record. */
+#define SEND_PIECE_MAX ((uint64_t)STM_FS_RECORDSIZE_MAX)
+_Static_assert(STM_FS_RECORDSIZE_MAX <= STM_SEND_CHUNK_PLAIN_MAX,
+               "a piece must fit one CHUNK record");
 
 /* P7-10 / R42 P2-1: snapshot of the DEKs the send needs, one per
  * (dataset, key_id) the records' keys belong to: the record's ORIGIN
@@ -153,6 +166,13 @@ struct stm_send_handle {
     /* A dataset the stream reads was logged out of after init: the keys
      * are wiped, and every later record answers STM_ELOCKED. */
     bool               revoked;
+
+    /* The parent chunk the last piece's CHUNK record decrypted (a
+     * parent's pieces come in a row), held until the CHUNKs end. */
+    uint8_t           *parent_plain;
+    size_t             parent_plain_cap;
+    uint8_t            parent_hash[STM_EXTENT_HASH_LEN];
+    bool               parent_valid;
 };
 
 #ifdef STRATUM_BUILD_TESTING_HOOKS
@@ -176,6 +196,17 @@ void stm_send_set_init_hook_for_test(void (*hook)(void *ctx, int stage),
  * included. Asked before each record: the keys wait in the handle until
  * that call or the close, and a record already being built when the evict
  * lands finishes, as a read in flight does. Callers hold no pin. */
+static void send_parent_release(stm_send_handle *h)
+{
+    if (h->parent_plain) {
+        stm_ct_memzero(h->parent_plain, h->parent_plain_cap);
+        free(h->parent_plain);
+    }
+    h->parent_plain = NULL;
+    h->parent_plain_cap = 0;
+    h->parent_valid = false;
+}
+
 static bool send_revoked(stm_send_handle *h)
 {
     if (h->revoked) return true;
@@ -187,6 +218,7 @@ static bool send_revoked(stm_send_handle *h)
                                               h->evict_seq0);
     if (!gone) return false;
     if (h->deks) stm_ct_memzero(h->deks, h->cap_deks * sizeof *h->deks);
+    send_parent_release(h);
     h->revoked = true;
     return true;
 }
@@ -199,6 +231,11 @@ bool stm_send_keys_wiped_for_test(const stm_send_handle *h)
     uint8_t acc = 0;
     for (size_t i = 0; i < n; i++) acc |= p[i];
     return h->n_deks > 0 && acc == 0;
+}
+
+bool stm_send_parent_held_for_test(const stm_send_handle *h)
+{
+    return h->parent_plain != NULL;
 }
 #endif
 
@@ -213,6 +250,7 @@ static void send_handle_free(stm_send_handle *h)
         free(h->deks);
     }
     free(h->origins);
+    send_parent_release(h);
     if (h->hasher) stm_blake3_free(h->hasher);
     free(h);
 }
@@ -319,6 +357,132 @@ static bool send_collect_cb(const stm_extent_record *e, void *ctx_) {
     /* R48 P0-1: capture link_gen for the collect-pass filter. */
     m->link_gen          = e->link_gen;
     return true;
+}
+
+static stm_status read_decrypt_cold_chunk(stm_send_handle *h,
+                                          const uint8_t *hash,
+                                          const uint64_t *paddrs,
+                                          uint8_t n_replicas, uint64_t gen,
+                                          uint64_t len, uint8_t *out_plain);
+
+/* P7-CAS-10: the chunk plan. Walk the captured extents in (ino, off)
+ * order and dedupe COLD content_hashes; for each unique hash, append the
+ * index of its FIRST-encountered extent to chunk_plan. The CHUNK record
+ * at emit-time sources its plaintext via that extent's cas_paddrs (any
+ * extent with the same hash is bytewise-equivalent for read purposes;
+ * using the first is deterministic). O(n_cold^2) dedup scan via memcmp:
+ * n_cold is bounded by the stream, which the application bounds. */
+static stm_status send_plan_chunks(stm_send_handle *h)
+{
+    h->n_chunk_plan = 0;
+    for (size_t i = 0; i < h->n_extents; i++) {
+        send_extent_meta *m = &h->extents[i];
+        if (m->kind != STM_EXTENT_KIND_COLD) continue;
+        bool already = false;
+        for (size_t j = 0; j < h->n_chunk_plan; j++) {
+            if (memcmp(h->extents[h->chunk_plan[j]].content_hash,
+                          m->content_hash, STM_EXTENT_HASH_LEN) == 0) {
+                already = true;
+                break;
+            }
+        }
+        if (already) continue;
+
+        if (h->n_chunk_plan == h->cap_chunk_plan) {
+            size_t new_cap = h->cap_chunk_plan == 0 ? 8 : h->cap_chunk_plan * 2;
+            size_t *grown = realloc(h->chunk_plan,
+                                       new_cap * sizeof(*h->chunk_plan));
+            if (!grown) return STM_ENOMEM;
+            h->chunk_plan     = grown;
+            h->cap_chunk_plan = new_cap;
+        }
+        h->chunk_plan[h->n_chunk_plan++] = i;
+    }
+    return STM_OK;
+}
+
+/* A COLD record longer than the wire's CHUNK cap (an older pool's
+ * uncapped CDC made them up to 16 MiB) goes as pieces of at most
+ * SEND_PIECE_MAX, each a COLD record whose CHUNK holds that slice of the
+ * parent's bytes under the slice's own hash: the target gets the records
+ * a capped migrate makes of the same bytes, and a piece equal to another
+ * chunk of the stream is sent once (the receiver refuses a second CHUNK
+ * of one hash). Each distinct parent is decrypted once here, to hash its
+ * pieces, and once more when its CHUNKs are emitted. Runs after the pins,
+ * which keep the parents' blocks; the plan is made again over the pieces. */
+static stm_status send_split_big_cold(stm_send_handle *h)
+{
+    size_t extra = 0;
+    for (size_t i = 0; i < h->n_extents; i++) {
+        const send_extent_meta *m = &h->extents[i];
+        if (m->kind == STM_EXTENT_KIND_COLD && m->len > SEND_PIECE_MAX)
+            extra += (size_t)((m->len - 1u) / SEND_PIECE_MAX);
+    }
+    if (extra == 0) return STM_OK;
+    if (extra > SIZE_MAX / sizeof(send_extent_meta) - h->n_extents)
+        return STM_ENOMEM;
+    size_t cap = h->n_extents + extra;
+    send_extent_meta *out = malloc(cap * sizeof *out);
+    if (!out) return STM_ENOMEM;
+    uint8_t *plain = NULL;
+    size_t plain_cap = 0;
+    stm_status rc = STM_OK;
+    size_t w = 0;
+    for (size_t i = 0; i < h->n_extents && rc == STM_OK; i++) {
+        const send_extent_meta *m = &h->extents[i];
+        if (m->kind != STM_EXTENT_KIND_COLD || m->len <= SEND_PIECE_MAX) {
+            out[w++] = *m;
+            continue;
+        }
+        /* An earlier record with this chunk was cut already. */
+        size_t first = SIZE_MAX;
+        for (size_t j = 0; j < w && first == SIZE_MAX; j++)
+            if (out[j].parent_len != 0u && out[j].piece_off == 0u &&
+                memcmp(out[j].parent_hash, m->content_hash,
+                       STM_EXTENT_HASH_LEN) == 0)
+                first = j;
+        if (first == SIZE_MAX) {
+            if (plain_cap < m->len) {
+                if (plain) { stm_ct_memzero(plain, plain_cap); free(plain); }
+                plain = malloc((size_t)m->len);
+                plain_cap = plain ? (size_t)m->len : 0u;
+                if (!plain) { rc = STM_ENOMEM; break; }
+            }
+            rc = read_decrypt_cold_chunk(h, m->content_hash, m->cas_paddrs,
+                                         m->cas_n_replicas, m->cas_gen,
+                                         m->len, plain);
+            if (rc != STM_OK) break;
+        }
+        for (uint64_t po = 0, k = 0; po < m->len; po += SEND_PIECE_MAX, k++) {
+            send_extent_meta *p = &out[w++];
+            *p = *m;
+            p->off        = m->off + po;
+            p->len        = m->len - po < SEND_PIECE_MAX ? m->len - po
+                                                         : SEND_PIECE_MAX;
+            p->parent_len = m->len;
+            p->piece_off  = po;
+            memcpy(p->parent_hash, m->content_hash, STM_EXTENT_HASH_LEN);
+            if (first != SIZE_MAX) {
+                const send_extent_meta *q = &out[first + k];
+                if (q->parent_len != m->len || q->piece_off != po) {
+                    rc = STM_ECORRUPT;
+                    break;
+                }
+                memcpy(p->content_hash, q->content_hash, STM_EXTENT_HASH_LEN);
+            } else {
+                stm_blake3_hash ph;
+                stm_blake3(plain + po, (size_t)p->len, &ph);
+                memcpy(p->content_hash, ph.bytes, STM_EXTENT_HASH_LEN);
+            }
+        }
+    }
+    if (plain) { stm_ct_memzero(plain, plain_cap); free(plain); }
+    if (rc != STM_OK) { free(out); return rc; }
+    free(h->extents);
+    h->extents     = out;
+    h->n_extents   = w;
+    h->cap_extents = cap;
+    return send_plan_chunks(h);
 }
 
 stm_status stm_send_init(stm_sync *sync,
@@ -490,42 +654,8 @@ stm_status stm_send_init(stm_sync *sync,
         }
     }
 
-    /* P7-CAS-10: build the chunk plan. Walk the captured extents in
-     * (ino, off) order and dedupe COLD content_hashes; for each unique
-     * hash, append the index of its FIRST-encountered extent to
-     * chunk_plan. The CHUNK record at emit-time will source its
-     * plaintext via that extent's cas_paddrs (any extent with the
-     * same hash is bytewise-equivalent for read purposes; using the
-     * first is deterministic).
-     *
-     * O(n_cold²) dedup scan via memcmp — n_cold is bounded by stream
-     * size which is application-bounded. A hash-map dedup would scale
-     * better but adds dependency complexity for marginal benefit at
-     * v1. Future: switch to a hash-table when n_cold routinely
-     * exceeds ~10k per stream. */
-    for (size_t i = 0; i < h->n_extents; i++) {
-        send_extent_meta *m = &h->extents[i];
-        if (m->kind != STM_EXTENT_KIND_COLD) continue;
-        bool already = false;
-        for (size_t j = 0; j < h->n_chunk_plan; j++) {
-            if (memcmp(h->extents[h->chunk_plan[j]].content_hash,
-                          m->content_hash, STM_EXTENT_HASH_LEN) == 0) {
-                already = true;
-                break;
-            }
-        }
-        if (already) continue;
-
-        if (h->n_chunk_plan == h->cap_chunk_plan) {
-            size_t new_cap = h->cap_chunk_plan == 0 ? 8 : h->cap_chunk_plan * 2;
-            size_t *grown = realloc(h->chunk_plan,
-                                       new_cap * sizeof(*h->chunk_plan));
-            if (!grown) { rc = STM_ENOMEM; goto fail; }
-            h->chunk_plan     = grown;
-            h->cap_chunk_plan = new_cap;
-        }
-        h->chunk_plan[h->n_chunk_plan++] = i;
-    }
+    rc = send_plan_chunks(h);
+    if (rc != STM_OK) goto fail;
 
     /* P7-10 / R42 P2-1: snapshot DEKs for every unique key_id the
      * collected extents reference. Without this, a concurrent
@@ -628,6 +758,9 @@ stm_status stm_send_init(stm_sync *sync,
         if (rc != STM_OK) goto fail;
     }
     stm_sync_send_hold_settle(sync, h->hold);
+
+    rc = send_split_big_cold(h);
+    if (rc != STM_OK) goto fail;
 
     *out_handle = h;
     return STM_OK;
@@ -765,18 +898,20 @@ static stm_status read_decrypt_extent_plaintext(stm_send_handle *h,
  * nest sync->lock for every emit. AEAD nonce: (paddrs[0], cas_gen,
  * pool_uuid). AEAD AD: stm_ad_cas(pool_uuid, content_hash). Key:
  * pool metadata key (cross-dataset shareable per ARCH §7.6.3). */
-static stm_status read_decrypt_cold_chunk_plaintext(stm_send_handle *h,
-                                                       const send_extent_meta *m,
-                                                       uint8_t *out_plain)
+static stm_status read_decrypt_cold_chunk(stm_send_handle *h,
+                                          const uint8_t *hash,
+                                          const uint64_t *paddrs,
+                                          uint8_t n_replicas, uint64_t gen,
+                                          uint64_t len, uint8_t *out_plain)
 {
-    if (m->cas_n_replicas == 0
-        || m->cas_n_replicas > STM_CAS_MAX_REPLICAS) return STM_ECORRUPT;
+    if (n_replicas == 0
+        || n_replicas > STM_CAS_MAX_REPLICAS) return STM_ECORRUPT;
 
     stm_aead_mode mode = STM_AEAD_AEGIS256;
     size_t tag_len = stm_aead_tag_len(mode);
     if (tag_len == 0) return STM_EINVAL;
 
-    size_t total = m->len + tag_len;
+    size_t total = (size_t)len + tag_len;
     void *cbuf = malloc(total);
     if (!cbuf) return STM_ENOMEM;
 
@@ -789,15 +924,15 @@ static stm_status read_decrypt_cold_chunk_plaintext(stm_send_handle *h,
     const uint64_t *puuid = stm_pool_uuid(stm_sync_pool(h->sync));
     cad.pool_uuid[0] = puuid[0];
     cad.pool_uuid[1] = puuid[1];
-    memcpy(cad.content_hash, m->content_hash, STM_CAS_HASH_LEN);
+    memcpy(cad.content_hash, hash, STM_CAS_HASH_LEN);
     uint8_t cad_packed[STM_AD_CAS_PACKED_LEN];
     stm_ad_cas_pack(&cad, cad_packed);
 
     /* Nonce: paddrs[0] || cas_gen || pool_uuid (LE). */
     uint8_t nonce[STM_AEAD_NONCE_LEN];
     {
-        le64 p_le  = stm_store_le64(m->cas_paddrs[0]);
-        le64 g_le  = stm_store_le64(m->cas_gen);
+        le64 p_le  = stm_store_le64(paddrs[0]);
+        le64 g_le  = stm_store_le64(gen);
         le64 u0_le = stm_store_le64(puuid[0]);
         le64 u1_le = stm_store_le64(puuid[1]);
         memcpy(nonce +  0, p_le.v,  8);
@@ -810,11 +945,11 @@ static stm_status read_decrypt_cold_chunk_plaintext(stm_send_handle *h,
     if (!mkey) { free(cbuf); return STM_ECORRUPT; }
 
     stm_status last_err = STM_EBADTAG;
-    for (uint8_t i = 0; i < m->cas_n_replicas; i++) {
-        uint16_t dev = stm_paddr_device(m->cas_paddrs[i]);
+    for (uint8_t i = 0; i < n_replicas; i++) {
+        uint16_t dev = stm_paddr_device(paddrs[i]);
         stm_bdev *bd = stm_pool_device_bdev(stm_sync_pool(h->sync), dev);
         if (!bd) { last_err = STM_EINVAL; continue; }
-        uint64_t boff = stm_paddr_offset(m->cas_paddrs[i]) * (uint64_t)STM_UB_SIZE;
+        uint64_t boff = stm_paddr_offset(paddrs[i]) * (uint64_t)STM_UB_SIZE;
         stm_status rs = stm_bdev_read(bd, boff, cbuf, total);
         if (rs != STM_OK) { last_err = rs; continue; }
 
@@ -824,7 +959,7 @@ static stm_status read_decrypt_cold_chunk_plaintext(stm_send_handle *h,
                                             cbuf, total,
                                             out_plain, &pt_out);
         if (ds == STM_OK) {
-            if (pt_out != m->len) { last_err = STM_ECORRUPT; continue; }
+            if (pt_out != len) { last_err = STM_ECORRUPT; continue; }
             free(cbuf);
             return STM_OK;
         }
@@ -833,6 +968,29 @@ static stm_status read_decrypt_cold_chunk_plaintext(stm_send_handle *h,
 
     free(cbuf);
     return last_err;
+}
+
+/* A piece's parent chunk, decrypted into the handle unless it holds it. */
+static stm_status send_parent_plain(stm_send_handle *h,
+                                    const send_extent_meta *m)
+{
+    if (h->parent_valid &&
+        memcmp(h->parent_hash, m->parent_hash, STM_EXTENT_HASH_LEN) == 0)
+        return STM_OK;
+    h->parent_valid = false;
+    if (h->parent_plain_cap < m->parent_len) {
+        send_parent_release(h);
+        h->parent_plain = malloc((size_t)m->parent_len);
+        if (!h->parent_plain) return STM_ENOMEM;
+        h->parent_plain_cap = (size_t)m->parent_len;
+    }
+    stm_status rs = read_decrypt_cold_chunk(h, m->parent_hash, m->cas_paddrs,
+                                            m->cas_n_replicas, m->cas_gen,
+                                            m->parent_len, h->parent_plain);
+    if (rs != STM_OK) return rs;
+    memcpy(h->parent_hash, m->parent_hash, STM_EXTENT_HASH_LEN);
+    h->parent_valid = true;
+    return STM_OK;
 }
 
 static stm_status emit_extent_locked(stm_send_handle *h,
@@ -911,10 +1069,22 @@ static stm_status emit_chunk_locked(stm_send_handle *h,
     /* Hash prefix. */
     memcpy(body, m->content_hash, STM_SEND_CHUNK_HASH_LEN);
     /* Plaintext suffix: decrypt the chunk via the captured cas_paddrs
-     * + cas_gen + pool metadata key + stm_ad_cas. */
-    stm_status ds = read_decrypt_cold_chunk_plaintext(
-            h, m, body + STM_SEND_CHUNK_HASH_LEN);
-    if (ds != STM_OK) return ds;
+     * + cas_gen + pool metadata key + stm_ad_cas; a piece's is its
+     * slice of the parent's. */
+    if (m->parent_len != 0u) {
+        if (m->piece_off > m->parent_len ||
+            m->len > m->parent_len - m->piece_off)
+            return STM_ECORRUPT;
+        stm_status ps = send_parent_plain(h, m);
+        if (ps != STM_OK) return ps;
+        memcpy(body + STM_SEND_CHUNK_HASH_LEN,
+               h->parent_plain + m->piece_off, (size_t)m->len);
+    } else {
+        stm_status ds = read_decrypt_cold_chunk(
+                h, m->content_hash, m->cas_paddrs, m->cas_n_replicas,
+                m->cas_gen, m->len, body + STM_SEND_CHUNK_HASH_LEN);
+        if (ds != STM_OK) return ds;
+    }
 
     stm_blake3_update(h->hasher, out, need);
     *out_len = need;
@@ -993,6 +1163,7 @@ stm_status stm_send_next(stm_send_handle *h,
     }
 
     if (h->cursor <= h->n_chunk_plan + h->n_extents) {
+        send_parent_release(h);
         size_t ext_idx = h->cursor - 1u - h->n_chunk_plan;
         const send_extent_meta *m = &h->extents[ext_idx];
         size_t need;
