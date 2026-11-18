@@ -31,9 +31,10 @@ margin, a device fault has no redundancy fallback — so recovery is layered:
 
 | Layer | Mechanism | On a *transient* fault | On a *genuine* (persistent) fault |
 |---|---|---|---|
-| **bdev** (`bdev_thylacine`) | in-place device re-init + bounded retry | self-heals (the FS never sees EIO) | exhausts the budget -> latches -> surfaces STM_EIO |
+| **bdev** (`bdev_thylacine`), the transport | in-place device re-init + bounded retry | self-heals (the FS never sees EIO) | exhausts the budget -> latches -> surfaces STM_EIO |
+| **bdev**, a request the device fails (IOERR) | no re-init, no latch: that request answers STM_EIO | the FS sees one STM_EIO and judges it (a drain's reader reads twice, then probes the device) | every read of that sector answers STM_EIO; every other request goes on |
 | **FS extent write** (`fs_flush_all_locked`) | dirty buffer stays in-RAM, NOT wedged | a retried `stm_fs_commit` succeeds (data intact) | the caller sees STM_EIO; data still in RAM for a later retry |
-| **FS commit** (`stm_sync_commit`) | wedge (integrity) + recover via remount | (unreachable — the bdev layer self-healed first) | wedge: a partial commit rolled back the in-RAM tree, so an in-process retry would silently lose mutations; the UB-ring rollback recovers on the next mount |
+| **FS commit** (`stm_sync_commit`) | wedge (integrity) + recover via remount | a transport hiccup: unreachable, the bdev layer self-heals first; a write or flush the device fails: wedge | wedge: a partial commit rolled back the in-RAM tree, so an in-process retry would silently lose mutations; the UB-ring rollback recovers on the next mount |
 
 The **bdev layer is the load-bearing fix** for the single-device case: it makes
 a transient virtio hiccup transparent to the FS, so the FS's *already-correct*
@@ -49,9 +50,10 @@ three functions:
 ```c
 static bool       reinit_device_locked(thyla_bdev *d);
 static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
-                                   uint32_t sector_count, bool is_write);
+                                   uint32_t sector_count, req_kind kind,
+                                   bdev_fail_info *fi);
 static stm_status do_request(thyla_bdev *d, uint64_t lba,
-                              uint32_t sector_count, bool is_write);
+                              uint32_t sector_count, req_kind kind);
 ```
 
 - **`do_request_once`** is the submit + IRQ-wait + completion check. It returns
@@ -77,6 +79,7 @@ static stm_status do_request(thyla_bdev *d, uint64_t lba,
   for (uint32_t attempt = 0; ; attempt++) {
       stm_status s = do_request_once(...);
       if (s == STM_OK) return STM_OK;
+      if (fi.own) return s;                 // the device failed this request alone
       if (attempt >= DO_REQUEST_MAX_REINIT) { d->failed = true; return STM_EIO; }
       if (!reinit_device_locked(d))         { d->failed = true; return STM_EIO; }
   }
@@ -86,6 +89,39 @@ static stm_status do_request(thyla_bdev *d, uint64_t lba,
   wake cap + `t_irq_wait`), so there is no unbounded spin. Exhaustion — or a
   re-init that itself fails to re-negotiate — latches `d->failed`
   **permanently** (fail-closed; the genuinely-dead-device case).
+
+### A request the device fails alone (X9, 2026-11-18)
+
+`do_request_once` answers a request whose completion the ring confirms (used.idx
+and the used id both match) by its status byte. `VIRTIO_BLK_S_IOERR` (a bad
+sector, or the host's I/O error) and `VIRTIO_BLK_S_UNSUPP` are that request's
+own outcome: the ring advances as for a success (`d->avail_idx = new_idx`), the
+request answers `STM_EIO` or `STM_ENOTSUPPORTED`, and `do_request` returns it
+with no re-init and no latch (`fi.own`). Any other status byte, the `0xff`
+pre-poison included (the device never wrote it), breaks the protocol and takes
+the transport path above.
+
+Before, the status arm took the transport path: one bad sector re-initialised
+the device twice, then latched it, so every later request on the device
+answered `STM_EIO` for the life of the process. A re-submit cannot help a
+request the device has answered, and for a flush it can hurt: a flush the
+device failed may have lost cached writes, and a second flush after a reset
+would report them durable. This matches Linux's virtio_blk (`virtblk_result`:
+the status fails that request) and ZFS, where the retry and the device probe
+live above the disk driver (`zio_vdev_io_assess`, `vdev_probe`). In Stratum
+they live in the classifying readers (vote 146: read twice, then ask whether
+the device still reads its labels).
+
+What the FS sees: a read answers `STM_EIO` (a plain reader returns it; a
+drain's merge read and promote judge it per `26-fs-write-path.md`); an extent
+write answers `STM_EIO` and its run stays buffered (Layer 2); a commit's own
+write or flush answers `STM_EIO` and the commit wedges (Layer 3), as ZFS
+suspends a single-device pool on a failed write.
+
+The first 32 such requests on a device each write one `BDEVDIAG: request-error`
+line (arm `status`, `st` the status byte); the 33rd writes one saying later
+ones go unshown (`BDEV_REQUEST_ERROR_LINES_MAX`), so a sector read again and
+again cannot flood the console. `request_errors` counts them all.
 
 ### Why this is the recovery the latch always assumed (R4-F1)
 
@@ -116,7 +152,9 @@ A re-submit re-issues the *same* request:
   negotiated `VIRTIO_BLK_F_FLUSH`) re-flushes — idempotent. It shares the
   `do_request` path, so a transient flush hiccup self-heals via the same
   bounded reinit recovery; only an exhausted budget latches + surfaces STM_EIO,
-  which wedges the in-flight commit (fail-closed durability). The flush is a
+  which wedges the in-flight commit (fail-closed durability). A flush the
+  device answers `VIRTIO_BLK_S_IOERR` is never re-submitted (see above): it
+  answers STM_EIO at once and the commit wedges. The flush is a
   header→status descriptor chain with no data buffer; see
   `31-durability-commit.md` §31.4.
 
@@ -133,9 +171,10 @@ clear_wedged/resume**; recovery is by **remount** (the UB-ring rollback picks
 the last-good gen; `crash_inject_during_commit_recovers_clean`).
 
 For the single-device boot pool, the bdev re-init (Layer 1) makes a transient
-commit-EIO unreachable (the device self-heals before the commit's UB write
-fails), so the wedge bites only a *genuinely* dead device — where permanent
-death pending a remount is acceptable. See "Known caveats" for the SOTA gap.
+transport hiccup unreachable here (the device self-heals before the commit's
+UB write fails). A write or flush the device fails (IOERR) does reach the
+commit and wedges it, as a genuinely dead device does; permanent death pending
+a remount is acceptable for both. See "Known caveats" for the SOTA gap.
 
 ## The errno boundary — honest error codes to userspace (#3)
 
@@ -190,15 +229,26 @@ Two residuals (Area F focused audit, P3, both v1.0-acceptable):
 - The `bdev_thylacine` re-init path itself is **Thylacine-only** (not
   host-compilable; `#error`-guarded on `__NR_mmio_create`). Its happy path is
   exercised by every Thylacine boot (the live stratumd drives virtio-blk
-  through `do_request` -> `do_request_once`); its **fault/recovery** path is
-  verified by code review against the VIRTIO 1.2 reset semantics + the in-guest
-  go-build E2E.
+  through `do_request` -> `do_request_once`); its re-init path is verified by
+  code review against the VIRTIO 1.2 reset semantics + the in-guest go-build
+  E2E. The request-error path (X9) is verified on
+  Thylacine with QEMU's blkdebug filter under the pool drive
+  (`THYLACINE_POOL_BLKDEBUG` in Thylacine's `tools/run-vm.sh`), failing every
+  read of one sector: label 3's commit-ring slot 0, which the mount's
+  uberblock scan reads and skips on error. With this driver the boot reaches
+  its login prompt; each of the sector's two reads writes one `request-error`
+  line (`st=1`) and nothing re-inits. With the driver before it, the same
+  sector re-inits the device twice and latches it, stratumd's mount fails
+  (`rc=-5`), and the boot stops. A driver that drops the ring-index advance on
+  the request-error path hangs the next request (stratumd never comes up).
 
 ## Error paths
 
 | Return | Trigger | Caller expectation |
 |---|---|---|
-| `STM_EIO` (bdev) | `do_request_once` failed AND the recovery budget exhausted (or re-init failed) | the FS extent-write path retries (data in RAM); a commit wedges |
+| `STM_EIO` (bdev) | a transport failure in `do_request_once` (arms 1-4, or a status byte that is none of OK, IOERR, UNSUPP) AND the recovery budget exhausted (or re-init failed) | the FS extent-write path retries (data in RAM); a commit wedges |
+| `STM_EIO` (bdev) | the device completed the request with `VIRTIO_BLK_S_IOERR` (a bad sector) | that request only, the device is not latched: a drain's reader judges it per ref 26; an extent write keeps its run; a commit wedges |
+| `STM_ENOTSUPPORTED` (bdev) | the device completed the request with `VIRTIO_BLK_S_UNSUPP` | that request only; a pool-wide error to the FS |
 | `STM_EWEDGED` (fs) | a mutating op after a failed commit | refuse until remount (the integrity guard) |
 | `-ENOSPC` / `-EIO` (dev9p) | Stratum Rlerror over 9P | userspace sees the honest errno (post-#3) |
 
@@ -208,6 +258,8 @@ The recovery path is **off the hot path**: a healthy `do_request` returns after
 one `do_request_once` with no re-init. A re-init costs a device reset +
 re-negotiation (a handful of MMIO round-trips), bounded at 2 per failed
 request. `reinit_count` is a diagnostic counter (single-writer under `d->lock`).
+A request the device fails alone costs no re-init, and one line of stderr at
+most.
 
 ## Known caveats / footguns
 
@@ -215,9 +267,10 @@ request. `reinit_count` is a diagnostic counter (single-writer under `d->lock`).
   within a process lifetime; recovery requires unmount+remount (a stratumd
   restart on Thylacine). Mature COW filesystems offer an in-process *suspend +
   clear* (ZFS `failmode=wait` + `zpool clear`; BTRFS read-only + remount). The
-  bdev re-init makes this gap unreachable for the *transient* case (the device
-  self-heals before the commit wedges), so it bites only a genuinely-dead
-  device. A recoverable-suspend that lets a hard-but-recovered device resume
+  bdev re-init makes this gap unreachable for a *transient* transport hiccup
+  (the device self-heals before the commit wedges), so it bites a
+  genuinely-dead device and a commit write or flush the device fails (IOERR).
+  A recoverable-suspend that lets a hard-but-recovered device resume
   without a restart is a tracked v1.x enhancement, not an Area F defect.
 - **Stale-pool contamination.** A pool baked by a *buggy* Stratum (e.g.
   pre-Area-A, which had the #352/#355 extent-overwrite data-loss bugs) can
@@ -235,6 +288,8 @@ request. `reinit_count` is a diagnostic counter (single-writer under `d->lock`).
 - Layer 1 (`bdev_thylacine` re-init + bounded retry): **implemented**
   (Area F #2). Happy path boot-verified live; fault path code-reviewed +
   owed the in-guest go-build E2E.
+- A request the device fails alone (X9): **implemented** (o1c, 2026-11-18);
+  verified on Thylacine with one injected bad sector (see Tests).
 - Layer 2 (FS extent-write recovery): **pre-existing + sound**; now pinned by
   `fs_io_transient_write_eio_flush_recovers`.
 - Layer 3 (commit wedge + remount recovery): **pre-existing + sound** (R154).

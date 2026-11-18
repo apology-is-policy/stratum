@@ -150,6 +150,8 @@
 #define VIRTIO_BLK_T_OUT             1u
 #define VIRTIO_BLK_T_FLUSH           4u
 #define VIRTIO_BLK_S_OK              0u
+#define VIRTIO_BLK_S_IOERR           1u
+#define VIRTIO_BLK_S_UNSUPP          2u
 
 /* VIRTIO_BLK_F_FLUSH (feature bit 9, bank 0): the device has a writeback
  * cache and honors VIRTIO_BLK_T_FLUSH. Negotiating it lets op_fsync issue a
@@ -185,6 +187,10 @@ typedef enum { REQ_READ, REQ_WRITE, REQ_FLUSH } req_kind;
  * permanently. A transient virtio hiccup self-heals on the first re-init;
  * a genuinely dead device exhausts the budget + latches (Area F #2). */
 #define DO_REQUEST_MAX_REINIT        2u
+
+/* Lines a device writes for requests it failed alone before it goes
+ * quiet: a bad sector read again and again must not flood the console. */
+#define BDEV_REQUEST_ERROR_LINES_MAX 32u
 
 /* Thylacine kobj-rights bits. Mirror of kernel/include/thylacine/handle.h
  * (and libthyla_rs / libt). The kernel reserves (1u << 3) for
@@ -242,13 +248,15 @@ typedef struct {
      * Reset to 0 by a device re-init (the recovery path), which also
      * resets the device's own idx via a VIRTIO reset. */
     uint16_t         avail_idx;
-    /* Latched PERMANENTLY only after a request fails AND the bounded
+    /* Latched PERMANENTLY only after the transport fails AND the bounded
      * re-init recovery (reinit_device_locked + retry) has been exhausted
      * -- i.e. a genuinely dead device, not a transient hiccup (R4-F1
-     * recovery, Area F #2). Once true, every op short-circuits to
+     * recovery, Area F #2). A request the device fails alone (a bad
+     * sector) never sets it. Once true, every op short-circuits to
      * STM_EIO. */
     bool             failed;
     uint64_t         reinit_count;  /* diagnostics: device recoveries fired */
+    uint64_t         request_errors; /* diagnostics: requests failed alone */
 
     /* VIRTIO_BLK_F_FLUSH negotiated at init -> op_fsync issues a real
      * VIRTIO_BLK_T_FLUSH barrier. When false (device offers no cache),
@@ -538,6 +546,7 @@ typedef struct {
     int64_t  irq_rc;     /* t_irq_wait return (arm 2) */
     uint16_t used_idx;   /* observed used.idx (arm 3) */
     uint16_t want_idx;   /* expected used.idx (arm 3) */
+    bool     own;        /* arm 5, the request's own failure: ring advanced */
 } bdev_fail_info;
 
 static const char *bdev_fail_arm_str(uint8_t arm)
@@ -567,15 +576,27 @@ static void bdev_diag(thyla_bdev *d, const char *what, uint64_t lba,
                      (long long)fi->irq_rc, fi->used_idx, fi->want_idx,
                      (unsigned long long)d->reinit_count);
     if (n > 0) {
-        ssize_t w = write(2, buf, (size_t)n);
+        /* snprintf returns the length it wanted, not what fits. */
+        size_t len = ((size_t)n < sizeof buf) ? (size_t)n : sizeof buf - 1u;
+        ssize_t w = write(2, buf, len);
         (void)w;
     }
 }
 
+/* A completion status that names the request's own outcome. Any other
+ * value (the 0xff pre-poison included: the device never wrote the byte)
+ * breaks the protocol, and is the transport's failure. */
+static bool blk_status_is_requests_own(uint8_t st)
+{
+    return st == VIRTIO_BLK_S_IOERR || st == VIRTIO_BLK_S_UNSUPP;
+}
+
 /* Submit one virtqueue request + wait for completion. STM_OK on a clean
- * completion; STM_EIO on any failure WITHOUT latching -- the recovery /
- * latch decision is do_request()'s. On failure `fi` names the failing
- * arm (BDEVDIAG). Caller holds d->lock. */
+ * completion. A completion whose status is the request's own failure
+ * (IOERR -> STM_EIO, UNSUPP -> STM_ENOTSUPPORTED) returns that status with
+ * the ring advanced and fi->own set. Any other failure returns STM_EIO
+ * WITHOUT latching -- the recovery / latch decision is do_request()'s.
+ * On failure `fi` names the failing arm (BDEVDIAG). Caller holds d->lock. */
 static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
                                    uint32_t sector_count, req_kind kind,
                                    bdev_fail_info *fi)
@@ -672,6 +693,14 @@ static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
     if (st != VIRTIO_BLK_S_OK) {
         fi->arm = 5;
         fi->st = st;
+        if (blk_status_is_requests_own(st)) {
+            /* The device consumed the request and answered it on a
+             * consistent ring (used.idx and the used id both matched), so
+             * the ring moves on as for a success. */
+            fi->own = true;
+            d->avail_idx = new_idx;
+            return (st == VIRTIO_BLK_S_IOERR) ? STM_EIO : STM_ENOTSUPPORTED;
+        }
         goto io_fail;
     }
 
@@ -688,7 +717,28 @@ io_fail:
     return STM_EIO;
 }
 
-/* Submit a request with bounded transient-fault recovery. A failed
+/* One line for each of the first BDEV_REQUEST_ERROR_LINES_MAX requests the
+ * device failed alone, then one saying later ones go unshown. Caller holds
+ * d->lock. */
+static void bdev_request_error(thyla_bdev *d, uint64_t lba,
+                               uint32_t sector_count, req_kind kind,
+                               uint32_t attempt, const bdev_fail_info *fi)
+{
+    d->request_errors++;
+    if (d->request_errors <= BDEV_REQUEST_ERROR_LINES_MAX)
+        bdev_diag(d, "request-error", lba, sector_count, kind, attempt, fi);
+    else if (d->request_errors == BDEV_REQUEST_ERROR_LINES_MAX + 1u)
+        bdev_diag(d, "request-error (later ones not shown)", lba,
+                  sector_count, kind, attempt, fi);
+}
+
+/* Submit a request with bounded transient-fault recovery. A request the
+ * device completes with its own failure status (a bad sector) fails
+ * alone: the ring is consistent, so there is no re-init and no latch, and
+ * the caller judges the error (Stratum's classifying readers read twice,
+ * then probe the device). A re-init and re-submit could not help it and
+ * could hurt: a flush the device failed may have lost cached writes that a
+ * second flush would then report durable. Any other failed
  * do_request_once is a (possibly transient) virtio hiccup: re-init the
  * device (resyncs both ends to idx 0) + re-submit, up to
  * DO_REQUEST_MAX_REINIT times. Only after the recovery budget is
@@ -711,6 +761,10 @@ static stm_status do_request(thyla_bdev *d, uint64_t lba,
         bdev_fail_info fi = {0};
         stm_status s = do_request_once(d, lba, sector_count, kind, &fi);
         if (s == STM_OK) return STM_OK;
+        if (fi.own) {
+            bdev_request_error(d, lba, sector_count, kind, attempt, &fi);
+            return s;
+        }
 
         bdev_diag(d, "io-fail", lba, sector_count, kind, attempt, &fi);
 
@@ -865,7 +919,8 @@ static stm_status op_fsync(stm_bdev *base)
      * cache=writethrough (RW-8 R4-F3). lba/sector_count are unused for FLUSH.
      * d->lock serialises the shared descriptor chain (invariant B-2), exactly
      * as read/write do; a transient flush hiccup self-heals via the same
-     * bounded reinit recovery in do_request. */
+     * bounded reinit recovery in do_request, and a flush the device fails
+     * (IOERR) answers STM_EIO at once. */
     pthread_mutex_lock(&d->lock);
     stm_status s = do_request(d, 0, 0, REQ_FLUSH);
     pthread_mutex_unlock(&d->lock);
