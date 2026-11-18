@@ -4688,3 +4688,99 @@ STM_TEST(corvus_login_promote_resumes_in_the_file_a_pool_error_stopped_it_in) {
     (void)fb;
     seal_pool_close(&sp);
 }
+
+/* A logout inside stm_send_init, after the key capture and before the
+ * split: the init unwraps none of the home's long cold chunks (the hook
+ * arms the next device read to fail, and none fires), and the stream
+ * answers STM_ELOCKED from its first record. The control, one variable
+ * away (no logout): that armed read is the split's, and the init fails. */
+static stm_fs *g_x5r_fs;
+static uint64_t g_x5r_ds;
+static int g_x5r_logout, g_x5r_fired;
+static stm_status g_x5r_out;
+
+static void x5r_hook(void *ctx, int stage)
+{
+    (void)ctx;
+    if (stage != STM_SEND_INIT_HOOK_BEFORE_PINS || g_x5r_fired) return;
+    g_x5r_fired = 1;
+    g_x5r_out = g_x5r_logout ? stm_fs_evict_dek(g_x5r_fs, g_x5r_ds) : STM_OK;
+    stm_bdev_inject_read_fail_after(stm_fs_bdev_for_test(g_x5r_fs), 1);
+}
+
+static void x5r_case(int logout)
+{
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, logout ? "x5rlo" : "x5rct", UINT64_C(1) << 30,
+                           UINT64_C(128) << 20)) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const size_t LEN = (size_t)24 << 20;
+    uint8_t *all = malloc(LEN);
+    STM_ASSERT(all != NULL);
+    if (!all) { seal_pool_close(&sp); return; }
+    r3_noise17(all, LEN);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(sp.fs, sp.home.ds, 1, (const uint8_t *)"x5",
+                                     2, 0600, 1000, 1000, &f));
+    for (size_t k = 0; k < LEN; k += (size_t)4 << 20)
+        STM_ASSERT_OK(stm_fs_write(sp.fs, sp.home.ds, f, k, all + k,
+                                   (size_t)4 << 20));
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    stm_sync_set_cold_chunks_uncapped_for_test(sync, true);
+    stm_sync_set_cas_admits_sealed_for_test(sync, true);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(sp.fs, sp.home.ds, f));
+    stm_sync_set_cas_admits_sealed_for_test(sync, false);
+    stm_sync_set_cold_chunks_uncapped_for_test(sync, false);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    stm_extent_record a;
+    memset(&a, 0, sizeof a);
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(sync), sp.home.ds,
+                                       f, 0, &a));
+    STM_ASSERT(a.len > STM_SEND_CHUNK_PLAIN_MAX);
+
+    g_x5r_fs = sp.fs;
+    g_x5r_ds = sp.home.ds;
+    g_x5r_logout = logout;
+    g_x5r_fired = 0;
+    g_x5r_out = STM_EINVAL;
+    struct stm_bdev *d = stm_fs_bdev_for_test(sp.fs);
+    uint32_t fired0 = stm_bdev_inject_read_fired_count(d);
+    stm_send_set_init_hook_for_test(x5r_hook, NULL);
+    stm_send_handle *h = NULL;
+    stm_status ir = stm_send_init(sync, sp.home.ds, 0, 0, &h);
+    stm_send_set_init_hook_for_test(NULL, NULL);
+    stm_bdev_inject_read_fail_after(d, 0);
+    uint32_t fired = stm_bdev_inject_read_fired_count(d) - fired0;
+    stm_test_info("x5r logout=%d: init %d, evict %d, injected reads fired %u",
+                  logout, (int)ir, (int)g_x5r_out, fired);
+    STM_ASSERT_EQ(g_x5r_fired, 1);
+    STM_ASSERT_OK(g_x5r_out);
+    if (logout) {
+        STM_ASSERT_OK(ir);
+        STM_ASSERT_EQ(fired, 0u);
+        STM_ASSERT(h != NULL);
+    } else {
+        STM_ASSERT_ERR(ir, STM_EIO);
+        STM_ASSERT_EQ(fired, 1u);
+        STM_ASSERT(h == NULL);
+    }
+    if (h) {
+        size_t cap = STM_SEND_RECORD_MAX_LEN, n = 0, need = 0;
+        uint8_t *buf = malloc(cap);
+        stm_status r = buf ? stm_send_next(h, buf, cap, &n, &need) : STM_ENOMEM;
+        STM_ASSERT_ERR(r, STM_ELOCKED);
+        STM_ASSERT(!stm_send_parent_held_for_test(h));
+        free(buf);
+        stm_send_close(h);
+    }
+    if (logout)
+        STM_ASSERT_OK(stm_fs_install_dek(sp.fs, sp.home.ds, &sp.cc));
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    free(all);
+    seal_pool_close(&sp);
+}
+
+STM_TEST(corvus_a_logout_inside_the_send_init_unwraps_no_long_cold_chunk) {
+    x5r_case(1);
+    x5r_case(0);
+}

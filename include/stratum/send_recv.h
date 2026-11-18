@@ -143,35 +143,13 @@
  * With a to_snap_id the stream comes from that snapshot's captured
  * tree, not the live one, so what was overwritten since is still sent.
  *
- * MVP caveat — stale-paddr during long sends (R39 P3-1): send_init
- * snapshots `paddrs[0..n_replicas-1]` at the time of the call. If
- * the source pool runs `stm_sync_commit` while the send is in
- * flight AND the source overwrites the snapshotted extent AND the
- * commit reaps the prior paddrs from PENDING to FREE AND a fresh
- * write reuses the paddr at a new gen, the next `stm_send_next`
- * for that extent reads bytes encrypted under a different
- * (paddr, gen) pair — AEAD verify fails with STM_EBADTAG. The
- * failure is clean (no silent corruption) but interrupts the
- * send. To avoid this on busy source pools, callers should either
- * (a) pause writes during send, or (b) snapshot the source first
- * (the snapshot's tree_root captures a stable view; future
- * snap-bounded incremental sends will source from the snapshot).
- *
- * R60 P3-2: the COLD path (P7-CAS-9) inherits a parallel race at
- * two distinct points:
- *
- *   - `stm_send_init` (between extent_iter and the post-iter
- *     cas_lookup): if the source's CAS chunk is reclaimed by
- *     auto_gc in the gap (concurrent overwrite + commit + sweep),
- *     send_init returns STM_EBUSY (R60 P2-1). Caller retries.
- *
- *   - `stm_send_next` (between send_init's cas_lookup and the
- *     per-extent emit's bdev_read): if the captured cas_paddrs
- *     are reclaimed-then-reused at a new gen between init and
- *     emit, the cold-decrypt's AEAD verify fails with STM_EBADTAG
- *     — same shape as the HOT-path stale-paddr race.
- *
- * Same caller mitigation applies (snapshot first, pause source).
+ * Long sends (R39 P3-1, R60 P3-2, both closed by the send hold): init
+ * pins every block the stream will read (each HOT record's replicas
+ * and each planned chunk's), so a commit, a reclaim or a write that
+ * runs while the stream is open cannot reuse them; they are let go at
+ * the close. Init may still answer STM_EBUSY when a COLD record's
+ * CAS entry went between its collect and its lookup (R60 P2-1); the
+ * caller retries.
  *
  * MVP caveat — recv durability (R39 P3-2): a successful
  * `stm_recv_finish` returns STM_OK once HEADER + every EXTENT +
@@ -264,7 +242,8 @@ typedef enum {
  * STM_SEND_CHUNK_PLAIN_MAX bytes. An older pool's COLD record may be
  * longer (its migrate did not cap chunks at the recordsize): the send
  * cuts it where a capped migrate would (its start + k x 8 MiB), and
- * each piece goes as a COLD record with its own CHUNK and hash. */
+ * each piece goes as a COLD record carrying the hash of its bytes,
+ * whose CHUNK goes once per stream, shared with any equal chunk. */
 #define STM_SEND_CHUNK_PLAIN_MAX (8u * 1024u * 1024u)
 /* END body length (BLAKE3 csum). */
 #define STM_SEND_END_BODY_LEN    32u
@@ -323,8 +302,11 @@ typedef struct stm_send_handle stm_send_handle;
  *     doesn't exist as PRESENT.
  *   STM_ENOMEM on allocation failure.
  *   STM_EBADTAG / STM_EIO if a COLD record longer than
- *     STM_SEND_CHUNK_PLAIN_MAX cannot be read: init reads each such
- *     chunk once, to hash the pieces it streams as (see that constant).
+ *     STM_SEND_CHUNK_PLAIN_MAX cannot be read: init reads, decrypts
+ *     and hashes each distinct such chunk once (up to 16 MiB each), to
+ *     hash the pieces it streams as (see that constant), so its cost
+ *     grows with those chunks' bytes; STM_EINVAL if every replica of
+ *     one is on a device the pool has no handle for.
  *   STM_EBUSY, a transient: a COLD extent's CAS record or a key was
  *     dropped between the collect and its lookup (retry).
  *   STM_ELOCKED if the dataset is locked (a logout under way shows it
@@ -393,7 +375,10 @@ stm_status stm_send_init(stm_sync *sync,
  *     records (a clone's origin), was logged out of (stm_sync_evict_dek)
  *     after init, even if a login followed: the handle's keys are wiped,
  *     and every later call answers the same. Only stm_send_close remains.
- *     The keys stay in the handle until that call or the close.
+ *     The keys stay in the handle until that call or the close, as do
+ *     the bytes of a long COLD record whose pieces' CHUNKs are going
+ *     (up to 16 MiB, held from its first piece's CHUNK to the first
+ *     EXTENT record).
  */
 STM_MUST_USE
 stm_status stm_send_next(stm_send_handle *h,
@@ -419,6 +404,11 @@ void stm_send_set_init_hook_for_test(void (*hook)(void *ctx, int stage),
 bool stm_send_keys_wiped_for_test(const stm_send_handle *h);
 /* True while the handle holds a long COLD record's decrypted chunk. */
 bool stm_send_parent_held_for_test(const stm_send_handle *h);
+/* False when the held chunk is longer than the buffer it was put in. */
+bool stm_send_parent_fits_for_test(const stm_send_handle *h);
+/* How many releases of such a chunk found its buffer all zero before the
+ * free (process-wide). */
+unsigned stm_send_parent_wipes_for_test(void);
 #endif
 
 /* ========================================================================= */

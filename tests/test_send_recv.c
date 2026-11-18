@@ -3361,8 +3361,8 @@ static void x5_send(testpool *src, testpool *tgt)
 
 /* Before, the send answered STM_ECORRUPT at the record (the wire caps a
  * CHUNK at 8 MiB). Now it streams pieces of at most 8 MiB, each a COLD
- * record with its own CHUNK, so the target holds a modern pool's records
- * and reads the same bytes, after a remount too. */
+ * record carrying its own hash, so the target holds a modern pool's
+ * records and reads the same bytes, after a remount too. */
 STM_TEST(x5_a_cold_record_over_the_wire_cap_sends_in_pieces) {
     testpool src; testpool_setup_sz(&src, "x5_piece", POOL_UUID_SRC,
                                     UINT64_C(128) << 20);
@@ -3382,13 +3382,18 @@ STM_TEST(x5_a_cold_record_over_the_wire_cap_sends_in_pieces) {
         x5_check_file(src.fs, 1, all);
 
         /* The parent's bytes stay in the handle while its pieces'
-         * CHUNKs go (the first is A's first piece), not past them. */
+         * CHUNKs go (the first is A's first piece), not past them. The
+         * init's own copy (one buffer: the first parent is the longest)
+         * is wiped before the init returns. */
         {
             stm_send_handle *sh = NULL;
+            const unsigned wi = stm_send_parent_wipes_for_test();
             STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0,
                                         0, &sh));
+            STM_ASSERT_EQ(stm_send_parent_wipes_for_test(), wi + 1u);
             uint8_t *rec = malloc(STM_SEND_RECORD_MAX_LEN);
             STM_ASSERT(rec != NULL);
+            const unsigned w0 = stm_send_parent_wipes_for_test();
             if (sh && rec) {
                 size_t n = 0, need = 0;
                 STM_ASSERT_OK(stm_send_next(sh, rec, STM_SEND_RECORD_MAX_LEN,
@@ -3406,9 +3411,33 @@ STM_TEST(x5_a_cold_record_over_the_wire_cap_sends_in_pieces) {
                 STM_ASSERT_OK(r);
                 STM_ASSERT_EQ(rec[0], (uint8_t)STM_SEND_REC_EXTENT);
                 STM_ASSERT(!stm_send_parent_held_for_test(sh));
+                /* Released wiped (both parents fit the first's buffer). */
+                STM_ASSERT_EQ(stm_send_parent_wipes_for_test(), w0 + 1u);
             }
             free(rec);
             if (sh) stm_send_close(sh);
+        }
+
+        /* A stream closed while it holds the parent's bytes wipes them. */
+        {
+            stm_send_handle *sh = NULL;
+            STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0,
+                                        0, &sh));
+            uint8_t *rec = malloc(STM_SEND_RECORD_MAX_LEN);
+            STM_ASSERT(rec != NULL);
+            if (sh && rec) {
+                size_t n = 0, need = 0;
+                for (int k = 0; k < 2; k++)
+                    STM_ASSERT_OK(stm_send_next(sh, rec,
+                                                STM_SEND_RECORD_MAX_LEN,
+                                                &n, &need));
+                STM_ASSERT_EQ(rec[0], (uint8_t)STM_SEND_REC_CHUNK);
+                STM_ASSERT(stm_send_parent_held_for_test(sh));
+            }
+            const unsigned w0 = stm_send_parent_wipes_for_test();
+            if (sh) stm_send_close(sh);
+            STM_ASSERT_EQ(stm_send_parent_wipes_for_test(), w0 + 1u);
+            free(rec);
         }
 
         x5_send(&src, &tgt);
@@ -3482,6 +3511,332 @@ STM_TEST(x5_pieces_share_chunks_with_a_capped_copy_of_the_same_bytes) {
         x5_check_file(tgt.fs, 3, all);
         free(all);
     }
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* The first COLD record of `ino` (dataset 1) longer than the wire cap. */
+typedef struct { stm_extent_record r; uint64_t ino; } x5_big;
+
+static bool x5_first_big_cb(const stm_extent_record *e, void *ctx)
+{
+    x5_big *b = ctx;
+    if (e->ino != b->ino || b->r.len != 0u) return true;
+    if (e->kind == STM_EXTENT_KIND_COLD && e->len > STM_SEND_CHUNK_PLAIN_MAX)
+        b->r = *e;
+    return true;
+}
+
+static stm_extent_record x5_first_big(stm_fs *fs, uint64_t ino)
+{
+    x5_big b;
+    memset(&b, 0, sizeof b);
+    b.ino = ino;
+    STM_ASSERT_OK(stm_extent_iter_ds(stm_sync_extent_index(stm_fs_sync_for_test(fs)),
+                                     1, x5_first_big_cb, &b));
+    return b.r;
+}
+
+/* x5_send's stream, asking after each record that a held parent fits the
+ * buffer it was decrypted into. */
+static void x5_send_checking_the_parent_buffer(testpool *src, testpool *tgt)
+{
+    stm_send_handle *sh = NULL;
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src->fs), 1, 0, 0, &sh));
+    STM_ASSERT_OK(stm_recv_init(stm_fs_sync_for_test(tgt->fs), 1, &rh));
+    uint8_t *rec = malloc(STM_SEND_RECORD_MAX_LEN);
+    STM_ASSERT(rec != NULL);
+    unsigned held = 0;
+    if (sh && rh && rec) {
+        for (;;) {
+            size_t n = 0, need = 0;
+            stm_status r = stm_send_next(sh, rec, STM_SEND_RECORD_MAX_LEN,
+                                         &n, &need);
+            if (r == STM_ENOENT) break;
+            STM_ASSERT_OK(r);
+            if (r != STM_OK) break;
+            STM_ASSERT(stm_send_parent_fits_for_test(sh));
+            if (stm_send_parent_held_for_test(sh)) held++;
+            stm_status a = stm_recv_apply(rh, rec, n);
+            STM_ASSERT_OK(a);
+            if (a != STM_OK) break;
+        }
+        STM_ASSERT_OK(stm_recv_finish(rh));
+    }
+    STM_ASSERT(held > 0u);
+    free(rec);
+    if (sh) stm_send_close(sh);
+    if (rh) stm_recv_close(rh);
+}
+
+/* The parent's blocks stay kept for its pieces' CHUNKs (read after the
+ * replan) over an overwrite, two commits and a write that wants its run. */
+STM_TEST(x5_the_hold_keeps_a_long_parents_blocks_over_an_overwrite) {
+    testpool src; testpool_setup_sz(&src, "x5r_hold", POOL_UUID_SRC,
+                                    UINT64_C(256) << 20);
+    testpool tgt; testpool_setup_sz(&tgt, "x5r_hold_tgt", POOL_UUID_TGT,
+                                    UINT64_C(128) << 20);
+    uint8_t *all = malloc(X5_LEN), *other = malloc(X5_LEN);
+    STM_ASSERT(all != NULL && other != NULL);
+    if (all && other) {
+        x5_noise(all, X5_LEN);
+        for (size_t i = 0; i < X5_LEN; i++) other[i] = (uint8_t)(all[i] ^ 0xA5u);
+        x5_write_file(src.fs, 1, all);
+        x5_migrate(src.fs, 1, true);
+        stm_extent_record r = x5_first_big(src.fs, 1);
+        STM_ASSERT(r.len > STM_SEND_CHUNK_PLAIN_MAX);
+        stm_cas_index *ci = stm_sync_cas_index(stm_fs_sync_for_test(src.fs));
+        stm_cas_record cr;
+        memset(&cr, 0, sizeof cr);
+        STM_ASSERT_OK(stm_cas_lookup(ci, r.content_hash, &cr));
+        const uint64_t old = cr.paddrs[0];
+        stm_send_handle *sh = NULL;
+        STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0, 0, &sh));
+        x5_write_file(src.fs, 1, other);
+        hold_commit2(&src);
+        STM_ASSERT_ERR(stm_cas_lookup(ci, r.content_hash, &cr), STM_ENOENT);
+        uint64_t len = hold_expect_waiting(&src, old);
+        uint64_t took = hold_take(&src, old, len);
+        stm_test_info("x5 hold: parent %llu bytes, run %llu blocks, took %s",
+                      (unsigned long long)r.len, (unsigned long long)len,
+                      took == old ? "THE PARENT'S RUN" : "elsewhere");
+        STM_ASSERT(took != old);
+        if (sh) hold_stream_to(sh, &tgt);
+        x5_check_file(tgt.fs, 1, all);
+        stm_send_close(sh);
+        hold_untake(&src, took);
+        hold_expect_released(&src, old, len);
+    }
+    free(all);
+    free(other);
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* A long parent the init cannot read fails the init (STM_EBADTAG) and
+ * leaves no handle. */
+STM_TEST(x5_a_long_parent_the_init_cannot_read_fails_the_init) {
+    testpool src; testpool_setup_sz(&src, "x5r_dmg", POOL_UUID_SRC,
+                                    UINT64_C(128) << 20);
+    uint8_t *all = malloc(X5_LEN);
+    STM_ASSERT(all != NULL);
+    if (all) {
+        x5_noise(all, X5_LEN);
+        x5_write_file(src.fs, 1, all);
+        x5_migrate(src.fs, 1, true);
+        stm_extent_record r = x5_first_big(src.fs, 1);
+        STM_ASSERT(r.len > STM_SEND_CHUNK_PLAIN_MAX);
+        stm_cas_record cr;
+        memset(&cr, 0, sizeof cr);
+        STM_ASSERT_OK(stm_cas_lookup(stm_sync_cas_index(stm_fs_sync_for_test(src.fs)),
+                                     r.content_hash, &cr));
+        STM_ASSERT_EQ(cr.n_replicas, 1u);
+        uint8_t junk[64];
+        memset(junk, 0x5A, sizeof junk);
+        int fd = open(src.path, O_WRONLY);
+        STM_ASSERT(fd >= 0);
+        if (fd >= 0) {
+            off_t at = (off_t)(stm_paddr_offset(cr.paddrs[0]) * (uint64_t)STM_UB_SIZE
+                               + r.len / 2u);
+            STM_ASSERT_EQ((size_t)pwrite(fd, junk, sizeof junk, at), sizeof junk);
+            STM_ASSERT_EQ(close(fd), 0);
+        }
+        stm_send_handle *sh = NULL;
+        stm_status rc = stm_send_init(stm_fs_sync_for_test(src.fs), 1, 0, 0, &sh);
+        stm_test_info("x5 damaged parent: init answered %d", (int)rc);
+        STM_ASSERT_ERR(rc, STM_EBADTAG);
+        STM_ASSERT(sh == NULL);
+        if (sh) stm_send_close(sh);
+    }
+    free(all);
+    testpool_teardown(&src);
+}
+
+/* Pieces first in the stream (an uncapped file before a capped copy): the
+ * plan's entries for the shared hashes are pieces, and the capped file's
+ * records reference their CHUNKs. */
+STM_TEST(x5_pieces_ahead_of_a_capped_copy_share_their_chunks) {
+    testpool src; testpool_setup_sz(&src, "x5r_rev", POOL_UUID_SRC,
+                                    UINT64_C(256) << 20);
+    testpool tgt; testpool_setup_sz(&tgt, "x5r_rev_tgt", POOL_UUID_TGT,
+                                    UINT64_C(128) << 20);
+    uint8_t *all = malloc(X5_LEN);
+    STM_ASSERT(all != NULL);
+    if (all) {
+        x5_noise(all, X5_LEN);
+        x5_write_file(src.fs, 1, all);
+        x5_write_file(src.fs, 2, all);
+        x5_migrate(src.fs, 1, true);
+        x5_migrate(src.fs, 2, false);
+        x5_census a = x5_count(src.fs, 2);
+        x5_census b = x5_count(src.fs, 1);
+        STM_ASSERT_EQ(a.n_over, (size_t)0);
+        STM_ASSERT(b.n_over >= 1u);
+        x5_send(&src, &tgt);
+        size_t n_cas = 0;
+        STM_ASSERT_OK(stm_cas_count(
+            stm_sync_cas_index(stm_fs_sync_for_test(tgt.fs)), &n_cas));
+        stm_test_info("x5 reverse order: capped %zu, target CAS %zu", a.n, n_cas);
+        STM_ASSERT_EQ(n_cas, a.n);
+        x5_check_file(tgt.fs, 1, all);
+        x5_check_file(tgt.fs, 2, all);
+    }
+    free(all);
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* An incremental stream whose window holds long records whose pieces the
+ * target holds already from the base stream. */
+STM_TEST(x5_an_incremental_send_cuts_the_long_records_in_its_window) {
+    testpool src; testpool_setup_sz(&src, "x5r_inc", POOL_UUID_SRC,
+                                    UINT64_C(256) << 20);
+    testpool tgt; testpool_setup_sz(&tgt, "x5r_inc_tgt", POOL_UUID_TGT,
+                                    UINT64_C(128) << 20);
+    uint8_t *all = malloc(X5_LEN);
+    STM_ASSERT(all != NULL);
+    if (all) {
+        x5_noise(all, X5_LEN);
+        uint64_t from = 0, to = 0;
+        x5_write_file(src.fs, 1, all);
+        x5_migrate(src.fs, 1, true);
+        STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "from", 4, &from));
+        x5_write_file(src.fs, 2, all);
+        x5_migrate(src.fs, 2, true);
+        STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "to", 2, &to));
+        send_window_to(&src, &tgt, 0, from);
+        x5_check_file(tgt.fs, 1, all);
+        send_window_to(&src, &tgt, from, to);
+        x5_census t2 = x5_count(tgt.fs, 2);
+        stm_test_info("x5 incremental: target file 2 has %zu records, %zu over",
+                      t2.n, t2.n_over);
+        STM_ASSERT_EQ(t2.n_over, (size_t)0);
+        STM_ASSERT_EQ(t2.next_off, (uint64_t)X5_LEN);
+        x5_check_file(tgt.fs, 1, all);
+        x5_check_file(tgt.fs, 2, all);
+    }
+    free(all);
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* A stream to a snapshot cuts the long records its frozen tree holds,
+ * though the live file was overwritten since. */
+STM_TEST(x5_a_send_to_a_snapshot_cuts_a_long_record_overwritten_since) {
+    testpool src; testpool_setup_sz(&src, "x5r_snp", POOL_UUID_SRC,
+                                    UINT64_C(256) << 20);
+    testpool tgt; testpool_setup_sz(&tgt, "x5r_snp_tgt", POOL_UUID_TGT,
+                                    UINT64_C(128) << 20);
+    uint8_t *all = malloc(X5_LEN), *other = malloc(X5_LEN);
+    STM_ASSERT(all != NULL && other != NULL);
+    if (all && other) {
+        x5_noise(all, X5_LEN);
+        for (size_t i = 0; i < X5_LEN; i++) other[i] = (uint8_t)(all[i] ^ 0x3Cu);
+        uint64_t snap = 0;
+        x5_write_file(src.fs, 1, all);
+        x5_migrate(src.fs, 1, true);
+        STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "s", 1, &snap));
+        x5_write_file(src.fs, 1, other);
+        hold_commit2(&src);
+        send_window_to(&src, &tgt, 0, snap);
+        x5_census t = x5_count(tgt.fs, 1);
+        STM_ASSERT_EQ(t.n_over, (size_t)0);
+        STM_ASSERT_EQ(t.next_off, (uint64_t)X5_LEN);
+        x5_check_file(tgt.fs, 1, all);
+    }
+    free(all);
+    free(other);
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* A clone's long COLD records name their origin; the clone's send cuts
+ * them like its own. */
+STM_TEST(x5_a_clones_send_cuts_its_origins_long_records) {
+    testpool src; testpool_setup_sz(&src, "x5r_cln", POOL_UUID_SRC,
+                                    UINT64_C(256) << 20);
+    testpool tgt; testpool_setup_sz(&tgt, "x5r_cln_tgt", POOL_UUID_TGT,
+                                    UINT64_C(128) << 20);
+    uint8_t *all = malloc(X5_LEN);
+    STM_ASSERT(all != NULL);
+    if (all) {
+        x5_noise(all, X5_LEN);
+        x5_write_file(src.fs, 1, all);
+        x5_migrate(src.fs, 1, true);
+        uint64_t snap = 0, clone_id = 0;
+        STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "origin", 6, &snap));
+        STM_ASSERT_OK(stm_fs_create_clone(src.fs, 1, "c_x5", snap, &clone_id));
+        STM_ASSERT_OK(stm_fs_commit(src.fs));
+        stm_extent_record r;
+        memset(&r, 0, sizeof r);
+        STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(stm_fs_sync_for_test(src.fs)),
+                                           clone_id, 1, 0, &r));
+        stm_test_info("x5 clone: record at 0 len %llu kind %d origin ds %llu",
+                      (unsigned long long)r.len, (int)r.kind,
+                      (unsigned long long)r.origin_dataset_id);
+        stm_send_handle *sh = NULL;
+        STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src.fs), clone_id, 0, 0, &sh));
+        stm_recv_handle *rh = NULL;
+        STM_ASSERT_OK(stm_recv_init(stm_fs_sync_for_test(tgt.fs), 1, &rh));
+        if (sh && rh) STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+        if (sh) stm_send_close(sh);
+        if (rh) stm_recv_close(rh);
+        x5_census t = x5_count(tgt.fs, 1);
+        STM_ASSERT_EQ(t.n_over, (size_t)0);
+        STM_ASSERT_EQ(t.next_off, (uint64_t)X5_LEN);
+        x5_check_file(tgt.fs, 1, all);
+    }
+    free(all);
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* A shorter long parent before a longer one: the split's buffer and the
+ * CHUNKs' parent buffer both grow, and the held parent fits its buffer
+ * after every record. */
+STM_TEST(x5_a_longer_parent_after_a_shorter_one_grows_both_buffers) {
+    testpool src; testpool_setup_sz(&src, "x5r_grow", POOL_UUID_SRC,
+                                    UINT64_C(256) << 20);
+    testpool tgt; testpool_setup_sz(&tgt, "x5r_grow_tgt", POOL_UUID_TGT,
+                                    UINT64_C(128) << 20);
+    uint8_t *all = malloc(X5_LEN);
+    STM_ASSERT(all != NULL);
+    if (all) {
+        x5_noise(all, X5_LEN);
+        const size_t OFF = 22212608u, N1 = (size_t)16 << 20;
+        for (size_t k = 0; k < N1; k += (size_t)4 << 20)
+            STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, k, all + OFF + k, (size_t)4 << 20));
+        STM_ASSERT_OK(stm_fs_commit(src.fs));
+        x5_write_file(src.fs, 2, all);
+        x5_migrate(src.fs, 1, true);
+        x5_migrate(src.fs, 2, true);
+        stm_extent_record r1 = x5_first_big(src.fs, 1);
+        stm_extent_record r2 = x5_first_big(src.fs, 2);
+        stm_test_info("x5 grow: ino 1 first long %llu at %llu, ino 2 first long %llu at %llu",
+                      (unsigned long long)r1.len, (unsigned long long)r1.off,
+                      (unsigned long long)r2.len, (unsigned long long)r2.off);
+        STM_ASSERT(r1.len > STM_SEND_CHUNK_PLAIN_MAX);
+        STM_ASSERT(r2.len > r1.len);
+        x5_send_checking_the_parent_buffer(&src, &tgt);
+        uint8_t *got = malloc(N1);
+        STM_ASSERT(got != NULL);
+        if (got) {
+            size_t done = 0;
+            while (done < N1) {
+                size_t n = 0;
+                stm_status rs = stm_fs_read(tgt.fs, 1, 1, done, got + done, N1 - done, &n);
+                STM_ASSERT_OK(rs);
+                if (rs != STM_OK || n == 0u) break;
+                done += n;
+            }
+            STM_ASSERT_EQ(done, N1);
+            STM_ASSERT(done == N1 && memcmp(got, all + OFF, N1) == 0);
+            free(got);
+        }
+        x5_check_file(tgt.fs, 2, all);
+    }
+    free(all);
     testpool_teardown(&src);
     testpool_teardown(&tgt);
 }

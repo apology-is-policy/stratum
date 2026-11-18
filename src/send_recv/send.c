@@ -11,7 +11,9 @@
  *     gen, paddr_0) tuples for the requested dataset, filtered by the
  *     gen range derived from from_snap_id / to_snap_id, sorted by
  *     (ino, off). Sending plays back the snapshot via repeated
- *     `stm_send_next` calls.
+ *     `stm_send_next` calls. Init also reads and decrypts each
+ *     distinct COLD record longer than the wire's CHUNK cap once, to
+ *     hash the pieces it is cut into (send_split_big_cold).
  *
  *   - Each EXTENT record carries the extent's PLAINTEXT bytes (decrypted
  *     from the source pool's key during `stm_send_next`). The wire is
@@ -172,6 +174,7 @@ struct stm_send_handle {
     uint8_t           *parent_plain;
     size_t             parent_plain_cap;
     uint8_t            parent_hash[STM_EXTENT_HASH_LEN];
+    uint64_t           parent_held_len;
     bool               parent_valid;
 };
 
@@ -191,22 +194,47 @@ void stm_send_set_init_hook_for_test(void (*hook)(void *ctx, int stage),
 #define SEND_INIT_HOOK(stage) do { } while (0)
 #endif
 
-/* A stream stops at the first record after a logout of the sent dataset or
- * of any origin of its records, and stays stopped, a login after it
- * included. Asked before each record: the keys wait in the handle until
- * that call or the close, and a record already being built when the evict
- * lands finishes, as a read in flight does. Callers hold no pin. */
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+#include <stdatomic.h>
+static atomic_uint g_send_parent_wipes;
+
+/* Counts a release whose buffer reads all zero just before its free. */
+static void send_parent_note_wipe(const uint8_t *p, size_t n)
+{
+    uint8_t acc = 0;
+    for (size_t i = 0; i < n; i++) acc |= p[i];
+    if (acc == 0)
+        atomic_fetch_add_explicit(&g_send_parent_wipes, 1u,
+                                  memory_order_relaxed);
+}
+#endif
+
+/* A long parent's plaintext, wiped before its free. */
+static void send_plain_free(uint8_t *p, size_t n)
+{
+    if (!p) return;
+    stm_ct_memzero(p, n);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    send_parent_note_wipe(p, n);
+#endif
+    free(p);
+}
+
 static void send_parent_release(stm_send_handle *h)
 {
-    if (h->parent_plain) {
-        stm_ct_memzero(h->parent_plain, h->parent_plain_cap);
-        free(h->parent_plain);
-    }
+    send_plain_free(h->parent_plain, h->parent_plain_cap);
     h->parent_plain = NULL;
     h->parent_plain_cap = 0;
+    h->parent_held_len = 0;
     h->parent_valid = false;
 }
 
+/* A stream stops at the first record after a logout of the sent dataset or
+ * of any origin of its records, and stays stopped, a login after it
+ * included. Asked before each record: the keys, and the bytes of a long
+ * COLD record whose pieces' CHUNKs are going, wait in the handle until
+ * that call or the close, and a record already being built when the evict
+ * lands finishes, as a read in flight does. Callers hold no pin. */
 static bool send_revoked(stm_send_handle *h)
 {
     if (h->revoked) return true;
@@ -236,6 +264,16 @@ bool stm_send_keys_wiped_for_test(const stm_send_handle *h)
 bool stm_send_parent_held_for_test(const stm_send_handle *h)
 {
     return h->parent_plain != NULL;
+}
+
+bool stm_send_parent_fits_for_test(const stm_send_handle *h)
+{
+    return !h->parent_valid || h->parent_held_len <= h->parent_plain_cap;
+}
+
+unsigned stm_send_parent_wipes_for_test(void)
+{
+    return atomic_load_explicit(&g_send_parent_wipes, memory_order_relaxed);
 }
 #endif
 
@@ -419,6 +457,9 @@ static stm_status send_split_big_cold(stm_send_handle *h)
             extra += (size_t)((m->len - 1u) / SEND_PIECE_MAX);
     }
     if (extra == 0) return STM_OK;
+    /* A logout since the lock check: the stream answers STM_ELOCKED from
+     * its first record, so no chunk is unwrapped for it here. */
+    if (send_revoked(h)) return STM_OK;
     if (extra > SIZE_MAX / sizeof(send_extent_meta) - h->n_extents)
         return STM_ENOMEM;
     size_t cap = h->n_extents + extra;
@@ -443,7 +484,7 @@ static stm_status send_split_big_cold(stm_send_handle *h)
                 first = j;
         if (first == SIZE_MAX) {
             if (plain_cap < m->len) {
-                if (plain) { stm_ct_memzero(plain, plain_cap); free(plain); }
+                send_plain_free(plain, plain_cap);
                 plain = malloc((size_t)m->len);
                 plain_cap = plain ? (size_t)m->len : 0u;
                 if (!plain) { rc = STM_ENOMEM; break; }
@@ -476,7 +517,7 @@ static stm_status send_split_big_cold(stm_send_handle *h)
             }
         }
     }
-    if (plain) { stm_ct_memzero(plain, plain_cap); free(plain); }
+    send_plain_free(plain, plain_cap);
     if (rc != STM_OK) { free(out); return rc; }
     free(h->extents);
     h->extents     = out;
@@ -759,6 +800,11 @@ stm_status stm_send_init(stm_sync *sync,
     }
     stm_sync_send_hold_settle(sync, h->hold);
 
+    /* The split and the pieces' CHUNKs read only blocks pinned above:
+     * each reads the first record of its parent's hash, the plan entry
+     * that hash was pinned through (a later record with the same hash
+     * takes the earlier cut's piece hashes, and its own cas_paddrs, from
+     * a separate CAS lookup, may differ and are not pinned). */
     rc = send_split_big_cold(h);
     if (rc != STM_OK) goto fail;
 
@@ -989,6 +1035,7 @@ static stm_status send_parent_plain(stm_send_handle *h,
                                             m->parent_len, h->parent_plain);
     if (rs != STM_OK) return rs;
     memcpy(h->parent_hash, m->parent_hash, STM_EXTENT_HASH_LEN);
+    h->parent_held_len = m->parent_len;
     h->parent_valid = true;
     return STM_OK;
 }
@@ -1045,8 +1092,8 @@ static stm_status emit_extent_locked(stm_send_handle *h,
 
 /* P7-CAS-10: emit one STM_SEND_REC_CHUNK record. Body = 32-byte
  * BLAKE3-256 content_hash + plaintext. The plaintext comes from
- * decrypting the chunk on-disk via the source extent's cas_paddrs
- * (mirrors `read_decrypt_cold_chunk_plaintext`). */
+ * decrypting the chunk on disk via the source extent's cas_paddrs
+ * (read_decrypt_cold_chunk), or for a piece from its parent's. */
 static stm_status emit_chunk_locked(stm_send_handle *h,
                                        const send_extent_meta *m,
                                        uint8_t *out, size_t out_cap,

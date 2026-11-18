@@ -10,6 +10,7 @@
  * will tell us whether to enable AVX2/AVX-512/NEON paths.
  */
 #include <stratum/hash.h>
+#include <stratum/crypto.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -72,7 +73,9 @@ stm_blake3_ctx *stm_blake3_new_kdf(const char *context)
 void stm_blake3_free(stm_blake3_ctx *ctx)
 {
     if (!ctx) return;
-    /* No sensitive material — hash state is not a key. Plain free. */
+    /* The state holds the last input bytes (a stream's plaintext) and,
+     * for a KDF hasher, key-derived words. */
+    stm_ct_memzero(ctx, sizeof *ctx);
     free(ctx);
 }
 
