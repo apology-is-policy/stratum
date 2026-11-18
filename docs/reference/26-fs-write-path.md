@@ -398,12 +398,18 @@ cover = [a_off, a_end)   (block-aligned, fully contains all stuck-out extents)
 | `fs_the_first_copy_after_a_drop_answers_eio_whatever_flush_dropped_it` | round 5 F2: a reflink and a copy after a drop an earlier commit made answer `EIO` once each |
 | `fs_unmount_answers_eio_for_a_report_the_table_evicted_unmade`, `fs_write_error_lines_go_to_stderr_with_no_sink` | round 5 F4a, F4d |
 | `p9_fsync_on_a_fid_never_opened_takes_no_report`, `p9_two_fsyncs_on_one_fid_report_a_drop_once` (`test_9p`) | round 5 F4c, F4b |
+| `fs_a_device_that_answers_no_read_keeps_the_run`, `sync_multi_eio_from_a_device_that_reads_no_label_is_the_pools` (`test_sync_multi`) | O1 review round 1 F1: EIO on every read of a device that reads none of its labels is the device's, so the pool's: the run stays buffered, the commit fails, and once the device reads again the write lands; the same EIO from a device whose labels read is the record's own |
+| `sync_multi_a_replica_on_a_removed_device_is_the_records_own` (`test_sync_multi`) | a replica on a device gone from the pool: the record's own to a classifying read, EIO to a plain one, for a HOT record, a COLD one and the promote |
+| `fs_a_buffered_read_of_a_failing_record_reads_it_as_a_plain_read`, `corvus_a_direct_write_into_a_big_cold_record_reads_a_bad_sector_once` (`test_corvus_mount`) | round 1 F3: a reader that drops nothing (a buffered read's fill, a direct write's promote) reads each replica once |
+| `fs_a_copy_of_a_new_file_at_a_dropped_files_ino_answers_ok` | the copy's mark belongs to its incarnation: a new file at the reused inode number copies |
+| `fs_a_full_report_table_evicts_one_fsync_and_copy_both_made_first`, `fs_write_error_lines_to_stderr_stop_at_32_a_mount` | a full table evicts a report the fsyncs and a copy both made before one a copy has not heard; with no sink, stderr takes 32 drop lines a mount and one saying the rest go untold |
+| `p9_fsync_answers_a_failed_commits_error_on_any_fid` (`test_9p`) | round 1 F2: a commit that fails pool-wide answers its error to a Tfsync on an open fid and on one never opened, never Rfsync |
 | `fs_the_promote_cursor_table_forgets_the_oldest_dataset_past_64` | round 4 F8: the login promote's cursor table evicts the dataset set longest ago |
 | `fs_a_write_far_past_a_small_file_is_sparse` | an empty or inline file takes a write at 16 MiB or 9 MiB and keeps its prefix, and a 1-byte write at 7 MiB costs its own blocks, not 7 MiB of zeros |
 
 Each fails on its named pre-fix bug, except the ones that witness a guard
 already in place (they were green before their chunk), which a sabotage of
-that guard turns red. `test_fs` holds 280 tests and
+that guard turns red. `test_fs` holds 285 tests and
 `test_fs_write_path` 37; the full ctest suite is 84 binaries.
 
 ## Error paths
@@ -472,14 +478,17 @@ that guard turns red. `test_fs` holds 280 tests and
   `stm_sync_promote_cold_at`'s `out_record_bad`: CAS content gone, a length
   or replica count that does not match, no key for it in this mount, a
   record over the bound, or no replica giving its bytes on a second read of
-  each: its tag fails, its sector answers `STM_EIO`, or its device is gone
-  from the pool; the second read spares a write a one-time fault), or the cover meets records off the
+  each: its tag fails, its sector answers `STM_EIO` on a device that still
+  reads one of its labels, or its device is gone from the pool; the second
+  read spares a write a one-time fault, and a device that reads none of its
+  labels is down, not the record, as ZFS's `vdev_probe` judges), or the cover meets records off the
   block grid it cannot rewrite (a split point, or a widening past
   `4 * recordsize`). It records the run (`fs_note_write_error_locked`); the
   record keeps its old bytes, every other run and inode still drains, and
   the commit goes on. A failure of the pool's metadata (an index node, the
   allocator, the keyschema's state), of a device write or flush, a device
-  read error other than `STM_EIO` (it may clear), `STM_ENOSPC` or
+  read error other than `STM_EIO` (it may clear), `STM_EIO` from a device
+  that reads none of its labels, `STM_ENOSPC` or
   `STM_ENOMEM` keeps the run buffered and fails the flush, as before X6. So does any failure of a run the dirty buffer holds
   (`stm_dirty_buffer_insert_held`, set by the insert itself under the
   buffer's lock, since a peer's cross-inode flush takes no pin of the
@@ -502,11 +511,20 @@ that guard turns red. `test_fs` holds 280 tests and
   report no fsync saw is left or was evicted; stratumd commits before it
   destroys the ctl, and the ctl reaps its orphans before it removes the
   sink, so a drop at either is heard, and with no sink installed the fs
-  writes its write-error lines to stderr. The first reflink or
+  writes its write-error lines to stderr (32 a mount, then one saying the
+  rest go untold, since they are written under the fs's locks; the
+  unmount's count line always). The first reflink or
   copy_file_range of a file after each drop of its live incarnation, by any
   flush, answers `STM_EIO` instead of copying the old bytes (Linux's
   `AS_EIO`, tested and cleared by the remap prep); the fsyncs keep their own
-  report. The
+  report, and an fsync's report leaves the copy's, where Linux's fsync
+  clears `AS_EIO`: the destination hears of the drop from no one else. A
+  reader that drops nothing (a plain read, a buffered read's fill, a direct
+  write's merge read and promote) reads each replica once. A garble that
+  happens once clears on the second read only where the read reaches the
+  device: the Thylacine backend and the host backends' direct mode; a
+  buffered host backend serves the second read from its page cache (an
+  `STM_EIO` is not cached). The
   flushes before a truncate, reflink and migrate, the write's buffer-full
   flush and the reclaim's drain take the same callback. A direct write
   answers the error to its caller.

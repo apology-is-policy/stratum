@@ -3281,4 +3281,156 @@ STM_TEST(sync_multi_a_bad_record_is_judged_on_its_second_pass) {
     teardown_mirror_pool(bds, as, pool, s);
 }
 
+/* A replica on a device gone from the pool (the pool's removal leaves the
+ * record's paddr naming a slot with no bdev), the other replica junked: a
+ * classifying read answers EIO and calls it the record's own, a plain read
+ * answers EIO. For a HOT record, a COLD record and the promote. */
+STM_TEST(sync_multi_a_replica_on_a_removed_device_is_the_records_own) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "o1rmdev", bds, as, &pool, &s);
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)(i * 11u + 3u);
+    STM_ASSERT_OK(stm_sync_write_extent(s, 1u, 1u, 0u, plain, sizeof plain));
+    STM_ASSERT_OK(stm_sync_write_extent(s, 1u, 2u, 0u, plain, sizeof plain));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_sync_migrate_to_cold(s, 1u, 2u));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_extent_record h, c;
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(s), 1u, 1u, 0u, &h));
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(s), 1u, 2u, 0u, &c));
+    stm_cas_record cr;
+    memset(&cr, 0, sizeof cr);
+    STM_ASSERT_OK(stm_cas_lookup(stm_sync_cas_index(s), c.content_hash, &cr));
+    /* A device (not 0) holding a replica of both records. */
+    uint16_t dr = 0;
+    for (int k = 0; k < 2 && dr == 0; k++) {
+        uint16_t hd = stm_paddr_device(h.paddrs[k]);
+        if (hd == 0) continue;
+        for (int m = 0; m < 2; m++)
+            if (stm_paddr_device(cr.paddrs[m]) == hd) dr = hd;
+    }
+    STM_ASSERT(dr != 0);
+    if (dr == 0) { teardown_mirror_pool(bds, as, pool, s); return; }
+    uint8_t junk[2u * STM_UB_SIZE];
+    memset(junk, 0x5a, sizeof junk);
+    for (int k = 0; k < 2; k++) {
+        if (stm_paddr_device(h.paddrs[k]) != dr)
+            STM_ASSERT_OK(stm_bdev_write(bds[stm_paddr_device(h.paddrs[k])],
+                                         stm_paddr_offset(h.paddrs[k]) * (uint64_t)STM_UB_SIZE,
+                                         junk, sizeof junk));
+        if (stm_paddr_device(cr.paddrs[k]) != dr)
+            STM_ASSERT_OK(stm_bdev_write(bds[stm_paddr_device(cr.paddrs[k])],
+                                         stm_paddr_offset(cr.paddrs[k]) * (uint64_t)STM_UB_SIZE,
+                                         junk, sizeof junk));
+    }
+    STM_ASSERT_OK(stm_pool_remove_device(pool, dr, 1u));
+    STM_ASSERT(stm_pool_device_bdev(pool, dr) == NULL);
+    stm_sync_force_locked_read_for_test(s, true);
+    uint8_t back[4096];
+    size_t got = 0;
+    bool bad = false;
+    for (uint64_t ino = 1u; ino <= 2u; ino++) {
+        stm_sync_dcache_drain_for_test(s);
+        bad = false;
+        stm_status a = stm_sync_read_extent_ex(s, 1u, ino, 0u, back, sizeof back,
+                                               &got, &bad);
+        stm_sync_dcache_drain_for_test(s);
+        stm_status b = stm_sync_read_extent(s, 1u, ino, 0u, back, sizeof back, &got);
+        fprintf(stderr, "  info: removed device, ino %llu: classifying %d bad %d, "
+                "plain %d\n", (unsigned long long)ino, (int)a, (int)bad, (int)b);
+        STM_ASSERT_ERR(a, STM_EIO);
+        STM_ASSERT(bad);
+        STM_ASSERT_ERR(b, STM_EIO);
+    }
+    stm_sync_dcache_drain_for_test(s);
+    bad = false;
+    stm_status p = stm_sync_promote_cold_at(s, 1u, 2u, 0u, &bad);
+    fprintf(stderr, "  info: removed device, promote %d bad %d\n", (int)p, (int)bad);
+    STM_ASSERT_ERR(p, STM_EIO);
+    STM_ASSERT(bad);
+    stm_sync_force_locked_read_for_test(s, false);
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* Replica 0's sectors answer EIO on every read, replica 1's tag fails.
+ * With replica 0's device reading none of its labels (deaf), the EIO is
+ * the device's, so the pool's: EIO, not the record's. With the labels
+ * reading, the same EIO is the record's own. For a HOT record's read, a
+ * COLD record's read and its promote. */
+STM_TEST(sync_multi_eio_from_a_device_that_reads_no_label_is_the_pools) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "o1deaf", bds, as, &pool, &s);
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)(i * 5u + 1u);
+    STM_ASSERT_OK(stm_sync_write_extent(s, 1u, 1u, 0u, plain, sizeof plain));
+    STM_ASSERT_OK(stm_sync_write_extent(s, 1u, 2u, 0u, plain, sizeof plain));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_sync_migrate_to_cold(s, 1u, 2u));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_extent_record h, c;
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(s), 1u, 1u, 0u, &h));
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(s), 1u, 2u, 0u, &c));
+    stm_cas_record cr;
+    memset(&cr, 0, sizeof cr);
+    STM_ASSERT_OK(stm_cas_lookup(stm_sync_cas_index(s), c.content_hash, &cr));
+    STM_ASSERT_EQ((int)h.n_replicas, 2);
+    STM_ASSERT_EQ((int)cr.n_replicas, 2);
+    if (h.n_replicas != 2u || cr.n_replicas != 2u) {
+        teardown_mirror_pool(bds, as, pool, s);
+        return;
+    }
+    uint8_t junk[2u * STM_UB_SIZE];
+    memset(junk, 0x5a, sizeof junk);
+    STM_ASSERT_OK(stm_bdev_write(bds[stm_paddr_device(h.paddrs[1])],
+                                 stm_paddr_offset(h.paddrs[1]) * (uint64_t)STM_UB_SIZE,
+                                 junk, sizeof junk));
+    STM_ASSERT_OK(stm_bdev_write(bds[stm_paddr_device(cr.paddrs[1])],
+                                 stm_paddr_offset(cr.paddrs[1]) * (uint64_t)STM_UB_SIZE,
+                                 junk, sizeof junk));
+    stm_sync_force_locked_read_for_test(s, true);
+    for (int k = 0; k < 3; k++) {
+        const bool promote = (k == 2);
+        const uint64_t ino = (k == 0) ? 1u : 2u;
+        const uint64_t p0 = (k == 0) ? h.paddrs[0] : cr.paddrs[0];
+        stm_bdev *b0 = bds[stm_paddr_device(p0)];
+        const uint64_t r0 = stm_paddr_offset(p0) * (uint64_t)STM_UB_SIZE;
+        const stm_bdev_caps *caps = stm_bdev_caps_of(b0);
+        uint64_t lo[STM_LABELS_PER_DEVICE];
+        STM_ASSERT(caps != NULL);
+        if (!caps) break;
+        STM_ASSERT_OK(stm_label_offsets(caps->size_bytes, lo));
+        STM_ASSERT(lo[0] < lo[1] && lo[1] < lo[2] && lo[2] < lo[3]);
+        for (int deaf = 1; deaf >= 0; deaf--) {
+            stm_bdev_inject_read_range_clear(b0);
+            stm_bdev_inject_read_range(b0, r0, r0 + 4096u, -1, STM_EIO);
+            if (deaf) {
+                stm_bdev_inject_read_range(b0, lo[0], lo[1] + STM_LABEL_SIZE,
+                                           -1, STM_EIO);
+                stm_bdev_inject_read_range(b0, lo[2], lo[3] + STM_LABEL_SIZE,
+                                           -1, STM_EIO);
+            }
+            stm_sync_dcache_drain_for_test(s);
+            uint8_t back[4096];
+            size_t got = 0;
+            bool bad = (deaf != 0);
+            stm_status rc = promote
+                ? stm_sync_promote_cold_at(s, 1u, ino, 0u, &bad)
+                : stm_sync_read_extent_ex(s, 1u, ino, 0u, back, sizeof back,
+                                          &got, &bad);
+            fprintf(stderr, "  info: case %d %s: %d bad %d\n", k,
+                    deaf ? "no label reads" : "labels read", (int)rc, (int)bad);
+            STM_ASSERT_ERR(rc, STM_EIO);
+            STM_ASSERT(bad == (deaf == 0));
+        }
+        stm_bdev_inject_read_range_clear(b0);
+    }
+    stm_sync_force_locked_read_for_test(s, false);
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+
 STM_TEST_MAIN("sync_multi")

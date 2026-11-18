@@ -12950,7 +12950,7 @@ STM_TEST(fs_a_bad_sector_under_a_record_drops_the_run_and_reports_it) {
     fprintf(stderr, "  info: o1 bad sector: commit %d, faulted reads %u, "
             "replicas %u\n", (int)c1, (unsigned)fired, nrep);
     STM_ASSERT_OK(c1);
-    STM_ASSERT(fired >= 2u * nrep);                  /* each replica twice */
+    STM_ASSERT(fired >= 3u * nrep);   /* a lock-free read, then each replica twice */
     char want[48];
     snprintf(want, sizeof want, "status=%d", (int)STM_EIO);
     STM_ASSERT(strstr(x6_events, want) != NULL);
@@ -13190,6 +13190,205 @@ STM_TEST(fs_the_promote_cursor_table_forgets_the_oldest_dataset_past_64) {
     STM_ASSERT(stm_fs_promote_cursor_for_test(fs, 1063u, &ino, &off));
     STM_ASSERT(ino == 64u);
     STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+
+/* ========================================================================= */
+/* o1a review round 1.                                                        */
+/* ========================================================================= */
+
+/* Every read of the device answers EIO (a device that is down, not a bad
+ * sector): the drain's merge read under g's 10-byte write fails, the
+ * device reads none of its labels, so the run stays buffered and the
+ * commit fails, with nothing dropped. Once the device reads again the
+ * next commit writes the run and it is there after a remount. (The same
+ * EIO on g's record alone drops the run:
+ * fs_a_bad_sector_under_a_record_drops_the_run_and_reports_it.) */
+STM_TEST(fs_a_device_that_answers_no_read_keeps_the_run) {
+    uint64_t f = 0, g = 0, h = 0;
+    unsigned nrep = 0;
+    stm_fs *fs = o1_mount("o1_deaf", &f, &g, &h, 0, false, &nrep);   /* inert */
+    if (!fs) return;
+    struct stm_bdev *d = stm_fs_bdev_for_test(fs);
+    x6_sink_reset();
+    stm_fs_set_event_sink(fs, x6_sink, NULL);
+    uint8_t w[10];
+    memset(w, 'w', sizeof w);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 8292, w, sizeof w));
+    const uint32_t f0 = stm_bdev_inject_read_range_fired(d);
+    stm_bdev_inject_read_range(d, 0u, UINT64_MAX, -1, STM_EIO);
+    stm_status c1 = stm_fs_commit(fs);
+    const uint32_t fired = stm_bdev_inject_read_range_fired(d) - f0;
+    stm_bdev_inject_read_range_clear(d);
+    stm_status c2 = stm_fs_commit(fs);
+    stm_status fy = stm_fs_fsync(fs, 1, g, NULL);
+    fprintf(stderr, "  info: device down: commit %d, faulted reads %u, then "
+            "commit %d, fsync %d, dropped %d\n", (int)c1, (unsigned)fired,
+            (int)c2, (int)fy, strstr(x6_events, "run dropped") != NULL);
+    STM_ASSERT_ERR(c1, STM_EIO);
+    STM_ASSERT(fired > 0u);
+    STM_ASSERT(strstr(x6_events, "run dropped") == NULL);
+    STM_ASSERT_OK(c2);
+    STM_ASSERT_OK(fy);
+    stm_fs_set_event_sink(fs, NULL, NULL);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    o1_after(f, g, false, true);
+}
+
+/* A plain read of a record whose every read answers EIO reads each
+ * replica as often through the buffered read's fill (g holds a buffered
+ * run elsewhere) as through the unbuffered read: a reader that drops
+ * nothing asks for no verdict. */
+STM_TEST(fs_a_buffered_read_of_a_failing_record_reads_it_as_a_plain_read) {
+    uint64_t f = 0, g = 0, h = 0;
+    unsigned nrep = 0;
+    stm_fs *fs = o1_mount("o1_plainreads", &f, &g, &h, -1, false, &nrep);
+    if (!fs) return;
+    struct stm_bdev *d = stm_fs_bdev_for_test(fs);
+    uint8_t b[4096];
+    size_t got = 0;
+    const uint32_t a0 = stm_bdev_inject_read_range_fired(d);
+    stm_status r1 = stm_fs_read(fs, 1, g, 8192, b, sizeof b, &got);
+    const uint32_t a1 = stm_bdev_inject_read_range_fired(d);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 0, "buffered", 8));   /* g buffered */
+    stm_status r2 = stm_fs_read(fs, 1, g, 8192, b, sizeof b, &got);
+    const uint32_t a2 = stm_bdev_inject_read_range_fired(d);
+    fprintf(stderr, "  info: unbuffered read %d: %u faulted reads; buffered "
+            "read %d: %u (replicas %u)\n", (int)r1, (unsigned)(a1 - a0),
+            (int)r2, (unsigned)(a2 - a1), nrep);
+    STM_ASSERT_ERR(r1, STM_EIO);
+    STM_ASSERT_ERR(r2, STM_EIO);
+    STM_ASSERT(a1 - a0 > 0u);
+    STM_ASSERT_EQ(a2 - a1, a1 - a0);
+    stm_bdev_inject_read_range_clear(d);
+    (void)stm_fs_unmount(fs);
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* A file whose run a commit dropped is unlinked and its inode number
+ * reused by a new file: the new file's first copy answers OK (the mark
+ * belongs to the old incarnation), and the old report keeps the unmount's
+ * EIO. */
+STM_TEST(fs_a_copy_of_a_new_file_at_a_dropped_files_ino_answers_ok) {
+    stm_fs *fs = x6_fresh("o1_copy_gen");
+    if (!fs) return;
+    uint64_t inos[1], dst = 0, y = 0;
+    x6_make_files(fs, inos, 1);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"dst", 3,
+                                     0644u, 0, 0, &dst));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    x6_dirty(fs, inos, 0, 1, 'r');
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));                 /* the drop */
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, 1, (const uint8_t *)"x0", 2));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"y0", 2,
+                                     0644u, 0, 0, &y));
+    fprintf(stderr, "  info: dropped ino %llu, new file ino %llu\n",
+            (unsigned long long)inos[0], (unsigned long long)y);
+    STM_ASSERT_EQ(y, inos[0]);
+    uint8_t z[4096];
+    memset(z, 'y', sizeof z);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, y, 0, z, sizeof z));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_reflink(fs, 1, y, 1, dst));
+    STM_ASSERT_OK(stm_fs_fsync(fs, 1, y, NULL));
+    STM_ASSERT_ERR(stm_fs_unmount(fs), STM_EIO);
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* A full table of reports every fsync made, one of which (x5's) a copy
+ * made too: a new drop evicts x5's, not the oldest (x0's), so x0's next
+ * copy still answers EIO once. */
+STM_TEST(fs_a_full_report_table_evicts_one_fsync_and_copy_both_made_first) {
+    stm_fs *fs = x6_fresh("o1_ev_copy");
+    if (!fs) return;
+    static uint64_t inos[257];
+    uint64_t dst = 0;
+    x6_make_files(fs, inos, 257);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"dst", 3,
+                                     0644u, 0, 0, &dst));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    x6_sink_reset();
+    stm_fs_set_event_sink(fs, x6_sink, NULL);
+    x6_dirty(fs, inos, 0, 1, 'd');
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));                 /* x0, the oldest */
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    x6_dirty(fs, inos, 1, 255, 'd');
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));                 /* x1..x255 */
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    for (unsigned i = 0; i < 256u; i++)
+        STM_ASSERT_ERR(stm_fs_fsync(fs, 1, inos[i], NULL), STM_EIO);
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, inos[5], 1, dst), STM_EIO);
+    x6_dirty(fs, inos, 256, 1, 'd');
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));                 /* x256 evicts one */
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    char want[96];
+    snprintf(want, sizeof want, "write-error dataset=1 ino=%llu gen=",
+             (unsigned long long)inos[5]);
+    const char *ev = strstr(x6_events, "report evicted after an fsync made it");
+    STM_ASSERT(ev != NULL);
+    if (ev) {
+        const char *ls = ev;
+        while (ls > x6_events && ls[-1] != '\n') ls--;
+        STM_ASSERT(strncmp(ls, want, strlen(want)) == 0);
+    }
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, inos[0], 1, dst), STM_EIO);
+    STM_ASSERT_OK(stm_fs_reflink(fs, 1, inos[0], 1, dst));
+    STM_ASSERT_ERR(stm_fs_fsync(fs, 1, inos[256], NULL), STM_EIO);
+    stm_fs_set_event_sink(fs, NULL, NULL);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* With no event sink, 40 drops in one commit: stderr takes 32 drop lines,
+ * then one saying the rest go untold, and the unmount's count line. */
+STM_TEST(fs_write_error_lines_to_stderr_stop_at_32_a_mount) {
+    stm_fs *fs = x6_fresh("o1_stderr_cap");
+    if (!fs) return;
+    static uint64_t inos[40];
+    x6_make_files(fs, inos, 40);
+    STM_ASSERT(!stm_fs_event_sink_for_test(fs));
+    char path[1100];
+    snprintf(path, sizeof path, "%s.stderr", g_tmp_path);
+    int cap = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    STM_ASSERT(cap >= 0);
+    if (cap < 0) { (void)stm_fs_unmount(fs); return; }
+    fflush(stderr);
+    int saved = dup(2);
+    (void)dup2(cap, 2);
+    x6_dirty(fs, inos, 0, 40, 'e');
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    stm_status c = stm_fs_commit(fs);
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    stm_status u = stm_fs_unmount(fs);
+    fflush(stderr);
+    (void)dup2(saved, 2);
+    close(saved);
+    static char buf[32768];
+    ssize_t n = pread(cap, buf, sizeof buf - 1u, 0);
+    close(cap);
+    unlink(path);
+    buf[n > 0 ? (size_t)n : 0u] = '\0';
+    unsigned drops = 0, untold = 0;
+    for (const char *p = buf; (p = strstr(p, "run dropped")) != NULL; p++) drops++;
+    for (const char *p = buf; (p = strstr(p, "go untold")) != NULL; p++) untold++;
+    fprintf(stderr, "  info: stderr took %u drop lines, %u untold lines, "
+            "%zd bytes\n", drops, untold, n);
+    STM_ASSERT_OK(c);
+    STM_ASSERT_ERR(u, STM_EIO);
+    STM_ASSERT_EQ(drops, 32u);
+    STM_ASSERT_EQ(untold, 1u);
+    STM_ASSERT(strstr(buf, "write-error unmount") != NULL);
     unlink(g_tmp_path);
     unlink(g_key_path);
 }

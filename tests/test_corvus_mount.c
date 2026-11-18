@@ -4928,3 +4928,46 @@ STM_TEST(corvus_a_write_into_a_big_cold_record_with_no_content_entry_is_dropped)
 STM_TEST(corvus_a_write_into_a_big_cold_record_its_content_entry_disowns_is_dropped) {
     o1_big_case("o1blen", O1_ENTRY_LEN);
 }
+
+
+/* A direct write (over 1 MiB) starting at an older pool's big COLD record
+ * whose chunk answers EIO on every read: the direct write promotes the
+ * record first, a reader that drops nothing, so it reads each replica
+ * once and answers the EIO to its caller; nothing is dropped. */
+STM_TEST(corvus_a_direct_write_into_a_big_cold_record_reads_a_bad_sector_once) {
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, "o1bdirect", UINT64_C(1) << 30,
+                           UINT64_C(128) << 20))
+        return;
+    const uint64_t ds = sp.sib.ds;
+    const size_t LEN = (size_t)64 << 20;
+    uint8_t *all = malloc(LEN);
+    STM_ASSERT(all != NULL);
+    if (!all) { seal_pool_close(&sp); return; }
+    stm_extent_record a;
+    uint64_t f = r4_big_file(&sp, ds, false, all, LEN, &a);
+    free(all);
+    struct stm_bdev *d = stm_fs_bdev_for_test(sp.fs);
+    stm_cas_record cr;
+    memset(&cr, 0, sizeof cr);
+    STM_ASSERT_OK(stm_cas_lookup(stm_sync_cas_index(stm_fs_sync(sp.fs)),
+                                 a.content_hash, &cr));
+    STM_ASSERT(a.len > (uint64_t)STM_FS_RECORDSIZE_MAX);
+    o1_fault_chunk(&sp, &a, -1, false);
+    const size_t WL = (size_t)STM_FS_RECORDSIZE_MAX + 4096u;
+    uint8_t *w = malloc(WL);
+    STM_ASSERT(w != NULL);
+    if (!w) { seal_pool_close(&sp); return; }
+    memset(w, 'v', WL);
+    const uint32_t f0 = stm_bdev_inject_read_range_fired(d);
+    stm_status ws = stm_fs_write(sp.fs, ds, f, a.off, w, WL);
+    const uint32_t fired = stm_bdev_inject_read_range_fired(d) - f0;
+    stm_bdev_inject_read_range_clear(d);
+    free(w);
+    fprintf(stderr, "  info: direct write %d, faulted reads %u (replicas %u)\n",
+            (int)ws, (unsigned)fired, (unsigned)cr.n_replicas);
+    STM_ASSERT_ERR(ws, STM_EIO);
+    STM_ASSERT_EQ(fired, (uint32_t)cr.n_replicas);
+    STM_ASSERT_OK(stm_fs_fsync(sp.fs, ds, f, NULL));
+    seal_pool_close(&sp);
+}

@@ -166,7 +166,8 @@ _Static_assert(STM_FLUSH_INODE_CAP_BYTES <= STM_FS_RECORDSIZE_MAX,
  * in the shape of Linux's errseq: seq numbers its latest drop (fs-wide,
  * they only grow), seen is whether an fsync has reported it since.
  * copy_unheard: no reflink or copy of the file has failed on its latest
- * drop yet (Linux's AS_EIO, which the remap prep tests and clears). gen is
+ * drop yet (Linux's AS_EIO, which the remap prep tests and clears; an
+ * fsync here leaves it, where Linux's clears it). gen is
  * the incarnation the run was written to, FS_WERR_NO_INODE for an ino the
  * inode index lacks. */
 struct fs_write_error {
@@ -177,6 +178,7 @@ struct fs_write_error {
 };
 #define FS_WRITE_ERRORS_MAX 256u
 #define FS_WERR_NO_INODE    UINT64_MAX
+#define FS_WERR_STDERR_MAX  32u   /* write-error lines stderr takes a mount */
 
 /* Where a dataset's next login promote starts (stm_fs_promote_sealed_cold):
  * the first file at or past ino, at off in that file. */
@@ -246,6 +248,7 @@ struct stm_fs {
     uint32_t werr_count;
     uint64_t werr_seq;   /* the last drop's number */
     uint64_t werr_lost;  /* unmade reports the table evicted */
+    uint32_t werr_stderr_lines;  /* taken by stderr, with no sink */
     pthread_mutex_t promote_cur_mu;
     struct fs_promote_cursor promote_cur[FS_PROMOTE_CURSORS];  /* oldest first */
     uint32_t promote_cur_count;
@@ -1906,11 +1909,26 @@ stm_status stm_fs_mount(const char *path,
 
 /* A write-error line: to the event sink, or with none installed to stderr,
  * so lost bytes are still told of at a shutdown that removed the sink.
- * Caller holds werr_mu. */
-static void fs_werr_event_locked(stm_fs *fs, const char *line)
+ * The lines go out under the fs's locks, so stderr takes at most
+ * FS_WERR_STDERR_MAX of them a mount and then one saying the rest go
+ * untold, far less than a pipe holds: a reader that stalls cannot block
+ * a lock holder on them. The unmount's count (always) goes regardless;
+ * the fsyncs report each drop either way. Caller holds werr_mu. */
+static void fs_werr_event_locked(stm_fs *fs, const char *line, bool always)
 {
-    if (fs->event_sink) fs->event_sink(fs->event_sink_ctx, line);
-    else fprintf(stderr, "STRATUM-FS: %s\n", line);
+    if (fs->event_sink) {
+        fs->event_sink(fs->event_sink_ctx, line);
+        return;
+    }
+    if (!always) {
+        if (fs->werr_stderr_lines > FS_WERR_STDERR_MAX) return;
+        if (fs->werr_stderr_lines++ == FS_WERR_STDERR_MAX) {
+            fputs("STRATUM-FS: write-error: later lines go untold (no event "
+                  "sink); the fsyncs and the unmount still report\n", stderr);
+            return;
+        }
+    }
+    fprintf(stderr, "STRATUM-FS: %s\n", line);
 }
 
 stm_status stm_fs_unmount(stm_fs *fs)
@@ -1952,7 +1970,7 @@ stm_status stm_fs_unmount(stm_fs *fs)
                      "fsync reported, and %llu such reports were evicted",
                      (unsigned long long)unseen,
                      (unsigned long long)fs->werr_lost);
-            fs_werr_event_locked(fs, line);
+            fs_werr_event_locked(fs, line, true);
             commit_status = STM_EIO;
         }
         pthread_mutex_unlock(&fs->werr_mu);
@@ -2108,7 +2126,9 @@ static bool fs_take_copy_error(stm_fs *fs, uint64_t ds, uint64_t ino)
  * bytes and the destination would hold no report: so the first copy after
  * each drop answers STM_EIO, as Linux's remap prep does on AS_EIO
  * (filemap_check_errors tests and clears it). The fsyncs keep their own
- * report. A report the table evicted is no longer asked of. */
+ * report, and an fsync's report leaves the copy's (Linux's fsync clears
+ * AS_EIO): the destination hears of the drop from no one else. A report
+ * the table evicted is no longer asked of. */
 static stm_status fs_flush_source_locked(stm_fs *fs, uint64_t ds, uint64_t ino)
 {
     stm_status s = fs_flush_ino_locked(fs, ds, ino);
@@ -2284,9 +2304,12 @@ static stm_status fs_rmw_read_span_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
         uint64_t want = (a_end < ext_end ? a_end : ext_end) - cur;
         size_t got = 0;
         bool bad = false;
+        /* Only a drain (unw) drops a run, so only it asks for the
+         * record's verdict and its second read of a failing replica. */
         stm_status rs = stm_sync_read_extent_ex(fs->sync, ds, ino, cur,
                                                 scratch + (cur - a_off),
-                                                (size_t)want, &got, &bad);
+                                                (size_t)want, &got,
+                                                unw ? &bad : NULL);
         if (rs != STM_OK) {
             if (bad && unw) *unw = true;
             return rs;
@@ -2350,7 +2373,8 @@ static stm_status fs_cover_big_record_locked(stm_fs *fs, uint64_t ds,
         return STM_ECORRUPT;
     }
     bool bad = false;
-    stm_status pz = stm_sync_promote_cold_at(fs->sync, ds, ino, e->off, &bad);
+    stm_status pz = stm_sync_promote_cold_at(fs->sync, ds, ino, e->off,
+                                             unw ? &bad : NULL);
     if (pz != STM_OK) {
         if (bad && unw) *unw = true;
         return pz;
@@ -2793,11 +2817,18 @@ static void fs_note_write_error_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
     cur.copy_unheard = true;
     {
         if (fs->werr_count == FS_WRITE_ERRORS_MAX) {
-            /* The oldest report an fsync made goes first: of it, only a
-             * file open since before the drop that has not synced loses
-             * word. */
+            /* The oldest report an fsync and a copy have both made goes
+             * first, then the oldest an fsync made (of it, only a file
+             * open since before the drop that has not synced, and the
+             * file's next copy, lose word), else the oldest. */
             uint32_t k = 0;
-            while (k < fs->werr_count && !fs->werr[k].seen) k++;
+            while (k < fs->werr_count &&
+                   (!fs->werr[k].seen || fs->werr[k].copy_unheard))
+                k++;
+            if (k == fs->werr_count) {
+                k = 0;
+                while (k < fs->werr_count && !fs->werr[k].seen) k++;
+            }
             if (k == fs->werr_count) k = 0;
             const struct fs_write_error *old = &fs->werr[k];
             if (!old->seen) fs->werr_lost++;
@@ -2809,7 +2840,7 @@ static void fs_note_write_error_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
                      (unsigned long long)old->gen,
                      old->seen ? "after an fsync made it" : "unmade",
                      (unsigned)FS_WRITE_ERRORS_MAX);
-            fs_werr_event_locked(fs, line);
+            fs_werr_event_locked(fs, line, false);
             memmove(&fs->werr[k], &fs->werr[k + 1u],
                     (size_t)(FS_WRITE_ERRORS_MAX - k - 1u)
                         * sizeof fs->werr[0]);
@@ -2825,7 +2856,7 @@ static void fs_note_write_error_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
              (unsigned long long)ds, (unsigned long long)ino,
              (unsigned long long)gen, (unsigned long long)off,
              (unsigned long long)len, (int)why, stm_strerror(why));
-    fs_werr_event_locked(fs, line);
+    fs_werr_event_locked(fs, line, false);
     pthread_mutex_unlock(&fs->werr_mu);
 }
 
@@ -2868,7 +2899,8 @@ static stm_status fs_flush_drain_cb(void *user, uint64_t ds, uint64_t ino,
     }
     /* A run whose write fails on one of its file's records (one off the
      * block grid, or one it must keep that no replica gives on a second
-     * read -- its bytes fail their check or its sector answers EIO --,
+     * read -- its bytes fail their check, or its sector answers EIO on a
+     * device that still reads its labels --,
      * whose content is gone or whose key is missing) can never be
      * written: kept buffered, it would fail every later flush, and so
      * every commit of the pool. Drop exactly this run (a cover the write

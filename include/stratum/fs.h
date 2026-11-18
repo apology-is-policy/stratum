@@ -298,21 +298,25 @@ stm_status stm_fs_free(stm_fs *fs, uint64_t paddr, uint64_t free_gen);
  * fails on a record of its file is dropped, so one damaged file cannot
  * fail every commit of the pool: a partial write merges the record's old
  * bytes, and no replica gives them on a second read (they fail their
- * integrity check, STM_EBADTAG or STM_ECORRUPT, or the sector answers
- * STM_EIO), or its content entry is gone or does not match it, or the key
- * it names is missing to this mount. The record keeps its old bytes, the
- * file's next stm_fs_fsync answers STM_EIO, and the event sink (stderr,
- * with none) hears of it. The flushes before a truncate, reflink, migrate
+ * integrity check, STM_EBADTAG or STM_ECORRUPT, or a sector answers
+ * STM_EIO on a device that still reads its labels), or its content entry
+ * is gone or does not match it, or the key it names is missing to this
+ * mount. The record keeps its old bytes, the file's next stm_fs_fsync
+ * answers STM_EIO, and the event sink hears of it (with none, stderr, up
+ * to 32 lines a mount). The flushes before a truncate, reflink, migrate
  * and the write path's own buffer-full flush drop such a run the same
  * way, and the first reflink or copy of the file after each drop answers
  * STM_EIO (it would copy the old bytes), as Linux's remap prep does on
- * AS_EIO; the fsyncs keep their own report. So is one whose cover meets records off
+ * AS_EIO; the fsyncs keep their own report, and unlike Linux's an fsync
+ * leaves the copy's (the destination hears of the drop from no one
+ * else). So is one whose cover meets records off
  * the block grid (which only a crafted stream received before they were
  * refused can make) where it cannot rewrite them: a split point or a
  * cover past 4 x recordsize. Only a failure that is one of the file's own
  * records drops a run: one of the pool's metadata (an index node, the
  * allocator, the keyschema's state on the write side), a device write or
- * flush, a device read error other than EIO, STM_ENOSPC or STM_ENOMEM
+ * flush, a device read error other than EIO, EIO from a device that
+ * reads none of its labels (it is down), STM_ENOSPC or STM_ENOMEM
  * keeps the bytes buffered and fails the commit, and so does any failure
  * of a run holding bytes an inline file's committed state keeps nowhere
  * else (its first write past the inline cap). */

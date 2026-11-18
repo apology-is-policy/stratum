@@ -7203,3 +7203,42 @@ STM_TEST(p9_two_fsyncs_on_one_fid_report_a_drop_once) {
     unlink(g_tmp_path);
     unlink(g_key_path);
 }
+
+
+/* A Tfsync whose commit fails pool-wide (a drain error that keeps its
+ * run, here STM_ENOMEM) answers that error, on an open fid and on one
+ * never opened, never Rfsync; once the drains succeed the next Tfsync
+ * commits. */
+STM_TEST(p9_fsync_answers_a_failed_commits_error_on_any_fid) {
+    stm_fs *fs = NULL;
+    uint64_t g = 0;
+    stm_9p_server *s = p9werr_setup("o1p9_fsync_fail", &fs, &g);
+    if (!s) return;
+    STM_ASSERT_EQ(p9werr_fsync(s, 10, 102), STM_9P_RLERROR);   /* the report */
+    walk_to(s, 100, 103, "g");
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 500, "kept....", 8));
+    stm_fs_fail_drains_for_test(fs, STM_ENOMEM);
+    const uint32_t fids[2] = { 102, 103 };
+    for (unsigned i = 0; i < 2u; i++) {
+        uint8_t req[64];
+        uint8_t *resp = malloc(RBUF);
+        STM_ASSERT(resp != NULL);
+        if (!resp) break;
+        uint32_t rlen = 0;
+        uint32_t sz = build_tfsync(req, (uint16_t)(20u + i), fids[i], 0);
+        STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+        fprintf(stderr, "  info: fid %u reply %u ecode %u\n",
+                (unsigned)fids[i], (unsigned)resp[4],
+                resp[4] == STM_9P_RLERROR ? (unsigned)load_u32(resp + 7) : 0u);
+        STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+        if (resp[4] == STM_9P_RLERROR)
+            STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENOMEM);
+        free(resp);
+    }
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    STM_ASSERT_EQ(p9werr_fsync(s, 30, 102), STM_9P_RFSYNC);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}

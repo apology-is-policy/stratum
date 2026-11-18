@@ -52,8 +52,9 @@ uint32_t stm_bdev_inject_read_fired_count(const struct stm_bdev *d);
 
 /* A sector that fails: the next `times` reads meeting the device bytes
  * [lo, hi) (every one, when times < 0) answer `answer` without reading,
- * or with STM_OK, read and come back with the range's first byte
- * inverted. Up to four ranges; armed by one thread while no read runs.
+ * or with STM_OK, read and come back with one byte inverted (the range's
+ * first byte inside the read). Up to four ranges, a fifth ignored; armed
+ * by one thread while no read runs.
  * _clear disarms them all; _fired counts the faulted reads. Fires only in
  * a build with testing hooks. */
 void     stm_bdev_inject_read_range(struct stm_bdev *d, uint64_t lo,

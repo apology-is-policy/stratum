@@ -7504,17 +7504,48 @@ static unsigned sync_read_passes(const bool *rec_bad)
 }
 
 /* No replica of a record gave its bytes; what is said here is the last
- * pass's. dev_err is a device error other than EIO (no memory, an
- * interrupted call): it may clear, so it is the pool's. unreadable: a
- * replica answered EIO or sits on a device the pool no longer has. After
- * the second pass that, like bytes failing their check, is the record's
- * own; a plain reader hears the EIO first. */
+ * pass's. dev_err is a device error that may clear or is the device's (no
+ * memory, an interrupted call, EIO from a device that reads none of its
+ * labels): it is the pool's. unreadable: a replica answered EIO on a
+ * device that still reads (sync_eio_unreadable), or sits on a device the
+ * pool no longer has. After the second pass that, like bytes failing
+ * their check, is the record's own; a plain reader hears the EIO first. */
 static stm_status sync_replicas_failed(bool *rec_bad, stm_status dev_err,
                                        bool unreadable, stm_status check_err)
 {
     if (dev_err != STM_OK) return dev_err;
     stm_status e = unreadable ? STM_EIO : check_err;
     return rec_bad ? sync_rec_bad(rec_bad, e) : e;
+}
+
+/* Whether a device reads one of its labels' mirror slots. A backend
+ * answers STM_EIO for any failure it cannot name (a dead ring, a latched
+ * device, an errno outside its table), not only for a bad sector; a
+ * device that reads none of its labels is down, and that is not the
+ * record's failure (ZFS's vdev_probe asks the same after a failed I/O). */
+static bool sync_device_answers(stm_bdev *bd)
+{
+    const stm_bdev_caps *caps = stm_bdev_caps_of(bd);
+    uint64_t lo[STM_LABELS_PER_DEVICE];
+    if (!caps || stm_label_offsets(caps->size_bytes, lo) != STM_OK)
+        return false;
+    uint8_t probe[STM_UB_SIZE];
+    for (uint32_t l = 0; l < STM_LABELS_PER_DEVICE; l++) {
+        uint64_t off = 0;
+        if (stm_ub_slot_offset(lo[l], STM_UB_MIRROR_SLOT, &off) == STM_OK &&
+            stm_bdev_read(bd, off, probe, sizeof probe) == STM_OK)
+            return true;
+    }
+    return false;
+}
+
+/* A replica that answered STM_EIO is unreadable, except on a classifying
+ * reader's last pass from a device that answers no read: that failure is
+ * the device's, so the pool's. */
+static bool sync_eio_unreadable(const bool *rec_bad, bool last_pass,
+                                stm_bdev *bd)
+{
+    return !rec_bad || !last_pass || sync_device_answers(bd);
 }
 
 /* #343 decrypted-extent cache helpers. Caller holds s->lock. */
@@ -8173,7 +8204,10 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
                                   * (uint64_t)STM_UB_SIZE;
             stm_status rs = stm_bdev_read(bd, byte_off, ccbuf, ctotal);
             if (rs != STM_OK) {
-                if (rs == STM_EIO) cunread = true;
+                if (rs == STM_EIO &&
+                    sync_eio_unreadable(rec_bad, k >= cn - cas_rec.n_replicas,
+                                        bd))
+                    cunread = true;
                 else if (cdev_err == STM_OK) cdev_err = rs;
                 continue;
             }
@@ -8342,7 +8376,9 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
         uint64_t byte_off = stm_paddr_offset(rec.paddrs[i]) * (uint64_t)STM_UB_SIZE;
         stm_status rs = stm_bdev_read(bd, byte_off, cbuf, total_bytes);
         if (rs != STM_OK) {
-            if (rs == STM_EIO) unread = true;
+            if (rs == STM_EIO &&
+                sync_eio_unreadable(rec_bad, k >= hn - rec.n_replicas, bd))
+                unread = true;
             else if (dev_err == STM_OK) dev_err = rs;
             continue;
         }
@@ -10954,7 +10990,10 @@ static stm_status promote_one_extent_locked(stm_sync *s,
                                   * (uint64_t)STM_UB_SIZE;
             stm_status rs = stm_bdev_read(bd, byte_off, cold_cbuf, cold_total);
             if (rs != STM_OK) {
-                if (rs == STM_EIO) unread = true;
+                if (rs == STM_EIO &&
+                    sync_eio_unreadable(rec_bad, k >= pn - cas_rec.n_replicas,
+                                        bd))
+                    unread = true;
                 else if (dev_err == STM_OK) dev_err = rs;
                 continue;
             }
