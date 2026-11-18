@@ -1915,4 +1915,359 @@ STM_TEST(sync_cf4b_inject_fail_then_retry) {
     unlink(g_tmp_path);
 }
 
+
+/* o1c round 1 F1: one read error on the newest uberblock's slot at mount
+ * used to roll the pool back one acknowledged commit (the scan skipped the
+ * slot, the open's claim then overwrote it). The pool: 'A' at gen 1, 'B'
+ * at gen 3 (reservation 2), the newest commit in one slot. */
+static void sync_f1_build(const char *tag)
+{
+    make_tmp(tag);
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+    uint8_t A[4096], B[4096];
+    memset(A, 'A', sizeof A);
+    memset(B, 'B', sizeof B);
+    STM_ASSERT_OK(stm_sync_write_extent(s, 1u, 7u, 0u, A, sizeof A));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_sync_write_extent(s, 1u, 7u, 0u, B, sizeof B));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s, &info));
+    STM_ASSERT_EQ(info.auth_gen, 3u);
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+}
+
+/* Faults generation gen's ring slot (label gen % 4, slot gen % 63). */
+static void sync_f1_fault_gen(stm_bdev *d, uint64_t gen, int64_t times)
+{
+    uint64_t lo[STM_LABELS_PER_DEVICE];
+    STM_ASSERT_OK(stm_label_offsets(stm_bdev_caps_of(d)->size_bytes, lo));
+    uint64_t off = lo[gen % 4u] + (gen % 63u) * (uint64_t)STM_UB_SIZE;
+    stm_bdev_inject_read_range(d, off, off + STM_UB_SIZE, times, STM_EIO);
+}
+
+/* Opens the pool; on STM_OK reports the gen it mounted and the first byte
+ * of ino 7, then closes it. */
+static stm_status sync_f1_mount(stm_bdev *d, uint64_t *out_gen,
+                                uint8_t *out_byte)
+{
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_pool *pool2 = make_test_pool(d);
+    stm_sync *s2 = NULL;
+    stm_status os = stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2);
+    if (os != STM_OK) {
+        stm_pool_close(pool2);
+        stm_alloc_close(a2);
+        return os;
+    }
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s2, &info));
+    *out_gen = info.mount_max_durable_gen;
+    uint8_t back[4096];
+    memset(back, 0, sizeof back);
+    size_t got = 0;
+    STM_ASSERT_OK(stm_sync_read_extent(s2, 1u, 7u, 0u, back, sizeof back,
+                                       &got));
+    *out_byte = back[0];
+    teardown(a2, s2, pool2);
+    return STM_OK;
+}
+
+STM_TEST(sync_mount_rereads_the_newest_ub_after_one_read_error) {
+    sync_f1_build("f1once");
+    stm_bdev *d = open_fresh_device();
+    sync_f1_fault_gen(d, 3u, 1);
+    uint64_t gen = 0;
+    uint8_t byte = 0;
+    STM_ASSERT_OK(sync_f1_mount(d, &gen, &byte));
+    STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(d), 1u);
+    STM_ASSERT_EQ(gen, 3u);
+    STM_ASSERT_EQ(byte, (uint8_t)'B');
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(sync_mount_fails_closed_when_the_newest_ub_stays_unreadable) {
+    sync_f1_build("f1perm");
+    stm_bdev *d = open_fresh_device();
+    sync_f1_fault_gen(d, 3u, -1);
+    uint64_t gen = 0;
+    uint8_t byte = 0;
+    STM_ASSERT_ERR(sync_f1_mount(d, &gen, &byte), STM_EIO);
+    STM_ASSERT(stm_bdev_inject_read_range_fired(d) >= 3u);
+    stm_bdev_close(d);
+    /* The failed mount wrote nothing over gen 3: a healthy mount has it. */
+    d = open_fresh_device();
+    STM_ASSERT_OK(sync_f1_mount(d, &gen, &byte));
+    STM_ASSERT_EQ(gen, 3u);
+    STM_ASSERT_EQ(byte, (uint8_t)'B');
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(sync_mount_skips_an_unreadable_older_ub) {
+    sync_f1_build("f1old");
+    stm_bdev *d = open_fresh_device();
+    sync_f1_fault_gen(d, 1u, -1);
+    sync_f1_fault_gen(d, 2u, -1);
+    uint64_t gen = 0;
+    uint8_t byte = 0;
+    STM_ASSERT_OK(sync_f1_mount(d, &gen, &byte));
+    STM_ASSERT(stm_bdev_inject_read_range_fired(d) >= 2u);
+    STM_ASSERT_EQ(gen, 3u);
+    STM_ASSERT_EQ(byte, (uint8_t)'B');
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(sync_open_on_a_device_whose_ring_reads_nothing_is_eio) {
+    sync_f1_build("f1deaf");
+    stm_bdev *d = open_fresh_device();
+    uint64_t lo[STM_LABELS_PER_DEVICE];
+    STM_ASSERT_OK(stm_label_offsets(stm_bdev_caps_of(d)->size_bytes, lo));
+    for (uint32_t l = 0; l < STM_LABELS_PER_DEVICE; l++)
+        stm_bdev_inject_read_range(d, lo[l], lo[l] + STM_LABEL_SIZE, -1,
+                                   STM_EIO);
+    uint64_t gen = 0;
+    uint8_t byte = 0;
+    STM_ASSERT_ERR(sync_f1_mount(d, &gen, &byte), STM_EIO);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+
+/* o1c round 1 F4/F6: the bootstrap's two header + bitmap pairs at mount.
+ * Six commits, so both header slots hold a valid header. */
+static void sync_f4_build(const char *tag, stm_bootstrap_stats *out)
+{
+    make_tmp(tag);
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+    uint8_t buf[4096];
+    for (int i = 0; i < 6; i++) {
+        memset(buf, 'a' + i, sizeof buf);
+        STM_ASSERT_OK(stm_sync_write_extent(s, 1u, 10u + (uint64_t)i, 0u, buf,
+                                            sizeof buf));
+        STM_ASSERT_OK(stm_sync_commit(s));
+    }
+    STM_ASSERT_OK(stm_bootstrap_stats_get(stm_alloc_bootstrap(a), out));
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+}
+
+typedef struct {
+    int64_t  hdr_slot;      /* header slot unreadable for good, or -1 */
+    bool     bitmap_once;   /* the live bitmap fails one read */
+    int64_t  walk_n;        /* the open's n-th read fails once, or 0 */
+    bool     spend;         /* hand out every free node and junk it */
+} sync_f4_faults;
+
+typedef struct {
+    stm_status open;        /* the alloc open's, else the sync open's */
+    uint64_t   opened_gen;  /* the bitmap gen the bootstrap open took */
+    uint64_t   restored;    /* nodes the reconcile took back */
+    uint32_t   walk_fired;
+    int        wrong;       /* spend: extents wrong after a healthy
+                             * remount; -1 when that mount failed */
+} sync_f4_result;
+
+static void sync_f4_mount(const stm_bootstrap_stats *built,
+                          const sync_f4_faults *f, sync_f4_result *r)
+{
+    memset(r, 0, sizeof *r);
+    r->wrong = -1;
+    stm_bdev *d = open_fresh_device();
+    if (f->hdr_slot >= 0) {
+        uint64_t off = STM_BOOTSTRAP_OFFSET + (uint64_t)f->hdr_slot * STM_UB_SIZE;
+        stm_bdev_inject_read_range(d, off, off + STM_UB_SIZE, -1, STM_EIO);
+    }
+    if (f->bitmap_once) {
+        uint64_t blk = built->bitmap_slot_live ? STM_BOOTSTRAP_BITMAP_SLOT_B
+                                               : STM_BOOTSTRAP_BITMAP_SLOT_A;
+        uint64_t off = STM_BOOTSTRAP_OFFSET + blk * STM_UB_SIZE;
+        stm_bdev_inject_read_range(d, off,
+            off + STM_BOOTSTRAP_BITMAP_BLOCKS * (uint64_t)STM_UB_SIZE, 1,
+            STM_EIO);
+    }
+    stm_alloc *a2 = NULL;
+    r->open = stm_alloc_open_blank(d, &a2);
+    if (r->open != STM_OK) { stm_bdev_close(d); return; }
+    stm_bootstrap_stats b0;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(stm_alloc_bootstrap(a2), &b0));
+    r->opened_gen = b0.bitmap_gen;
+    if (f->walk_n > 0) stm_bdev_inject_read_fail_after(d, f->walk_n);
+    stm_pool *pool2 = make_test_pool(d);
+    stm_sync *s2 = NULL;
+    r->open = stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2);
+    r->walk_fired = stm_bdev_inject_read_fired_count(d);
+    stm_bdev_inject_read_fail_after(d, 0);
+    if (r->open != STM_OK) {
+        stm_pool_close(pool2);
+        stm_alloc_close(a2);
+        stm_bdev_close(d);
+        return;
+    }
+    stm_bootstrap_stats b1;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(stm_alloc_bootstrap(a2), &b1));
+    r->restored = b1.restored_nodes;
+    if (f->spend) {
+        static uint8_t junk[STM_BOOTSTRAP_NODE_BLOCKS * STM_UB_SIZE];
+        memset(junk, 0x5a, sizeof junk);
+        uint64_t pa = 0;
+        while (stm_bootstrap_reserve(stm_alloc_bootstrap(a2),
+                                     STM_BOOTSTRAP_NODE_BLOCKS, 0, &pa) == STM_OK)
+            STM_ASSERT_OK(stm_bdev_write(d, stm_paddr_offset(pa) * STM_UB_SIZE,
+                                         junk, sizeof junk));
+    }
+    teardown(a2, s2, pool2);
+    stm_bdev_close(d);
+    if (!f->spend) return;
+
+    d = open_fresh_device();
+    a2 = NULL;
+    s2 = NULL;
+    stm_status as = stm_alloc_open_blank(d, &a2);
+    pool2 = make_test_pool(d);
+    stm_status os = (as == STM_OK)
+        ? stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2) : as;
+    if (os == STM_OK) {
+        r->wrong = 0;
+        for (uint64_t ino = 10u; ino < 16u; ino++) {
+            uint8_t buf[4096];
+            size_t got = 0;
+            stm_status rr = stm_sync_read_extent(s2, 1u, ino, 0u, buf,
+                                                 sizeof buf, &got);
+            if (rr != STM_OK || buf[0] != (uint8_t)('a' + (ino - 10u)))
+                r->wrong++;
+        }
+        teardown(a2, s2, pool2);
+    } else {
+        stm_pool_close(pool2);
+        if (as == STM_OK) stm_alloc_close(a2);
+    }
+    stm_bdev_close(d);
+}
+
+STM_TEST(sync_mount_survives_one_unreadable_bootstrap_header_slot) {
+    stm_bootstrap_stats built;
+    sync_f4_build("f6hdr", &built);
+    for (uint32_t k = 0; k < 2u; k++) {
+        /* k 0: the live header slot; k 1: the other. */
+        uint32_t slot = (k == 0) ? (uint32_t)built.header_slot_live
+                                 : 1u - (uint32_t)built.header_slot_live;
+        sync_f4_faults f = { (int64_t)slot, false, 0, true };
+        sync_f4_result r;
+        sync_f4_mount(&built, &f, &r);
+        fprintf(stderr, "  info: header slot %u unreadable: open %d, bitmap "
+                "gen %llu of %llu, restored %llu, wrong %d\n", slot,
+                (int)r.open, (unsigned long long)r.opened_gen,
+                (unsigned long long)built.bitmap_gen,
+                (unsigned long long)r.restored, r.wrong);
+        STM_ASSERT_OK(r.open);
+        STM_ASSERT_EQ(r.wrong, 0);
+    }
+    unlink(g_tmp_path);
+}
+
+STM_TEST(sync_mount_reconciles_a_bitmap_it_fell_back_to) {
+    stm_bootstrap_stats built;
+    sync_f4_build("f4ctl", &built);
+    sync_f4_faults f = { -1, true, 0, true };
+    sync_f4_result r;
+    sync_f4_mount(&built, &f, &r);
+    STM_ASSERT_OK(r.open);
+    /* The premise the walk-fault test leans on: this pool's fallback
+     * bitmap is stale, and a reconcile that completes takes nodes back. */
+    STM_ASSERT(r.opened_gen < built.bitmap_gen);
+    STM_ASSERT(r.restored > 0u);
+    STM_ASSERT_EQ(r.wrong, 0);
+    unlink(g_tmp_path);
+}
+
+/* A fallen-back bitmap, and one read error at each read of the open in
+ * turn: no open may succeed with that bitmap unreconciled. */
+STM_TEST(sync_mount_refuses_a_fallen_back_bitmap_it_could_not_reconcile) {
+    stm_bootstrap_stats built;
+    sync_f4_build("f4walk", &built);
+    unsigned unreconciled = 0, reached_end = 0, refused = 0;
+    for (int64_t n = 1; n <= 4000 && !reached_end; n++) {
+        sync_f4_faults f = { -1, true, n, false };
+        sync_f4_result r;
+        sync_f4_mount(&built, &f, &r);
+        if (r.walk_fired == 0) {          /* past the open's last read */
+            reached_end = 1;
+            STM_ASSERT_OK(r.open);
+            STM_ASSERT(r.restored > 0u);
+            continue;
+        }
+        if (r.open != STM_OK) { refused++; continue; }
+        if (r.opened_gen < built.bitmap_gen && r.restored == 0u) {
+            if (unreconciled == 0)
+                fprintf(stderr, "  info: n=%lld: open OK with the bitmap "
+                        "unreconciled\n", (long long)n);
+            unreconciled++;
+        }
+    }
+    fprintf(stderr, "  info: unreconciled opens %u, refused %u\n",
+            unreconciled, refused);
+    STM_ASSERT(reached_end);
+    STM_ASSERT_EQ(unreconciled, 0u);
+    unlink(g_tmp_path);
+}
+
+
+STM_TEST(sync_bootstrap_open_says_when_it_cannot_confirm_the_bitmap) {
+    stm_bootstrap_stats built;
+    sync_f4_build("f4conf", &built);
+    struct { int64_t hdr; bool bitmap; bool want; } legs[] = {
+        { -1, false, false },                               /* control */
+        { (int64_t)built.header_slot_live, false, true },
+        { 1 - (int64_t)built.header_slot_live, false, true },
+        { -1, true, true },
+    };
+    for (size_t i = 0; i < sizeof legs / sizeof legs[0]; i++) {
+        stm_bdev *d = open_fresh_device();
+        if (legs[i].hdr >= 0) {
+            uint64_t off = STM_BOOTSTRAP_OFFSET +
+                           (uint64_t)legs[i].hdr * STM_UB_SIZE;
+            stm_bdev_inject_read_range(d, off, off + STM_UB_SIZE, -1, STM_EIO);
+        }
+        if (legs[i].bitmap) {
+            uint64_t blk = built.bitmap_slot_live ? STM_BOOTSTRAP_BITMAP_SLOT_B
+                                                  : STM_BOOTSTRAP_BITMAP_SLOT_A;
+            uint64_t off = STM_BOOTSTRAP_OFFSET + blk * STM_UB_SIZE;
+            stm_bdev_inject_read_range(d, off,
+                off + STM_BOOTSTRAP_BITMAP_BLOCKS * (uint64_t)STM_UB_SIZE, 1,
+                STM_EIO);
+        }
+        stm_alloc *a2 = NULL;
+        STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+        STM_ASSERT_EQ(stm_bootstrap_bitmap_unconfirmed(stm_alloc_bootstrap(a2)),
+                      legs[i].want);
+        stm_alloc_close(a2);
+        stm_bdev_close(d);
+    }
+    unlink(g_tmp_path);
+    /* A fresh pool's header slot B is not written until its second
+     * bootstrap commit: one commit leaves the bitmap unconfirmed. */
+    make_tmp("f4fresh");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+    d = open_fresh_device();
+    a = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a));
+    STM_ASSERT(stm_bootstrap_bitmap_unconfirmed(stm_alloc_bootstrap(a)));
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("sync")

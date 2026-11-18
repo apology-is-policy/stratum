@@ -216,10 +216,12 @@ Btrfs pinned-extents + delayed-refs + `flush_space`→`COMMIT_TRANS`; ZFS
 - **Ring rotation:** `slot = gen % 63`. A commit never overwrites the
   most-recent-prior UB until a full ring cycle (252 commits), so the prior
   durable state always survives a single torn UB write.
-- **Selection (`stm_sb_mount_scan`):** scan all 4×63 slots, decode each
-  (a BLAKE3 csum mismatch = torn/partial → skipped), pick the **highest valid
+- **Selection (`stm_sb_mount_scan`):** scan all 4x63 slots, decode each
+  (a BLAKE3 csum mismatch = torn/partial -> skipped), pick the **highest valid
   `ub_gen`**. A torn final UB fails its MAC and is skipped, so mount falls back
-  to the prior gen automatically.
+  to the prior gen automatically. A slot the device cannot READ is not a torn
+  write: if it is the slot of gen best+1 or best+2 and two re-reads fail, the
+  mount fails closed (STM_EIO) instead (`07-sb-sync.md`).
 
 The generation counter is monotonic (each commit bumps by 2 for an established
 pool); the MAC over the encoded UB rejects any partial write. Together these

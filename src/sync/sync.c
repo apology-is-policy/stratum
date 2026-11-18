@@ -1307,15 +1307,8 @@ static stm_status compute_merkle_root(const uint8_t main_csum[32],
 /* Ring rotation.                                                             */
 /* ========================================================================= */
 
-static inline uint32_t ring_label_for_gen(uint64_t gen)
-{
-    return (uint32_t)(gen % (uint64_t)STM_LABELS_PER_DEVICE);
-}
-
-static inline uint32_t ring_slot_for_gen(uint64_t gen)
-{
-    return (uint32_t)(gen % (uint64_t)STM_UB_SLOTS_PER_LABEL);
-}
+/* stm_sb_ring_label_for_gen / stm_sb_ring_slot_for_gen (super.h): the
+ * mount scan shares the placement to know where a newer commit can be. */
 
 /* ========================================================================= */
 /* Uberblock construction.                                                    */
@@ -2159,9 +2152,12 @@ static uint64_t compute_auth_gen(const sync_scan *scans, size_t n, size_t quorum
 /* from the durable UB across every bootstrap-backed tree, then sweep every   */
 /* allocated-but-unmarked node (stm_bootstrap_reconcile_*).                   */
 /*                                                                            */
-/* It is BEST-EFFORT and never fails the mount: a mark error or a missing     */
-/* handle ABORTS the pass without sweeping (an incomplete mark must never free */
-/* a live node -- abort leaves the bitmap as found, reclaiming nothing). freed  */
+/* A mark error or a missing handle ABORTS the pass without sweeping (an       */
+/* incomplete mark must never free a live node -- abort leaves the bitmap as   */
+/* found, reclaiming nothing) and returns the error. The mount goes on unless  */
+/* open could not confirm the bitmap is the newest (stm_bootstrap_bitmap_      */
+/* unconfirmed): then only the pass's restore stands between it and a reserve  */
+/* handing out live nodes, and the mount fails instead. freed                  */
 /* > 0 is no sign of a crash: a pending free is not rebuilt on open, so the    */
 /* last commit's own frees are swept here after a clean unmount too.           */
 /*                                                                            */
@@ -2186,13 +2182,15 @@ static void sync_recon_mark(void *ctx, uint64_t paddr, uint32_t nblocks) {
     stm_status m = stm_bootstrap_reconcile_mark(r->boot, paddr, nblocks);
     if (m != STM_OK && r->mark_err == STM_OK) r->mark_err = m;
 }
-static void sync_reconcile_bootstrap(stm_sync *s) {
+static stm_status sync_reconcile_bootstrap(stm_sync *s) {
     s->reconcile_freed_nodes = 0;
     stm_bootstrap *boot = stm_alloc_bootstrap(s->alloc);
-    if (!boot) return;
+    if (!boot) return STM_OK;
     if (!s->roots || !s->keyschema || !s->repair_log || !s->cas_idx ||
-        !s->dataset_idx || !s->snap_idx) return;   /* a tree would go unmarked */
-    if (stm_bootstrap_reconcile_begin(boot) != STM_OK) return;
+        !s->dataset_idx || !s->snap_idx)
+        return STM_ECORRUPT;                       /* a tree would go unmarked */
+    stm_status bs = stm_bootstrap_reconcile_begin(boot);
+    if (bs != STM_OK) return bs;
 
     struct sync_recon_route route = { boot, STM_OK };
     stm_status rs = STM_OK;
@@ -2210,13 +2208,14 @@ static void sync_reconcile_bootstrap(stm_sync *s) {
      * an incomplete mark must never free a live node. */
     if (rs != STM_OK || route.mark_err != STM_OK) {
         stm_bootstrap_reconcile_abort(boot);
-        return;
+        return (rs != STM_OK) ? rs : route.mark_err;
     }
     uint64_t freed = 0;
-    if (stm_bootstrap_reconcile_end(boot, &freed) == STM_OK) {
-        s->reconcile_freed_nodes = freed;
-        stm_snapshot_index_set_boot_lists_unverified(s->snap_idx, false);
-    }
+    stm_status es = stm_bootstrap_reconcile_end(boot, &freed);
+    if (es != STM_OK) return es;
+    s->reconcile_freed_nodes = freed;
+    stm_snapshot_index_set_boot_lists_unverified(s->snap_idx, false);
+    return STM_OK;
 }
 
 stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
@@ -2246,6 +2245,7 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
      * an incompatible format version" — fail fast. */
     sync_scan *scans = calloc(n, sizeof *scans);
     if (!scans) return STM_ENOMEM;
+    bool saw_scan_eio = false;  /* a device whose ring could not be read */
     for (size_t i = 0; i < n; i++) {
         stm_bdev *di = stm_pool_device_bdev(p, (uint16_t)i);
         if (!di) continue;
@@ -2256,6 +2256,8 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         } else if (sc == STM_EBADVERSION) {
             free(scans);
             return STM_EBADVERSION;
+        } else if (sc != STM_ENOENT) {
+            saw_scan_eio = true;
         }
         /* STM_ENOENT / STM_ECORRUPT / STM_EIO: device contributes nothing. */
     }
@@ -2264,11 +2266,13 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
     uint64_t auth_gen = compute_auth_gen(scans, n, quorum);
     if (auth_gen == 0) {
         /* Not enough devices to form quorum. Distinguish:
-         *   - No device had a valid UB → STM_ENOENT (fresh pool). */
+         *   - No device had a valid UB -> STM_ENOENT (fresh pool),
+         *     unless a device's ring could not be read: STM_EIO. */
         size_t valid_count = 0;
         for (size_t i = 0; i < n; i++) if (scans[i].valid) valid_count++;
         free(scans);
-        return (valid_count == 0) ? STM_ENOENT : STM_EQUORUM;
+        if (valid_count == 0) return saw_scan_eio ? STM_EIO : STM_ENOENT;
+        return STM_EQUORUM;
     }
 
     /* R9 P0-1: bound durable_gen so the +1 (claim) and +2 (first
@@ -2887,8 +2891,8 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                          /*cas_index_gen=*/     s2->cas_index_root_gen,
                          /*merkle_root=*/       ub.ub_merkle_root,
                          &astats_claim);
-        uint32_t lbl  = ring_label_for_gen(auth_gen + 1);
-        uint32_t slot = ring_slot_for_gen(auth_gen + 1);
+        uint32_t lbl  = stm_sb_ring_label_for_gen(auth_gen + 1);
+        uint32_t slot = stm_sb_ring_slot_for_gen(auth_gen + 1);
         stm_status cw = write_ub_to_all_devices(s2, &claim_prototype, lbl, slot);
         if (cw == STM_OK) {
             s2->auth_gen       = auth_gen + 1;
@@ -2904,8 +2908,8 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
              * after having done in-RAM mutation. */
             s2->read_only      = true;
             uint64_t canon_gen = stm_load_le64(ub.ub_gen);
-            s2->live_label_idx = ring_label_for_gen(canon_gen);
-            s2->live_slot_idx  = ring_slot_for_gen(canon_gen);
+            s2->live_label_idx = stm_sb_ring_label_for_gen(canon_gen);
+            s2->live_slot_idx  = stm_sb_ring_slot_for_gen(canon_gen);
         } else {
             stm_sync_close(s2);
             return cw;
@@ -2931,11 +2935,20 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
 
     /* #791: reclaim crash-orphaned bootstrap (metadata) nodes now that every
      * tree is loaded -- BEFORE the pool starts serving, so the reclaimed bits
-     * are reusable this mount (durable on the next commit). Best-effort; never
-     * fails the mount. Skipped on a read-only pool (no commit will persist the
-     * swept bitmap, and a RO pool issues no reserves to brick on). */
+     * are reusable this mount (durable on the next commit). A pass that does
+     * not complete fails the mount only over a bitmap open could not confirm
+     * (its restore is then owed). Skipped on a read-only pool (no commit
+     * will persist the swept bitmap, and a RO pool issues no reserves to
+     * brick on). */
     if (s2->snap_idx) stm_snapshot_index_set_boot_lists_unverified(s2->snap_idx, true);
-    if (!s2->read_only) sync_reconcile_bootstrap(s2);
+    if (!s2->read_only) {
+        stm_status rc = sync_reconcile_bootstrap(s2);
+        if (rc != STM_OK &&
+            stm_bootstrap_bitmap_unconfirmed(stm_alloc_bootstrap(s2->alloc))) {
+            stm_sync_close(s2);
+            return rc;
+        }
+    }
 
     *out_sync = s2;
     return STM_OK;
@@ -3453,8 +3466,8 @@ stm_status stm_sync_commit(stm_sync *s)
      * strictly before the final UB write — the same durable ordering as
      * the old position (reservation durable-before final, quorum.tla). */
     if (!is_fresh) {
-        uint32_t res_label = ring_label_for_gen(reservation_gen);
-        uint32_t res_slot  = ring_slot_for_gen(reservation_gen);
+        uint32_t res_label = stm_sb_ring_label_for_gen(reservation_gen);
+        uint32_t res_slot  = stm_sb_ring_slot_for_gen(reservation_gen);
         stm_status rw = write_ub_to_all_devices(s, &res_prototype,
                                                     res_label, res_slot);
         if (rw != STM_OK) {
@@ -3517,8 +3530,8 @@ stm_status stm_sync_commit(stm_sync *s)
         if (ai) stm_bootstrap_commit_defer_finalize(stm_alloc_bootstrap(ai));
     }
 
-    uint32_t fin_label = ring_label_for_gen(target_gen);
-    uint32_t fin_slot  = ring_slot_for_gen(target_gen);
+    uint32_t fin_label = stm_sb_ring_label_for_gen(target_gen);
+    uint32_t fin_slot  = stm_sb_ring_slot_for_gen(target_gen);
     stm_status fw = write_ub_to_all_devices(s, &fin_prototype,
                                                 fin_label, fin_slot);
     if (fw != STM_OK) {

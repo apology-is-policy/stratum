@@ -11,6 +11,7 @@
 #include "tharness.h"
 #include <stratum/super.h>
 #include <stratum/block.h>
+#include <stratum/block_inject.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -397,6 +398,120 @@ STM_TEST(sb_mount_scan_four_label_redundancy) {
     STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 55u);
     STM_ASSERT_EQ(found_label, 3u);
 
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+
+/* o1c round 1 F1: a slot the device fails to READ is not a torn write.
+ * The scan fails closed when the slot of best+1 or best+2 (where the only
+ * newer commit can be) stays unreadable; elsewhere it skips the slot. */
+static void sb_put_gen(stm_bdev *d, uint64_t gen)
+{
+    stm_uberblock ub;
+    fill_example(&ub);
+    ub.ub_gen = stm_store_le64(gen);
+    STM_ASSERT_OK(stm_sb_label_write(d, (uint32_t)(gen % 4u),
+                                     (uint32_t)(gen % 63u), &ub));
+}
+
+static uint64_t sb_gen_off(stm_bdev *d, uint64_t gen)
+{
+    uint64_t lo[STM_LABELS_PER_DEVICE];
+    STM_ASSERT_OK(stm_label_offsets(stm_bdev_caps_of(d)->size_bytes, lo));
+    return lo[gen % 4u] + (gen % 63u) * (uint64_t)STM_UB_SIZE;
+}
+
+static void sb_fault_gen(stm_bdev *d, uint64_t gen, int64_t times)
+{
+    uint64_t off = sb_gen_off(d, gen);
+    stm_bdev_inject_read_range(d, off, off + STM_UB_SIZE, times, STM_EIO);
+}
+
+STM_TEST(sb_mount_scan_fails_closed_on_an_unreadable_successor_slot) {
+    stm_bdev *d = open_test_device("f1succ", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_gen(d, 41);
+    sb_put_gen(d, 42);
+    stm_uberblock found;
+
+    /* Control: the faults land, elsewhere they cost nothing. */
+    sb_fault_gen(d, 7, -1);
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &found, NULL, NULL));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
+    STM_ASSERT(stm_bdev_inject_read_range_fired(d) >= 1u);
+    stm_bdev_inject_read_range_clear(d);
+
+    /* best+1 unreadable for good: one read, two re-reads. The fired
+     * count is cumulative across _clear. */
+    uint32_t f0 = stm_bdev_inject_read_range_fired(d);
+    sb_fault_gen(d, 43, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan(d, &found, NULL, NULL), STM_EIO);
+    STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(d) - f0, 3u);
+    stm_bdev_inject_read_range_clear(d);
+
+    /* best+2 unreadable for good, best+1 blank. */
+    sb_fault_gen(d, 44, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan(d, &found, NULL, NULL), STM_EIO);
+    stm_bdev_inject_read_range_clear(d);
+
+    /* best+1 fails once: the re-read finds nothing newer there. */
+    f0 = stm_bdev_inject_read_range_fired(d);
+    sb_fault_gen(d, 43, 1);
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &found, NULL, NULL));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
+    STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(d) - f0, 1u);
+    stm_bdev_inject_read_range_clear(d);
+
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(sb_mount_scan_a_reread_that_finds_newer_checks_its_successors) {
+    stm_bdev *d = open_test_device("f1move", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_gen(d, 42);
+    sb_put_gen(d, 43);
+    sb_put_gen(d, 44);
+    stm_uberblock found;
+    uint32_t label = 99, slot = 99;
+
+    /* 43 and 44 each fail once: both re-reads succeed, 44 wins. */
+    sb_fault_gen(d, 43, 1);
+    sb_fault_gen(d, 44, 1);
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &found, &label, &slot));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 44u);
+    STM_ASSERT_EQ(label, 0u);
+    STM_ASSERT_EQ(slot, 44u);
+    stm_bdev_inject_read_range_clear(d);
+
+    /* 43 fails once (its re-read finds 43), then 43+1 = 44 for good. */
+    sb_fault_gen(d, 43, 1);
+    sb_fault_gen(d, 44, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan(d, &found, NULL, NULL), STM_EIO);
+    stm_bdev_inject_read_range_clear(d);
+
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(sb_mount_scan_a_device_that_reads_no_slot_is_eio_not_fresh) {
+    stm_bdev *d = open_test_device("f1deaf", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_gen(d, 5);
+    uint64_t lo[STM_LABELS_PER_DEVICE];
+    STM_ASSERT_OK(stm_label_offsets(stm_bdev_caps_of(d)->size_bytes, lo));
+    for (uint32_t l = 0; l < STM_LABELS_PER_DEVICE; l++)
+        stm_bdev_inject_read_range(d, lo[l], lo[l] + STM_LABEL_SIZE, -1,
+                                   STM_EIO);
+    stm_uberblock found;
+    STM_ASSERT_ERR(stm_sb_mount_scan(d, &found, NULL, NULL), STM_EIO);
+    stm_bdev_inject_read_range_clear(d);
+    /* Control: a blank device is still "nothing here". */
+    stm_bdev_close(d);
+    d = open_test_device("f1blank", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    STM_ASSERT_ERR(stm_sb_mount_scan(d, &found, NULL, NULL), STM_ENOENT);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }

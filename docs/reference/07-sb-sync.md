@@ -156,10 +156,29 @@ stm_status stm_sb_label_read(stm_bdev *d, uint32_t label, uint32_t slot, stm_ube
 stm_status stm_sb_label_write(stm_bdev *d, uint32_t label, uint32_t slot, const stm_uberblock *ub);
 
 // Scan every (label, slot) on a device, return the single uberblock with
-// highest valid ub_gen. Used at mount. Returns STM_ENOENT if no valid UB.
+// highest valid ub_gen. Used at mount. Returns STM_ENOENT if no valid UB,
+// STM_EIO if no slot decoded and the device failed a read, or if the slot
+// of gen best+1 or best+2 still fails after two re-reads.
 stm_status stm_sb_mount_scan(stm_bdev *d,
                               stm_uberblock *out, uint32_t *out_lbl, uint32_t *out_slot);
 ```
+
+A slot that fails to decode is a torn or unused slot and is skipped. A slot
+the device fails to READ is different: generations are written in order, one
+ring slot each (`stm_sb_ring_label_for_gen` / `stm_sb_ring_slot_for_gen`,
+super.h), so a commit newer than the best one found can only sit at best+1
+(the next reservation, or a mount's claim) or best+2 (its final). If the
+device cannot read either slot after two re-reads, the scan fails closed:
+mounting the best would roll the pool back past an acknowledged commit, and
+the mount's claim at best+1 would overwrite it for good. A re-read that finds
+a newer generation moves the best, and its successors are checked in turn.
+An unreadable slot anywhere else costs nothing. The price of one copy per
+generation: a slot at best+1 that stays unreadable refuses every mount, even
+when it held only an old generation, until the operator overwrites it,
+accepting the loss of at most the newest commit (each generation in two or
+more labels, which would remove this, is enqueued). (o1c review round 1, F1;
+btrfs's `usebackuproot` and ZFS's `zpool import -F` are likewise explicit
+opt-ins to a rollback, never a silent one.)
 
 ## Commit protocol (sync)
 
@@ -299,7 +318,10 @@ first record went answers `STM_EWEDGED` and the sync wedges.
 ### Mount flow
 
 ```
-1. For each device in pool: stm_sb_mount_scan → (highest valid ub_gen, ub).
+1. For each device in pool: stm_sb_mount_scan -> (highest valid ub_gen, ub).
+   A device whose scan answers STM_EIO contributes nothing; if no device
+   gave a uberblock and one answered STM_EIO, the open answers STM_EIO, not
+   STM_ENOENT (an unreadable pool is not a fresh one).
 2. Compute authoritative gen:
      sort valid gens desc
      auth = gens[quorum - 1]        // kth largest, where k = floor(N/2)+1

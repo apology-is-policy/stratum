@@ -61,9 +61,13 @@ stm_status stm_sb_label_write(stm_bdev *d, uint32_t label_idx,
     return stm_bdev_fsync(d);
 }
 
-stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
-                              uint32_t slot_idx, stm_uberblock *out_ub)
+/* *out_unreadable: the device failed the read itself, as against a slot
+ * that read and did not decode. */
+static stm_status label_read_ex(stm_bdev *d, uint32_t label_idx,
+                                uint32_t slot_idx, stm_uberblock *out_ub,
+                                bool *out_unreadable)
 {
+    *out_unreadable = false;
     if (!out_ub) return STM_EINVAL;
 
     uint64_t byte_offset = 0;
@@ -72,10 +76,26 @@ stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
 
     uint8_t buf[STM_UB_SIZE];
     s = stm_bdev_read(d, byte_offset, buf, sizeof buf);
-    if (s != STM_OK) return s;
+    if (s != STM_OK) {
+        *out_unreadable = true;
+        return s;
+    }
 
     return stm_ub_decode(buf, sizeof buf, out_ub);
 }
+
+stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
+                              uint32_t slot_idx, stm_uberblock *out_ub)
+{
+    bool unreadable = false;
+    return label_read_ex(d, label_idx, slot_idx, out_ub, &unreadable);
+}
+
+/* Re-reads of an unreadable slot that could hold a newer commit. */
+static const uint32_t SB_SCAN_REREADS = 2u;
+
+_Static_assert(STM_UB_SLOTS_PER_LABEL <= 64u,
+               "one uint64_t of unreadable-slot bits per label");
 
 stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
                               uint32_t *out_label_idx,
@@ -91,6 +111,8 @@ stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
     uint32_t best_label    = 0;
     uint32_t best_slot     = 0;
     stm_uberblock best_ub;
+    uint64_t unread[STM_LABELS_PER_DEVICE] = {0};  /* bit si: read failed */
+    bool     any_unread    = false;
 
     /* Scan every label × every commit-ring slot. We deliberately
      * skip the mirror slot (STM_UB_MIRROR_SLOT) since it carries a
@@ -99,12 +121,19 @@ stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
     for (uint32_t li = 0; li < STM_LABELS_PER_DEVICE; li++) {
         for (uint32_t si = 0; si < STM_UB_SLOTS_PER_LABEL; si++) {
             stm_uberblock candidate;
-            stm_status s = stm_sb_label_read(d, li, si, &candidate);
+            bool unreadable = false;
+            stm_status s = label_read_ex(d, li, si, &candidate, &unreadable);
             if (s != STM_OK) {
-                /* Expected: unused slots, corrupted slots. Skip —
+                /* Expected: unused slots, corrupted slots. Skip --
                  * but remember a version mismatch so we can surface
-                 * it as a distinct error if no slot decoded OK. */
-                if (s == STM_EBADVERSION) saw_bad_version = true;
+                 * it as a distinct error if no slot decoded OK, and a
+                 * slot the device could not read at all. */
+                if (unreadable) {
+                    unread[li] |= 1ull << si;
+                    any_unread = true;
+                } else if (s == STM_EBADVERSION) {
+                    saw_bad_version = true;
+                }
                 continue;
             }
             uint64_t gen = stm_load_le64(candidate.ub_gen);
@@ -124,7 +153,43 @@ stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
      * freshly" path — misleading an admin into reformatting a pool
      * that just needs an upgrade would be destructive. */
     if (!have_any) {
-        return saw_bad_version ? STM_EBADVERSION : STM_ENOENT;
+        if (saw_bad_version) return STM_EBADVERSION;
+        return any_unread ? STM_EIO : STM_ENOENT;
+    }
+
+    /* Generations are written in order, each to one ring slot, so a
+     * commit newer than best_gen can only be at best+1 (the next
+     * reservation, or a mount's claim) or best+2 (its final). If the
+     * device could not read either slot, the newest commit may be
+     * there: mounting best_gen would roll the pool back past it, and the
+     * mount's claim at best+1 would overwrite it. Re-read; still
+     * unreadable -> fail closed. A re-read that finds a newer
+     * generation moves best, and its own successors are checked. */
+    bool moved = true;
+    while (moved) {
+        moved = false;
+        for (uint64_t k = 1; k <= 2u && !moved; k++) {
+            uint64_t g  = best_gen + k;
+            uint32_t li = stm_sb_ring_label_for_gen(g);
+            uint32_t si = stm_sb_ring_slot_for_gen(g);
+            if (!(unread[li] & (1ull << si))) continue;
+            stm_uberblock candidate;
+            stm_status s = STM_EIO;
+            bool unreadable = true;
+            for (uint32_t r = 0; r < SB_SCAN_REREADS && unreadable; r++)
+                s = label_read_ex(d, li, si, &candidate, &unreadable);
+            if (unreadable) return STM_EIO;
+            unread[li] &= ~(1ull << si);
+            if (s != STM_OK) continue;
+            uint64_t gen = stm_load_le64(candidate.ub_gen);
+            if (gen > best_gen) {
+                best_gen   = gen;
+                best_label = li;
+                best_slot  = si;
+                best_ub    = candidate;
+                moved      = true;
+            }
+        }
     }
 
     *out_ub = best_ub;

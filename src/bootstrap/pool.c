@@ -113,6 +113,7 @@ struct stm_bootstrap {
     uint32_t   hdr_slot_live;       /* 0 or 1 (STM_BOOTSTRAP_HDR_SLOT_A/B)   */
     uint32_t   bitmap_slot_live;    /* 0 or 1                            */
     uint64_t   bitmap_gen;
+    bool       bitmap_unconfirmed;  /* stm_bootstrap_bitmap_unconfirmed */
 
     /* In-RAM bitmap: bit i = 1 iff node i is allocated (or PENDING). */
     uint8_t   *bitmap;
@@ -545,25 +546,29 @@ stm_status stm_bootstrap_open(stm_bdev *d, stm_bootstrap **out_alloc)
     uint8_t hdr_buf_a[STM_UB_SIZE];
     uint8_t hdr_buf_b[STM_UB_SIZE];
 
-    stm_status s = stm_bdev_read(d, hdr_slot_offset(0),
-                                  hdr_buf_a, sizeof hdr_buf_a);
-    if (s != STM_OK) return s;
-    s = stm_bdev_read(d, hdr_slot_offset(1), hdr_buf_b, sizeof hdr_buf_b);
-    if (s != STM_OK) return s;
+    /* A slot the device cannot read is like one that does not decode: the
+     * other slot alone can be a valid header. */
+    stm_status r_a = stm_bdev_read(d, hdr_slot_offset(0),
+                                    hdr_buf_a, sizeof hdr_buf_a);
+    stm_status r_b = stm_bdev_read(d, hdr_slot_offset(1),
+                                    hdr_buf_b, sizeof hdr_buf_b);
 
     stm_bootstrap_hdr hdr_a, hdr_b;
-    stm_status s_a = decode_hdr(hdr_buf_a, &hdr_a);
-    stm_status s_b = decode_hdr(hdr_buf_b, &hdr_b);
+    stm_status s_a = (r_a == STM_OK) ? decode_hdr(hdr_buf_a, &hdr_a) : r_a;
+    stm_status s_b = (r_b == STM_OK) ? decode_hdr(hdr_buf_b, &hdr_b) : r_b;
 
     bool have_a = (s_a == STM_OK);
     bool have_b = (s_b == STM_OK);
     if (!have_a && !have_b) {
         /* If either slot is STM_EBADVERSION (magic/version mismatch), the
-         * operator needs to know the format isn't what we expected;
-         * otherwise report generic corruption. */
+         * operator needs to know the format isn't what we expected; a
+         * device that read neither slot answers its own error; otherwise
+         * report generic corruption. */
         if (s_a == STM_EBADVERSION || s_b == STM_EBADVERSION) {
             return STM_EBADVERSION;
         }
+        if (r_a != STM_OK) return r_a;
+        if (r_b != STM_OK) return r_b;
         return STM_ECORRUPT;
     }
 
@@ -665,6 +670,11 @@ stm_status stm_bootstrap_open(stm_bdev *d, stm_bootstrap **out_alloc)
 
     a->bitmap_gen       = stm_load_le64(chosen_hdr->h_bitmap_gen);
     a->hdr_slot_live    = chosen_slot;
+    /* Confirmed newest only when both slots decoded and the newer one's
+     * bitmap loaded: a slot that did not read or decode may have held the
+     * newer header (a fresh pool's never-written slot B too, until its
+     * second commit). */
+    a->bitmap_unconfirmed = !(have_a && have_b && chosen_hdr == cand_hdr[0]);
     a->bitmap_slot_live =
         block_to_bitmap_slot(stm_load_le64(chosen_hdr->h_bitmap_block));
 
@@ -1363,6 +1373,11 @@ void stm_bootstrap_reconcile_abort(stm_bootstrap *a)
 /* ========================================================================= */
 /* Inspection.                                                                */
 /* ========================================================================= */
+
+bool stm_bootstrap_bitmap_unconfirmed(const stm_bootstrap *a)
+{
+    return a && a->bitmap_unconfirmed;
+}
 
 stm_status stm_bootstrap_stats_get(const stm_bootstrap *a, stm_bootstrap_stats *out)
 {

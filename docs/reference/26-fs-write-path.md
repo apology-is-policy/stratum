@@ -524,7 +524,15 @@ that guard turns red. `test_fs` holds 285 tests and
   happens once clears on the second read only where the read reaches the
   device: the Thylacine backend and the host backends' direct mode; a
   buffered host backend serves the second read from its page cache (an
-  `STM_EIO` is not cached). The
+  `STM_EIO` is not cached). The device probe has the same limit: on a
+  buffered backend, or under QEMU with `cache=writeback`, the label reads can
+  be answered from the host's page cache while reads that reach the device
+  fail, and a device outage there can drop a run (an uncached probe read is
+  enqueued). The probe costs up to four reads per failing replica on the
+  last pass, under `s->lock` on the locked path. In a mirror, a replica on a
+  bad sector beside one on a down device reads as the pool's failure, so the
+  run is kept and each commit fails until the device returns (latent: the fs
+  mounts one device today). The
   flushes before a truncate, reflink and migrate, the write's buffer-full
   flush and the reclaim's drain take the same callback. A direct write
   answers the error to its caller.

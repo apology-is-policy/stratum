@@ -198,8 +198,14 @@ sync-layer driver `sync_reconcile_bootstrap`:
   driver may feed every paddr a tree walk yields.
 - `end` frees every ALLOCATED-but-UNMARKED node (the orphans), reports the
   count, and the freed bits become durable on the next `stm_bootstrap_commit`.
-- `abort` drops the marked-bitmap WITHOUT sweeping — the fail-safe when a mark
+- `abort` drops the marked-bitmap WITHOUT sweeping: the fail-safe when a mark
   pass could not complete (an incomplete mark must never free a live node).
+- `end` also takes back every node a tree names that the bitmap calls free
+  (`restored_nodes`): what repairs a bitmap open fell back to. A pass that
+  does not complete leaves the mount going only when open confirmed its
+  bitmap; over an unconfirmed one (`stm_bootstrap_bitmap_unconfirmed`) the
+  mount fails with the pass's error, since the next reserve would hand out a
+  live node (o1c review round 1, F4).
 
 **Completeness is the caller's obligation**: a bootstrap-backed tree left
 unwalked has its live nodes swept → corruption. The driver walks alloc +
@@ -284,8 +290,14 @@ blocks 36..39: data node 1
   slot from the one the current state lives in, then fsyncs, then the
   header points at the new slot. Torn-write safe: either slot can
   be the authoritative one on mount based on a higher `bitmap_gen`
-  (a header whose bitmap fails `h_bitmap_csum` is rejected and open
-  falls back to the other pair — the R7a fallback).
+  (a header whose bitmap fails `h_bitmap_csum` or does not read is rejected
+  and open falls back to the other pair: the R7a fallback). A header slot the
+  device cannot read is treated like one that does not decode, so the other
+  slot alone can open the pool. Open is sure it took the newest pair only
+  when both slots decoded and the newer one's bitmap loaded;
+  otherwise `stm_bootstrap_bitmap_unconfirmed` is true, the bitmap may be a
+  commit older than the trees the mount takes, and the mount's reconcile must
+  complete (below).
 - **CF-4 B clean short-circuit**: a commit with no bitmap/user_data
   mutation since the last persisted COW AND nothing sweepable is a
   no-op — no COW, no fsync, `bitmap_gen` unchanged (the gen exists

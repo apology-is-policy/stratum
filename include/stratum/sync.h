@@ -1418,8 +1418,13 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  * other than EIO on the second pass, EIO from a device that reads none of
  * its labels, or a locked dataset leaves it false. With out_record_bad
  * NULL each replica is read once; with it a failing replica is read twice,
- * under s->lock on the locked path. A covering write's drain drops its
- * run only on such a failure (fs).
+ * under s->lock on the locked path, and an EIO on the second read costs up
+ * to four more reads (each label's mirror slot until one answers), under
+ * s->lock too: on a device in error recovery each can take seconds. On a
+ * buffered backend (the host page cache; a QEMU drive with
+ * cache=writeback) that probe can be answered from the cache while the
+ * reads that reach the device fail, so an outage there can drop a run. A
+ * covering write's drain drops its run only on such a failure (fs).
  */
 STM_MUST_USE
 stm_status stm_sync_read_extent_ex(stm_sync *s, uint64_t dataset_id,

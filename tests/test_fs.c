@@ -13392,3 +13392,41 @@ STM_TEST(fs_write_error_lines_to_stderr_stop_at_32_a_mount) {
     unlink(g_tmp_path);
     unlink(g_key_path);
 }
+
+/* o1c round 1 F8: the device probe reads each label's mirror slot until
+ * one answers. With label 0's unreadable and the others whole the device
+ * still answers, so the record's bad sector is its own: the run drops. */
+STM_TEST(fs_a_bad_sector_with_label_0s_mirror_slot_unreadable_is_the_records) {
+    uint64_t f = 0, g = 0, h = 0;
+    unsigned nrep = 0;
+    stm_fs *fs = o1_mount("o1_lbl0", &f, &g, &h, -1, false, &nrep);
+    if (!fs) return;
+    struct stm_bdev *d = stm_fs_bdev_for_test(fs);
+    uint64_t lo[STM_LABELS_PER_DEVICE];
+    STM_ASSERT_OK(stm_label_offsets(stm_bdev_caps_of(d)->size_bytes, lo));
+    uint64_t m0 = lo[0] + (uint64_t)STM_UB_MIRROR_SLOT * STM_UB_SIZE;
+    stm_bdev_inject_read_range(d, m0, m0 + STM_UB_SIZE, -1, STM_EIO);
+    x6_sink_reset();
+    stm_fs_set_event_sink(fs, x6_sink, NULL);
+    uint8_t w[10];
+    memset(w, 'w', sizeof w);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 8292, w, sizeof w));
+    uint32_t f0 = stm_bdev_inject_read_range_fired(d);
+    stm_status c1 = stm_fs_commit(fs);
+    uint32_t fired = stm_bdev_inject_read_range_fired(d) - f0;
+    fprintf(stderr, "  info: o1 label 0 mirror unreadable: commit %d, "
+            "faulted reads %u, replicas %u\n", (int)c1, (unsigned)fired, nrep);
+    STM_ASSERT_OK(c1);
+    /* Per replica: a lock-free read, two locked reads, the probe's label 0. */
+    STM_ASSERT(fired >= 4u * nrep);
+    STM_ASSERT(strstr(x6_events, "run dropped") != NULL);
+    uint8_t b[4096];
+    memset(b, 'F', sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, b, sizeof b));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_fsync(fs, 1, f, NULL));
+    STM_ASSERT_ERR(stm_fs_fsync(fs, 1, g, NULL), STM_EIO);
+    stm_fs_set_event_sink(fs, NULL, NULL);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    o1_after(f, g, true, false);
+}

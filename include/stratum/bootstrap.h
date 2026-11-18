@@ -441,6 +441,13 @@ void stm_bootstrap_reconcile_abort(stm_bootstrap *a);
 STM_MUST_USE
 stm_status stm_bootstrap_stats_get(const stm_bootstrap *a, stm_bootstrap_stats *out);
 
+/* True when open could not confirm it took the newest header + bitmap
+ * pair: a header slot did not read or decode, or the newer header's bitmap
+ * failed and open took the older pair. The bitmap may then be a commit
+ * older than the trees the mount takes, and marks free nodes they hold:
+ * the mount's reconcile must complete before the first reserve. */
+bool stm_bootstrap_bitmap_unconfirmed(const stm_bootstrap *a);
+
 /* Report whether a given paddr's data node is currently allocated (bitmap
  * bit set, includes PENDING). For tests and diagnostics. */
 STM_MUST_USE

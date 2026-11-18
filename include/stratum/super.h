@@ -547,6 +547,16 @@ extern "C" {
 #define STM_UB_SLOTS_PER_LABEL 63u                       /* commit ring */
 #define STM_UB_MIRROR_SLOT    63u                        /* pool-config mirror */
 
+/* Commit-ring placement: generation `gen` lives in label gen % 4, slot
+ * gen % 63. 4 and 63 are coprime, so 252 consecutive generations take 252
+ * distinct slots. */
+static inline uint32_t stm_sb_ring_label_for_gen(uint64_t gen) {
+    return (uint32_t)(gen % (uint64_t)STM_LABELS_PER_DEVICE);
+}
+static inline uint32_t stm_sb_ring_slot_for_gen(uint64_t gen) {
+    return (uint32_t)(gen % (uint64_t)STM_UB_SLOTS_PER_LABEL);
+}
+
 /* Minimum device size: 4 × labels + some user-data breathing room.
  * Labels are 2 × 256 KiB at head + 2 × 256 KiB at tail, so 1 MiB each
  * end. 8 MiB minimum is conservative. */
@@ -1083,6 +1093,12 @@ stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
  * (fresh / never-mounted / irrecoverably corrupt). Per-slot
  * STM_ECORRUPT / STM_EBADVERSION failures are NOT errors — they're
  * expected for unused slots and get silently filtered out.
+ *
+ * A slot the device fails to READ is not a torn write. Returns STM_EIO
+ * when no slot decoded and some read failed, or when the slot of
+ * generation best+1 or best+2 (where the only newer commit could be)
+ * still fails after a bounded re-read: mounting the older generation
+ * would roll back an acknowledged commit.
  *
  * Single-device: this is the authoritative mount-time selection.
  * Multi-device pools (Phase 5) will add a quorum layer on top.
