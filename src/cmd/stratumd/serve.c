@@ -29,6 +29,7 @@
 #include <stratum/listen.h>
 #include <stratum/lp9.h>
 #include <stratum/scrub.h>
+#include <stratum/super.h>
 #include <stratum/sync.h>
 #include <stratum/types.h>
 
@@ -1502,6 +1503,9 @@ static stm_status stratumd_run_client(const stm_stratumd_opts *opts)
  * --ctl-listen refused (one-shot, nothing to serve). */
 static stm_status image_must_exist(const char *path);
 
+static void say_scan_refusal(const stm_stratumd_opts *opts, stm_status rc,
+                             const stm_sb_scan_refusal *why);
+
 static stm_status stratumd_run_provision(const stm_stratumd_opts *opts, const int *claimed_fd)
 {
     if (!opts->provision_dataset_name || !*opts->provision_dataset_name) {
@@ -1570,6 +1574,7 @@ static stm_status stratumd_run_provision(const stm_stratumd_opts *opts, const in
     /* Mount the pool. corvus_socket + token are forwarded so any
      * pre-existing CORVUS slots resolve at mount; a freshly-formatted
      * pool has only LEGACY slots and the forward is harmless. */
+    stm_sb_scan_refusal refusal = {0};
     stm_fs_mount_opts mopts = {
         .read_only              = false,
         .keyfile_path           = opts->keyfile_path,
@@ -1581,6 +1586,7 @@ static stm_status stratumd_run_provision(const stm_stratumd_opts *opts, const in
         .corvus_socket             = opts->corvus_unwrap_socket,
         .corvus_session_token_file = opts->corvus_session_token_file,
         .claimed_fd                = claimed_fd,
+        .scan_refusal              = &refusal,
     };
     stm_fs *fs = NULL;
     stm_status rc = image_must_exist(opts->fs_path);
@@ -1590,6 +1596,7 @@ static stm_status stratumd_run_provision(const stm_stratumd_opts *opts, const in
         fprintf(stderr,
             "stratumd: provisioning: mount of %s failed (rc=%d)\n",
             opts->fs_path, (int)rc);
+        say_scan_refusal(opts, rc, &refusal);
         return rc;
     }
 
@@ -1750,6 +1757,19 @@ static void say_why_mount_failed(const stm_stratumd_opts *opts, stm_status rc)
                     "or it is damaged\n", opts->fs_path);
 }
 
+/* A mount that stops rather than roll back past a commit it cannot read says
+ * where that commit would be, so the slot can be found and dealt with. */
+static void say_scan_refusal(const stm_stratumd_opts *opts, stm_status rc,
+                             const stm_sb_scan_refusal *why)
+{
+    if (rc != STM_EIO || why->gen == 0) return;
+    fprintf(stderr, "stratumd: %s: the newest commit may be generation %llu, in uberblock "
+                    "label %u slot %u (byte offset %llu), which the device cannot read; "
+                    "the mount stops rather than go back to generation %llu\n",
+            opts->fs_path, (unsigned long long)why->gen, why->label_idx, why->slot_idx,
+            (unsigned long long)why->byte_offset, (unsigned long long)why->best_gen);
+}
+
 static stm_status stratumd_run_locked(const stm_stratumd_opts *opts, const int *claimed_fd);
 
 stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
@@ -1795,6 +1815,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts, const int *
      * (stratumd_run_provision builds its own). */
     if (opts->provision_corvus) return stratumd_run_provision(opts, claimed_fd);
 
+    stm_sb_scan_refusal refusal = {0};
     stm_fs_mount_opts mopts = {
         .read_only             = opts->read_only,
         .keyfile_path          = opts->keyfile_path,
@@ -1809,6 +1830,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts, const int *
         .corvus_socket             = opts->corvus_unwrap_socket,
         .corvus_session_token_file = opts->corvus_session_token_file,
         .claimed_fd                = claimed_fd,
+        .scan_refusal              = &refusal,
     };
 
     stm_fs *fs = NULL;
@@ -1817,6 +1839,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts, const int *
     rc = stm_fs_mount(opts->fs_path, &mopts, &fs);
     if (rc != STM_OK) {
         say_why_mount_failed(opts, rc);
+        say_scan_refusal(opts, rc, &refusal);
         if (rc == STM_ESERIAL && opts->bind_pool_serial) {
             /* TLY-A1: log the truncated observed serial + truncated
              * expected serial. Full values stay out of the public

@@ -303,7 +303,8 @@ static void encode_hdr(const stm_bootstrap_hdr *hdr_in, uint8_t buf[STM_UB_SIZE]
 
 /*
  * Deserialize a 4 KiB header buffer. Validates magic, version, self-csum.
- * Returns STM_EBADVERSION on magic/version mismatch, STM_ECORRUPT on csum.
+ * Returns STM_ENOENT on a bad magic (nothing there), STM_EBADVERSION on a
+ * version mismatch, STM_ECORRUPT on csum.
  */
 static stm_status decode_hdr(const uint8_t buf[STM_UB_SIZE],
                               stm_bootstrap_hdr *out_hdr)
@@ -311,7 +312,7 @@ static stm_status decode_hdr(const uint8_t buf[STM_UB_SIZE],
     const stm_bootstrap_hdr *on_disk = (const stm_bootstrap_hdr *)buf;
 
     uint64_t magic = stm_load_le64(on_disk->h_magic);
-    if (magic != STM_BOOTSTRAP_HDR_MAGIC) return STM_EBADVERSION;
+    if (magic != STM_BOOTSTRAP_HDR_MAGIC) return STM_ENOENT;
     uint32_t version = stm_load_le32(on_disk->h_version);
     if (version != STM_BOOTSTRAP_HDR_VERSION) return STM_EBADVERSION;
 
@@ -560,10 +561,11 @@ stm_status stm_bootstrap_open(stm_bdev *d, stm_bootstrap **out_alloc)
     bool have_a = (s_a == STM_OK);
     bool have_b = (s_b == STM_OK);
     if (!have_a && !have_b) {
-        /* If either slot is STM_EBADVERSION (magic/version mismatch), the
-         * operator needs to know the format isn't what we expected; a
-         * device that read neither slot answers its own error; otherwise
-         * report generic corruption. */
+        /* If either slot is STM_EBADVERSION (a header at another
+         * version), the operator needs to know the format isn't what we
+         * expected; a device that failed a slot's read answers its own
+         * error; otherwise (blank or failing its csum, under a pool's
+         * uberblock) report corruption. */
         if (s_a == STM_EBADVERSION || s_b == STM_EBADVERSION) {
             return STM_EBADVERSION;
         }
@@ -609,6 +611,7 @@ stm_status stm_bootstrap_open(stm_bdev *d, stm_bootstrap **out_alloc)
 
     stm_bootstrap_hdr *chosen_hdr  = NULL;
     uint32_t        chosen_slot = 0;
+    stm_status      read_err    = STM_OK;   /* a bitmap the device failed */
     for (int i = 0; i < ncand; i++) {
         stm_status cs = load_bitmap_for_hdr(d, cand_hdr[i], bitmap_region);
         if (cs == STM_OK) {
@@ -616,8 +619,12 @@ stm_status stm_bootstrap_open(stm_bdev *d, stm_bootstrap **out_alloc)
             chosen_slot = cand_slot[i];
             break;
         }
+        if (cs != STM_ECORRUPT) read_err = cs;
     }
-    if (!chosen_hdr) { rc = STM_ECORRUPT; goto done; }
+    if (!chosen_hdr) {
+        rc = (read_err != STM_OK) ? read_err : STM_ECORRUPT;
+        goto done;
+    }
 
     /* Validate bounds on decoded sizes before using them (R7a P2-2):
      * an attacker-controlled header with a valid csum must not drive

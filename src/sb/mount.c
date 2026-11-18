@@ -94,13 +94,86 @@ stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
 /* Re-reads of an unreadable slot that could hold a newer commit. */
 static const uint32_t SB_SCAN_REREADS = 2u;
 
-_Static_assert(STM_UB_SLOTS_PER_LABEL <= 64u,
-               "one uint64_t of unreadable-slot bits per label");
+typedef enum {
+    SB_SLOT_VALID = 0,   /* decoded */
+    SB_SLOT_BLANK,       /* read; no uberblock magic: never written */
+    SB_SLOT_UNDECODED,   /* read; magic, but it did not decode */
+    SB_SLOT_UNREADABLE   /* the device failed the read */
+} sb_slot_state;
 
-stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
-                              uint32_t *out_label_idx,
-                              uint32_t *out_slot_idx)
+static uint8_t sb_slot_classify(stm_status s, bool unreadable)
 {
+    if (unreadable)      return (uint8_t)SB_SLOT_UNREADABLE;
+    if (s == STM_OK)     return (uint8_t)SB_SLOT_VALID;
+    if (s == STM_ENOENT) return (uint8_t)SB_SLOT_BLANK;
+    return (uint8_t)SB_SLOT_UNDECODED;
+}
+
+/* The state of slot(gen), re-read if the device failed it. A slot that
+ * decoded in the scan holds a generation no newer than best; *newer is
+ * set when a re-read decodes one above best_gen into *cand. */
+static sb_slot_state sb_successor(stm_bdev *d,
+                                  uint8_t st[STM_LABELS_PER_DEVICE][STM_UB_SLOTS_PER_LABEL],
+                                  uint64_t gen, uint64_t best_gen,
+                                  stm_uberblock *cand, bool *newer)
+{
+    uint32_t li = stm_sb_ring_label_for_gen(gen);
+    uint32_t si = stm_sb_ring_slot_for_gen(gen);
+    *newer = false;
+    if (st[li][si] != (uint8_t)SB_SLOT_UNREADABLE)
+        return (sb_slot_state)st[li][si];
+    for (uint32_t r = 0; r < SB_SCAN_REREADS; r++) {
+        bool unreadable = false;
+        stm_status s = label_read_ex(d, li, si, cand, &unreadable);
+        if (unreadable) continue;
+        st[li][si] = sb_slot_classify(s, false);
+        *newer = s == STM_OK && stm_load_le64(cand->ub_gen) > best_gen;
+        return (sb_slot_state)st[li][si];
+    }
+    return SB_SLOT_UNREADABLE;
+}
+
+/* A reservation and a mount's claim carry their predecessor's trees
+ * (merkle_root unchanged), so best is a final when best-1 decodes with
+ * another merkle_root. Anything less proves nothing. */
+static bool sb_best_is_final(stm_bdev *d, const stm_uberblock *best,
+                             uint64_t best_gen)
+{
+    if (best_gen < 2u) return false;
+    uint64_t g = best_gen - 1u;
+    stm_uberblock prev;
+    bool unreadable = false;
+    if (label_read_ex(d, stm_sb_ring_label_for_gen(g),
+                      stm_sb_ring_slot_for_gen(g), &prev,
+                      &unreadable) != STM_OK)
+        return false;
+    if (stm_load_le64(prev.ub_gen) != g) return false;
+    return memcmp(prev.ub_merkle_root, best->ub_merkle_root,
+                  sizeof prev.ub_merkle_root) != 0;
+}
+
+static stm_status sb_refuse(stm_bdev *d, uint64_t gen, uint64_t best_gen,
+                            stm_sb_scan_refusal *why)
+{
+    if (why) {
+        why->gen       = gen;
+        why->label_idx = stm_sb_ring_label_for_gen(gen);
+        why->slot_idx  = stm_sb_ring_slot_for_gen(gen);
+        why->best_gen  = best_gen;
+        if (compute_offset(d, why->label_idx, why->slot_idx,
+                           &why->byte_offset) != STM_OK)
+            why->byte_offset = 0;
+    }
+    return STM_EIO;
+}
+
+stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
+                                stm_uberblock *out_ub,
+                                uint32_t *out_label_idx,
+                                uint32_t *out_slot_idx,
+                                stm_sb_scan_refusal *why)
+{
+    if (why) memset(why, 0, sizeof *why);
     if (!d || !out_ub) return STM_EINVAL;
 
     bool    have_any       = false;
@@ -111,7 +184,7 @@ stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
     uint32_t best_label    = 0;
     uint32_t best_slot     = 0;
     stm_uberblock best_ub;
-    uint64_t unread[STM_LABELS_PER_DEVICE] = {0};  /* bit si: read failed */
+    uint8_t  st[STM_LABELS_PER_DEVICE][STM_UB_SLOTS_PER_LABEL];
     bool     any_unread    = false;
 
     /* Scan every label × every commit-ring slot. We deliberately
@@ -123,17 +196,14 @@ stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
             stm_uberblock candidate;
             bool unreadable = false;
             stm_status s = label_read_ex(d, li, si, &candidate, &unreadable);
+            st[li][si] = sb_slot_classify(s, unreadable);
             if (s != STM_OK) {
                 /* Expected: unused slots, corrupted slots. Skip --
                  * but remember a version mismatch so we can surface
                  * it as a distinct error if no slot decoded OK, and a
                  * slot the device could not read at all. */
-                if (unreadable) {
-                    unread[li] |= 1ull << si;
-                    any_unread = true;
-                } else if (s == STM_EBADVERSION) {
-                    saw_bad_version = true;
-                }
+                if (unreadable) any_unread = true;
+                else if (s == STM_EBADVERSION) saw_bad_version = true;
                 continue;
             }
             uint64_t gen = stm_load_le64(candidate.ub_gen);
@@ -157,43 +227,63 @@ stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
         return any_unread ? STM_EIO : STM_ENOENT;
     }
 
-    /* Generations are written in order, each to one ring slot, so a
-     * commit newer than best_gen can only be at best+1 (the next
-     * reservation, or a mount's claim) or best+2 (its final). If the
-     * device could not read either slot, the newest commit may be
-     * there: mounting best_gen would roll the pool back past it, and the
-     * mount's claim at best+1 would overwrite it. Re-read; still
-     * unreadable -> fail closed. A re-read that finds a newer
-     * generation moves best, and its own successors are checked. */
-    bool moved = true;
-    while (moved) {
-        moved = false;
-        for (uint64_t k = 1; k <= 2u && !moved; k++) {
-            uint64_t g  = best_gen + k;
-            uint32_t li = stm_sb_ring_label_for_gen(g);
-            uint32_t si = stm_sb_ring_slot_for_gen(g);
-            if (!(unread[li] & (1ull << si))) continue;
-            stm_uberblock candidate;
-            stm_status s = STM_EIO;
-            bool unreadable = true;
-            for (uint32_t r = 0; r < SB_SCAN_REREADS && unreadable; r++)
-                s = label_read_ex(d, li, si, &candidate, &unreadable);
-            if (unreadable) return STM_EIO;
-            unread[li] &= ~(1ull << si);
-            if (s != STM_OK) continue;
-            uint64_t gen = stm_load_le64(candidate.ub_gen);
-            if (gen > best_gen) {
-                best_gen   = gen;
-                best_label = li;
-                best_slot  = si;
-                best_ub    = candidate;
-                moved      = true;
-            }
+    /* Each generation's UB is in one ring slot. A commit newer than
+     * best can only follow it: at best+1 (when best is a reservation,
+     * best+1 is its final; otherwise a reservation or a claim with
+     * best's trees) or at best+2 (the final after a reservation at
+     * best+1). If the device cannot read the slot where it would be,
+     * mounting best would roll the pool back past it and the mount's
+     * claim at best+1 would overwrite it: re-read, and refuse while it
+     * stays unreadable. A re-read that finds a newer generation moves
+     * best, and its own successors are checked.
+     *
+     * One device writes its generations in order, each after the last
+     * is durable, so it refuses only where an acknowledged commit can
+     * hide: best+1 when best may be a reservation, and best+2 only when
+     * best+1 did not read as an older generation or blank. A device of
+     * a multi-device pool can miss a generation's write while quorum
+     * holds, so there either slot unreadable refuses. */
+    for (;;) {
+        stm_uberblock cand;
+        bool newer = false;
+        uint64_t g1 = best_gen + 1u;
+        uint64_t g2 = best_gen + 2u;
+        sb_slot_state s1 = sb_successor(d, st, g1, best_gen, &cand, &newer);
+        if (newer) {
+            best_gen   = stm_load_le64(cand.ub_gen);
+            best_label = stm_sb_ring_label_for_gen(g1);
+            best_slot  = stm_sb_ring_slot_for_gen(g1);
+            best_ub    = cand;
+            continue;
         }
+        if (one_device && (s1 == SB_SLOT_VALID || s1 == SB_SLOT_BLANK))
+            break;
+        if (s1 == SB_SLOT_UNREADABLE &&
+            !(one_device && sb_best_is_final(d, &best_ub, best_gen)))
+            return sb_refuse(d, g1, best_gen, why);
+        sb_slot_state s2 = sb_successor(d, st, g2, best_gen, &cand, &newer);
+        if (newer) {
+            best_gen   = stm_load_le64(cand.ub_gen);
+            best_label = stm_sb_ring_label_for_gen(g2);
+            best_slot  = stm_sb_ring_slot_for_gen(g2);
+            best_ub    = cand;
+            continue;
+        }
+        if (s2 == SB_SLOT_UNREADABLE)
+            return sb_refuse(d, g2, best_gen, why);
+        break;
     }
 
     *out_ub = best_ub;
     if (out_label_idx) *out_label_idx = best_label;
     if (out_slot_idx)  *out_slot_idx  = best_slot;
     return STM_OK;
+}
+
+stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
+                              uint32_t *out_label_idx,
+                              uint32_t *out_slot_idx)
+{
+    return stm_sb_mount_scan_ex(d, false, out_ub, out_label_idx,
+                                out_slot_idx, NULL);
 }

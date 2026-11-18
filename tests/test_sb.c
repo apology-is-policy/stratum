@@ -516,4 +516,112 @@ STM_TEST(sb_mount_scan_a_device_that_reads_no_slot_is_eio_not_fresh) {
     unlink(g_tmp_path);
 }
 
+
+/* o1c round 2 F1: on one device (its generations contiguous) the scan
+ * refuses only where an acknowledged commit can hide. m fills the
+ * merkle_root, so a final (trees other than its predecessor's) can be
+ * told from a reservation (the same trees). */
+static void sb_put_gen_m(stm_bdev *d, uint64_t gen, uint8_t m)
+{
+    stm_uberblock ub;
+    fill_example(&ub);
+    ub.ub_gen = stm_store_le64(gen);
+    memset(ub.ub_merkle_root, m, sizeof ub.ub_merkle_root);
+    STM_ASSERT_OK(stm_sb_label_write(d, (uint32_t)(gen % 4u),
+                                     (uint32_t)(gen % 63u), &ub));
+}
+
+/* gen's slot holds a UB whose checksum no longer matches. */
+static void sb_rot_gen(stm_bdev *d, uint64_t gen)
+{
+    sb_put_gen_m(d, gen, 9);
+    uint8_t buf[STM_UB_SIZE];
+    uint64_t off = sb_gen_off(d, gen);
+    STM_ASSERT_OK(stm_bdev_read(d, off, buf, sizeof buf));
+    buf[384] ^= 0xffu;
+    STM_ASSERT_OK(stm_bdev_write(d, off, buf, sizeof buf));
+    stm_uberblock ub;
+    STM_ASSERT_ERR(stm_sb_label_read(d, (uint32_t)(gen % 4u),
+                                     (uint32_t)(gen % 63u), &ub),
+                   STM_ECORRUPT);
+}
+
+STM_TEST(sb_mount_scan_one_device_refuses_only_where_a_commit_can_hide) {
+    stm_uberblock found;
+    stm_sb_scan_refusal why;
+
+    /* best (42) a reservation: best+1 may be its final. */
+    stm_bdev *d = open_test_device("r2res", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_gen_m(d, 41, 1);
+    sb_put_gen_m(d, 42, 1);
+    sb_fault_gen(d, 43, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why),
+                   STM_EIO);
+    STM_ASSERT_EQ(why.gen, 43u);
+    STM_ASSERT_EQ(why.label_idx, 3u);
+    STM_ASSERT_EQ(why.slot_idx, 43u);
+    STM_ASSERT_EQ(why.byte_offset, sb_gen_off(d, 43));
+    STM_ASSERT_EQ(why.best_gen, 42u);
+    stm_bdev_inject_read_range_clear(d);
+    /* best+1 blank: nothing can follow it. The strict rule refuses. */
+    sb_fault_gen(d, 44, -1);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
+    STM_ASSERT_EQ(why.gen, 0u);
+    STM_ASSERT_ERR(stm_sb_mount_scan(d, &found, NULL, NULL), STM_EIO);
+    /* best+1 read but did not decode: a durable generation gone bad may
+     * be there, so best+2 counts. */
+    sb_rot_gen(d, 43);
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why),
+                   STM_EIO);
+    STM_ASSERT_EQ(why.gen, 44u);
+    stm_bdev_inject_read_range_clear(d);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+
+    /* best (42) a final: best+1 holds at most a reservation or a claim
+     * with its trees... */
+    d = open_test_device("r2fin", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_gen_m(d, 41, 1);
+    sb_put_gen_m(d, 42, 2);
+    sb_fault_gen(d, 43, -1);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
+    STM_ASSERT_ERR(stm_sb_mount_scan(d, &found, NULL, NULL), STM_EIO);
+    /* ...but best+2 may be the final after that reservation. */
+    sb_fault_gen(d, 44, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why),
+                   STM_EIO);
+    STM_ASSERT_EQ(why.gen, 44u);
+    stm_bdev_inject_read_range_clear(d);
+    /* best-1 unreadable: best cannot be shown to be a final. */
+    sb_fault_gen(d, 41, -1);
+    sb_fault_gen(d, 43, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why),
+                   STM_EIO);
+    STM_ASSERT_EQ(why.gen, 43u);
+    stm_bdev_inject_read_range_clear(d);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+
+    /* best+1's slot holds an older generation (the ring came round), so
+     * best+1 never landed. slot(49) is slot(301). */
+    d = open_test_device("r2old", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_gen(d, 49);
+    sb_put_gen(d, 299);
+    sb_put_gen(d, 300);
+    sb_fault_gen(d, 302, -1);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 300u);
+    STM_ASSERT_ERR(stm_sb_mount_scan(d, &found, NULL, NULL), STM_EIO);
+    stm_bdev_inject_read_range_clear(d);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("sb")

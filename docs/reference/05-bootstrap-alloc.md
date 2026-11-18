@@ -205,7 +205,9 @@ sync-layer driver `sync_reconcile_bootstrap`:
   does not complete leaves the mount going only when open confirmed its
   bitmap; over an unconfirmed one (`stm_bootstrap_bitmap_unconfirmed`) the
   mount fails with the pass's error, since the next reserve would hand out a
-  live node (o1c review round 1, F4).
+  live node (o1c review round 1, F4). This covers device 0's bootstrap: the
+  allocators of a multi-device pool's other devices attach after the open
+  with no such check (enqueued; the fs mounts one device).
 
 **Completeness is the caller's obligation**: a bootstrap-backed tree left
 unwalked has its live nodes swept → corruption. The driver walks alloc +
@@ -293,7 +295,12 @@ blocks 36..39: data node 1
   (a header whose bitmap fails `h_bitmap_csum` or does not read is rejected
   and open falls back to the other pair: the R7a fallback). A header slot the
   device cannot read is treated like one that does not decode, so the other
-  slot alone can open the pool. Open is sure it took the newest pair only
+  slot alone can open the pool. When no header or no bitmap can be used and
+  the device failed a read, open answers the device's error (STM_EIO); a
+  header slot with no magic is blank, one at another version is
+  STM_EBADVERSION, and blank or failing its checksum otherwise is
+  STM_ECORRUPT (under a pool's uberblock, a missing bootstrap is damage).
+  Open is sure it took the newest pair only
   when both slots decoded and the newer one's bitmap loaded;
   otherwise `stm_bootstrap_bitmap_unconfirmed` is true, the bitmap may be a
   commit older than the trees the mount takes, and the mount's reconcile must

@@ -13430,3 +13430,73 @@ STM_TEST(fs_a_bad_sector_with_label_0s_mirror_slot_unreadable_is_the_records) {
     STM_ASSERT_OK(stm_fs_unmount(fs));
     o1_after(f, g, true, false);
 }
+
+/* o1c round 2 F1: a mount that refuses says which slot. The hook finds
+ * the newest generation (a final, checked) before any fault and makes its
+ * slot unreadable for the mount's own scan. */
+static uint64_t r2_newest_gen;
+static uint64_t r2_newest_off;
+static bool     r2_newest_is_final;
+
+static void r2_fault_newest_hook(struct stm_bdev *d, void *arg)
+{
+    (void)arg;
+    stm_uberblock ub, prev;
+    uint32_t lbl = 0, slot = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
+    r2_newest_gen = stm_load_le64(ub.ub_gen);
+    uint64_t g = r2_newest_gen - 1u;
+    STM_ASSERT_OK(stm_sb_label_read(d, (uint32_t)(g % 4u),
+                                    (uint32_t)(g % 63u), &prev));
+    r2_newest_is_final = memcmp(prev.ub_merkle_root, ub.ub_merkle_root,
+                                sizeof ub.ub_merkle_root) != 0;
+    uint64_t lo[STM_LABELS_PER_DEVICE];
+    STM_ASSERT_OK(stm_label_offsets(stm_bdev_caps_of(d)->size_bytes, lo));
+    r2_newest_off = lo[lbl] + (uint64_t)slot * STM_UB_SIZE;
+    stm_bdev_inject_read_range(d, r2_newest_off, r2_newest_off + STM_UB_SIZE,
+                               -1, STM_EIO);
+}
+
+STM_TEST(fs_mount_names_the_uberblock_slot_it_refuses_on) {
+    make_tmp("r2refuse");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t f = 0, g = 0, h = 0;
+    rh_make(fs, &f, &g, &h);
+    uint8_t x = 'x';
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, &x, 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    stm_sb_scan_refusal why;
+    memset(&why, 0xa5, sizeof why);
+    mopts.scan_refusal = &why;
+    stm_fs_set_mount_open_hook_for_test(r2_fault_newest_hook, NULL);
+    fs = NULL;
+    stm_status ms = stm_fs_mount(g_tmp_path, &mopts, &fs);
+    stm_fs_set_mount_open_hook_for_test(NULL, NULL);
+    STM_ASSERT(r2_newest_is_final);
+    STM_ASSERT_ERR(ms, STM_EIO);
+    STM_ASSERT(fs == NULL);
+    STM_ASSERT_EQ(why.gen, r2_newest_gen);
+    STM_ASSERT_EQ(why.label_idx, (uint32_t)(r2_newest_gen % 4u));
+    STM_ASSERT_EQ(why.slot_idx, (uint32_t)(r2_newest_gen % 63u));
+    STM_ASSERT_EQ(why.byte_offset, r2_newest_off);
+    STM_ASSERT_EQ(why.best_gen, r2_newest_gen - 1u);
+
+    /* Control: read whole, the pool mounts its newest generation. */
+    memset(&why, 0xa5, sizeof why);
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    STM_ASSERT_EQ(why.gen, 0u);
+    if (fs) {
+        stm_sync_info info;
+        STM_ASSERT_OK(stm_sync_info_get(stm_fs_sync_for_test(fs), &info));
+        STM_ASSERT_EQ(info.mount_max_durable_gen, r2_newest_gen);
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+    }
+    unlink(g_tmp_path);
+}

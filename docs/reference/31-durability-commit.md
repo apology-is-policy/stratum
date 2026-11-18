@@ -220,8 +220,9 @@ Btrfs pinned-extents + delayed-refs + `flush_space`→`COMMIT_TRANS`; ZFS
   (a BLAKE3 csum mismatch = torn/partial -> skipped), pick the **highest valid
   `ub_gen`**. A torn final UB fails its MAC and is skipped, so mount falls back
   to the prior gen automatically. A slot the device cannot READ is not a torn
-  write: if it is the slot of gen best+1 or best+2 and two re-reads fail, the
-  mount fails closed (STM_EIO) instead (`07-sb-sync.md`).
+  write: if it is a slot that could hold a newer acknowledged commit and two
+  re-reads fail, the mount fails closed (STM_EIO) instead (`07-sb-sync.md`
+  says which slots).
 
 The generation counter is monotonic (each commit bumps by 2 for an established
 pool); the MAC over the encoded UB rejects any partial write. Together these

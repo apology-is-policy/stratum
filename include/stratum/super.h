@@ -1098,15 +1098,39 @@ stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
  * when no slot decoded and some read failed, or when the slot of
  * generation best+1 or best+2 (where the only newer commit could be)
  * still fails after a bounded re-read: mounting the older generation
- * would roll back an acknowledged commit.
- *
- * Single-device: this is the authoritative mount-time selection.
- * Multi-device pools (Phase 5) will add a quorum layer on top.
+ * would roll back an acknowledged commit. This is the strict rule, for
+ * a device whose pool may have others: stm_sb_mount_scan_ex(d, false).
  */
 STM_MUST_USE
 stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
                               uint32_t *out_label_idx,
                               uint32_t *out_slot_idx);
+
+/* Why a scan refused: the slot of `gen`, which may hold a commit newer
+ * than best_gen (the newest it read), stayed unreadable. gen is 0 when
+ * the scan refused for another reason. */
+typedef struct stm_sb_scan_refusal {
+    uint64_t gen;
+    uint32_t label_idx;
+    uint32_t slot_idx;
+    uint64_t byte_offset;
+    uint64_t best_gen;
+} stm_sb_scan_refusal;
+
+/*
+ * stm_sb_mount_scan, told the pool's shape. With one_device (`d` is the
+ * pool's only device, so its generations are contiguous) it refuses only
+ * where an acknowledged commit can hide: slot(best+1) when best may be a
+ * reservation (best-1 does not decode with other trees), and slot(best+2)
+ * when slot(best+1) neither decoded nor read blank. Without it, either
+ * slot unreadable refuses. `why`, if not NULL, says which slot.
+ */
+STM_MUST_USE
+stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
+                                stm_uberblock *out_ub,
+                                uint32_t *out_label_idx,
+                                uint32_t *out_slot_idx,
+                                stm_sb_scan_refusal *why);
 
 #ifdef __cplusplus
 }

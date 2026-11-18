@@ -2246,11 +2246,13 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
     sync_scan *scans = calloc(n, sizeof *scans);
     if (!scans) return STM_ENOMEM;
     bool saw_scan_eio = false;  /* a device whose ring could not be read */
+    bool one_device = stm_pool_live_device_count(p) == 1u;
     for (size_t i = 0; i < n; i++) {
         stm_bdev *di = stm_pool_device_bdev(p, (uint16_t)i);
         if (!di) continue;
         uint32_t lbl = 0, slot = 0;
-        stm_status sc = stm_sb_mount_scan(di, &scans[i].ub, &lbl, &slot);
+        stm_status sc = stm_sb_mount_scan_ex(di, one_device, &scans[i].ub,
+                                             &lbl, &slot, NULL);
         if (sc == STM_OK) {
             scans[i].valid = true;
         } else if (sc == STM_EBADVERSION) {

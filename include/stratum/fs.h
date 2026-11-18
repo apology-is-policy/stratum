@@ -71,6 +71,7 @@ extern "C" {
  * every translation unit that consumes fs.h. */
 struct stm_pool;
 struct stm_sync;
+struct stm_sb_scan_refusal;
 
 typedef struct stm_fs stm_fs;
 
@@ -248,6 +249,11 @@ typedef struct {
      * (stm_bdev_claim_image): the pool is the file that descriptor has open, and
      * `path` only names it; see stm_bdev_open_opts.claimed_fd. */
     const int *claimed_fd;
+
+    /* NULL, or where to say which uberblock slot a mount refused on
+     * (STM_EIO: a commit newer than the newest one read may be there, and
+     * the device cannot read it). Zeroed at entry; gen stays 0 otherwise. */
+    struct stm_sb_scan_refusal *scan_refusal;
 } stm_fs_mount_opts;
 
 /*

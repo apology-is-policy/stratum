@@ -1579,11 +1579,18 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
     return fs;
 }
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+static stm_fs_mount_open_hook g_mount_open_hook;
+static void *g_mount_open_hook_arg;
+#endif
+
 stm_status stm_fs_mount(const char *path,
                          const stm_fs_mount_opts *opts,
                          stm_fs **out_fs)
 {
     if (!path || !opts || !out_fs) return STM_EINVAL;
+    if (opts->scan_refusal)
+        memset(opts->scan_refusal, 0, sizeof *opts->scan_refusal);
 
     /* 9.8-LF-3: ensure EBR substrate is initialised before any code path
      * that might enter an epoch. Idempotent — safe to call on every mount.
@@ -1638,7 +1645,12 @@ stm_status stm_fs_mount(const char *path,
     stm_uberblock peek_ub;
     {
         uint32_t peek_lbl = 0, peek_slot = 0;
-        s = stm_sb_mount_scan(d, &peek_ub, &peek_lbl, &peek_slot);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+        if (g_mount_open_hook) g_mount_open_hook(d, g_mount_open_hook_arg);
+#endif
+        /* One device here; with more, stm_sync_open's strict scan rules. */
+        s = stm_sb_mount_scan_ex(d, true, &peek_ub, &peek_lbl, &peek_slot,
+                                 opts->scan_refusal);
         if (s != STM_OK) {
             stm_bdev_close(d);
             stm_hybrid_keys_wipe(&wk);
@@ -4373,6 +4385,12 @@ void stm_fs_fail_next_rename_install_for_test(stm_fs *fs, stm_status fail)
 void stm_fs_fail_next_rename_src_drop_for_test(stm_fs *fs, stm_status fail)
 {
     fs->rename_src_drop_fail_next = fail;
+}
+
+void stm_fs_set_mount_open_hook_for_test(stm_fs_mount_open_hook fn, void *arg)
+{
+    g_mount_open_hook = fn;
+    g_mount_open_hook_arg = arg;
 }
 
 void stm_fs_set_rename_walk_hook_for_test(stm_fs *fs,

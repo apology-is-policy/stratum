@@ -157,28 +157,54 @@ stm_status stm_sb_label_write(stm_bdev *d, uint32_t label, uint32_t slot, const 
 
 // Scan every (label, slot) on a device, return the single uberblock with
 // highest valid ub_gen. Used at mount. Returns STM_ENOENT if no valid UB,
-// STM_EIO if no slot decoded and the device failed a read, or if the slot
-// of gen best+1 or best+2 still fails after two re-reads.
+// STM_EIO if no slot decoded and the device failed a read, or if a slot
+// that could hold a newer commit still fails after two re-reads (below).
+// one_device: the device is the pool's only one. why: which slot refused.
+stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
+                                stm_uberblock *out, uint32_t *out_lbl,
+                                uint32_t *out_slot, stm_sb_scan_refusal *why);
+// The strict rule (one_device false), for a device of a multi-device pool.
 stm_status stm_sb_mount_scan(stm_bdev *d,
                               stm_uberblock *out, uint32_t *out_lbl, uint32_t *out_slot);
 ```
 
 A slot that fails to decode is a torn or unused slot and is skipped. A slot
-the device fails to READ is different: generations are written in order, one
-ring slot each (`stm_sb_ring_label_for_gen` / `stm_sb_ring_slot_for_gen`,
-super.h), so a commit newer than the best one found can only sit at best+1
-(the next reservation, or a mount's claim) or best+2 (its final). If the
-device cannot read either slot after two re-reads, the scan fails closed:
-mounting the best would roll the pool back past an acknowledged commit, and
-the mount's claim at best+1 would overwrite it for good. A re-read that finds
-a newer generation moves the best, and its successors are checked in turn.
-An unreadable slot anywhere else costs nothing. The price of one copy per
-generation: a slot at best+1 that stays unreadable refuses every mount, even
-when it held only an old generation, until the operator overwrites it,
-accepting the loss of at most the newest commit (each generation in two or
-more labels, which would remove this, is enqueued). (o1c review round 1, F1;
-btrfs's `usebackuproot` and ZFS's `zpool import -F` are likewise explicit
-opt-ins to a rollback, never a silent one.)
+the device fails to READ is different: each generation's uberblock is in one
+ring slot (`stm_sb_ring_label_for_gen` / `stm_sb_ring_slot_for_gen`,
+super.h), and a commit newer than the best one found can only follow it, at
+best+1 (best's final when best is a reservation; otherwise a reservation or a
+claim, which carry best's trees) or at best+2 (the final after a reservation
+at best+1). If the device cannot read the slot where it would be, mounting
+the best would roll the pool back past an acknowledged commit, and the
+mount's claim at best+1 would overwrite it for good: the scan re-reads the
+slot twice and, while it stays unreadable, refuses (STM_EIO). A re-read that
+finds a newer generation moves the best, and its successors are checked in
+turn.
+
+Where it refuses depends on the pool. One device writes its generations in
+order, each only after the one before is durable (a final waits for its
+reservation's barrier), and a reservation or a claim carries its
+predecessor's `ub_merkle_root` unchanged. So on a one-device pool
+(`stm_sync_open` and `stm_fs_mount` pass `one_device`) the scan refuses only
+where an acknowledged commit can hide: slot(best+1) when best may be a
+reservation (best-1 does not decode as gen best-1 with another merkle root;
+a claim looks the same, so an unreadable slot after a claim refuses too),
+and slot(best+2) when slot(best+1) neither decoded (as an older generation:
+the ring came round) nor read blank. A device of a multi-device pool can miss
+a generation's write while quorum holds, so there either slot unreadable
+refuses. An unreadable slot anywhere else costs nothing. A refusal says which
+slot (`stm_sb_scan_refusal`: the generation, label, slot, byte offset and the
+best generation read; `stm_fs_mount_opts.scan_refusal`), and stratumd prints
+it.
+
+The price of one copy per generation: while that slot stays unreadable,
+every mount refuses (a refused mount writes nothing, so the sector never
+gets the rewrite that would heal it) until the operator overwrites it,
+accepting the loss of at most the newest commit. Each generation in two or
+more labels, which would remove this, and an explicit opt-in mount that takes
+the newest readable generation, are enqueued for the operator. (o1c review
+rounds 1 and 2, F1; btrfs's `usebackuproot` and ZFS's `zpool import -F` are
+likewise explicit opt-ins to a rollback, never a silent one.)
 
 ## Commit protocol (sync)
 
@@ -318,10 +344,14 @@ first record went answers `STM_EWEDGED` and the sync wedges.
 ### Mount flow
 
 ```
-1. For each device in pool: stm_sb_mount_scan -> (highest valid ub_gen, ub).
-   A device whose scan answers STM_EIO contributes nothing; if no device
-   gave a uberblock and one answered STM_EIO, the open answers STM_EIO, not
-   STM_ENOENT (an unreadable pool is not a fresh one).
+1. For each device in pool: stm_sb_mount_scan_ex -> (highest valid ub_gen,
+   ub); one_device when the pool has one live device. A device whose scan
+   answers STM_EIO contributes nothing; if no device gave a uberblock and one
+   answered STM_EIO, the open answers STM_EIO, not STM_ENOENT (an unreadable
+   pool is not a fresh one). The no-rollback rule above holds for one
+   device: in a multi-device pool a device that refuses drops out of the
+   quorum like a dead one, and a commit acknowledged by exactly a quorum,
+   one of whose devices refuses, can be rolled back (enqueued).
 2. Compute authoritative gen:
      sort valid gens desc
      auth = gens[quorum - 1]        // kth largest, where k = floor(N/2)+1

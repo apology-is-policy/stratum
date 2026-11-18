@@ -2270,4 +2270,100 @@ STM_TEST(sync_bootstrap_open_says_when_it_cannot_confirm_the_bitmap) {
     unlink(g_tmp_path);
 }
 
+
+/* o1c round 2 F1: one device refuses only where an acknowledged commit
+ * can hide. sync_f1_build's gen 3 is a final (its trees differ from
+ * reservation 2's), in label 3. */
+STM_TEST(sync_mount_refuses_only_the_unreadable_label_that_can_hide_a_commit) {
+    for (uint32_t L = 0; L < STM_LABELS_PER_DEVICE; L++) {
+        sync_f1_build("r2lbl");
+        stm_bdev *d = open_fresh_device();
+        uint64_t lo[STM_LABELS_PER_DEVICE];
+        STM_ASSERT_OK(stm_label_offsets(stm_bdev_caps_of(d)->size_bytes, lo));
+        stm_bdev_inject_read_range(d, lo[L], lo[L] + STM_LABEL_SIZE, -1,
+                                   STM_EIO);
+        uint64_t gen = 0;
+        uint8_t byte = 0;
+        stm_status os = sync_f1_mount(d, &gen, &byte);
+        if (L == 3u) {
+            STM_ASSERT_ERR(os, STM_EIO);
+        } else {
+            STM_ASSERT_OK(os);
+            STM_ASSERT_EQ(gen, 3u);
+            STM_ASSERT_EQ(byte, (uint8_t)'B');
+        }
+        STM_ASSERT(stm_bdev_inject_read_range_fired(d) >= 1u);
+        stm_bdev_close(d);
+        unlink(g_tmp_path);
+    }
+}
+
+STM_TEST(sync_mount_skips_the_unreadable_slot_of_a_generation_never_written) {
+    for (uint64_t g = 4u; g <= 5u; g++) {
+        sync_f1_build("r2nw");
+        stm_bdev *d = open_fresh_device();
+        sync_f1_fault_gen(d, g, -1);
+        uint64_t gen = 0;
+        uint8_t byte = 0;
+        STM_ASSERT_OK(sync_f1_mount(d, &gen, &byte));
+        STM_ASSERT_EQ(gen, 3u);
+        STM_ASSERT_EQ(byte, (uint8_t)'B');
+        STM_ASSERT(stm_bdev_inject_read_range_fired(d) >= 1u);
+        stm_bdev_close(d);
+        unlink(g_tmp_path);
+    }
+}
+
+
+/* o1c round 2 F4: a bootstrap the device cannot read answers the
+ * device's error, not "corrupt" or "another version". */
+STM_TEST(sync_bootstrap_open_answers_eio_for_what_the_device_cannot_read) {
+    stm_bootstrap_stats built;
+    sync_f4_build("r2boot", &built);
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    uint64_t h0 = STM_BOOTSTRAP_OFFSET;
+    uint64_t h1 = STM_BOOTSTRAP_OFFSET + STM_UB_SIZE;
+
+    /* Both header slots unreadable. */
+    stm_bdev_inject_read_range(d, h0, h1 + STM_UB_SIZE, -1, STM_EIO);
+    STM_ASSERT_ERR(stm_alloc_open_blank(d, &a2), STM_EIO);
+    stm_bdev_inject_read_range_clear(d);
+
+    /* Both bitmap copies unreadable. */
+    for (int k = 0; k < 2; k++) {
+        uint64_t blk = k ? STM_BOOTSTRAP_BITMAP_SLOT_B
+                         : STM_BOOTSTRAP_BITMAP_SLOT_A;
+        uint64_t off = STM_BOOTSTRAP_OFFSET + blk * STM_UB_SIZE;
+        stm_bdev_inject_read_range(d, off,
+            off + STM_BOOTSTRAP_BITMAP_BLOCKS * (uint64_t)STM_UB_SIZE, -1,
+            STM_EIO);
+    }
+    STM_ASSERT_ERR(stm_alloc_open_blank(d, &a2), STM_EIO);
+    stm_bdev_inject_read_range_clear(d);
+
+    /* Control: read whole, it opens. */
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_alloc_close(a2);
+    a2 = NULL;
+
+    /* One header slot blank: the other alone opens, and when the device
+     * cannot read that one, the open answers the device's error. */
+    uint8_t zeros[STM_UB_SIZE];
+    memset(zeros, 0, sizeof zeros);
+    STM_ASSERT_OK(stm_bdev_write(d, h1, zeros, sizeof zeros));
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_alloc_close(a2);
+    a2 = NULL;
+    stm_bdev_inject_read_range(d, h0, h0 + STM_UB_SIZE, -1, STM_EIO);
+    STM_ASSERT_ERR(stm_alloc_open_blank(d, &a2), STM_EIO);
+    stm_bdev_inject_read_range_clear(d);
+
+    /* Both blank, under a pool's uberblock: corruption. */
+    STM_ASSERT_OK(stm_bdev_write(d, h0, zeros, sizeof zeros));
+    STM_ASSERT_ERR(stm_alloc_open_blank(d, &a2), STM_ECORRUPT);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("sync")

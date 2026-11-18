@@ -40,7 +40,8 @@
  *        released in close. Partial-init failures unwind cleanly.
  *   B-4  avail.idx counts requests modulo 2^16, as the device's own
  *        index does; every index comparison is wrap-safe. A device
- *        re-init resets both ends to 0.
+ *        re-init resets both ends to 0, and zeroes the ring before the
+ *        device may read it again.
  *   B-5  DSB SY at submission time guarantees all descriptor + ring
  *        writes are visible to the device before the virtqueue
  *        notification kicks the doorbell.
@@ -184,6 +185,13 @@ typedef enum { REQ_READ, REQ_WRITE, REQ_FLUSH } req_kind;
 /* Cap on spurious IRQ wakes (config-change without used-buffer). */
 #define MAX_NON_USED_BUFFER_WAKES    16u
 
+/* A request the device has not answered within BDEV_IRQ_WAIT_MAX waits of
+ * BDEV_IRQ_WAIT_NS each (30 s, the request timeout blk-mq gives NVMe) is
+ * the transport's failure: the re-init path, not a stratumd hung holding
+ * d->lock. */
+#define BDEV_IRQ_WAIT_NS             1000000000ull
+#define BDEV_IRQ_WAIT_MAX            30u
+
 /* Bounded transient-fault recovery: a failed request triggers up to this
  * many (device re-init + re-submit) cycles before the bdev is latched
  * permanently. A transient virtio hiccup self-heals on the first re-init;
@@ -224,6 +232,7 @@ _Static_assert(VQ_AVAIL_OFF + 4 + (VQ_QUEUE_SIZE * 2) <= VQ_USED_OFF, "avail/use
 _Static_assert(VQ_USED_OFF  + 4 + (VQ_QUEUE_SIZE * 8) <= VQ_REQ_OFF,  "used/req overlap");
 _Static_assert(VQ_REQ_OFF   + 16 <= VQ_STATUS_OFF,                    "req/status overlap");
 _Static_assert(VQ_STATUS_OFF + 1 <= VQ_RING_DMA_SIZE,                 "status/end overlap");
+_Static_assert(VQ_RING_DMA_SIZE % 8u == 0,                            "ring zeroed in 8-byte words");
 
 /* ------------------------------------------------------------------------- */
 /* Backing struct.                                                            */
@@ -255,9 +264,9 @@ typedef struct {
     uint32_t         slot;
     uint32_t         intid;
 
-    /* avail.idx counter. Monotonic across all requests; invariant B-4.
-     * Reset to 0 by a device re-init (the recovery path), which also
-     * resets the device's own idx via a VIRTIO reset. */
+    /* avail.idx counter, modulo 2^16; invariant B-4. Reset to 0 by a
+     * device re-init (the recovery path), which also resets the device's
+     * own idx via a VIRTIO reset. */
     uint16_t         avail_idx;
     /* Latched PERMANENTLY only after the transport fails AND the bounded
      * re-init recovery (reinit_device_locked + retry) has been exhausted
@@ -269,7 +278,7 @@ typedef struct {
     uint64_t         reinit_count;  /* diagnostics: device recoveries fired */
     /* diagnostics: submissions the device failed alone, per req_kind */
     uint64_t         request_errors[3];
-    uint64_t         transport_fails; /* diagnostics: io-fail lines owed */
+    uint64_t         transport_fails; /* diagnostics: transport failures (io-fail + flush-lost lines, capped) */
 
     /* VIRTIO_BLK_F_FLUSH negotiated at init -> op_fsync issues a real
      * VIRTIO_BLK_T_FLUSH barrier. When false (device offers no cache),
@@ -302,14 +311,13 @@ static inline int64_t t_irq_create(uint32_t intid, uint32_t rights)
     return syscall(__NR_irq_create, (long)intid, (long)rights);
 }
 
-static inline int64_t t_irq_wait(int64_t handle)
+static inline int64_t t_irq_wait(int64_t handle, uint64_t timeout_ns)
 {
-    /* SYS_IRQ_WAIT gained x1 = timeout_ns (0 = wait forever) in the Thylacine
-       kernel (F-A1). musl's varargs syscall() loads x1 from the 2nd arg, so it
-       MUST be passed explicitly here -- an omitted arg leaves x1 indeterminate,
-       which the kernel would read as a bogus timeout. 0 = the pre-change
-       (block-until-IRQ) semantics this driver relies on. */
-    return syscall(__NR_irq_wait, (long)handle, 0L);
+    /* SYS_IRQ_WAIT takes x1 = timeout_ns (0 = wait forever; Thylacine kernel
+       F-A1) and answers 0 when it times out. musl's varargs syscall() loads x1
+       from the 2nd arg, so it MUST be passed explicitly here -- an omitted arg
+       leaves x1 indeterminate. */
+    return syscall(__NR_irq_wait, (long)handle, (long)timeout_ns);
 }
 
 static inline int64_t t_dma_create(uint64_t size, uint32_t rights)
@@ -413,20 +421,34 @@ static bool find_blk_slot(thyla_bdev *d)
 /* VirtIO 1.2 init (sec 3.1.1).                                               */
 /* ------------------------------------------------------------------------- */
 
-static bool init_device(uint64_t slot_va, uint64_t ring_pa,
+static void init_descriptors(uint64_t ring_va, uint64_t ring_pa, uint64_t data_pa);
+
+static bool init_device(uint64_t slot_va, uint64_t ring_pa, uint64_t data_pa,
                         bool *out_flush_supported)
 {
     if (out_flush_supported) *out_flush_supported = false;
 
-    /* Reset, and wait for it to finish (VIRTIO 1.2 2.4.2: the driver MUST
-     * read device_status back as 0 before re-initialising): a device that
-     * resets late could still complete an abandoned request into the ring
-     * and the status byte a re-submit shares. Then ACKNOWLEDGE + DRIVER. */
+    /* Reset, and wait for it to finish: VIRTIO 1.2 2.4.2 has the driver
+     * consider a reset complete when it reads device status back as 0. A
+     * device that resets late could still be completing an abandoned
+     * request into the ring zeroed below. */
     mmio_write32(slot_va + VREG_STATUS, 0);
     uint32_t reset_reads = 0;
     while (mmio_read32(slot_va + VREG_STATUS) != 0) {
         if (++reset_reads >= RESET_READBACK_MAX) return false;
     }
+
+    /* Zero the queue memory and build the descriptor chain before the
+     * device may read the ring (VIRTIO 1.2 4.2.3.2 step 4). After a re-init
+     * the ring page still holds avail.idx at the old count, every entry
+     * head 0 and the abandoned request's header, and a device may process
+     * the queue as DRIVER_OK is written (QEMU kicks it as it starts
+     * ioeventfd): it would run the abandoned request again, answered as
+     * the re-submit's, or find more heads than the queue holds. */
+    for (uint64_t o = 0; o < VQ_RING_DMA_SIZE; o += 8u)
+        mmio_write64(THYLA_RING_USER_VA + o, 0);
+    init_descriptors(THYLA_RING_USER_VA, ring_pa, data_pa);
+    dsb_sy();
     mmio_write32(slot_va + VREG_STATUS, VSTATUS_ACKNOWLEDGE);
     mmio_write32(slot_va + VREG_STATUS, VSTATUS_ACKNOWLEDGE | VSTATUS_DRIVER);
 
@@ -492,8 +514,8 @@ static bool init_device(uint64_t slot_va, uint64_t ring_pa,
 /* Descriptor table - 3-entry chain (req-header / data / status).             */
 /*                                                                            */
 /* desc[0] (req header) is OUT, addr/len/flags stable.                        */
-/* desc[1] (data) addr/len stable; flags flips between NEXT and NEXT|WRITE    */
-/*               depending on direction (set in do_request).                  */
+/* desc[1] (data) addr stable; len (0 until then) and flags (NEXT, or         */
+/*               NEXT|WRITE) set per request in do_request_once.              */
 /* desc[2] (status) is WRITE (device-writable), addr/len/flags stable.        */
 /* ------------------------------------------------------------------------- */
 
@@ -507,9 +529,9 @@ static void init_descriptors(uint64_t ring_va, uint64_t ring_pa, uint64_t data_p
     mmio_write16(desc_va + 12, VIRTQ_DESC_F_NEXT);
     mmio_write16(desc_va + 14, 1);
 
-    /* desc[1]: data; flags filled per request. */
+    /* desc[1]: data; len + flags filled per request. */
     mmio_write64(desc_va + 16, data_pa);
-    mmio_write32(desc_va + 24, (uint32_t)VQ_DATA_DMA_SIZE);
+    mmio_write32(desc_va + 24, 0);
     /* desc[1].flags written in do_request(). */
     mmio_write16(desc_va + 30, 2);
 
@@ -531,9 +553,9 @@ static void init_descriptors(uint64_t ring_va, uint64_t ring_pa, uint64_t data_p
 /* Recover a failed virtio device IN PLACE. init_device writes STATUS=0
  * first -- a full VIRTIO 1.2 reset (sec 4.2.3.1 / 2.1: the device MUST
  * re-initialise all state, dropping any in-flight request and resetting
- * its avail/used idx to 0) -- then re-negotiates + re-programs the rings;
- * init_descriptors rebuilds the 3-entry chain; avail_idx resets to 0 to
- * match the freshly-reset device. The MMIO bank + DMA mappings persist
+ * its avail/used idx to 0) -- then zeroes the ring page, rebuilds the
+ * 3-entry chain, re-negotiates + re-programs the rings; avail_idx resets
+ * to 0 to match the freshly-reset device. The MMIO bank + DMA mappings persist
  * (claimed once at open; invariant B-6) -- only the device-side state
  * machine + the rings reset, so the data DMA buffer's contents survive
  * (a re-submit re-uses them). This is the recovery the R4-F1 latch always
@@ -546,9 +568,8 @@ static bool reinit_device_locked(thyla_bdev *d)
     /* An fsync reads flush_supported without the lock. init_device starts from
      * false, and a barrier skipped on that would be reported durable. */
     bool flush = false;
-    if (!init_device(d->slot_va, d->ring_pa, &flush)) return false;
+    if (!init_device(d->slot_va, d->ring_pa, d->data_pa, &flush)) return false;
     if (flush != d->flush_supported) d->flush_supported = flush;
-    init_descriptors(THYLA_RING_USER_VA, d->ring_pa, d->data_pa);
     d->avail_idx = 0;
     d->reinit_count++;
     return true;
@@ -577,6 +598,7 @@ static const char *bdev_fail_arm_str(uint8_t arm)
     case 3:  return "used-idx";
     case 4:  return "used-id";
     case 5:  return "status";
+    case 6:  return "irq-timeout";
     default: return "none";
     }
 }
@@ -677,14 +699,17 @@ static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
     mmio_write32(d->slot_va + VREG_QUEUE_NOTIFY, 0);
 
     /* Wait for the device's IRQ; tolerate up to N spurious config-
-     * change wakes before giving up. */
+     * change wakes, and BDEV_IRQ_WAIT_MAX timed-out waits, before giving
+     * up. A timed-out wait still reads the interrupt status, so a lost
+     * interrupt is caught there. */
     uint32_t spurious = 0;
+    uint32_t timeouts = 0;
     for (;;) {
         if (spurious >= MAX_NON_USED_BUFFER_WAKES) {
             fi->arm = 1;
             goto io_fail;
         }
-        int64_t count = t_irq_wait(d->irq_handle);
+        int64_t count = t_irq_wait(d->irq_handle, BDEV_IRQ_WAIT_NS);
         if (count < 0) {
             fi->arm = 2;
             fi->irq_rc = count;
@@ -694,6 +719,13 @@ static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
         uint32_t int_status = mmio_read32(d->slot_va + VREG_INTERRUPT_STATUS);
         mmio_write32(d->slot_va + VREG_INTERRUPT_ACK, int_status);
         if (int_status & VINT_USED_BUFFER) break;
+        if (count == 0) {
+            if (++timeouts >= BDEV_IRQ_WAIT_MAX) {
+                fi->arm = 6;
+                goto io_fail;
+            }
+            continue;
+        }
         spurious++;
     }
 
@@ -1184,11 +1216,9 @@ stm_status stm_bdev_open_thylacine(const char *path,
     for (uint64_t o = 0; o < VQ_DATA_DMA_SIZE; o += THYLA_PAGE_SIZE)
         *(volatile uint8_t *)(THYLA_DATA_USER_VA + o) = 0;
 
-    /* Phase 7: VirtIO init. */
-    if (!init_device(d->slot_va, d->ring_pa, &d->flush_supported)) goto fail;
-
-    /* Phase 8: descriptor chain (one-time). */
-    init_descriptors(THYLA_RING_USER_VA, d->ring_pa, d->data_pa);
+    /* Phase 7: VirtIO init (zeroes the ring, builds the descriptor chain). */
+    if (!init_device(d->slot_va, d->ring_pa, d->data_pa, &d->flush_supported))
+        goto fail;
 
     /* Phase 9: device capacity -> caps.size_bytes. VirtIO blk config
      * sec 5.2.4 - u64 capacity at config-space offset 0, in 512-byte
