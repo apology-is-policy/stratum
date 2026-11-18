@@ -391,10 +391,19 @@ cover = [a_off, a_end)   (block-aligned, fully contains all stuck-out extents)
 | `sync_multi_read_answers_a_device_error_over_a_bad_replica` (`test_sync_multi`) | round 4 F4: a mirror read whose first replica's device fails and second fails its tag answers the device error |
 | `sync_multi_cold_read_and_promote_answer_a_device_error_over_a_bad_replica` (`test_sync_multi`) | the same for a COLD record's chunk, read and promoted; with both tags failing, a bad record |
 | `corvus_write_into_a_big_cold_record_on_a_fragmented_pool_commits` and its two siblings (`test_corvus_mount`) | round 4 F1: on a pool with no free run of a recordsize, the drain promotes an older pool's big cold record in pieces and the commit succeeds (with frees pending too); in a home the logout after it locks the home |
+| `fs_a_bad_sector_under_a_record_drops_the_run_and_reports_it` | O1 (vote 146): every read of the sectors under a record answers `EIO`; a write into it is dropped after each replica is read twice, reported once, and the pool commits |
+| `fs_a_read_error_that_clears_on_the_re_read_costs_no_write`, `fs_a_tag_failure_that_clears_on_the_re_read_costs_no_write` | one `EIO` or one flipped byte on the drain's first read of a record: the second read gives the bytes and the run lands |
+| `fs_a_write_into_a_cold_record_with_no_content_entry_is_dropped`, `..._its_content_entry_disowns_is_dropped` | round 5 F1: a COLD record whose CAS entry is gone, or names another length, drops a write into it (witnesses of guards in place) |
+| `corvus_a_drain_promote_of_a_damaged_big_cold_record_drops_the_run` and five siblings (`test_corvus_mount`) | the drain's promote of an older pool's big COLD record: a tag that fails always, a bad sector, a missing or mismatched CAS entry drop the run; one failed read on the promote's first pass costs nothing |
+| `fs_the_first_copy_after_a_drop_answers_eio_whatever_flush_dropped_it` | round 5 F2: a reflink and a copy after a drop an earlier commit made answer `EIO` once each |
+| `fs_unmount_answers_eio_for_a_report_the_table_evicted_unmade`, `fs_write_error_lines_go_to_stderr_with_no_sink` | round 5 F4a, F4d |
+| `p9_fsync_on_a_fid_never_opened_takes_no_report`, `p9_two_fsyncs_on_one_fid_report_a_drop_once` (`test_9p`) | round 5 F4c, F4b |
+| `fs_the_promote_cursor_table_forgets_the_oldest_dataset_past_64` | round 4 F8: the login promote's cursor table evicts the dataset set longest ago |
 | `fs_a_write_far_past_a_small_file_is_sparse` | an empty or inline file takes a write at 16 MiB or 9 MiB and keeps its prefix, and a 1-byte write at 7 MiB costs its own blocks, not 7 MiB of zeros |
 
-Each is non-vacuous (each fails on its named pre-fix bug; verified by
-reintroducing the bug surgically). `test_fs` holds 252 tests and
+Each fails on its named pre-fix bug, except the ones that witness a guard
+already in place (they were green before their chunk), which a sabotage of
+that guard turns red. `test_fs` holds 280 tests and
 `test_fs_write_path` 37; the full ctest suite is 84 binaries.
 
 ## Error paths
@@ -450,9 +459,10 @@ reintroducing the bug surgically). `test_fs` holds 252 tests and
   grid chained across an edge; the bound is checked before every step of
   both edges' widening, the step that ends it included, and the drain drops
   the run as unwritable.
-- `STM_ECORRUPT` — the split's pullback found an existing extent with
-  `len > recordsize` (F3 fail-closed; only reachable on an already-corrupt FS,
-  which the AEAD read path catches first).
+- `STM_ECORRUPT` -- the split's pullback found an existing extent with
+  `len > recordsize` that is not an older pool's COLD record (that one is
+  promoted, `fs_cover_big_record_locked`), or one off the block grid; a
+  drain drops its run as unwritable (the AEAD read does not catch it).
 - `STM_EBADTAG` / `STM_ECORRUPT` at a drain: a run that can never be written,
   kept buffered, failed every later commit of the pool, and the files written
   after it were lost at unmount (X6). The drain callback (`fs_flush_drain_cb`)
@@ -460,16 +470,17 @@ reintroducing the bug surgically). `test_fs` holds 252 tests and
   (`out_unwritable`): the merge read or the promote of a record the cover
   takes found the RECORD bad (`stm_sync_read_extent_ex`'s and
   `stm_sync_promote_cold_at`'s `out_record_bad`: CAS content gone, a length
-  or replica count that does not match, every replica failing its tag, no
-  key for it, a record over the bound), or the cover meets records off the
+  or replica count that does not match, no key for it in this mount, a
+  record over the bound, or no replica giving its bytes on a second read of
+  each: its tag fails, its sector answers `STM_EIO`, or its device is gone
+  from the pool; the second read spares a write a one-time fault), or the cover meets records off the
   block grid it cannot rewrite (a split point, or a widening past
   `4 * recordsize`). It records the run (`fs_note_write_error_locked`); the
   record keeps its old bytes, every other run and inode still drains, and
   the commit goes on. A failure of the pool's metadata (an index node, the
-  allocator, the keys), of a device (a mirror read where one replica's
-  device failed answers that device error, not a later replica's tag
-  failure), `STM_ENOSPC` or `STM_ENOMEM` keeps the run buffered and fails the
-  flush, as before X6. So does any failure of a run the dirty buffer holds
+  allocator, the keyschema's state), of a device write or flush, a device
+  read error other than `STM_EIO` (it may clear), `STM_ENOSPC` or
+  `STM_ENOMEM` keeps the run buffered and fails the flush, as before X6. So does any failure of a run the dirty buffer holds
   (`stm_dirty_buffer_insert_held`, set by the insert itself under the
   buffer's lock, since a peer's cross-inode flush takes no pin of the
   inode): an inline file's first write past the inline cap carries its
@@ -480,15 +491,22 @@ reintroducing the bug surgically). `test_fs` holds 252 tests and
   flag. A 9P open samples it (`stm_fs_write_error_sample`), and Tfsync
   answers `STM_EIO` through `stm_fs_fsync_since` when a drop came after the
   fid's sample, then moves the sample, so every fid open before a drop hears
-  of it once and one opened after an fsync reported it does not.
+  of it once and one opened after an fsync reported it does not. The server
+  decides the report under its lock, so two Tfsyncs on one fid report a drop
+  once (Linux checks and advances under `f_lock`); a fid never opened makes
+  the commit and takes no report.
   `stm_fs_fsync` with no sample reports a drop no fsync has seen. The table
   keeps 256 files: a drop for a new one into a full table evicts the oldest
   report an fsync made, else the oldest, and the event says which; a repeat
   drop moves its file to the newest end. An unmount answers `STM_EIO` when a
-  report no fsync saw is left; stratumd commits before it destroys the ctl,
-  and the ctl reaps its orphans before it removes the sink, so a drop at
-  either is heard. A reflink or copy_file_range whose flush of the source
-  dropped a run answers `STM_EIO` instead of copying the stale bytes. The
+  report no fsync saw is left or was evicted; stratumd commits before it
+  destroys the ctl, and the ctl reaps its orphans before it removes the
+  sink, so a drop at either is heard, and with no sink installed the fs
+  writes its write-error lines to stderr. The first reflink or
+  copy_file_range of a file after each drop of its live incarnation, by any
+  flush, answers `STM_EIO` instead of copying the old bytes (Linux's
+  `AS_EIO`, tested and cleared by the remap prep); the fsyncs keep their own
+  report. The
   flushes before a truncate, reflink and migrate, the write's buffer-full
   flush and the reclaim's drain take the same callback. A direct write
   answers the error to its caller.

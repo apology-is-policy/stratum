@@ -3690,10 +3690,11 @@ static stm_status h_statfs(stm_9p_server *s,
 /* Tfsync:  fid[4] datasync[4]                                             */
 /* Rfsync:  (header only)                                                   */
 /*                                                                         */
-/* Routes to stm_fs_fsync: the commit is pool-wide, and the fid's file    */
-/* answers EIO once for a buffered run a flush dropped (its record failed */
-/* its integrity check). datasync is ignored: a commit makes the data and */
-/* the metadata durable together.                                         */
+/* Routes to stm_fs_fsync_since: the commit is pool-wide, and an open     */
+/* fid answers EIO once for a buffered run of its file a flush dropped    */
+/* (a record of it could not be read: stm_fs_commit). A fid never opened */
+/* makes the commit and takes no report. datasync is ignored: a commit    */
+/* makes the data and the metadata durable together.                     */
 /* ────────────────────────────────────────────────────────────────────── */
 
 static stm_status h_fsync(stm_9p_server *s,
@@ -3718,18 +3719,29 @@ static stm_status h_fsync(stm_9p_server *s,
      * full-lock stall in the pre-CF-2b server. */
     fid_pin_locked(f);
     const uint64_t ds = f->dataset_id, ino = f->ino, gen = f->cached_gen;
-    uint64_t since = f->werr_since;
+    const bool opened = f->is_open;
+    const uint64_t since0 = f->werr_since;
+    uint64_t since = since0;
     phase_b_enter(s, STM_9P_TFSYNC, tag);
 
-    /* (b) unlocked. The fid's own errseq sample: every fid open before a
-     * dropped run hears of it once (Linux's per-file errseq). */
-    stm_status rc = stm_fs_fsync_since(s->fs, ds, ino, &gen, &since);
+    /* (b) unlocked. An open fid's own errseq sample: every fid open before
+     * a dropped run hears of it once (Linux's per-file errseq). One never
+     * opened has no sample (Linux's fsync needs an open file). */
+    stm_status rc = opened ? stm_fs_fsync_since(s->fs, ds, ino, &gen, &since)
+                           : stm_fs_commit(s->fs);
 
-    /* (c) the sample moves forward only, for this binding; unpin. */
+    /* (c) the report is decided under s->lock, as Linux checks and
+     * advances a file's sample under f_lock: a report a peer Tfsync on
+     * this fid already made (its sample is at or past this one) is not
+     * made again. The sample moves forward only, for this binding. A
+     * commit error takes no report (since unmoved) and stands. */
     must_lock(&s->lock);
-    if (f->kind == P9_FID_NODE && f->dataset_id == ds && f->ino == ino &&
-        since > f->werr_since)
-        f->werr_since = since;
+    if (f->kind == P9_FID_NODE && f->dataset_id == ds && f->ino == ino) {
+        if (since > since0 && f->werr_since >= since)
+            rc = STM_OK;
+        else if (since > f->werr_since)
+            f->werr_since = since;
+    }
     fid_unpin_locked(s, f);
     if (rc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);

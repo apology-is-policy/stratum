@@ -288,13 +288,22 @@ void stm_fs_set_buffer_insert_hook_for_test(stm_fs *fs,
 
 /*
  * Fail every dirty-buffer drain write with `fail`, writing nothing, until
- * disarmed with STM_OK.
+ * disarmed with STM_OK. STM_EBADTAG and STM_ECORRUPT fail as one of the
+ * file's records would (the drain drops the run); any other status as a
+ * device or the room would (the run stays).
  */
 void stm_fs_fail_drains_for_test(stm_fs *fs, stm_status fail);
 
 /* As stm_fs_fail_drains_for_test, after the next `skip` drain writes run. */
 void stm_fs_fail_drains_after_for_test(stm_fs *fs, stm_status fail,
                                        uint32_t skip);
+
+/* The login promote's per-dataset cursor table (stm_fs_promote_sealed_cold):
+ * set one as a stopped step does, or look one up (false: none kept). */
+void stm_fs_promote_cursor_set_for_test(stm_fs *fs, uint64_t ds, uint64_t ino,
+                                        uint64_t off);
+bool stm_fs_promote_cursor_for_test(stm_fs *fs, uint64_t ds, uint64_t *ino,
+                                    uint64_t *off);
 
 /* Whether an event sink (stm_fs_set_event_sink) is installed. */
 bool stm_fs_event_sink_for_test(stm_fs *fs);

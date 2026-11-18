@@ -7483,14 +7483,38 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
                                                        size_t *out_read,
                                                        bool *rec_bad);
 
-/* A failure that is the record's own: its bytes fail their check on every
- * replica that was read, its content entry is gone or does not match it,
- * or the key it names is missing. Not one of the pool's metadata (an index
- * or content-index node), a device, or a locked dataset. */
+/* A failure that is the record's own: no replica gives its bytes on two
+ * reads of each (sync_replicas_failed), its content entry is gone or does
+ * not match it, or the key it names is missing (for this mount: one a
+ * session-token mount unwraps may be missing to a keyfile mount). Not one
+ * of the pool's metadata (an index or content-index node), a device error
+ * that may clear, or a locked dataset. */
 static stm_status sync_rec_bad(bool *rec_bad, stm_status e)
 {
     if (rec_bad) *rec_bad = true;
     return e;
+}
+
+/* A reader that drops a run on the record's own failure (it passes
+ * rec_bad) reads every replica twice before it calls one: a sector that
+ * read badly once, or bytes a bus garbled once, cost no write. */
+static unsigned sync_read_passes(const bool *rec_bad)
+{
+    return rec_bad ? 2u : 1u;
+}
+
+/* No replica of a record gave its bytes; what is said here is the last
+ * pass's. dev_err is a device error other than EIO (no memory, an
+ * interrupted call): it may clear, so it is the pool's. unreadable: a
+ * replica answered EIO or sits on a device the pool no longer has. After
+ * the second pass that, like bytes failing their check, is the record's
+ * own; a plain reader hears the EIO first. */
+static stm_status sync_replicas_failed(bool *rec_bad, stm_status dev_err,
+                                       bool unreadable, stm_status check_err)
+{
+    if (dev_err != STM_OK) return dev_err;
+    stm_status e = unreadable ? STM_EIO : check_err;
+    return rec_bad ? sync_rec_bad(rec_bad, e) : e;
 }
 
 /* #343 decrypted-extent cache helpers. Caller holds s->lock. */
@@ -8126,21 +8150,31 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
         }
 
         /* The bytes fail their check only when every replica read was
-         * checked and failed: one the device did not answer may be good. */
+         * checked and failed: one the device did not answer may be good.
+         * k runs over the replicas once per pass; each pass starts clean. */
         stm_status clast_err = STM_EBADTAG, cdev_err = STM_OK;
-        bool decrypted = false;
-        for (uint8_t i = 0; i < cas_rec.n_replicas && !decrypted; i++) {
+        bool decrypted = false, cunread = false;
+        const unsigned cn = (unsigned)cas_rec.n_replicas
+                            * sync_read_passes(rec_bad);
+        for (unsigned k = 0; k < cn && !decrypted; k++) {
+            uint8_t i = (uint8_t)(k % cas_rec.n_replicas);
+            if (i == 0u) {
+                clast_err = STM_EBADTAG;
+                cdev_err = STM_OK;
+                cunread = false;
+            }
             uint16_t dev = stm_paddr_device(cas_rec.paddrs[i]);
             stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
             if (!bd) {
-                if (cdev_err == STM_OK) cdev_err = STM_EINVAL;
+                cunread = true;
                 continue;
             }
             uint64_t byte_off = stm_paddr_offset(cas_rec.paddrs[i])
                                   * (uint64_t)STM_UB_SIZE;
             stm_status rs = stm_bdev_read(bd, byte_off, ccbuf, ctotal);
             if (rs != STM_OK) {
-                if (cdev_err == STM_OK) cdev_err = rs;
+                if (rs == STM_EIO) cunread = true;
+                else if (cdev_err == STM_OK) cdev_err = rs;
                 continue;
             }
 
@@ -8170,8 +8204,7 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
         if (!decrypted) {
             stm_ct_memzero(cpbuf, rec.len);
             free(cpbuf);
-            if (cdev_err != STM_OK) return cdev_err;
-            return sync_rec_bad(rec_bad, clast_err);
+            return sync_replicas_failed(rec_bad, cdev_err, cunread, clast_err);
         }
         memcpy(buf, (uint8_t *)cpbuf + slice_off, slice_len);
         /* Visible at birth: COLD decrypts under the pool-wide
@@ -8291,18 +8324,26 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
      * replica we sourced bytes from — the cipher was computed once
      * with that nonce at write time and replicated bytewise. */
     stm_status last_err = STM_EBADTAG, dev_err = STM_OK;
-    bool decrypted = false;
-    for (uint8_t i = 0; i < rec.n_replicas && !decrypted; i++) {
+    bool decrypted = false, unread = false;
+    const unsigned hn = (unsigned)rec.n_replicas * sync_read_passes(rec_bad);
+    for (unsigned k = 0; k < hn && !decrypted; k++) {
+        uint8_t i = (uint8_t)(k % rec.n_replicas);
+        if (i == 0u) {                       /* a pass starts clean */
+            last_err = STM_EBADTAG;
+            dev_err = STM_OK;
+            unread = false;
+        }
         uint16_t dev = stm_paddr_device(rec.paddrs[i]);
         stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
         if (!bd) {
-            if (dev_err == STM_OK) dev_err = STM_EINVAL;
+            unread = true;
             continue;
         }
         uint64_t byte_off = stm_paddr_offset(rec.paddrs[i]) * (uint64_t)STM_UB_SIZE;
         stm_status rs = stm_bdev_read(bd, byte_off, cbuf, total_bytes);
         if (rs != STM_OK) {
-            if (dev_err == STM_OK) dev_err = rs;
+            if (rs == STM_EIO) unread = true;
+            else if (dev_err == STM_OK) dev_err = rs;
             continue;
         }
 
@@ -8323,8 +8364,7 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
     if (!decrypted) {
         stm_ct_memzero(pbuf, rec.len);
         free(pbuf);
-        if (dev_err != STM_OK) return dev_err;
-        return sync_rec_bad(rec_bad, last_err);
+        return sync_replicas_failed(rec_bad, dev_err, unread, last_err);
     }
 
     memcpy(buf, (uint8_t *)pbuf + slice_off, slice_len);
@@ -10894,19 +10934,28 @@ static stm_status promote_one_extent_locked(stm_sync *s,
         }
 
         stm_status last_err = STM_EBADTAG, dev_err = STM_OK;
-        bool decrypted = false;
-        for (uint8_t i = 0; i < cas_rec.n_replicas && !decrypted; i++) {
+        bool decrypted = false, unread = false;
+        const unsigned pn = (unsigned)cas_rec.n_replicas
+                            * sync_read_passes(rec_bad);
+        for (unsigned k = 0; k < pn && !decrypted; k++) {
+            uint8_t i = (uint8_t)(k % cas_rec.n_replicas);
+            if (i == 0u) {                   /* a pass starts clean */
+                last_err = STM_EBADTAG;
+                dev_err = STM_OK;
+                unread = false;
+            }
             uint16_t dev = stm_paddr_device(cas_rec.paddrs[i]);
             stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
             if (!bd) {
-                if (dev_err == STM_OK) dev_err = STM_EINVAL;
+                unread = true;
                 continue;
             }
             uint64_t byte_off = stm_paddr_offset(cas_rec.paddrs[i])
                                   * (uint64_t)STM_UB_SIZE;
             stm_status rs = stm_bdev_read(bd, byte_off, cold_cbuf, cold_total);
             if (rs != STM_OK) {
-                if (dev_err == STM_OK) dev_err = rs;
+                if (rs == STM_EIO) unread = true;
+                else if (dev_err == STM_OK) dev_err = rs;
                 continue;
             }
             size_t pt_out = 0;
@@ -10925,8 +10974,7 @@ static stm_status promote_one_extent_locked(stm_sync *s,
         if (!decrypted) {
             stm_ct_memzero(plain, C->len);
             free(plain);
-            if (dev_err != STM_OK) return dev_err;
-            return sync_rec_bad(rec_bad, last_err);
+            return sync_replicas_failed(rec_bad, dev_err, unread, last_err);
         }
     }
 

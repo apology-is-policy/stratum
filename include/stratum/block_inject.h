@@ -50,6 +50,18 @@ uint32_t stm_bdev_inject_fired_count(const struct stm_bdev *d);
 void     stm_bdev_inject_read_fail_after(struct stm_bdev *d, int64_t n_reads);
 uint32_t stm_bdev_inject_read_fired_count(const struct stm_bdev *d);
 
+/* A sector that fails: the next `times` reads meeting the device bytes
+ * [lo, hi) (every one, when times < 0) answer `answer` without reading,
+ * or with STM_OK, read and come back with the range's first byte
+ * inverted. Up to four ranges; armed by one thread while no read runs.
+ * _clear disarms them all; _fired counts the faulted reads. Fires only in
+ * a build with testing hooks. */
+void     stm_bdev_inject_read_range(struct stm_bdev *d, uint64_t lo,
+                                    uint64_t hi, int64_t times,
+                                    stm_status answer);
+void     stm_bdev_inject_read_range_clear(struct stm_bdev *d);
+uint32_t stm_bdev_inject_read_range_fired(const struct stm_bdev *d);
+
 /*
  * Area G bench instrumentation. stm_bdev_io_stats reports the running per-op I/O accounting:
  * total state-changing writes, total bytes written to the device, and

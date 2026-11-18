@@ -4784,3 +4784,147 @@ STM_TEST(corvus_a_logout_inside_the_send_init_unwraps_no_long_cold_chunk) {
     x5r_case(1);
     x5r_case(0);
 }
+
+
+/* ========================================================================= */
+/* A big COLD record the drain's promote cannot read (O1, round 5 F1).        */
+/* ========================================================================= */
+
+/* The chunk of COLD record c on every replica: its device bytes faulted
+ * `times` reads each (every one when < 0), EIO or read with a byte
+ * flipped. */
+static void o1_fault_chunk(seal_pool *sp, const stm_extent_record *c,
+                           int64_t times, bool flip)
+{
+    stm_sync *sync = stm_fs_sync(sp->fs);
+    stm_cas_record cr;
+    memset(&cr, 0, sizeof cr);
+    STM_ASSERT_OK(stm_cas_lookup(stm_sync_cas_index(sync), c->content_hash, &cr));
+    struct stm_bdev *d = stm_fs_bdev_for_test(sp->fs);
+    for (uint8_t i = 0; i < cr.n_replicas && i < 4u; i++) {
+        uint64_t lo = stm_paddr_offset(cr.paddrs[i]) * 4096u;
+        stm_bdev_inject_read_range(d, lo, lo + cr.length, times,
+                                   flip ? STM_OK : STM_EIO);
+    }
+    stm_sync_dcache_drain_for_test(sync);
+}
+
+/* c's content entry dereferenced and collected; put back with length
+ * c->len + delta when delta is not 0. */
+static void o1_take_chunk(seal_pool *sp, const stm_extent_record *c,
+                          uint64_t delta)
+{
+    stm_sync *sync = stm_fs_sync(sp->fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    stm_cas_record cr;
+    memset(&cr, 0, sizeof cr);
+    STM_ASSERT_OK(stm_cas_lookup(cas, c->content_hash, &cr));
+    for (uint32_t k = 0; k < cr.refcount; k++)
+        STM_ASSERT_OK(stm_cas_deref(cas, c->content_hash));
+    uint64_t pads[8];
+    size_t np = 0;
+    STM_ASSERT_OK(stm_cas_gc(cas, c->content_hash, pads, 8, &np));
+    if (delta != 0u)
+        STM_ASSERT_OK(stm_cas_insert(cas, c->content_hash, cr.paddrs,
+                                     cr.n_replicas, cr.length + delta, cr.gen));
+    stm_sync_dcache_drain_for_test(sync);
+}
+
+enum o1_big_damage {
+    O1_TAG_ALWAYS, O1_EIO_ALWAYS, O1_TAG_ONCE, O1_EIO_ONCE, O1_NO_ENTRY,
+    O1_ENTRY_LEN
+};
+
+/* A 10-byte buffered write near the end of an older pool's big COLD record
+ * damaged as `dmg` says: the drain's lower widening meets the record and
+ * its promote is the first to read it. A damage that stays drops the run
+ * (f's fsync answers EIO once) and the pool commits another file; one that
+ * clears on the promote's re-read costs nothing, and the write is there. */
+static void o1_big_case(const char *tag, enum o1_big_damage dmg)
+{
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, tag, UINT64_C(1) << 30, UINT64_C(128) << 20))
+        return;
+    const uint64_t ds = sp.sib.ds;
+    const size_t LEN = (size_t)64 << 20;
+    uint8_t *all = malloc(LEN);
+    STM_ASSERT(all != NULL);
+    if (!all) { seal_pool_close(&sp); return; }
+    stm_extent_record a;
+    uint64_t f = r4_big_file(&sp, ds, false, all, LEN, &a);
+    free(all);
+    struct stm_bdev *d = stm_fs_bdev_for_test(sp.fs);
+    stm_cas_record cr;
+    memset(&cr, 0, sizeof cr);
+    STM_ASSERT_OK(stm_cas_lookup(stm_sync_cas_index(stm_fs_sync(sp.fs)),
+                                 a.content_hash, &cr));
+    const bool clears = (dmg == O1_TAG_ONCE || dmg == O1_EIO_ONCE);
+    switch (dmg) {
+    case O1_TAG_ALWAYS: o1_fault_chunk(&sp, &a, -1, true);  break;
+    case O1_EIO_ALWAYS: o1_fault_chunk(&sp, &a, -1, false); break;
+    case O1_TAG_ONCE:   o1_fault_chunk(&sp, &a, 1, true);   break;
+    case O1_EIO_ONCE:   o1_fault_chunk(&sp, &a, 1, false);  break;
+    case O1_NO_ENTRY:   o1_take_chunk(&sp, &a, 0u);         break;
+    case O1_ENTRY_LEN:  o1_take_chunk(&sp, &a, 4096u);      break;
+    }
+    const uint64_t at = a.off + a.len - 100u;
+    STM_ASSERT_OK(stm_fs_write(sp.fs, ds, f, at, "wwwwwwwwww", 10));
+    stm_status c1 = stm_fs_commit(sp.fs);
+    uint32_t fired = stm_bdev_inject_read_range_fired(d);
+    stm_bdev_inject_read_range_clear(d);
+    uint64_t g = 0;
+    STM_ASSERT_OK(stm_fs_create_file(sp.fs, ds, 1, (const uint8_t *)"g", 1,
+                                     0600, 1000, 1000, &g));
+    STM_ASSERT_OK(stm_fs_write(sp.fs, ds, g, 0, "other", 5));
+    stm_status c2 = stm_fs_commit(sp.fs);
+    stm_status fy = stm_fs_fsync(sp.fs, ds, f, NULL);
+    fprintf(stderr, "  info: o1 big %s: commit %d, faulted reads %u (replicas "
+            "%u), other commit %d, fsync %d\n", tag, (int)c1, (unsigned)fired,
+            (unsigned)cr.n_replicas, (int)c2, (int)fy);
+    STM_ASSERT_OK(c1);
+    STM_ASSERT_OK(c2);
+    if (clears) {
+        STM_ASSERT(fired == cr.n_replicas);
+        STM_ASSERT_OK(fy);
+        uint8_t b[10];
+        size_t got = 0;
+        memset(b, 0, sizeof b);
+        STM_ASSERT_OK(stm_fs_read(sp.fs, ds, f, at, b, sizeof b, &got));
+        STM_ASSERT(got == sizeof b && memcmp(b, "wwwwwwwwww", 10) == 0);
+    } else {
+        if (dmg == O1_TAG_ALWAYS || dmg == O1_EIO_ALWAYS)
+            STM_ASSERT(fired >= 2u * cr.n_replicas);
+        STM_ASSERT_ERR(fy, STM_EIO);
+        STM_ASSERT_OK(stm_fs_fsync(sp.fs, ds, f, NULL));
+    }
+    if (c1 != STM_OK || c2 != STM_OK) {
+        stm_status u = stm_fs_unmount(sp.fs);
+        fprintf(stderr, "  info: o1 big %s: unmount %d\n", tag, (int)u);
+        sp.fs = NULL;
+    }
+    seal_pool_close(&sp);
+}
+
+STM_TEST(corvus_a_drain_promote_of_a_damaged_big_cold_record_drops_the_run) {
+    o1_big_case("o1btag", O1_TAG_ALWAYS);
+}
+
+STM_TEST(corvus_a_bad_sector_under_a_big_cold_record_drops_the_run) {
+    o1_big_case("o1beio", O1_EIO_ALWAYS);
+}
+
+STM_TEST(corvus_a_tag_failure_that_clears_on_the_promotes_re_read_costs_no_write) {
+    o1_big_case("o1btag1", O1_TAG_ONCE);
+}
+
+STM_TEST(corvus_a_read_error_that_clears_on_the_promotes_re_read_costs_no_write) {
+    o1_big_case("o1beio1", O1_EIO_ONCE);
+}
+
+STM_TEST(corvus_a_write_into_a_big_cold_record_with_no_content_entry_is_dropped) {
+    o1_big_case("o1bgone", O1_NO_ENTRY);
+}
+
+STM_TEST(corvus_a_write_into_a_big_cold_record_its_content_entry_disowns_is_dropped) {
+    o1_big_case("o1blen", O1_ENTRY_LEN);
+}

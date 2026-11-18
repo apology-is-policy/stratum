@@ -295,19 +295,24 @@ stm_status stm_fs_free(stm_fs *fs, uint64_t paddr, uint64_t free_gen);
  * advances gen.
  *
  * The flush first writes every file's buffered bytes. A run whose write
- * fails because the record under it fails its integrity check
- * (STM_EBADTAG, STM_ECORRUPT: a partial write merges the old bytes) is
- * dropped, so one damaged file cannot fail every commit of the pool: the
- * record keeps its old bytes, the file's next stm_fs_fsync answers
- * STM_EIO, and the event sink hears of it. The flushes before a
- * truncate, reflink, migrate and the write path's own buffer-full flush
- * drop such a run the same way. So is one whose cover meets records off
+ * fails on a record of its file is dropped, so one damaged file cannot
+ * fail every commit of the pool: a partial write merges the record's old
+ * bytes, and no replica gives them on a second read (they fail their
+ * integrity check, STM_EBADTAG or STM_ECORRUPT, or the sector answers
+ * STM_EIO), or its content entry is gone or does not match it, or the key
+ * it names is missing to this mount. The record keeps its old bytes, the
+ * file's next stm_fs_fsync answers STM_EIO, and the event sink (stderr,
+ * with none) hears of it. The flushes before a truncate, reflink, migrate
+ * and the write path's own buffer-full flush drop such a run the same
+ * way, and the first reflink or copy of the file after each drop answers
+ * STM_EIO (it would copy the old bytes), as Linux's remap prep does on
+ * AS_EIO; the fsyncs keep their own report. So is one whose cover meets records off
  * the block grid (which only a crafted stream received before they were
  * refused can make) where it cannot rewrite them: a split point or a
  * cover past 4 x recordsize. Only a failure that is one of the file's own
  * records drops a run: one of the pool's metadata (an index node, the
- * allocator, the keys), a device (a replica the device did not answer
- * makes the read answer that device error), STM_ENOSPC or STM_ENOMEM
+ * allocator, the keyschema's state on the write side), a device write or
+ * flush, a device read error other than EIO, STM_ENOSPC or STM_ENOMEM
  * keeps the bytes buffered and fails the commit, and so does any failure
  * of a run holding bytes an inline file's committed state keeps nowhere
  * else (its first write past the inline cap). */
@@ -323,7 +328,7 @@ stm_status stm_fs_commit(stm_fs *fs);
  * stm_fs_fsync_since. The reports live in RAM, up to 256 files; past
  * that a new one evicts, with an event, the oldest an fsync made, else
  * the oldest. A crash forgets them, and an unmount answers STM_EIO when
- * one no fsync saw is left. */
+ * one no fsync saw is left or was evicted. */
 STM_MUST_USE
 stm_status stm_fs_fsync(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                         const uint64_t *gen);
@@ -332,7 +337,10 @@ stm_status stm_fs_fsync(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
  * dropped a run of the incarnation after *since was sampled
  * (stm_fs_write_error_sample, when the file was opened), then *since moves
  * to it. So every open file that predates a drop hears of it once, from
- * its own fsync, and one opened after it was reported does not. */
+ * its own fsync, and one opened after it was reported does not. Two
+ * calls with one sample both report: a caller sharing a sample between
+ * threads decides under its own lock (the 9P server does, as Linux does
+ * under f_lock). */
 STM_MUST_USE
 stm_status stm_fs_fsync_since(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                               const uint64_t *gen, uint64_t *since);
@@ -344,8 +352,10 @@ uint64_t stm_fs_write_error_sample(stm_fs *fs, uint64_t dataset_id,
                                    uint64_t ino, uint64_t gen);
 
 /* The fs's operational events (one line each, no newline): a flush that
- * dropped a file's run. The sink is called under the fs's locks, so it
- * must take no lock that is ever held across a call into the fs. */
+ * dropped a file's run, a report evicted, an unmount that lost bytes.
+ * With no sink installed these lines go to stderr. The sink is called
+ * under the fs's locks, so it must take no lock that is ever held across
+ * a call into the fs. */
 typedef void (*stm_fs_event_sink)(void *ctx, const char *line);
 
 /* Install fn with ctx; fn == NULL removes the sink if ctx is the one

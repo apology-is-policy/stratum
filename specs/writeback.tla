@@ -107,8 +107,9 @@
 (*   - InodeCapBlocks ≥ 1 — per-inode buffer cap (blocks).                  *)
 (*   - GlobalCapBlocks ≥ 1 — global buffer cap (blocks).                    *)
 (*                                                                          *)
-(* A flush that cannot ever write a run (the record under it fails its     *)
-(* integrity check, so the merge read fails at every drain): kept         *)
+(* A flush that cannot ever write a run (a record under it that no        *)
+(* replica gives on a second read, so the merge read fails at every       *)
+(* drain, or records off the block grid its cover cannot rewrite): kept   *)
 (* buffered, the run would fail every later flush and so every Commit,    *)
 (* which needs buffer = {}. FlushFails drops exactly that run and records *)
 (* its inode in write_errors; Fsync(ino) reports the error once. The      *)
@@ -121,7 +122,10 @@
 (* full table evicts another inode's report and tells the event sink,      *)
 (* which is that inode's report (its runs leave `lost`).                    *)
 (* BuggyEvictSilently evicts without it: DroppedIsReported fires.          *)
-(* Transition(ino) is an inline file's cutover: its committed bytes (here  *)
+(* Transition(ino) is an inline file's dense transition (its first write  *)
+(* past the inline cap that continues the inline bytes; the sparse        *)
+(* cutover writes its prefix at once and holds nothing): its committed    *)
+(* bytes (here                                                            *)
 (* an extent at offset 0) go back into the buffer as a HELD run, the       *)
 (* committed copy gone. held[ino] is the end of the held bytes (the C      *)
 (* dirty buffer's held_end), cleared by a Flush of the inode; `taken` the  *)
@@ -198,7 +202,7 @@ VARIABLES
     next_seq,       \* 1..MaxSeq+1 -- next writer's seq stamp
     write_errors,   \* SUBSET InoIds -- inodes owed an fsync error report
     lost,           \* SUBSET BufRange -- ghost: dropped runs not yet reported
-    held,           \* [InoIds -> 0..MaxOff] -- end of a cutover's held bytes
+    held,           \* [InoIds -> 0..MaxOff] -- end of a transition's held bytes
     taken,          \* SUBSET Seqs -- ghost: seqs a cutover took from committed
     cut             \* SUBSET InoIds -- files that have cut over
 
@@ -393,12 +397,19 @@ Crash ==
     /\ UNCHANGED <<durable_disk, used_paddrs, current_txg, next_seq, cut>>
 
 (***************************************************************************)
-(* FlushFails -- the drain cannot write run r of ino (its record failed its *)
-(* integrity check): r leaves the buffer unwritten, so the inode's other   *)
-(* runs and every other inode still flush and Commit stays reachable; the *)
-(* inode is owed a report. committed is unchanged: the record keeps its   *)
-(* old bytes. A run starting below held[ino] is never dropped. A new       *)
-(* inode's report into a full table evicts another's, by event.            *)
+(* FlushFails -- the drain cannot write run r of ino (a record it merges   *)
+(* with gives no bytes on a second read of every replica, its content     *)
+(* entry is gone or its key missing, or its cover meets records off the   *)
+(* block grid): r leaves the buffer unwritten, so the inode's other runs  *)
+(* and every other inode still flush and Commit stays reachable; the      *)
+(* inode is owed a report. committed is unchanged: the model takes a run  *)
+(* whole. In the C a cover over the recordsize goes in pieces, and those  *)
+(* before the failing one land (their bytes are committed, the rest is    *)
+(* lost); a promote before the failure rewrites a record's extents, not   *)
+(* its bytes. Which failure counts is below this abstraction: a read that *)
+(* fails and then succeeds is a Flush. A run starting below held[ino] is  *)
+(* never dropped. A new inode's report into a full table evicts another's,*)
+(* by event.                                                              *)
 (***************************************************************************)
 FlushFails(ino, r) ==
     /\ r \in BufferedFor(ino)

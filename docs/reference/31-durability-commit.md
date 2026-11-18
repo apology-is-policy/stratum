@@ -301,11 +301,14 @@ buffered bytes after the fid's sample (26, Error paths), and the sample moves
 to it. A fid samples at Tlopen and Tlcreate (`stm_fs_write_error_sample`), so,
 as with Linux's errseq, every fid open before a drop hears of it once, from its
 own fsync, and one opened after an fsync reported it does not; a retried fsync
-through the same fid answers OK over the lost bytes. A commit error wins and
-keeps the report. The reports live in RAM, for 256 files at most; a crash
-forgets them. A clean unmount (`stm_fs_unmount`) performs a final commit unless
-the fs is read-only or wedged, and answers `STM_EIO` when a report no fsync saw
-is left.
+through the same fid answers OK over the lost bytes. The server decides the
+report under its lock, so two Tfsyncs on one fid report a drop once, as Linux
+checks and advances a file's sample under `f_lock`; a fid never opened makes
+the commit and takes no report. A commit error wins and keeps the report. The
+reports live in RAM, for 256 files at most; a crash forgets them. A clean
+unmount (`stm_fs_unmount`) performs a final commit unless the fs is read-only
+or wedged, and answers `STM_EIO` when a report no fsync saw is left or was
+evicted.
 
 ---
 

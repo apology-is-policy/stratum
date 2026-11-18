@@ -164,14 +164,16 @@ _Static_assert(STM_FLUSH_INODE_CAP_BYTES <= STM_FS_RECORDSIZE_MAX,
 
 /* A file whose buffered run a flush dropped (fs_note_write_error_locked),
  * in the shape of Linux's errseq: seq numbers its latest drop (fs-wide,
- * they only grow), seen is whether an fsync has reported it since. gen is
+ * they only grow), seen is whether an fsync has reported it since.
+ * copy_unheard: no reflink or copy of the file has failed on its latest
+ * drop yet (Linux's AS_EIO, which the remap prep tests and clears). gen is
  * the incarnation the run was written to, FS_WERR_NO_INODE for an ino the
  * inode index lacks. */
 struct fs_write_error {
     uint64_t ds, ino, gen;
     uint64_t seq;
-    uint64_t last_drop;  /* the fs's drop count at its last drop */
     bool     seen;
+    bool     copy_unheard;
 };
 #define FS_WRITE_ERRORS_MAX 256u
 #define FS_WERR_NO_INODE    UINT64_MAX
@@ -243,7 +245,7 @@ struct stm_fs {
     struct fs_write_error werr[FS_WRITE_ERRORS_MAX];   /* oldest first */
     uint32_t werr_count;
     uint64_t werr_seq;   /* the last drop's number */
-    uint64_t werr_drops; /* every drop, counted */
+    uint64_t werr_lost;  /* unmade reports the table evicted */
     pthread_mutex_t promote_cur_mu;
     struct fs_promote_cursor promote_cur[FS_PROMOTE_CURSORS];  /* oldest first */
     uint32_t promote_cur_count;
@@ -1902,6 +1904,15 @@ stm_status stm_fs_mount(const char *path,
 /* Unmount.                                                                   */
 /* ========================================================================= */
 
+/* A write-error line: to the event sink, or with none installed to stderr,
+ * so lost bytes are still told of at a shutdown that removed the sink.
+ * Caller holds werr_mu. */
+static void fs_werr_event_locked(stm_fs *fs, const char *line)
+{
+    if (fs->event_sink) fs->event_sink(fs->event_sink_ctx, line);
+    else fprintf(stderr, "STRATUM-FS: %s\n", line);
+}
+
 stm_status stm_fs_unmount(stm_fs *fs)
 {
     if (!fs) return STM_EINVAL;
@@ -1927,21 +1938,24 @@ stm_status stm_fs_unmount(stm_fs *fs)
         }
     }
     /* A dropped run no fsync reported (its report dies with the fs, and
-     * the final flush may have made it): the unmount says data was lost. */
+     * the final flush may have made it), or whose report the table
+     * evicted unmade: the unmount says data was lost. */
     if (commit_status == STM_OK) {
-        uint32_t unseen = 0;
+        uint64_t unseen = 0;
         pthread_mutex_lock(&fs->werr_mu);
         for (uint32_t i = 0; i < fs->werr_count; i++)
             if (!fs->werr[i].seen) unseen++;
-        if (unseen != 0u && fs->event_sink) {
-            char line[160];
+        if (unseen != 0u || fs->werr_lost != 0u) {
+            char line[200];
             snprintf(line, sizeof line,
-                     "write-error unmount: %u files hold a dropped run no "
-                     "fsync reported", (unsigned)unseen);
-            fs->event_sink(fs->event_sink_ctx, line);
+                     "write-error unmount: %llu files hold a dropped run no "
+                     "fsync reported, and %llu such reports were evicted",
+                     (unsigned long long)unseen,
+                     (unsigned long long)fs->werr_lost);
+            fs_werr_event_locked(fs, line);
+            commit_status = STM_EIO;
         }
         pthread_mutex_unlock(&fs->werr_mu);
-        if (unseen != 0u) commit_status = STM_EIO;
     }
 
     /* Close the stack regardless of commit result. Order matters:
@@ -2067,34 +2081,38 @@ uint64_t stm_fs_write_error_sample(stm_fs *fs, uint64_t dataset_id,
     return at;
 }
 
-/* When (ds, ino) last dropped a run, in any incarnation, on the fs's drop
- * count; 0 for none. A repeat drop of a report no fsync saw keeps its seq
- * (errseq_set), so this, not the seq, says a drop happened. */
-static uint64_t fs_write_error_last_drop(stm_fs *fs, uint64_t ds,
-                                         uint64_t ino)
+/* Whether the live incarnation of (ds, ino) dropped a run no reflink or
+ * copy has failed on yet; it is then heard. */
+static bool fs_take_copy_error(stm_fs *fs, uint64_t ds, uint64_t ino)
 {
-    uint64_t at = 0u;
+    uint64_t gen = FS_WERR_NO_INODE;
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    struct stm_inode_value iv;
+    if (iidx && stm_inode_lookup(iidx, ds, ino, &iv) == STM_OK)
+        gen = stm_load_le64(iv.si_gen);
+    bool unheard = false;
     pthread_mutex_lock(&fs->werr_mu);
-    for (uint32_t i = 0; i < fs->werr_count; i++)
-        if (fs->werr[i].ds == ds && fs->werr[i].ino == ino &&
-            fs->werr[i].last_drop > at)
-            at = fs->werr[i].last_drop;
+    for (uint32_t i = 0; i < fs->werr_count; i++) {
+        struct fs_write_error *e = &fs->werr[i];
+        if (e->ds != ds || e->ino != ino || e->gen != gen) continue;
+        unheard = e->copy_unheard;
+        e->copy_unheard = false;
+        break;
+    }
     pthread_mutex_unlock(&fs->werr_mu);
-    return at;
+    return unheard;
 }
 
-/* A reflink's flush of its source: the copy would take the source's
- * stale bytes where the flush dropped a run of it (whose report the
- * destination never gets), so it answers STM_EIO, as Linux's remap prep
- * fails on the writeback error. The source keeps its report. A drop
- * stamps a count above every earlier one; a peer's eviction of the
- * source's report reads 0, which is no drop. */
+/* A reflink's or copy's flush of its source. Where a flush dropped a run
+ * of the source, this one or an earlier one, the copy would take the old
+ * bytes and the destination would hold no report: so the first copy after
+ * each drop answers STM_EIO, as Linux's remap prep does on AS_EIO
+ * (filemap_check_errors tests and clears it). The fsyncs keep their own
+ * report. A report the table evicted is no longer asked of. */
 static stm_status fs_flush_source_locked(stm_fs *fs, uint64_t ds, uint64_t ino)
 {
-    uint64_t before = fs_write_error_last_drop(fs, ds, ino);
     stm_status s = fs_flush_ino_locked(fs, ds, ino);
-    if (s == STM_OK && fs_write_error_last_drop(fs, ds, ino) > before)
-        s = STM_EIO;
+    if (s == STM_OK && fs_take_copy_error(fs, ds, ino)) s = STM_EIO;
     return s;
 }
 
@@ -2760,7 +2778,7 @@ static void fs_note_write_error_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
            !(fs->werr[i].ds == ds && fs->werr[i].ino == ino &&
              fs->werr[i].gen == gen))
         i++;
-    struct fs_write_error cur = { ds, ino, gen, 0u, 0u, true };
+    struct fs_write_error cur = { ds, ino, gen, 0u, true, false };
     if (i < fs->werr_count) {
         cur = fs->werr[i];
         memmove(&fs->werr[i], &fs->werr[i + 1u],
@@ -2772,7 +2790,7 @@ static void fs_note_write_error_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
         cur.seq = ++fs->werr_seq;
         cur.seen = false;
     }
-    cur.last_drop = ++fs->werr_drops;
+    cur.copy_unheard = true;
     {
         if (fs->werr_count == FS_WRITE_ERRORS_MAX) {
             /* The oldest report an fsync made goes first: of it, only a
@@ -2782,17 +2800,16 @@ static void fs_note_write_error_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
             while (k < fs->werr_count && !fs->werr[k].seen) k++;
             if (k == fs->werr_count) k = 0;
             const struct fs_write_error *old = &fs->werr[k];
-            if (fs->event_sink) {
-                snprintf(line, sizeof line,
-                         "write-error dataset=%llu ino=%llu gen=%llu "
-                         "report evicted %s: %u files hold one",
-                         (unsigned long long)old->ds,
-                         (unsigned long long)old->ino,
-                         (unsigned long long)old->gen,
-                         old->seen ? "after an fsync made it" : "unmade",
-                         (unsigned)FS_WRITE_ERRORS_MAX);
-                fs->event_sink(fs->event_sink_ctx, line);
-            }
+            if (!old->seen) fs->werr_lost++;
+            snprintf(line, sizeof line,
+                     "write-error dataset=%llu ino=%llu gen=%llu "
+                     "report evicted %s: %u files hold one",
+                     (unsigned long long)old->ds,
+                     (unsigned long long)old->ino,
+                     (unsigned long long)old->gen,
+                     old->seen ? "after an fsync made it" : "unmade",
+                     (unsigned)FS_WRITE_ERRORS_MAX);
+            fs_werr_event_locked(fs, line);
             memmove(&fs->werr[k], &fs->werr[k + 1u],
                     (size_t)(FS_WRITE_ERRORS_MAX - k - 1u)
                         * sizeof fs->werr[0]);
@@ -2802,15 +2819,13 @@ static void fs_note_write_error_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
         fs->werr[i] = cur;
         fs->werr_count++;
     }
-    if (fs->event_sink) {
-        snprintf(line, sizeof line,
-                 "write-error dataset=%llu ino=%llu gen=%llu off=%llu "
-                 "len=%llu status=%d (%s): run dropped, fsync answers EIO",
-                 (unsigned long long)ds, (unsigned long long)ino,
-                 (unsigned long long)gen, (unsigned long long)off,
-                 (unsigned long long)len, (int)why, stm_strerror(why));
-        fs->event_sink(fs->event_sink_ctx, line);
-    }
+    snprintf(line, sizeof line,
+             "write-error dataset=%llu ino=%llu gen=%llu off=%llu "
+             "len=%llu status=%d (%s): run dropped, fsync answers EIO",
+             (unsigned long long)ds, (unsigned long long)ino,
+             (unsigned long long)gen, (unsigned long long)off,
+             (unsigned long long)len, (int)why, stm_strerror(why));
+    fs_werr_event_locked(fs, line);
     pthread_mutex_unlock(&fs->werr_mu);
 }
 
@@ -2837,7 +2852,7 @@ static stm_status fs_flush_drain_cb(void *user, uint64_t ds, uint64_t ino,
 #ifdef STRATUM_BUILD_TESTING_HOOKS
     if (fs->fail_drains != STM_OK && fs->fail_drains_skip == 0u) {
         drc = fs->fail_drains;
-        unw = true;
+        unw = (drc == STM_EBADTAG || drc == STM_ECORRUPT);
     } else
 #endif
     {
@@ -2852,17 +2867,18 @@ static stm_status fs_flush_drain_cb(void *user, uint64_t ds, uint64_t ino,
         stm_sync_drain_end(fs->sync);
     }
     /* A run whose write fails on one of its file's records (one off the
-     * block grid, or one it must keep whose bytes fail their check on
-     * every replica, whose content is gone or whose key is missing) can
-     * never be written: kept buffered, it would fail every later flush,
-     * and so every commit of the pool. Drop exactly this run (a cover the
-     * write widened is not taken) and report it at the file's fsync. A
-     * failure of the pool's metadata, a device or the room keeps the run
-     * and fails the flush. So does one of a run holding bytes the file's
+     * block grid, or one it must keep that no replica gives on a second
+     * read -- its bytes fail their check or its sector answers EIO --,
+     * whose content is gone or whose key is missing) can never be
+     * written: kept buffered, it would fail every later flush, and so
+     * every commit of the pool. Drop exactly this run (a cover the write
+     * widened is not taken) and report it at the file's fsync. A failure
+     * of the pool's metadata, a device write or flush, or the room keeps
+     * the run and fails the flush. So does one of a run holding bytes the file's
      * committed state keeps nowhere else (an inline file's first write
      * past the inline cap moved them here): dropping it would lose bytes
      * the file had. */
-    if ((drc == STM_EBADTAG || drc == STM_ECORRUPT) && unw &&
+    if ((drc == STM_EBADTAG || drc == STM_ECORRUPT || drc == STM_EIO) && unw &&
         !stm_dirty_buffer_view_holds(view, off)) {
         fs_note_write_error_locked(fs, ds, ino, off, len, drc);
         *out_end = off + len;
@@ -9850,6 +9866,30 @@ static void fs_promote_cursor_set(stm_fs *fs, uint64_t ds, uint64_t ino,
         (struct fs_promote_cursor){ .ds = ds, .ino = ino, .off = off };
     pthread_mutex_unlock(&fs->promote_cur_mu);
 }
+
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+void stm_fs_promote_cursor_set_for_test(stm_fs *fs, uint64_t ds, uint64_t ino,
+                                        uint64_t off)
+{
+    if (fs) fs_promote_cursor_set(fs, ds, ino, off);
+}
+
+bool stm_fs_promote_cursor_for_test(stm_fs *fs, uint64_t ds, uint64_t *ino,
+                                    uint64_t *off)
+{
+    bool found = false;
+    if (!fs) return false;
+    pthread_mutex_lock(&fs->promote_cur_mu);
+    for (uint32_t i = 0; i < fs->promote_cur_count && !found; i++) {
+        if (fs->promote_cur[i].ds != ds) continue;
+        *ino = fs->promote_cur[i].ino;
+        *off = fs->promote_cur[i].off;
+        found = true;
+    }
+    pthread_mutex_unlock(&fs->promote_cur_mu);
+    return found;
+}
+#endif
 
 stm_status stm_fs_promote_sealed_cold(stm_fs *fs, uint64_t dataset_id,
                                       uint64_t max_bytes,

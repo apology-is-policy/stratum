@@ -55,6 +55,14 @@ struct stm_bdev {
      * a build with testing hooks. */
     atomic_int_fast64_t        inject_read_countdown;
     atomic_uint_fast32_t       inject_read_fired;
+    /* Reads meeting a byte range (stm_bdev_inject_read_range), up to four:
+     * each answers rr_answer without reading, or with STM_OK reads and
+     * inverts the range's first byte. rr_left is the reads left to fault,
+     * < 0 for every one. Checked only in a build with testing hooks. */
+    atomic_uint_fast64_t       rr_lo[4], rr_hi[4];
+    atomic_int_fast64_t        rr_left[4];
+    atomic_int                 rr_answer[4];
+    atomic_uint_fast32_t       rr_n, rr_fired;
 
     /* Per-op accounting, relaxed, read by bench_commit and the tests. */
     atomic_uint_fast64_t       io_writes;

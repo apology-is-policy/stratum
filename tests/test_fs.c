@@ -12170,7 +12170,7 @@ STM_TEST(fs_fsync_keeps_the_newest_256_reports) {
     for (unsigned i = 1; i < 257u; i++)
         STM_ASSERT_ERR(stm_fs_fsync(fs, 1, inos[i], NULL), STM_EIO);
     stm_fs_set_event_sink(fs, NULL, NULL);
-    STM_ASSERT_OK(stm_fs_unmount(fs));
+    STM_ASSERT_ERR(stm_fs_unmount(fs), STM_EIO);   /* x0's evicted unmade */
     unlink(g_tmp_path);
     unlink(g_key_path);
 }
@@ -12672,7 +12672,7 @@ STM_TEST(fs_a_repeat_drop_keeps_a_file_among_the_newest_reports) {
     for (unsigned i = 2; i < 257u; i++)
         STM_ASSERT_ERR(stm_fs_fsync(fs, 1, inos[i], NULL), STM_EIO);
     stm_fs_set_event_sink(fs, NULL, NULL);
-    STM_ASSERT_OK(stm_fs_unmount(fs));
+    STM_ASSERT_ERR(stm_fs_unmount(fs), STM_EIO);   /* x1's evicted unmade */
     unlink(g_tmp_path);
     unlink(g_key_path);
 }
@@ -12859,6 +12859,336 @@ STM_TEST(fs_fsync_since_reports_a_drop_to_every_sample_that_predates_it) {
     STM_ASSERT_ERR(stm_fs_fsync(fs, 1, f, NULL), STM_EIO);
     STM_ASSERT_OK(stm_fs_fsync(fs, 1, f, NULL));
     STM_ASSERT_ERR(stm_fs_fsync_since(fs, 1, f, &gen, &a), STM_EIO);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+
+/* ========================================================================= */
+/* A record no replica of which reads: re-read once, then dropped (O1).      */
+/* ========================================================================= */
+
+/* rh_make's pool remounted (no cache holds g's record), its record at 8192
+ * faulted on every replica: `times` reads each (every one when < 0), each
+ * answering EIO, or read with a byte flipped. *nrep: its replica count. */
+static stm_fs *o1_mount(const char *name, uint64_t *f, uint64_t *g,
+                        uint64_t *h, int64_t times, bool flip, unsigned *nrep)
+{
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return NULL;
+    rh_make(fs, f, g, h);
+    stm_extent_record rec;
+    memset(&rec, 0, sizeof rec);
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(stm_fs_sync_for_test(fs)),
+                                       1, *g, 8192, &rec));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return NULL;
+    STM_ASSERT(rec.n_replicas >= 1u);
+    *nrep = rec.n_replicas;
+    for (uint8_t i = 0; i < rec.n_replicas && i < 4u; i++) {
+        uint64_t lo = stm_paddr_offset(rec.paddrs[i]) * 4096u;
+        stm_bdev_inject_read_range(stm_fs_bdev_for_test(fs), lo, lo + rec.len,
+                                   times, flip ? STM_OK : STM_EIO);
+    }
+    return fs;
+}
+
+/* After a remount: f holds 'F' at [0, 4096) when f_written; g's block at
+ * 8192 holds 'C' with the 10 bytes at 8292 'w' when g_written. */
+static void o1_after(uint64_t f, uint64_t g, bool f_written, bool g_written)
+{
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (fs) {
+        uint8_t b[4096];
+        size_t got = 0;
+        if (f_written) {
+            memset(b, 0, sizeof b);
+            STM_ASSERT_OK(stm_fs_read(fs, 1, f, 0, b, sizeof b, &got));
+            STM_ASSERT(got == sizeof b);
+            STM_ASSERT(rh_is(b, 0, sizeof b, 'F'));
+        }
+        memset(b, 0, sizeof b);
+        got = 0;
+        STM_ASSERT_OK(stm_fs_read(fs, 1, g, 8192, b, sizeof b, &got));
+        STM_ASSERT(got == sizeof b);
+        STM_ASSERT(rh_is(b, 0, 100, 'C'));
+        STM_ASSERT(rh_is(b, 100, 110, g_written ? 'w' : 'C'));
+        STM_ASSERT(rh_is(b, 110, sizeof b, 'C'));
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+    }
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Every read of the sectors under g's record answers EIO. A buffered write
+ * into the record, which the drain must merge with the record's bytes, is
+ * dropped after the re-read and reported once at g's fsync; the pool
+ * commits and f's later write lands. */
+STM_TEST(fs_a_bad_sector_under_a_record_drops_the_run_and_reports_it) {
+    uint64_t f = 0, g = 0, h = 0;
+    unsigned nrep = 0;
+    stm_fs *fs = o1_mount("o1_bad", &f, &g, &h, -1, false, &nrep);
+    if (!fs) return;
+    struct stm_bdev *d = stm_fs_bdev_for_test(fs);
+    x6_sink_reset();
+    stm_fs_set_event_sink(fs, x6_sink, NULL);
+    uint8_t w[10];
+    memset(w, 'w', sizeof w);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 8292, w, sizeof w));
+    stm_status c1 = stm_fs_commit(fs);
+    uint32_t fired = stm_bdev_inject_read_range_fired(d);
+    fprintf(stderr, "  info: o1 bad sector: commit %d, faulted reads %u, "
+            "replicas %u\n", (int)c1, (unsigned)fired, nrep);
+    STM_ASSERT_OK(c1);
+    STM_ASSERT(fired >= 2u * nrep);                  /* each replica twice */
+    char want[48];
+    snprintf(want, sizeof want, "status=%d", (int)STM_EIO);
+    STM_ASSERT(strstr(x6_events, want) != NULL);
+    STM_ASSERT(strstr(x6_events, "run dropped") != NULL);
+    uint8_t b[4096];
+    memset(b, 'F', sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, b, sizeof b));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_fsync(fs, 1, f, NULL));
+    STM_ASSERT_ERR(stm_fs_fsync(fs, 1, g, NULL), STM_EIO);
+    STM_ASSERT_OK(stm_fs_fsync(fs, 1, g, NULL));     /* once */
+    stm_fs_set_event_sink(fs, NULL, NULL);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    o1_after(f, g, true, false);
+}
+
+/* The drain's merge read of g's record (forced onto the locked read, so it
+ * is the first read of it) fails once per replica, EIO or with a byte
+ * flipped; the re-read gives the bytes, so the run lands, nothing is
+ * reported, and the write is there after a remount. */
+static void o1_once(const char *name, bool flip)
+{
+    uint64_t f = 0, g = 0, h = 0;
+    unsigned nrep = 0;
+    stm_fs *fs = o1_mount(name, &f, &g, &h, 1, flip, &nrep);
+    if (!fs) return;
+    struct stm_bdev *d = stm_fs_bdev_for_test(fs);
+    stm_sync_force_locked_read_for_test(stm_fs_sync_for_test(fs), true);
+    uint8_t w[10];
+    memset(w, 'w', sizeof w);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 8292, w, sizeof w));
+    stm_status c1 = stm_fs_commit(fs);
+    uint32_t fired = stm_bdev_inject_read_range_fired(d);
+    fprintf(stderr, "  info: o1 once (%s): commit %d, faulted reads %u, "
+            "replicas %u\n", flip ? "flip" : "EIO", (int)c1, (unsigned)fired,
+            nrep);
+    STM_ASSERT_OK(c1);
+    STM_ASSERT(fired == nrep);
+    STM_ASSERT_OK(stm_fs_fsync(fs, 1, g, NULL));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    o1_after(f, g, false, true);
+}
+
+STM_TEST(fs_a_read_error_that_clears_on_the_re_read_costs_no_write) {
+    o1_once("o1_once_eio", false);
+}
+
+STM_TEST(fs_a_tag_failure_that_clears_on_the_re_read_costs_no_write) {
+    o1_once("o1_once_flip", true);
+}
+
+/* x0 migrated COLD, then its content entry taken (dereferenced and
+ * collected) and, when put_back_len is not 0, put back with that length.
+ * A buffered write into x0 is dropped and reported; x1 still commits. */
+static void o1_cold_entry_case(const char *name, int64_t put_back_delta)
+{
+    stm_fs *fs = x6_fresh(name);
+    if (!fs) return;
+    uint64_t inos[2];
+    x6_make_files(fs, inos, 2);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, inos[0]));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_record e;
+    memset(&e, 0, sizeof e);
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(sync), 1, inos[0],
+                                       0, &e));
+    STM_ASSERT_EQ(e.kind, STM_EXTENT_KIND_COLD);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    stm_cas_record cr;
+    memset(&cr, 0, sizeof cr);
+    STM_ASSERT_OK(stm_cas_lookup(cas, e.content_hash, &cr));
+    for (uint32_t k = 0; k < cr.refcount; k++)
+        STM_ASSERT_OK(stm_cas_deref(cas, e.content_hash));
+    uint64_t pads[8];
+    size_t np = 0;
+    STM_ASSERT_OK(stm_cas_gc(cas, e.content_hash, pads, 8, &np));
+    STM_ASSERT_ERR(stm_cas_lookup(cas, e.content_hash, &cr), STM_ENOENT);
+    if (put_back_delta != 0) {
+        STM_ASSERT_OK(stm_cas_insert(cas, e.content_hash, cr.paddrs,
+                                     cr.n_replicas,
+                                     cr.length + (uint64_t)put_back_delta,
+                                     cr.gen));
+    }
+    stm_sync_dcache_drain_for_test(sync);
+    x6_dirty(fs, inos, 0, 1, 'q');
+    stm_status c1 = stm_fs_commit(fs);
+    x6_dirty(fs, inos, 1, 1, 'o');
+    stm_status c2 = stm_fs_commit(fs);
+    stm_status fy = stm_fs_fsync(fs, 1, inos[0], NULL);
+    fprintf(stderr, "  info: o1 cold entry %s: commit %d, other commit %d, "
+            "fsync %d\n", name, (int)c1, (int)c2, (int)fy);
+    STM_ASSERT_OK(c1);
+    STM_ASSERT_OK(c2);
+    STM_ASSERT_ERR(fy, STM_EIO);
+    STM_ASSERT_OK(stm_fs_fsync(fs, 1, inos[1], NULL));
+    rh_read(fs, inos[1], 0, 4096, 4096);
+    STM_ASSERT(rh_is(rh_buf, 100, 200, 'o'));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_a_write_into_a_cold_record_with_no_content_entry_is_dropped) {
+    o1_cold_entry_case("o1_dangle", 0);
+}
+
+STM_TEST(fs_a_write_into_a_cold_record_its_content_entry_disowns_is_dropped) {
+    o1_cold_entry_case("o1_cas_len", 4096);
+}
+
+
+/* ========================================================================= */
+/* Round 5 F2 and F4: the copy's report, evictions, stderr.                   */
+/* ========================================================================= */
+
+/* A reflink and a copy_file_range of a file whose run an earlier commit
+ * dropped (not the copy's own flush): the first copy after each drop
+ * answers STM_EIO (Linux's AS_EIO, which the remap prep tests and clears),
+ * the next one copies; the source's fsync still reports the drops once. */
+STM_TEST(fs_the_first_copy_after_a_drop_answers_eio_whatever_flush_dropped_it) {
+    stm_fs *fs = x6_fresh("o1_copy_prior");
+    if (!fs) return;
+    uint64_t inos[1], dst = 0, dst2 = 0;
+    x6_make_files(fs, inos, 1);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"dst", 3,
+                                     0644u, 0, 0, &dst));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"dst2", 4,
+                                     0644u, 0, 0, &dst2));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    x6_dirty(fs, inos, 0, 1, 'r');
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));                 /* the commit drops it */
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, inos[0], 1, dst), STM_EIO);
+    STM_ASSERT_OK(stm_fs_reflink(fs, 1, inos[0], 1, dst));      /* heard */
+    x6_dirty(fs, inos, 0, 1, 's');
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    uint64_t copied = 0;
+    STM_ASSERT_ERR(stm_fs_copy_file_range(fs, 1, inos[0], 0, 1, dst2, 0, 4096,
+                                          &copied), STM_EIO);
+    STM_ASSERT_OK(stm_fs_copy_file_range(fs, 1, inos[0], 0, 1, dst2, 0, 4096,
+                                         &copied));
+    STM_ASSERT_ERR(stm_fs_fsync(fs, 1, inos[0], NULL), STM_EIO);
+    STM_ASSERT_OK(stm_fs_fsync(fs, 1, inos[0], NULL));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* 257 drops, none reported: the 257th evicts x0's report unmade (it is
+ * logged), every other file's fsync reports, and the unmount answers
+ * STM_EIO for x0's lost bytes. */
+STM_TEST(fs_unmount_answers_eio_for_a_report_the_table_evicted_unmade) {
+    stm_fs *fs = x6_fresh("o1_umnt_ev");
+    if (!fs) return;
+    static uint64_t inos[257];
+    x6_make_files(fs, inos, 257);
+    x6_sink_reset();
+    stm_fs_set_event_sink(fs, x6_sink, NULL);
+    x6_dirty(fs, inos, 0, 257, 'd');
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    STM_ASSERT(strstr(x6_events, "report evicted unmade") != NULL);
+    unsigned eio = 0;
+    for (unsigned i = 0; i < 257u; i++)
+        if (stm_fs_fsync(fs, 1, inos[i], NULL) == STM_EIO) eio++;
+    STM_ASSERT_EQ(eio, 256u);
+    stm_fs_set_event_sink(fs, NULL, NULL);
+    STM_ASSERT_ERR(stm_fs_unmount(fs), STM_EIO);
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* With no event sink installed, the write-error lines go to stderr: the
+ * drop's, and the unmount's for the report no fsync made. */
+STM_TEST(fs_write_error_lines_go_to_stderr_with_no_sink) {
+    stm_fs *fs = x6_fresh("o1_stderr");
+    if (!fs) return;
+    uint64_t inos[1];
+    x6_make_files(fs, inos, 1);
+    STM_ASSERT(!stm_fs_event_sink_for_test(fs));
+    char path[1100];
+    snprintf(path, sizeof path, "%s.stderr", g_tmp_path);
+    int cap = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    STM_ASSERT(cap >= 0);
+    if (cap < 0) { (void)stm_fs_unmount(fs); return; }
+    fflush(stderr);
+    int saved = dup(2);
+    (void)dup2(cap, 2);
+    x6_dirty(fs, inos, 0, 1, 'e');
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    stm_status c = stm_fs_commit(fs);
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    stm_status u = stm_fs_unmount(fs);
+    fflush(stderr);
+    (void)dup2(saved, 2);
+    close(saved);
+    char buf[4096];
+    ssize_t n = pread(cap, buf, sizeof buf - 1u, 0);
+    close(cap);
+    unlink(path);
+    buf[n > 0 ? (size_t)n : 0u] = '\0';
+    STM_ASSERT_OK(c);
+    STM_ASSERT_ERR(u, STM_EIO);
+    STM_ASSERT(strstr(buf, "run dropped") != NULL);
+    STM_ASSERT(strstr(buf, "write-error unmount") != NULL);
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+
+/* The login promote's cursor table keeps 64 datasets: a 65th forgets the
+ * one set longest ago (its next pass starts at its first file), and a
+ * dataset set again moves to the newest end. */
+STM_TEST(fs_the_promote_cursor_table_forgets_the_oldest_dataset_past_64) {
+    stm_fs *fs = x6_fresh("o1_cursors");
+    if (!fs) return;
+    uint64_t ino = 0, off = 0;
+    for (uint64_t d = 0; d < 64u; d++)
+        stm_fs_promote_cursor_set_for_test(fs, 1000u + d, d + 1u, 4096u);
+    STM_ASSERT(stm_fs_promote_cursor_for_test(fs, 1000u, &ino, &off));
+    STM_ASSERT(ino == 1u && off == 4096u);
+    stm_fs_promote_cursor_set_for_test(fs, 2000u, 7u, 0u);
+    STM_ASSERT(!stm_fs_promote_cursor_for_test(fs, 1000u, &ino, &off));
+    STM_ASSERT(stm_fs_promote_cursor_for_test(fs, 1001u, &ino, &off));
+    STM_ASSERT(stm_fs_promote_cursor_for_test(fs, 2000u, &ino, &off));
+    STM_ASSERT(ino == 7u);
+    stm_fs_promote_cursor_set_for_test(fs, 1001u, 9u, 8192u);
+    stm_fs_promote_cursor_set_for_test(fs, 3000u, 1u, 0u);
+    STM_ASSERT(!stm_fs_promote_cursor_for_test(fs, 1002u, &ino, &off));
+    STM_ASSERT(stm_fs_promote_cursor_for_test(fs, 1001u, &ino, &off));
+    STM_ASSERT(ino == 9u && off == 8192u);
+    STM_ASSERT(stm_fs_promote_cursor_for_test(fs, 1063u, &ino, &off));
+    STM_ASSERT(ino == 64u);
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);

@@ -1408,12 +1408,14 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
 
 /*
  * As stm_sync_read_extent; on a failure, *out_record_bad (when non-NULL)
- * says whether it is the record's own: its bytes failed their check on
- * every replica read (a replica a device did not answer makes the read
- * answer that device error instead), its content entry is gone or does
- * not match it, or the key it names is missing. A failure of the pool's
- * metadata (an index or content-index node), a device, or a locked
- * dataset leaves it false. A covering write's drain drops its run only on
+ * says whether it is the record's own: no replica gave its bytes on two
+ * reads of each (they failed their check, or the sector answered
+ * STM_EIO, or the replica's device is gone from the pool), its content
+ * entry is gone or does not match it, or the key it names is missing (to
+ * this mount: a session-token mount may hold a key a keyfile mount
+ * lacks). A failure of the pool's metadata (an index or content-index
+ * node), a device error other than EIO, or a locked dataset leaves it
+ * false. With out_record_bad NULL each replica is read once. A covering write's drain drops its run only on
  * such a failure (fs).
  */
 STM_MUST_USE

@@ -3034,9 +3034,11 @@ STM_TEST(sync_multi_a_send_hold_needs_one_replica_held) {
 }
 
 
-/* Replica 1 fails its check and device 0 does not answer replica 0's read:
- * the read answers the device's error, which is not the record's own, so
- * a drain keeps its run. With every replica read and bad, it is. */
+/* Replica 1 fails its check. Device 0 failing one read of replica 0 costs
+ * a drain's reader nothing (it reads every replica twice) and a plain
+ * read its EIO; a device error that may clear (ENOMEM) is the pool's on
+ * every read; EIO on every read of replica 0 is the record's own, as is
+ * every replica read and bad. */
 STM_TEST(sync_multi_read_answers_a_device_error_over_a_bad_replica) {
     stm_bdev *bds[NDEV] = {0};
     stm_alloc *as[NDEV] = {0};
@@ -3067,10 +3069,35 @@ STM_TEST(sync_multi_read_answers_a_device_error_over_a_bad_replica) {
     STM_ASSERT(memcmp(back, plain, sizeof plain) == 0);
     stm_sync_dcache_drain_for_test(s);
     stm_bdev_inject_read_fail_after(bds[d0], 1);
+    memset(back, 0, sizeof back);
+    bad = true;
+    STM_ASSERT_OK(stm_sync_read_extent_ex(s, 1u, 1u, 0u, back, sizeof back,
+                                          &got, &bad));
+    STM_ASSERT(!bad);
+    STM_ASSERT(memcmp(back, plain, sizeof plain) == 0);
+    STM_ASSERT_EQ(stm_bdev_inject_read_fired_count(bds[d0]), 1u);
+    stm_sync_dcache_drain_for_test(s);
+    stm_bdev_inject_read_fail_after(bds[d0], 1);
+    STM_ASSERT_ERR(stm_sync_read_extent(s, 1u, 1u, 0u, back, sizeof back,
+                                        &got), STM_EIO);
+    STM_ASSERT_EQ(stm_bdev_inject_read_fired_count(bds[d0]), 2u);
+    const uint64_t r0 = stm_paddr_offset(e.paddrs[0]) * (uint64_t)STM_UB_SIZE;
+    stm_bdev_inject_read_range(bds[d0], r0, r0 + 4096u, -1, STM_ENOMEM);
+    stm_sync_dcache_drain_for_test(s);
+    bad = true;
+    STM_ASSERT_ERR(stm_sync_read_extent_ex(s, 1u, 1u, 0u, back, sizeof back,
+                                           &got, &bad), STM_ENOMEM);
+    STM_ASSERT(!bad);
+    stm_bdev_inject_read_range_clear(bds[d0]);
+    const uint32_t f0 = stm_bdev_inject_read_range_fired(bds[d0]);
+    stm_bdev_inject_read_range(bds[d0], r0, r0 + 4096u, -1, STM_EIO);
+    stm_sync_dcache_drain_for_test(s);
+    bad = false;
     STM_ASSERT_ERR(stm_sync_read_extent_ex(s, 1u, 1u, 0u, back, sizeof back,
                                            &got, &bad), STM_EIO);
-    STM_ASSERT(!bad);
-    STM_ASSERT_EQ(stm_bdev_inject_read_fired_count(bds[d0]), 1u);
+    STM_ASSERT(bad);
+    STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(bds[d0]) - f0, 2u);
+    stm_bdev_inject_read_range_clear(bds[d0]);
     STM_ASSERT_OK(stm_bdev_write(bds[d0], stm_paddr_offset(e.paddrs[0]) *
                                  (uint64_t)STM_UB_SIZE, junk, sizeof junk));
     STM_ASSERT_OK(stm_bdev_fsync(bds[d0]));
@@ -3082,9 +3109,10 @@ STM_TEST(sync_multi_read_answers_a_device_error_over_a_bad_replica) {
     teardown_mirror_pool(bds, as, pool, s);
 }
 
-/* A COLD record's chunk, read and promoted, with one replica's device
- * failing and the other's tag: the device error, not a bad record; with
- * both tags failing, a bad record. */
+/* A COLD record's chunk, read and promoted, its replica 1's tag failing:
+ * one failed read of replica 0 costs a drain's reader nothing; a device
+ * error that may clear (ENOMEM) on every read is the pool's; EIO on every
+ * read of replica 0 is the record's own, as is both tags failing. */
 STM_TEST(sync_multi_cold_read_and_promote_answer_a_device_error_over_a_bad_replica) {
     stm_bdev *bds[NDEV] = {0};
     stm_alloc *as[NDEV] = {0};
@@ -3122,17 +3150,34 @@ STM_TEST(sync_multi_cold_read_and_promote_answer_a_device_error_over_a_bad_repli
     STM_ASSERT(memcmp(back, plain, sizeof plain) == 0);
     stm_sync_dcache_drain_for_test(s);
     stm_bdev_inject_read_fail_after(bds[d0], 1);
+    memset(back, 0, sizeof back);
+    bad = true;
+    STM_ASSERT_OK(stm_sync_read_extent_ex(s, 1u, 1u, 0u, back, sizeof back,
+                                          &got, &bad));
+    STM_ASSERT(!bad);
+    STM_ASSERT(memcmp(back, plain, sizeof plain) == 0);
+    STM_ASSERT_EQ(stm_bdev_inject_read_fired_count(bds[d0]), 1u);
+    const uint64_t r0 = stm_paddr_offset(cr.paddrs[0]) * (uint64_t)STM_UB_SIZE;
+    stm_bdev_inject_read_range(bds[d0], r0, r0 + 4096u, -1, STM_ENOMEM);
+    stm_sync_dcache_drain_for_test(s);
     bad = true;
     STM_ASSERT_ERR(stm_sync_read_extent_ex(s, 1u, 1u, 0u, back, sizeof back,
-                                           &got, &bad), STM_EIO);
+                                           &got, &bad), STM_ENOMEM);
     STM_ASSERT(!bad);
-    STM_ASSERT_EQ(stm_bdev_inject_read_fired_count(bds[d0]), 1u);
-    stm_sync_dcache_drain_for_test(s);
-    stm_bdev_inject_read_fail_after(bds[d0], 1);
     bad = true;
-    STM_ASSERT_ERR(stm_sync_promote_cold_at(s, 1u, 1u, 0u, &bad), STM_EIO);
+    STM_ASSERT_ERR(stm_sync_promote_cold_at(s, 1u, 1u, 0u, &bad), STM_ENOMEM);
     STM_ASSERT(!bad);
-    STM_ASSERT_EQ(stm_bdev_inject_read_fired_count(bds[d0]), 2u);
+    stm_bdev_inject_read_range_clear(bds[d0]);
+    stm_bdev_inject_read_range(bds[d0], r0, r0 + 4096u, -1, STM_EIO);
+    stm_sync_dcache_drain_for_test(s);
+    bad = false;
+    STM_ASSERT_ERR(stm_sync_read_extent_ex(s, 1u, 1u, 0u, back, sizeof back,
+                                           &got, &bad), STM_EIO);
+    STM_ASSERT(bad);
+    bad = false;
+    STM_ASSERT_ERR(stm_sync_promote_cold_at(s, 1u, 1u, 0u, &bad), STM_EIO);
+    STM_ASSERT(bad);
+    stm_bdev_inject_read_range_clear(bds[d0]);
     STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(s), 1u, 1u, 0u, &e));
     STM_ASSERT_EQ(e.kind, STM_EXTENT_KIND_COLD);
     STM_ASSERT_OK(stm_bdev_write(bds[d0], stm_paddr_offset(cr.paddrs[0]) *
@@ -3146,6 +3191,92 @@ STM_TEST(sync_multi_cold_read_and_promote_answer_a_device_error_over_a_bad_repli
     stm_status ps = stm_sync_promote_cold_at(s, 1u, 1u, 0u, &bad);
     STM_ASSERT(ps == STM_EBADTAG || ps == STM_ECORRUPT);
     STM_ASSERT(bad);
+    stm_sync_force_locked_read_for_test(s, false);
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+
+/* One classifying read (or promote) with replica 1's tag failing and
+ * replica 0 faulted per pass by two ranges: the first `times1` reads answer
+ * a1, every later one a2 (STM_OK: read and garbled). */
+static stm_status pass2_try(stm_sync *s, stm_bdev *b0, uint64_t r0, stm_status a1,
+                            stm_status a2, uint64_t ino, bool promote,
+                            bool *bad)
+{
+    stm_bdev_inject_read_range_clear(b0);
+    stm_bdev_inject_read_range(b0, r0, r0 + 4096u, 1, a1);
+    stm_bdev_inject_read_range(b0, r0, r0 + 4096u, -1, a2);
+    stm_sync_dcache_drain_for_test(s);
+    uint8_t back[4096];
+    size_t got = 0;
+    *bad = false;
+    stm_status rc = promote ? stm_sync_promote_cold_at(s, 1u, ino, 0u, bad)
+                            : stm_sync_read_extent_ex(s, 1u, ino, 0u, back,
+                                                      sizeof back, &got, bad);
+    stm_bdev_inject_read_range_clear(b0);
+    return rc;
+}
+
+/* What is said of a record is its second pass's: each pass over the
+ * replicas starts clean. Replica 1's tag fails throughout; replica 0
+ * answers ENOMEM on the first pass and EIO on the second (the record's
+ * own, EIO), or EIO and then a garbled read (the record's own, a bad tag).
+ * For a HOT record's read, a COLD record's read and its promote. */
+STM_TEST(sync_multi_a_bad_record_is_judged_on_its_second_pass) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "o1pass2", bds, as, &pool, &s);
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)(i * 3u + 2u);
+    STM_ASSERT_OK(stm_sync_write_extent(s, 1u, 1u, 0u, plain, sizeof plain));
+    STM_ASSERT_OK(stm_sync_write_extent(s, 1u, 2u, 0u, plain, sizeof plain));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_sync_migrate_to_cold(s, 1u, 2u));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_extent_record h, c;
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(s), 1u, 1u, 0u, &h));
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(s), 1u, 2u, 0u, &c));
+    STM_ASSERT_EQ((int)h.n_replicas, 2);
+    STM_ASSERT_EQ(c.kind, STM_EXTENT_KIND_COLD);
+    stm_cas_record cr;
+    memset(&cr, 0, sizeof cr);
+    STM_ASSERT_OK(stm_cas_lookup(stm_sync_cas_index(s), c.content_hash, &cr));
+    STM_ASSERT_EQ((int)cr.n_replicas, 2);
+    if (h.n_replicas != 2u || cr.n_replicas != 2u) {
+        teardown_mirror_pool(bds, as, pool, s);
+        return;
+    }
+    uint8_t junk[2u * STM_UB_SIZE];
+    memset(junk, 0x5a, sizeof junk);
+    const uint64_t hp[2] = { h.paddrs[0], h.paddrs[1] };
+    const uint64_t cp[2] = { cr.paddrs[0], cr.paddrs[1] };
+    STM_ASSERT_OK(stm_bdev_write(bds[stm_paddr_device(hp[1])],
+                                 stm_paddr_offset(hp[1]) * (uint64_t)STM_UB_SIZE,
+                                 junk, sizeof junk));
+    STM_ASSERT_OK(stm_bdev_write(bds[stm_paddr_device(cp[1])],
+                                 stm_paddr_offset(cp[1]) * (uint64_t)STM_UB_SIZE,
+                                 junk, sizeof junk));
+    stm_sync_force_locked_read_for_test(s, true);
+    for (int k = 0; k < 3; k++) {
+        const bool promote = (k == 2);
+        const uint64_t ino = (k == 0) ? 1u : 2u;
+        const uint64_t p0 = (k == 0) ? hp[0] : cp[0];
+        stm_bdev *b0 = bds[stm_paddr_device(p0)];
+        const uint64_t r0 = stm_paddr_offset(p0) * (uint64_t)STM_UB_SIZE;
+        bool bad = false;
+        stm_status a = pass2_try(s, b0, r0, STM_ENOMEM, STM_EIO, ino, promote,
+                                 &bad);
+        fprintf(stderr, "  info: pass2 case %d ENOMEM then EIO: %d bad %d\n", k,
+                (int)a, (int)bad);
+        STM_ASSERT_ERR(a, STM_EIO);
+        STM_ASSERT(bad);
+        stm_status b = pass2_try(s, b0, r0, STM_EIO, STM_OK, ino, promote, &bad);
+        fprintf(stderr, "  info: pass2 case %d EIO then garbled: %d bad %d\n", k,
+                (int)b, (int)bad);
+        STM_ASSERT_ERR(b, STM_EBADTAG);
+        STM_ASSERT(bad);
+    }
     stm_sync_force_locked_read_for_test(s, false);
     teardown_mirror_pool(bds, as, pool, s);
 }

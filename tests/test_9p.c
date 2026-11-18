@@ -6968,8 +6968,11 @@ STM_TEST(p9_fsync_answers_eio_once_for_a_dropped_run) {
     walk_to(s, 100, 102, "g");
     uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
     uint32_t rlen = 0;
+    uint32_t sz = build_tlopen(req, 1, 102, 2u);   /* Tfsync names an open fid */
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOPEN);
     stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
-    uint32_t sz = build_tfsync(req, 2, 101, 0);
+    sz = build_tfsync(req, 2, 101, 0);
     STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
     STM_ASSERT_EQ(resp[4], STM_9P_RFSYNC);
     stm_fs_fail_drains_for_test(fs, STM_OK);
@@ -7058,6 +7061,145 @@ STM_TEST(p9_fsync_reports_a_dropped_run_to_every_fid_open_before_it) {
     free(req); free(resp);
     stm_9p_server_destroy(s);
     (void)stm_fs_unmount(fs);   /* fids 103 and 104 never saw the second */
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+
+/* g an extent file, committed; the server attached at fid 100, fid 102
+ * walked to g and opened; g's next buffered run dropped by a commit. */
+static stm_9p_server *p9werr_setup(const char *name, stm_fs **out_fs,
+                                   uint64_t *out_g)
+{
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    *out_fs = fs;
+    if (!fs) return NULL;
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t g = mk_file(fs, root, "g");
+    *out_g = g;
+    uint8_t z[4096];
+    memset(z, 'z', sizeof z);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 0, z, sizeof z));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 102, "g");
+    uint8_t req[64];
+    uint8_t *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tlopen(req, 2, 102, 2u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOPEN);
+    free(resp);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 100, "dropped!", 8));
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    return s;
+}
+
+/* One Tfsync's reply type (and EIO for an Rlerror). */
+static uint8_t p9werr_fsync(stm_9p_server *s, uint16_t tag, uint32_t fid)
+{
+    uint8_t req[64];
+    uint8_t *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tfsync(req, tag, fid, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    uint8_t t = resp[4];
+    if (t == STM_9P_RLERROR) STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EIO);
+    free(resp);
+    return t;
+}
+
+/* A fid walked to a file and never opened has no errseq sample (9P2000.L's
+ * Tfsync names a fid opened with Tlopen; Linux's fsync needs an open file):
+ * its Tfsync makes the commit and takes no report, neither one an fsync
+ * already made nor one still unmade, which the open fid then hears. */
+STM_TEST(p9_fsync_on_a_fid_never_opened_takes_no_report) {
+    stm_fs *fs = NULL;
+    uint64_t g = 0;
+    stm_9p_server *s = p9werr_setup("9p_fsync_unopened", &fs, &g);
+    if (!s) return;
+    STM_ASSERT_EQ(p9werr_fsync(s, 10, 102), STM_9P_RLERROR);
+    walk_to(s, 100, 103, "g");
+    STM_ASSERT_EQ(p9werr_fsync(s, 11, 103), STM_9P_RFSYNC);  /* a made one */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 300, "dropped!", 8));
+    stm_fs_fail_drains_for_test(fs, STM_ECORRUPT);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    STM_ASSERT_EQ(p9werr_fsync(s, 12, 103), STM_9P_RFSYNC);  /* an unmade one */
+    STM_ASSERT_EQ(p9werr_fsync(s, 13, 102), STM_9P_RLERROR);
+    STM_ASSERT_EQ(p9werr_fsync(s, 14, 102), STM_9P_RFSYNC);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+static pthread_mutex_t p9werr_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  p9werr_cv = PTHREAD_COND_INITIALIZER;
+static bool p9werr_parked, p9werr_go;
+
+static void p9werr_phase_b(uint8_t type, uint16_t tag, void *arg)
+{
+    (void)arg;
+    if (type != STM_9P_TFSYNC || tag != 77u) return;
+    pthread_mutex_lock(&p9werr_mu);
+    p9werr_parked = true;
+    pthread_cond_broadcast(&p9werr_cv);
+    while (!p9werr_go) pthread_cond_wait(&p9werr_cv, &p9werr_mu);
+    pthread_mutex_unlock(&p9werr_mu);
+}
+
+struct p9werr_job {
+    stm_9p_server *s;
+    uint8_t type;
+};
+
+static void *p9werr_run(void *p)
+{
+    struct p9werr_job *j = p;
+    j->type = p9werr_fsync(j->s, 77, 102);
+    return NULL;
+}
+
+/* Two Tfsyncs on one open fid: the first parked in its unlocked phase,
+ * after it copied the fid's sample; the second run whole. The drop is
+ * reported once, to the second; the first, let go, answers Rfsync, since
+ * the report is decided under s->lock (Linux checks and advances under
+ * f_lock). */
+STM_TEST(p9_two_fsyncs_on_one_fid_report_a_drop_once) {
+    stm_fs *fs = NULL;
+    uint64_t g = 0;
+    stm_9p_server *s = p9werr_setup("9p_fsync_twice", &fs, &g);
+    if (!s) return;
+    p9werr_parked = false;
+    p9werr_go = false;
+    stm_9p_server_set_test_hooks(p9werr_phase_b, NULL);
+    struct p9werr_job j = { s, 0u };
+    pthread_t th;
+    STM_ASSERT_EQ(pthread_create(&th, NULL, p9werr_run, &j), 0);
+    pthread_mutex_lock(&p9werr_mu);
+    while (!p9werr_parked) pthread_cond_wait(&p9werr_cv, &p9werr_mu);
+    pthread_mutex_unlock(&p9werr_mu);
+    STM_ASSERT_EQ(p9werr_fsync(s, 78, 102), STM_9P_RLERROR);
+    pthread_mutex_lock(&p9werr_mu);
+    p9werr_go = true;
+    pthread_cond_broadcast(&p9werr_cv);
+    pthread_mutex_unlock(&p9werr_mu);
+    pthread_join(th, NULL);
+    stm_9p_server_set_test_hooks(NULL, NULL);
+    STM_ASSERT_EQ(j.type, STM_9P_RFSYNC);
+    STM_ASSERT_EQ(p9werr_fsync(s, 79, 102), STM_9P_RFSYNC);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);
 }
