@@ -254,6 +254,20 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                           stm_sync **out_sync);
 
 /*
+ * stm_sync_open, and on a pool with one live device `why`, if not NULL,
+ * says which uberblock slot its scan refused on (STM_EIO; see
+ * stm_sb_mount_scan_ex). Zeroed at entry; gen stays 0 otherwise.
+ */
+struct stm_sb_scan_refusal;
+STM_MUST_USE
+stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
+                             const stm_hybrid_keys *wk,
+                             struct stm_janus_client *janus,
+                             const stm_corvus_mount_cfg *corvus,
+                             struct stm_sb_scan_refusal *why,
+                             stm_sync **out_sync);
+
+/*
  * Commit. Writes Phase 1 reservation UB at auth+1, flushes, writes
  * Phase 3 final UB at auth+2, to every pool device in parallel.
  * Each phase requires quorum (⌊N/2⌋+1) of fsync confirmations; if

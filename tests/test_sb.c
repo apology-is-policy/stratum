@@ -546,7 +546,7 @@ static void sb_rot_gen(stm_bdev *d, uint64_t gen)
                    STM_ECORRUPT);
 }
 
-STM_TEST(sb_mount_scan_one_device_refuses_only_where_a_commit_can_hide) {
+STM_TEST(sb_mount_scan_one_device_refuses_where_a_newer_commit_may_be) {
     stm_uberblock found;
     stm_sb_scan_refusal why;
 
@@ -620,6 +620,177 @@ STM_TEST(sb_mount_scan_one_device_refuses_only_where_a_commit_can_hide) {
     STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 300u);
     STM_ASSERT_ERR(stm_sb_mount_scan(d, &found, NULL, NULL), STM_EIO);
     stm_bdev_inject_read_range_clear(d);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* o1c round 3. Every final stamps ub_repair_log_root_gen with its own
+ * generation; a reservation and a claim carry an older one (sync.c). */
+static void sb_put_ub(stm_bdev *d, uint64_t gen, uint8_t m, uint64_t mark,
+                      uint32_t version)
+{
+    stm_uberblock ub;
+    fill_example(&ub);
+    ub.ub_version = stm_store_le32(version);
+    ub.ub_gen = stm_store_le64(gen);
+    ub.ub_repair_log_root_gen = stm_store_le64(mark);
+    memset(ub.ub_merkle_root, m, sizeof ub.ub_merkle_root);
+    STM_ASSERT_OK(stm_sb_label_write(d, (uint32_t)(gen % 4u),
+                                     (uint32_t)(gen % 63u), &ub));
+}
+
+STM_TEST(sb_mount_scan_one_device_knows_a_final_by_its_mark) {
+    stm_uberblock found;
+    stm_sb_scan_refusal why;
+
+    /* A final whose commit changed no tree carries best-1's trees. */
+    stm_bdev *d = open_test_device("r3mark", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_ub(d, 41, 1, 40, STM_UB_VERSION);
+    sb_put_ub(d, 42, 1, 42, STM_UB_VERSION);
+    sb_fault_gen(d, 43, -1);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
+    STM_ASSERT_EQ(why.gen, 0u);
+    /* best-1 unreadable: the mark needs no read of it. */
+    sb_fault_gen(d, 41, -1);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
+    /* best+2 still counts behind a final. */
+    sb_fault_gen(d, 44, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why),
+                   STM_EIO);
+    STM_ASSERT_EQ(why.gen, 44u);
+    stm_bdev_inject_read_range_clear(d);
+    /* The strict rule does not read the mark. */
+    sb_fault_gen(d, 43, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan(d, &found, NULL, NULL), STM_EIO);
+    stm_bdev_inject_read_range_clear(d);
+    /* A reservation (or a claim) carries an older mark: best+1 may be its
+     * final. */
+    sb_put_ub(d, 42, 1, 41, STM_UB_VERSION);
+    sb_fault_gen(d, 43, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why),
+                   STM_EIO);
+    STM_ASSERT_EQ(why.gen, 43u);
+    stm_bdev_inject_read_range_clear(d);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+
+    /* Gen 1, a fresh pool's final. */
+    d = open_test_device("r3gen1", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_ub(d, 1, 1, 1, STM_UB_VERSION);
+    sb_fault_gen(d, 2, -1);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 1u);
+    stm_bdev_inject_read_range_clear(d);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+
+    /* A v32 uberblock was written by code this tree does not have: its
+     * mark proves nothing, only its trees. */
+    d = open_test_device("r3v32", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_ub(d, 41, 1, 40, 32u);
+    sb_put_ub(d, 42, 1, 42, 32u);
+    sb_fault_gen(d, 43, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why),
+                   STM_EIO);
+    STM_ASSERT_EQ(why.gen, 43u);
+    stm_bdev_inject_read_range_clear(d);
+    sb_put_ub(d, 42, 2, 42, 32u);
+    sb_fault_gen(d, 43, -1);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
+    stm_bdev_inject_read_range_clear(d);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A re-read at best+2 that decodes newer moves best (one device: best a
+ * final, best+1 unreadable for good, best+2 failing its first read). */
+STM_TEST(sb_mount_scan_a_reread_at_best_plus_2_that_finds_newer_moves_best) {
+    stm_bdev *d = open_test_device("r3mv2", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_gen_m(d, 41, 1);
+    sb_put_gen_m(d, 42, 2);
+    sb_put_gen_m(d, 44, 3);
+    sb_fault_gen(d, 43, -1);
+    sb_fault_gen(d, 44, 1);
+    stm_uberblock found;
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, NULL));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 44u);
+    stm_bdev_inject_read_range_clear(d);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* best-1's slot holds an older lap with other trees: best is not shown to
+ * be a final. slot(47) is slot(299). */
+STM_TEST(sb_mount_scan_best_minus_1_at_an_older_lap_proves_nothing) {
+    stm_bdev *d = open_test_device("r3lap", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_gen_m(d, 47, 6);
+    sb_put_gen_m(d, 300, 5);
+    sb_fault_gen(d, 301, -1);
+    stm_uberblock found;
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, NULL),
+                   STM_EIO);
+    stm_bdev_inject_read_range_clear(d);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Blank is a slot that reads back all zero (format zeroes the labels);
+ * one with no magic and other bytes may be a durable generation whose
+ * magic rotted. */
+STM_TEST(sb_mount_scan_one_device_reads_blank_only_as_zeros) {
+    stm_bdev *d = open_test_device("r3zero", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_gen_m(d, 41, 1);
+    sb_put_gen_m(d, 42, 1);
+    uint8_t buf[STM_UB_SIZE];
+    memset(buf, 0x5a, sizeof buf);
+    STM_ASSERT_OK(stm_bdev_write(d, sb_gen_off(d, 43), buf, sizeof buf));
+    sb_fault_gen(d, 44, -1);
+    stm_uberblock found;
+    stm_sb_scan_refusal why;
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why),
+                   STM_EIO);
+    STM_ASSERT_EQ(why.gen, 44u);
+    stm_bdev_inject_read_range_clear(d);
+    /* Control, one variable away: the same slot all zero. */
+    memset(buf, 0, sizeof buf);
+    STM_ASSERT_OK(stm_bdev_write(d, sb_gen_off(d, 43), buf, sizeof buf));
+    sb_fault_gen(d, 44, -1);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
+    stm_bdev_inject_read_range_clear(d);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A durable final at best+1 read back garbled once, with no error, is
+ * read again before it counts as torn. */
+STM_TEST(sb_mount_scan_reads_an_undecoded_successor_again) {
+    stm_bdev *d = open_test_device("r3garb", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_gen_m(d, 41, 1);
+    sb_put_gen_m(d, 42, 1);
+    sb_put_ub(d, 43, 2, 43, STM_UB_VERSION);
+    uint64_t off = sb_gen_off(d, 43);
+    stm_uberblock found;
+    for (int strict = 0; strict < 2; strict++) {
+        uint32_t fired = stm_bdev_inject_read_range_fired(d);
+        stm_bdev_inject_read_range(d, off + 384u, off + 385u, 1, STM_OK);
+        STM_ASSERT_OK(strict ? stm_sb_mount_scan(d, &found, NULL, NULL)
+                             : stm_sb_mount_scan_ex(d, true, &found, NULL,
+                                                    NULL, NULL));
+        STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(d), fired + 1u);
+        STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 43u);
+        stm_bdev_inject_read_range_clear(d);
+    }
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }

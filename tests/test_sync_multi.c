@@ -3432,5 +3432,85 @@ STM_TEST(sync_multi_eio_from_a_device_that_reads_no_label_is_the_pools) {
     teardown_mirror_pool(bds, as, pool, s);
 }
 
+/* o1c round 3: a device whose scan refuses is not a vote for the older
+ * generation it read. Three devices, quorum 2: commit 2 (reservation 4,
+ * final 5) reached devices 1 and 2; on device 0 the reservation's slot is
+ * unreadable and the final's never landed (zero). Device 1 is then lost.
+ * Device 0's one-device verdict would be gen 3 (a final, best+2 blank),
+ * and gen 3 with device 2's gen 5 would make a quorum of the older gen:
+ * the strict rule refuses device 0's vote and the open fails closed. */
+STM_TEST(sync_multi_a_device_that_refuses_is_not_a_stale_vote) {
+    make_paths("r3vote");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool *pool = make_multi_pool(bds);
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));                       /* gen 1 */
+    { uint64_t dp = 0; STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp)); }
+    STM_ASSERT_OK(stm_sync_commit(s));                       /* 2, 3 */
+    { uint64_t dp = 0; STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp)); }
+    STM_ASSERT_OK(stm_sync_commit(s));                       /* 4, 5 */
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s, &info));
+    STM_ASSERT_EQ(info.auth_gen, 5u);
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+
+    /* Device 0 never got gen 5; device 1 is gone. */
+    {
+        FILE *f = fopen(g_paths[0], "rb+");
+        STM_ASSERT(f != NULL);
+        if (!f) return;
+        uint64_t lo[STM_LABELS_PER_DEVICE];
+        STM_ASSERT_OK(stm_label_offsets(TEST_DEVICE_BYTES, lo));
+        uint8_t zeros[STM_UB_SIZE];
+        memset(zeros, 0, sizeof zeros);
+        STM_ASSERT_EQ(fseeko(f, (off_t)(lo[5u % 4u] + 5u * STM_UB_SIZE),
+                             SEEK_SET), 0);
+        STM_ASSERT_EQ(fwrite(zeros, 1, sizeof zeros, f), sizeof zeros);
+        fclose(f);
+    }
+    wipe_device_labels(g_paths[1]);
+
+    open_bdevs(bds);
+    uint64_t lo[STM_LABELS_PER_DEVICE];
+    STM_ASSERT_OK(stm_label_offsets(TEST_DEVICE_BYTES, lo));
+    uint64_t off4 = lo[4u % 4u] + 4u * (uint64_t)STM_UB_SIZE;
+    stm_bdev_inject_read_range(bds[0], off4, off4 + STM_UB_SIZE, -1, STM_EIO);
+    /* The premise, device by device. */
+    stm_uberblock ub;
+    STM_ASSERT_ERR(stm_sb_mount_scan(bds[0], &ub, NULL, NULL), STM_EIO);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(bds[0], true, &ub, NULL, NULL, NULL));
+    STM_ASSERT_EQ(stm_load_le64(ub.ub_gen), 3u);
+    STM_ASSERT_ERR(stm_sb_mount_scan(bds[1], &ub, NULL, NULL), STM_ENOENT);
+    STM_ASSERT_OK(stm_sb_mount_scan(bds[2], &ub, NULL, NULL));
+    STM_ASSERT_EQ(stm_load_le64(ub.ub_gen), 5u);
+
+    pool = make_multi_pool(bds);
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
+    stm_sync *s2 = NULL;
+    stm_sb_scan_refusal why;
+    memset(&why, 0xab, sizeof why);
+    stm_status os = stm_sync_open_ex(pool, a2, make_wk(), NULL, NULL, &why,
+                                     &s2);
+    STM_ASSERT_ERR(os, STM_EQUORUM);
+    /* A pool of three names no one device's slot. */
+    STM_ASSERT_EQ(why.gen, 0u);
+    if (os == STM_OK) stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool);
+    stm_bdev_inject_read_range_clear(bds[0]);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
 
 STM_TEST_MAIN("sync_multi")

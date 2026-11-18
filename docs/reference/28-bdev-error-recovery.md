@@ -99,12 +99,18 @@ static stm_status do_request(thyla_bdev *d, uint64_t lba,
   `DO_REQUEST_MAX_REINIT == 2` -> at most 2 re-inits per request, and
   `DO_REQUEST_MAX_RESUBMIT == 2` -> at most 2 re-submits of a read or write
   the device failed alone. Each
-  `do_request_once` is itself bounded (the `MAX_NON_USED_BUFFER_WAKES` spurious-
-  wake cap, and a timed `t_irq_wait`: `BDEV_IRQ_WAIT_MAX` waits of 1 s, so a
-  submission the device has not answered in 30 s, the request timeout blk-mq
-  gives NVMe, takes the transport path as `arm=irq-timeout`; a timed-out wait
-  still reads the interrupt status, so a lost interrupt is caught), so there
-  is neither an unbounded spin nor a stratumd hung holding `d->lock`. Exhaustion -- or a
+  `do_request_once` caps wakes with no used buffer (`MAX_NON_USED_BUFFER_WAKES`)
+  and looks at the device once a second while it does not answer: each
+  `t_irq_wait` returns within 1 s, and then a used ring that moved with no
+  interrupt seen completes the request (an `irq-late` line: a lost
+  interrupt), and DEVICE_NEEDS_RESET in the status (VIRTIO 1.2 2.1.2; QEMU
+  sets it on a malformed ring) takes the transport path as
+  `arm=needs-reset`. Otherwise the wait has no end, as in Linux's virtio-blk
+  (no blk-mq timeout handler, so its timer re-arms): a slow host is not a
+  failed device, and a reset cannot hurry a request QEMU is still running
+  (its reset drains it). A request outstanding 30 s gets one `slow` line and
+  goes on waiting. So a slow host costs time, never a failed request (see
+  Known caveats for a device that never answers). Exhaustion -- or a
   re-init that itself fails to re-negotiate — latches `d->failed`
   **permanently** (fail-closed; the genuinely-dead-device case).
 
@@ -298,8 +304,15 @@ Two residuals (Area F focused audit, P3, both v1.0-acceptable):
   leg-only driver copies that force one transport failure, a re-init with the
   zeroed ring (a completed read treated as lost: re-init, re-submit, login), a
   flush whose completion is lost (re-init, one `flush-lost` line, the mount
-  fails), and a doorbell never rung (`arm=irq-timeout` after 30 s, re-init,
-  re-submit, login). The stale-ring replay the zeroing closes was not
+  fails), and a doorbell never rung (on that driver `arm=irq-timeout` after
+  30 s, re-init, re-submit, login; the wait now has no end). Round 3's legs
+  (legs-r3.sh, legs-r3b.sh) add: the slot after the newest final (generation
+  160) failing every read, where the one-device rule mounts generation 159
+  and the mount's claim writes that slot (round 1's rule refused); a doorbell
+  rung only after 35 s (one `slow` line at 30 s, then the completion, login,
+  no re-init); and a head published out of the queue's range (QEMU: "Guest
+  says index 16 is available", DEVICE_NEEDS_RESET, `arm=needs-reset`,
+  re-init, re-submit, login). The stale-ring replay the zeroing closes was not
   reproduced: the round-1 driver with the same forced re-init still reached
   login (on HVF the vCPU republishes before QEMU's kick runs), so that fix
   rests on VIRTIO 1.2 4.2.3.2 and QEMU's sources, not on a red leg. No leg
@@ -313,18 +326,28 @@ Two residuals (Area F focused audit, P3, both v1.0-acceptable):
   `sync_bootstrap_open_says_when_it_cannot_confirm_the_bitmap` (the bootstrap
   fallback), `test_fs.c::fs_a_bad_sector_with_label_0s_mirror_slot_unreadable_is_the_records`
   (the device probe's label loop). Round 2:
-  `sb_mount_scan_one_device_refuses_only_where_a_commit_can_hide`,
+  `sb_mount_scan_one_device_refuses_where_a_newer_commit_may_be`,
   `sync_mount_refuses_only_the_unreadable_label_that_can_hide_a_commit`,
   `sync_mount_skips_the_unreadable_slot_of_a_generation_never_written` (the
   one-device rule), `sync_bootstrap_open_answers_eio_for_what_the_device_cannot_read`
   and `test_fs.c::fs_mount_names_the_uberblock_slot_it_refuses_on` (the
-  refusal record).
+  refusal record). Round 3: `sb_mount_scan_one_device_knows_a_final_by_its_mark`,
+  `sb_mount_scan_a_reread_at_best_plus_2_that_finds_newer_moves_best`,
+  `sb_mount_scan_best_minus_1_at_an_older_lap_proves_nothing`,
+  `sb_mount_scan_one_device_reads_blank_only_as_zeros`,
+  `sb_mount_scan_reads_an_undecoded_successor_again`;
+  `test_fs.c::fs_mount_takes_a_final_past_its_unreadable_successor` and
+  `fs_mount_takes_a_noop_final_past_its_unreadable_successor` (the one-device
+  rule on the path stratumd mounts through), `fs_mount_names_the_slot_the_open_refuses_on`
+  and `fs_mount_zeroes_the_refusal_before_its_argument_check`;
+  `test_sync_multi.c::sync_multi_a_device_that_refuses_is_not_a_stale_vote`
+  (the strict rule on a pool of three).
 
 ## Error paths
 
 | Return | Trigger | Caller expectation |
 |---|---|---|
-| `STM_EIO` (bdev) | a transport failure in `do_request_once` (arms 1-4, arm 6 = no answer in 30 s, or the `0xff` pre-poison: a status byte the device never wrote) AND the recovery budget exhausted (or re-init failed) | the FS extent-write path retries (data in RAM); a commit wedges |
+| `STM_EIO` (bdev) | a transport failure in `do_request_once` (arms 1-4, arm 6 = the device asked to be reset (DEVICE_NEEDS_RESET), or the `0xff` pre-poison: a status byte the device never wrote) AND the recovery budget exhausted (or re-init failed) | the FS extent-write path retries (data in RAM); a commit wedges |
 | `STM_EIO` (bdev) | a transport failure on a flush (re-inited, not re-submitted) | the commit wedges |
 | `STM_EIO` (bdev) | the device completed the request with a non-OK status it wrote (IOERR, UNSUPP, or one VIRTIO does not name): three times for a read or write, once for a flush | that request only, the device is not latched: a drain's reader judges it per ref 26; mount fails closed where the newest state may be; an extent write keeps its run; a commit wedges |
 | `STM_EWEDGED` (fs) | a mutating op after a failed commit | refuse until remount (the integrity guard) |
@@ -354,10 +377,12 @@ stderr, at most 32 per request kind over the process.
   final uberblock to one ring slot (label `gen % 4`, slot `gen % 63`), so one
   unreadable sector there hides the newest commit; the mount then fails closed
   rather than roll back (`07-sb-sync.md`), and stratumd names the slot. On one
-  device it refuses only where an acknowledged commit can hide; a refused
-  mount writes nothing, so it goes on refusing while that sector stays
-  unreadable. Recovery is then the operator's explicit choice to accept
-  losing at most the newest commit (overwrite that slot; it then reads blank
+  device it refuses at the slot after the newest generation only when that
+  generation may be a reservation (a claim, which a session that crashed
+  before its first commit leaves, reads as one); a refused mount writes
+  nothing, so it goes on refusing while that sector stays unreadable.
+  Recovery is then the operator's explicit choice to accept losing at most
+  the newest commit (overwrite that slot with zeros; it then reads back zero
   and the mount takes the generation before). Writing each generation to two
   or more labels (ZFS writes all four) would let it mount, and an explicit
   opt-in mount could take the newest readable generation; both are enqueued
@@ -368,6 +393,10 @@ stderr, at most 32 per request kind over the process.
   `cache=writeback`, or a buffered host backend, the classifying readers'
   device probe can be answered from the host's page cache while reads that
   reach the device fail (ref 26).
+- **A device that never answers.** The driver waits on a request with no end,
+  as Linux's virtio-blk does, so a device that stops answering without
+  asking for a reset holds stratumd, `d->lock` held, until it answers; the
+  `slow` line at 30 s names the request.
   A recoverable-suspend that lets a hard-but-recovered device resume
   without a restart is a tracked v1.x enhancement, not an Area F defect.
 - **Stale-pool contamination.** A pool baked by a *buggy* Stratum (e.g.
@@ -389,10 +418,13 @@ stderr, at most 32 per request kind over the process.
 - A request the device fails alone (X9): **implemented** (o1c, 2026-11-18),
   with its review round 1 closed the same day (the read and write re-submit,
   the flush never re-submitted, per-kind diagnostics, the reset read-back, and
-  mount failing closed) and round 2 the next (the ring zeroed on re-init, the
-  timed IRQ wait, mount refusing only where a commit can hide, the refusal
-  named); verified on Thylacine with injected bad sectors and leg-only forced
-  transport failures (see Tests).
+  mount failing closed), round 2 (the ring zeroed on re-init, the one-device
+  mount rule, the refusal named) and round 3 (a final known by its mark,
+  blank only when zero, an undecoded slot read again, the open's refusal
+  named, an IRQ wait with no end that still catches a lost interrupt and
+  DEVICE_NEEDS_RESET) the same day; verified on Thylacine with injected bad
+  sectors, the slot after the newest final unreadable, and leg-only forced
+  faults (see Tests).
 - Layer 2 (FS extent-write recovery): **pre-existing + sound**; now pinned by
   `fs_io_transient_write_eio_flush_recovers`.
 - Layer 3 (commit wedge + remount recovery): **pre-existing + sound** (R154).

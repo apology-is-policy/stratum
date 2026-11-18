@@ -140,6 +140,7 @@
 #define VSTATUS_DRIVER               2u
 #define VSTATUS_DRIVER_OK            4u
 #define VSTATUS_FEATURES_OK          8u
+#define VSTATUS_DEVICE_NEEDS_RESET   64u
 #define VSTATUS_FAILED               128u
 
 #define VIRTIO_F_VERSION_1_BIT_BANK1 (1u << 0)
@@ -185,12 +186,17 @@ typedef enum { REQ_READ, REQ_WRITE, REQ_FLUSH } req_kind;
 /* Cap on spurious IRQ wakes (config-change without used-buffer). */
 #define MAX_NON_USED_BUFFER_WAKES    16u
 
-/* A request the device has not answered within BDEV_IRQ_WAIT_MAX waits of
- * BDEV_IRQ_WAIT_NS each (30 s, the request timeout blk-mq gives NVMe) is
- * the transport's failure: the re-init path, not a stratumd hung holding
- * d->lock. */
+/* Each IRQ wait returns within BDEV_IRQ_WAIT_NS, so a request the device
+ * has not answered is looked at once a second: a used ring that moved with
+ * no interrupt seen (a lost one) completes it, and DEVICE_NEEDS_RESET
+ * (VIRTIO 1.2 2.1.2: an error the device cannot recover from) sends it
+ * down the transport path. The wait itself has no end, as in Linux's
+ * virtio-blk (no blk-mq timeout handler): a slow host is not a failed
+ * device, and a reset cannot hurry a request QEMU is still running (its
+ * reset drains it). After BDEV_SLOW_LINE_WAITS waits the request gets one
+ * line. */
 #define BDEV_IRQ_WAIT_NS             1000000000ull
-#define BDEV_IRQ_WAIT_MAX            30u
+#define BDEV_SLOW_LINE_WAITS         30u
 
 /* Bounded transient-fault recovery: a failed request triggers up to this
  * many (device re-init + re-submit) cycles before the bdev is latched
@@ -207,6 +213,9 @@ typedef enum { REQ_READ, REQ_WRITE, REQ_FLUSH } req_kind;
  * and again must not flood the console, nor hide a later failed flush. */
 #define BDEV_REQUEST_ERROR_LINES_MAX 32u
 #define BDEV_TRANSPORT_LINES_MAX     32u
+/* The same for requests still waiting after BDEV_SLOW_LINE_WAITS and for
+ * completions seen without their interrupt. */
+#define BDEV_WAIT_LINES_MAX          32u
 
 /* Reads of the status register after a reset, waiting for it to read 0. */
 #define RESET_READBACK_MAX           1000000u
@@ -279,6 +288,8 @@ typedef struct {
     /* diagnostics: submissions the device failed alone, per req_kind */
     uint64_t         request_errors[3];
     uint64_t         transport_fails; /* diagnostics: transport failures (io-fail + flush-lost lines, capped) */
+    uint64_t         wait_lines;      /* diagnostics: slow + irq-late lines (capped) */
+    uint64_t         late_completions; /* diagnostics: completions seen without their interrupt */
 
     /* VIRTIO_BLK_F_FLUSH negotiated at init -> op_fsync issues a real
      * VIRTIO_BLK_T_FLUSH barrier. When false (device offers no cache),
@@ -532,7 +543,7 @@ static void init_descriptors(uint64_t ring_va, uint64_t ring_pa, uint64_t data_p
     /* desc[1]: data; len + flags filled per request. */
     mmio_write64(desc_va + 16, data_pa);
     mmio_write32(desc_va + 24, 0);
-    /* desc[1].flags written in do_request(). */
+    /* desc[1].flags written in do_request_once(). */
     mmio_write16(desc_va + 30, 2);
 
     /* desc[2]: status (WRITE). */
@@ -582,7 +593,8 @@ static bool reinit_device_locked(thyla_bdev *d)
  * (no stdio: I/O runs on server worker threads; a bounded stack buffer
  * + one write syscall is thread-safe and allocation-free). */
 typedef struct {
-    uint8_t  arm;        /* 0=none 1=spurious 2=irqwait 3=used_idx 4=used_id 5=status */
+    uint8_t  arm;        /* 0=none 1=spurious 2=irqwait 3=used_idx 4=used_id
+                          * 5=status 6=needs-reset */
     uint8_t  st;         /* device status byte (arm 5) */
     int64_t  irq_rc;     /* t_irq_wait return (arm 2) */
     uint16_t used_idx;   /* observed used.idx (arm 3) */
@@ -598,7 +610,7 @@ static const char *bdev_fail_arm_str(uint8_t arm)
     case 3:  return "used-idx";
     case 4:  return "used-id";
     case 5:  return "status";
-    case 6:  return "irq-timeout";
+    case 6:  return "needs-reset";
     default: return "none";
     }
 }
@@ -608,7 +620,7 @@ static void bdev_diag(thyla_bdev *d, const char *what, uint64_t lba,
                       uint32_t attempt, const bdev_fail_info *fi)
 {
     /* The longest line (the longest `what`, every number at full width) is
-     * under 260 bytes. */
+     * under 290 bytes. */
     char buf[320];
     uint64_t reqerrs = d->request_errors[REQ_READ] +
                        d->request_errors[REQ_WRITE] +
@@ -616,20 +628,35 @@ static void bdev_diag(thyla_bdev *d, const char *what, uint64_t lba,
     int n = snprintf(buf, sizeof buf,
                      "BDEVDIAG: %s kind=%c lba=%llu n=%u attempt=%u "
                      "arm=%s st=%u irq_rc=%lld used=%u want=%u reinits=%llu "
-                     "reqerrs=%llu\n",
+                     "reqerrs=%llu late=%llu\n",
                      what,
                      (kind == REQ_WRITE) ? 'W' : (kind == REQ_FLUSH) ? 'F' : 'R',
                      (unsigned long long)lba, sector_count, attempt,
                      bdev_fail_arm_str(fi->arm), fi->st,
                      (long long)fi->irq_rc, fi->used_idx, fi->want_idx,
                      (unsigned long long)d->reinit_count,
-                     (unsigned long long)reqerrs);
+                     (unsigned long long)reqerrs,
+                     (unsigned long long)d->late_completions);
     if (n > 0) {
         /* snprintf returns the length it wanted, not what fits. */
         size_t len = ((size_t)n < sizeof buf) ? (size_t)n : sizeof buf - 1u;
         ssize_t w = write(2, buf, len);
         (void)w;
     }
+}
+
+/* Lines about waiting, bounded like the others. Caller holds d->lock. */
+static void bdev_wait_diag(thyla_bdev *d, const char *what, uint64_t lba,
+                           uint32_t sector_count, req_kind kind,
+                           uint32_t attempt)
+{
+    bdev_fail_info none = {0};
+    uint64_t n = ++d->wait_lines;
+    if (n <= BDEV_WAIT_LINES_MAX)
+        bdev_diag(d, what, lba, sector_count, kind, attempt, &none);
+    else if (n == BDEV_WAIT_LINES_MAX + 1u)
+        bdev_diag(d, "wait lines (later ones not shown)", lba, sector_count,
+                  kind, attempt, &none);
 }
 
 /* A non-OK status the device wrote on a consistent ring is the request's
@@ -650,7 +677,7 @@ static bool blk_status_is_requests_own(uint8_t st)
  * `fi` names the failing arm (BDEVDIAG). Caller holds d->lock. */
 static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
                                    uint32_t sector_count, req_kind kind,
-                                   bdev_fail_info *fi)
+                                   uint32_t attempt, bdev_fail_info *fi)
 {
     /* Pre-poison status byte so a missing device write surfaces. */
     *(volatile uint8_t *)(THYLA_RING_USER_VA + VQ_STATUS_OFF) =
@@ -698,12 +725,14 @@ static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
     dsb_sy();
     mmio_write32(d->slot_va + VREG_QUEUE_NOTIFY, 0);
 
-    /* Wait for the device's IRQ; tolerate up to N spurious config-
-     * change wakes, and BDEV_IRQ_WAIT_MAX timed-out waits, before giving
-     * up. A timed-out wait still reads the interrupt status, so a lost
-     * interrupt is caught there. */
+    /* Wait for the device's IRQ, tolerating up to N spurious config-change
+     * wakes. A wait that returns with no interrupt looks at the used ring
+     * (it holds d->avail_idx until the device answers this request) and
+     * the device status, and otherwise goes on: see BDEV_IRQ_WAIT_NS. */
+    uint64_t used_va = THYLA_RING_USER_VA + VQ_USED_OFF;
     uint32_t spurious = 0;
-    uint32_t timeouts = 0;
+    uint32_t waits = 0;
+    bool     late = false;
     for (;;) {
         if (spurious >= MAX_NON_USED_BUFFER_WAKES) {
             fi->arm = 1;
@@ -719,27 +748,42 @@ static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
         uint32_t int_status = mmio_read32(d->slot_va + VREG_INTERRUPT_STATUS);
         mmio_write32(d->slot_va + VREG_INTERRUPT_ACK, int_status);
         if (int_status & VINT_USED_BUFFER) break;
+        if (mmio_read32(d->slot_va + VREG_STATUS) & VSTATUS_DEVICE_NEEDS_RESET) {
+            fi->arm = 6;
+            goto io_fail;
+        }
         if (count == 0) {
-            if (++timeouts >= BDEV_IRQ_WAIT_MAX) {
-                fi->arm = 6;
-                goto io_fail;
+            virtio_rmb();
+            if (mmio_read16(used_va + 2) != d->avail_idx) {
+                late = true;
+                break;
             }
+            if (++waits == BDEV_SLOW_LINE_WAITS)
+                bdev_wait_diag(d, "slow (outstanding 30 s, still waiting)",
+                               lba, sector_count, kind, attempt);
             continue;
         }
         spurious++;
     }
 
     /* used.idx must equal expected. */
-    uint64_t used_va = THYLA_RING_USER_VA + VQ_USED_OFF;
     uint16_t used_idx = mmio_read16(used_va + 2);
     /* Barrier between observing used.idx advance and reading used-ring
      * + data payload. */
     virtio_rmb();
     if (used_idx != new_idx) {
-        fi->arm = 3;
+        /* QEMU's notification of DEVICE_NEEDS_RESET arrives with the
+         * used-buffer bit set, so a used ring that did not move asks. */
+        fi->arm = (mmio_read32(d->slot_va + VREG_STATUS) &
+                   VSTATUS_DEVICE_NEEDS_RESET) ? 6 : 3;
         fi->used_idx = used_idx;
         fi->want_idx = new_idx;
         goto io_fail;
+    }
+    if (late) {
+        d->late_completions++;
+        bdev_wait_diag(d, "irq-late (completion seen without its interrupt)",
+                       lba, sector_count, kind, attempt);
     }
 
     /* used.ring[(new_idx - 1) % QUEUE_SIZE].id must be 0 (the head). */
@@ -826,8 +870,9 @@ static void bdev_transport_diag(thyla_bdev *d, const char *what, uint64_t lba,
  * is never re-submitted: one the device failed may have lost cached writes,
  * which a second flush would then report durable.
  *
- * Anything else is the transport's (an interrupt missed or spurious, a used
- * ring out of step, a status byte the device never wrote): re-init the
+ * Anything else is the transport's (wakes with no used buffer past the cap,
+ * a used ring out of step, a device asking to be reset, a status byte the
+ * device never wrote): re-init the
  * device (both ends back to idx 0) and re-submit, up to
  * DO_REQUEST_MAX_REINIT times, then latch the bdev PERMANENTLY (d->failed:
  * every later op answers STM_EIO; R4-F1, Area F #2). A FLUSH is re-inited
@@ -845,7 +890,8 @@ static stm_status do_request(thyla_bdev *d, uint64_t lba,
     uint32_t resubmits = 0;
     for (uint32_t attempt = 0; ; attempt++) {
         bdev_fail_info fi = {0};
-        stm_status s = do_request_once(d, lba, sector_count, kind, &fi);
+        stm_status s = do_request_once(d, lba, sector_count, kind, attempt,
+                                       &fi);
         if (s == STM_OK) return STM_OK;
 
         if (fi.own) {

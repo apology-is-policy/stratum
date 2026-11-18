@@ -2224,6 +2224,17 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                           const stm_corvus_mount_cfg *corvus,
                           stm_sync **out_sync)
 {
+    return stm_sync_open_ex(p, a, wk, janus, corvus, NULL, out_sync);
+}
+
+stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
+                             const stm_hybrid_keys *wk,
+                             struct stm_janus_client *janus,
+                             const stm_corvus_mount_cfg *corvus,
+                             stm_sb_scan_refusal *why,
+                             stm_sync **out_sync)
+{
+    if (why) memset(why, 0, sizeof *why);
     if (!p || !a || !out_sync) return STM_EINVAL;
     if (stm_pool_device_count(p) == 0) return STM_EINVAL;
     /* P4-4a/P4-4b: key source is mandatory, exactly one. */
@@ -2252,7 +2263,8 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         if (!di) continue;
         uint32_t lbl = 0, slot = 0;
         stm_status sc = stm_sb_mount_scan_ex(di, one_device, &scans[i].ub,
-                                             &lbl, &slot, NULL);
+                                             &lbl, &slot,
+                                             one_device ? why : NULL);
         if (sc == STM_OK) {
             scans[i].valid = true;
         } else if (sc == STM_EBADVERSION) {

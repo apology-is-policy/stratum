@@ -295,10 +295,11 @@ blocks 36..39: data node 1
   (a header whose bitmap fails `h_bitmap_csum` or does not read is rejected
   and open falls back to the other pair: the R7a fallback). A header slot the
   device cannot read is treated like one that does not decode, so the other
-  slot alone can open the pool. When no header or no bitmap can be used and
-  the device failed a read, open answers the device's error (STM_EIO); a
-  header slot with no magic is blank, one at another version is
-  STM_EBADVERSION, and blank or failing its checksum otherwise is
+  slot alone can open the pool. When neither header slot can be used, a slot
+  at another version answers STM_EBADVERSION even beside a failed read;
+  otherwise, when no header or no bitmap can be used and the device failed a
+  read, open answers the device's error (STM_EIO); a header slot with no
+  magic is blank, and blank or failing its checksum otherwise is
   STM_ECORRUPT (under a pool's uberblock, a missing bootstrap is damage).
   Open is sure it took the newest pair only
   when both slots decoded and the newer one's bitmap loaded;

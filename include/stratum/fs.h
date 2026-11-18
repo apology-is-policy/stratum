@@ -252,7 +252,8 @@ typedef struct {
 
     /* NULL, or where to say which uberblock slot a mount refused on
      * (STM_EIO: a commit newer than the newest one read may be there, and
-     * the device cannot read it). Zeroed at entry; gen stays 0 otherwise. */
+     * the device cannot read it), by its first scan or by stm_sync_open's
+     * own. Zeroed at entry; gen stays 0 otherwise. */
     struct stm_sb_scan_refusal *scan_refusal;
 } stm_fs_mount_opts;
 

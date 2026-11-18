@@ -168,8 +168,10 @@ stm_status stm_sb_mount_scan(stm_bdev *d,
                               stm_uberblock *out, uint32_t *out_lbl, uint32_t *out_slot);
 ```
 
-A slot that fails to decode is a torn or unused slot and is skipped. A slot
-the device fails to READ is different: each generation's uberblock is in one
+A slot that fails to decode is skipped: a torn write, or a durable
+generation gone bad, which the scan cannot tell apart (one copy per
+generation: the price below). A slot the device fails to READ is
+different: each generation's uberblock is in one
 ring slot (`stm_sb_ring_label_for_gen` / `stm_sb_ring_slot_for_gen`,
 super.h), and a commit newer than the best one found can only follow it, at
 best+1 (best's final when best is a reservation; otherwise a reservation or a
@@ -183,19 +185,28 @@ turn.
 
 Where it refuses depends on the pool. One device writes its generations in
 order, each only after the one before is durable (a final waits for its
-reservation's barrier), and a reservation or a claim carries its
-predecessor's `ub_merkle_root` unchanged. So on a one-device pool
-(`stm_sync_open` and `stm_fs_mount` pass `one_device`) the scan refuses only
-where an acknowledged commit can hide: slot(best+1) when best may be a
-reservation (best-1 does not decode as gen best-1 with another merkle root;
-a claim looks the same, so an unreadable slot after a claim refuses too),
-and slot(best+2) when slot(best+1) neither decoded (as an older generation:
-the ring came round) nor read blank. A device of a multi-device pool can miss
-a generation's write while quorum holds, so there either slot unreadable
-refuses. An unreadable slot anywhere else costs nothing. A refusal says which
-slot (`stm_sb_scan_refusal`: the generation, label, slot, byte offset and the
-best generation read; `stm_fs_mount_opts.scan_refusal`), and stratumd prints
-it.
+reservation's barrier). A reservation or a claim carries its predecessor's
+`ub_merkle_root` unchanged and an older `ub_repair_log_root_gen`, while every
+final stamps `ub_repair_log_root_gen` with its own generation (its mark). So
+on a one-device pool (`stm_sync_open` and `stm_fs_mount` pass `one_device`)
+the scan refuses at slot(best+1) only when best may be a reservation: neither
+its mark (read on a v33 uberblock only: a v32 one was written by code not in
+this tree) nor best-1 decoding as gen best-1 with another merkle root says
+final. A claim reads as a reservation, so an unreadable slot after a claim
+still refuses (a session that crashed before its first commit leaves one).
+It refuses at slot(best+2) only when slot(best+1) neither decoded (as an
+older generation: the ring came round) nor read back all zero (format zeroes
+the labels; a slot with no magic and other bytes may be a generation whose
+magic rotted). Before either counts, a slot that failed to read is read twice
+more, and one that did not decode once more. A device of a multi-device pool
+can miss a generation's write while quorum holds, so there either slot
+unreadable refuses; a refusing device is then no vote for the older
+generation it read (a stale vote could make a false quorum). An unreadable
+slot anywhere else costs nothing (slot(best-1) still counts under a v32
+uberblock). A refusal says which slot (`stm_sb_scan_refusal`: the
+generation, label, slot, byte offset and the best generation read;
+`stm_fs_mount_opts.scan_refusal`, filled by the mount's first scan or by
+`stm_sync_open_ex`'s own), and stratumd prints it.
 
 The price of one copy per generation: while that slot stays unreadable,
 every mount refuses (a refused mount writes nothing, so the sector never

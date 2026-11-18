@@ -1075,8 +1075,9 @@ stm_status stm_sb_label_write(stm_bdev *d, uint32_t label_idx,
 
 /*
  * Read the uberblock at (label_idx, slot_idx) from `d` and decode it
- * into `*out_ub`. Returns STM_ECORRUPT on csum failure,
- * STM_EBADVERSION on magic/version mismatch.
+ * into `*out_ub`. Returns STM_ENOENT when the slot has no uberblock
+ * magic, STM_EBADVERSION at a version this build does not read,
+ * STM_ECORRUPT on csum failure.
  */
 STM_MUST_USE
 stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
@@ -1119,11 +1120,13 @@ typedef struct stm_sb_scan_refusal {
 
 /*
  * stm_sb_mount_scan, told the pool's shape. With one_device (`d` is the
- * pool's only device, so its generations are contiguous) it refuses only
- * where an acknowledged commit can hide: slot(best+1) when best may be a
- * reservation (best-1 does not decode with other trees), and slot(best+2)
- * when slot(best+1) neither decoded nor read blank. Without it, either
- * slot unreadable refuses. `why`, if not NULL, says which slot.
+ * pool's only device, so its generations are contiguous) it refuses at
+ * slot(best+1) only when best may be a reservation (neither its mark,
+ * ub_repair_log_root_gen == ub_gen on a v33 uberblock, nor best-1 decoding
+ * with other trees says final; a claim reads as a reservation), and at
+ * slot(best+2) only when slot(best+1) neither decoded nor read back zero.
+ * Without it, either slot unreadable refuses. `why`, if not NULL, says
+ * which slot.
  */
 STM_MUST_USE
 stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,

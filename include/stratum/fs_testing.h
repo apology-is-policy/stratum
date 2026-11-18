@@ -344,11 +344,18 @@ void stm_fs_set_clone_of_sealed_for_test(stm_fs *fs, bool on);
 unsigned stm_fs_txn_order_violations_for_test(void);
 
 /*
- * Call `fn` in every stm_fs_mount, process-wide, once it has opened the
- * pool's bdev and before it reads anything, so a test can arm faults on
- * that bdev. NULL restores it. Set it only while no mount runs.
+ * Call `fn` in every stm_fs_mount, process-wide, so a test can arm faults
+ * on the pool's bdev: with STM_FS_MOUNT_HOOK_PEEK once the bdev is open and
+ * before anything is read, and with STM_FS_MOUNT_HOOK_SYNC_OPEN after the
+ * peek, before stm_sync_open's own scan. NULL restores it. Set it only
+ * while no mount runs.
  */
-typedef void (*stm_fs_mount_open_hook)(struct stm_bdev *d, void *arg);
+enum {
+    STM_FS_MOUNT_HOOK_PEEK      = 0,
+    STM_FS_MOUNT_HOOK_SYNC_OPEN = 1
+};
+typedef void (*stm_fs_mount_open_hook)(struct stm_bdev *d, int phase,
+                                       void *arg);
 void stm_fs_set_mount_open_hook_for_test(stm_fs_mount_open_hook fn, void *arg);
 #endif
 

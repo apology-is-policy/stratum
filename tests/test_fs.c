@@ -13438,9 +13438,10 @@ static uint64_t r2_newest_gen;
 static uint64_t r2_newest_off;
 static bool     r2_newest_is_final;
 
-static void r2_fault_newest_hook(struct stm_bdev *d, void *arg)
+static void r2_fault_newest_hook(struct stm_bdev *d, int phase, void *arg)
 {
     (void)arg;
+    if (phase != STM_FS_MOUNT_HOOK_PEEK) return;
     stm_uberblock ub, prev;
     uint32_t lbl = 0, slot = 0;
     STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
@@ -13498,5 +13499,153 @@ STM_TEST(fs_mount_names_the_uberblock_slot_it_refuses_on) {
         STM_ASSERT_EQ(info.mount_max_durable_gen, r2_newest_gen);
         STM_ASSERT_OK(stm_fs_unmount(fs));
     }
+    unlink(g_tmp_path);
+}
+
+/* o1c round 3: the one-device rule on the path stratumd mounts through.
+ * The hook, at r3_phase, faults slot(newest+k) for each k in r3_ks. */
+static uint64_t r3_newest;
+static uint64_t r3_ks[2];
+static size_t r3_nks;
+static int r3_phase;
+static void r3_fault_after_newest_hook(struct stm_bdev *d, int phase,
+                                       void *arg)
+{
+    (void)arg;
+    if (phase != r3_phase) return;
+    stm_uberblock ub;
+    uint32_t lbl = 0, slot = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
+    r3_newest = stm_load_le64(ub.ub_gen);
+    uint64_t lo[STM_LABELS_PER_DEVICE];
+    STM_ASSERT_OK(stm_label_offsets(stm_bdev_caps_of(d)->size_bytes, lo));
+    for (size_t i = 0; i < r3_nks; i++) {
+        uint64_t g = r3_newest + r3_ks[i];
+        uint64_t off = lo[g % 4u] + (g % 63u) * (uint64_t)STM_UB_SIZE;
+        stm_bdev_inject_read_range(d, off, off + STM_UB_SIZE, -1, STM_EIO);
+    }
+}
+
+/* Mount with the hook armed; *mounted is the generation mounted (0 when
+ * the mount failed). */
+static stm_status r3_mount_faulted(stm_fs_mount_opts *mopts, int phase,
+                                   uint64_t k1, uint64_t k2,
+                                   stm_sb_scan_refusal *why,
+                                   uint64_t *mounted)
+{
+    r3_phase = phase;
+    r3_ks[0] = k1;
+    r3_ks[1] = k2;
+    r3_nks = k2 ? 2u : 1u;
+    memset(why, 0, sizeof *why);
+    mopts->scan_refusal = why;
+    stm_fs_set_mount_open_hook_for_test(r3_fault_after_newest_hook, NULL);
+    stm_fs *fs = NULL;
+    stm_status ms = stm_fs_mount(g_tmp_path, mopts, &fs);
+    stm_fs_set_mount_open_hook_for_test(NULL, NULL);
+    mopts->scan_refusal = NULL;
+    *mounted = 0;
+    if (ms == STM_OK && fs) {
+        stm_sync_info info;
+        STM_ASSERT_OK(stm_sync_info_get(stm_fs_sync_for_test(fs), &info));
+        *mounted = info.mount_max_durable_gen;
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+    }
+    return ms;
+}
+
+/* A pool whose last session wrote one byte and unmounted. */
+static void r3_make_written_pool(const char *tag, stm_fs_mount_opts *mopts)
+{
+    make_tmp(tag);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    *mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, mopts, &fs));
+    if (!fs) return;
+    uint64_t f = 0, g = 0, h = 0;
+    rh_make(fs, &f, &g, &h);
+    uint8_t x = 'x';
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, &x, 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+STM_TEST(fs_mount_takes_a_final_past_its_unreadable_successor) {
+    stm_fs_mount_opts mopts;
+    r3_make_written_pool("r3fsfin", &mopts);
+    for (uint64_t k = 1; k <= 2; k++) {
+        stm_sb_scan_refusal why;
+        uint64_t mounted = 0;
+        STM_ASSERT_OK(r3_mount_faulted(&mopts, STM_FS_MOUNT_HOOK_PEEK, k, 0,
+                                       &why, &mounted));
+        STM_ASSERT_EQ(why.gen, 0u);
+        /* The mount before this one was clean: newest is its unmount's
+         * final, and it is what mounts. */
+        STM_ASSERT_EQ(mounted, r3_newest);
+    }
+    unlink(g_tmp_path);
+}
+
+/* After a session that changed no tree, the newest final carries its
+ * reservation's trees; its mark still says final. */
+STM_TEST(fs_mount_takes_a_noop_final_past_its_unreadable_successor) {
+    stm_fs_mount_opts mopts;
+    r3_make_written_pool("r3fsnoop", &mopts);
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    /* The premise: newest is a final with its predecessor's merkle root. */
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    stm_bdev *d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &bo, &d));
+    stm_uberblock nu, pu;
+    uint32_t lbl = 0, slot = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &nu, &lbl, &slot));
+    uint64_t n = stm_load_le64(nu.ub_gen);
+    STM_ASSERT_OK(stm_sb_label_read(d, (uint32_t)((n - 1u) % 4u),
+                                    (uint32_t)((n - 1u) % 63u), &pu));
+    STM_ASSERT_EQ(memcmp(nu.ub_merkle_root, pu.ub_merkle_root,
+                         sizeof nu.ub_merkle_root), 0);
+    STM_ASSERT_EQ(stm_load_le64(nu.ub_repair_log_root_gen), n);
+    stm_bdev_close(d);
+    stm_sb_scan_refusal why;
+    uint64_t mounted = 0;
+    STM_ASSERT_OK(r3_mount_faulted(&mopts, STM_FS_MOUNT_HOOK_PEEK, 1, 0, &why,
+                                   &mounted));
+    STM_ASSERT_EQ(mounted, n);
+    STM_ASSERT_EQ(why.gen, 0u);
+    unlink(g_tmp_path);
+}
+
+/* The peek reads the slots whole, then the open's own scan cannot: the
+ * refusal names the open's slot. */
+STM_TEST(fs_mount_names_the_slot_the_open_refuses_on) {
+    stm_fs_mount_opts mopts;
+    r3_make_written_pool("r3fsopen", &mopts);
+    stm_sb_scan_refusal why;
+    uint64_t mounted = 0;
+    STM_ASSERT_ERR(r3_mount_faulted(&mopts, STM_FS_MOUNT_HOOK_SYNC_OPEN, 1, 2,
+                                    &why, &mounted), STM_EIO);
+    STM_ASSERT_EQ(why.gen, r3_newest + 2u);
+    STM_ASSERT_EQ(why.best_gen, r3_newest);
+    STM_ASSERT(why.byte_offset != 0u);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(fs_mount_zeroes_the_refusal_before_its_argument_check) {
+    make_tmp("r3fsarg");
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_sb_scan_refusal why;
+    memset(&why, 0xab, sizeof why);
+    mopts.scan_refusal = &why;
+    stm_fs *fs = NULL;
+    STM_ASSERT_ERR(stm_fs_mount(NULL, &mopts, &fs), STM_EINVAL);
+    STM_ASSERT_EQ(why.gen, 0u);
+    memset(&why, 0xab, sizeof why);
+    STM_ASSERT_ERR(stm_fs_mount(g_tmp_path, &mopts, NULL), STM_EINVAL);
+    STM_ASSERT_EQ(why.gen, 0u);
     unlink(g_tmp_path);
 }

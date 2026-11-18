@@ -1588,9 +1588,9 @@ stm_status stm_fs_mount(const char *path,
                          const stm_fs_mount_opts *opts,
                          stm_fs **out_fs)
 {
-    if (!path || !opts || !out_fs) return STM_EINVAL;
-    if (opts->scan_refusal)
+    if (opts && opts->scan_refusal)
         memset(opts->scan_refusal, 0, sizeof *opts->scan_refusal);
+    if (!path || !opts || !out_fs) return STM_EINVAL;
 
     /* 9.8-LF-3: ensure EBR substrate is initialised before any code path
      * that might enter an epoch. Idempotent — safe to call on every mount.
@@ -1646,7 +1646,8 @@ stm_status stm_fs_mount(const char *path,
     {
         uint32_t peek_lbl = 0, peek_slot = 0;
 #ifdef STRATUM_BUILD_TESTING_HOOKS
-        if (g_mount_open_hook) g_mount_open_hook(d, g_mount_open_hook_arg);
+        if (g_mount_open_hook)
+            g_mount_open_hook(d, STM_FS_MOUNT_HOOK_PEEK, g_mount_open_hook_arg);
 #endif
         /* One device here; with more, stm_sync_open's strict scan rules. */
         s = stm_sb_mount_scan_ex(d, true, &peek_ub, &peek_lbl, &peek_slot,
@@ -1838,11 +1839,16 @@ stm_status stm_fs_mount(const char *path,
     }
 
     stm_sync *sync = NULL;
-    s = stm_sync_open(pool, a,
-                        have_kf ? &wk : NULL,
-                        have_jn ? janus : NULL,
-                        corvus_cfg_p,
-                        &sync);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (g_mount_open_hook)
+        g_mount_open_hook(d, STM_FS_MOUNT_HOOK_SYNC_OPEN, g_mount_open_hook_arg);
+#endif
+    s = stm_sync_open_ex(pool, a,
+                         have_kf ? &wk : NULL,
+                         have_jn ? janus : NULL,
+                         corvus_cfg_p,
+                         opts->scan_refusal,
+                         &sync);
     /* The session token is needed only for the mount-time unwrap;
      * the resulting DEKs now live in the sync DEK map (zeroed at
      * unmount via sync_dek_wipe_all). Scrub + release the token
