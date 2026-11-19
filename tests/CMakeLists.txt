@@ -42,6 +42,13 @@ stm_add_test(test_crypto     test_crypto.c)
 stm_add_test(test_hybrid     test_hybrid.c)
 stm_add_test(test_bdev       test_bdev.c)
 stm_add_test(test_bdev_async test_bdev_async.c)
+# The Thylacine virtio-blk driver against a scripted device: the test
+# compiles the driver itself (the host library builds posix.c instead).
+if(NOT STM_PLATFORM_THYLACINE)
+    stm_add_test(test_bdev_thylacine test_bdev_thylacine.c)
+    target_include_directories(test_bdev_thylacine PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/block ${CMAKE_SOURCE_DIR}/src)
+endif()
 stm_add_test(test_ebr        test_ebr.c)
 stm_add_test(test_btree      test_btree.c)
 stm_add_test(test_btree_mt   test_btree_mt.c)

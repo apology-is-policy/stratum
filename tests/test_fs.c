@@ -13581,8 +13581,10 @@ STM_TEST(fs_mount_takes_a_final_past_its_unreadable_successor) {
         STM_ASSERT_OK(r3_mount_faulted(&mopts, STM_FS_MOUNT_HOOK_PEEK, k, 0,
                                        &why, &mounted));
         STM_ASSERT_EQ(why.gen, 0u);
-        /* The mount before this one was clean: newest is its unmount's
-         * final, and it is what mounts. */
+        /* Newest is a final, and it is what mounts: for k = 1 the
+         * explicit commit's (the unmount after it had nothing to commit),
+         * for k = 2 the unmount's of the mount before (the clean-commit
+         * skip cannot fire right after an open). */
         STM_ASSERT_EQ(mounted, r3_newest);
     }
     unlink(g_tmp_path);

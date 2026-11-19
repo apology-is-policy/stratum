@@ -688,21 +688,22 @@ STM_TEST(sb_mount_scan_one_device_knows_a_final_by_its_mark) {
     stm_bdev_close(d);
     unlink(g_tmp_path);
 
-    /* A v32 uberblock was written by code this tree does not have: its
-     * mark proves nothing, only its trees. */
+    /* The v32 writers stamped the mark as the v33 ones do: a v32 final's
+     * mark proves it, and a v32 reservation's is older. */
     d = open_test_device("r3v32", 16 * 1024 * 1024);
     STM_ASSERT(d != NULL);
     sb_put_ub(d, 41, 1, 40, 32u);
     sb_put_ub(d, 42, 1, 42, 32u);
     sb_fault_gen(d, 43, -1);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
+    STM_ASSERT_EQ(why.gen, 0u);
+    stm_bdev_inject_read_range_clear(d);
+    sb_put_ub(d, 42, 1, 41, 32u);
+    sb_fault_gen(d, 43, -1);
     STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why),
                    STM_EIO);
     STM_ASSERT_EQ(why.gen, 43u);
-    stm_bdev_inject_read_range_clear(d);
-    sb_put_ub(d, 42, 2, 42, 32u);
-    sb_fault_gen(d, 43, -1);
-    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why));
-    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
     stm_bdev_inject_read_range_clear(d);
     stm_bdev_close(d);
     unlink(g_tmp_path);
@@ -793,6 +794,63 @@ STM_TEST(sb_mount_scan_reads_an_undecoded_successor_again) {
     }
     stm_bdev_close(d);
     unlink(g_tmp_path);
+}
+
+/* Best is a reservation (42) and best+1 holds its final (43), read with
+ * device errors (E) and silent garbles (G) in the order given, then clean.
+ * The slot counts as torn only after two garbled reads, a failed read
+ * counts toward unreadable, and three reads bound it. */
+STM_TEST(sb_mount_scan_counts_a_slot_torn_after_two_garbled_reads) {
+    static const struct {
+        const char *faults;
+        uint64_t    gen;        /* the generation mounted; 0: refused at 43 */
+    } cases[] = {
+        { "EG", 43 }, { "GE", 43 }, { "GEE", 0 }, { "EGE", 0 }, { "GG", 42 },
+    };
+    for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+        for (int strict = 0; strict < 2; strict++) {
+            stm_bdev *d = open_test_device("r4mix", 16 * 1024 * 1024);
+            STM_ASSERT(d != NULL);
+            if (!d) return;
+            sb_put_gen_m(d, 41, 1);
+            sb_put_gen_m(d, 42, 1);
+            sb_put_ub(d, 43, 2, 43, STM_UB_VERSION);
+            uint64_t off = sb_gen_off(d, 43);
+            const char *f = cases[c].faults;
+            for (size_t i = 0; f[i]; i++) {
+                if (f[i] == 'E')
+                    stm_bdev_inject_read_range(d, off, off + STM_UB_SIZE, 1,
+                                               STM_EIO);
+                else
+                    stm_bdev_inject_read_range(d, off + 384u, off + 385u, 1,
+                                               STM_OK);
+            }
+            uint32_t f0 = stm_bdev_inject_read_range_fired(d);
+            stm_uberblock found;
+            stm_sb_scan_refusal why;
+            memset(&why, 0, sizeof why);
+            stm_status s = strict
+                ? stm_sb_mount_scan(d, &found, NULL, NULL)
+                : stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why);
+            printf("  %s, %s: scan %d\n", f, strict ? "strict" : "one device",
+                   (int)s);
+            STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(d) - f0, strlen(f));
+            if (cases[c].gen != 0) {
+                STM_ASSERT_OK(s);
+                STM_ASSERT_EQ(stm_load_le64(found.ub_gen), cases[c].gen);
+            } else {
+                STM_ASSERT_ERR(s, STM_EIO);
+                if (!strict) STM_ASSERT_EQ(why.gen, 43u);
+            }
+            /* Premise: the slot decodes once the faults are spent. */
+            stm_bdev_inject_read_range_clear(d);
+            stm_uberblock again;
+            STM_ASSERT_OK(stm_sb_label_read(d, 3u, 43u, &again));
+            STM_ASSERT_EQ(stm_load_le64(again.ub_gen), 43u);
+            stm_bdev_close(d);
+            unlink(g_tmp_path);
+        }
+    }
 }
 
 STM_TEST_MAIN("sb")

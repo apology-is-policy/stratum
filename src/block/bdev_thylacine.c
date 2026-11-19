@@ -104,9 +104,11 @@
  * <0x01000000 (it draws from BURROW_VA_BASE in mm/burrow.c). So these
  * fixed VAs are reservation-safe.
  */
+#ifndef THYLA_BDEV_FAKE_DEVICE
 #define THYLA_MMIO_USER_VA           0x00500000ull
 #define THYLA_RING_USER_VA           0x00600000ull
 #define THYLA_DATA_USER_VA           0x00700000ull
+#endif
 
 /* VirtIO MMIO register offsets. */
 #define VREG_MAGIC_VALUE             0x000
@@ -166,8 +168,6 @@
  * data descriptor; FLUSH is a header->status chain with no data. */
 typedef enum { REQ_READ, REQ_WRITE, REQ_FLUSH } req_kind;
 
-#define VINT_USED_BUFFER             (1u << 0)
-
 /* Virtqueue dimensions + ring DMA layout. */
 #define VQ_QUEUE_SIZE                16u
 #define VQ_RING_DMA_SIZE             THYLA_PAGE_SIZE
@@ -183,20 +183,27 @@ typedef enum { REQ_READ, REQ_WRITE, REQ_FLUSH } req_kind;
 #define VQ_DATA_DMA_SIZE             (1ull << 20)
 #define SECTORS_PER_REQUEST          (VQ_DATA_DMA_SIZE / SECTOR_SIZE)
 
-/* Cap on spurious IRQ wakes (config-change without used-buffer). */
+/* Cap on wakes that bring an interrupt but no answer (another
+ * completion's stale bit, a configuration change). */
 #define MAX_NON_USED_BUFFER_WAKES    16u
 
-/* Each IRQ wait returns within BDEV_IRQ_WAIT_NS, so a request the device
- * has not answered is looked at once a second: a used ring that moved with
- * no interrupt seen (a lost one) completes it, and DEVICE_NEEDS_RESET
- * (VIRTIO 1.2 2.1.2: an error the device cannot recover from) sends it
- * down the transport path. The wait itself has no end, as in Linux's
- * virtio-blk (no blk-mq timeout handler): a slow host is not a failed
- * device, and a reset cannot hurry a request QEMU is still running (its
- * reset drains it). After BDEV_SLOW_LINE_WAITS waits the request gets one
- * line. */
+/* Each IRQ wait returns within BDEV_IRQ_WAIT_NS, and every wake asks the
+ * used ring first, as Linux's vring_interrupt does: the request is done
+ * when used.idx has moved off d->avail_idx, whatever the interrupt status
+ * says. That status can hold another completion's bit: a completion found
+ * on a timed-out wait leaves its bit, and the kernel's count of its edge,
+ * to the next request. An unanswered request then goes down the transport
+ * path on DEVICE_NEEDS_RESET (VIRTIO 1.2 2.1: the device met an error it
+ * cannot recover from), and otherwise waits on. The wait has no end, as in
+ * Linux's virtio-blk (no blk-mq timeout handler): a slow host is not a
+ * failed device, and a reset cannot hurry a request QEMU is still running
+ * (its reset drains it). A request outstanding BDEV_SLOW_LINE_WAITS
+ * timed-out waits gets a line, and another every BDEV_STILL_WAITING_WAITS. */
 #define BDEV_IRQ_WAIT_NS             1000000000ull
 #define BDEV_SLOW_LINE_WAITS         30u
+#define BDEV_STILL_WAITING_WAITS     300u
+_Static_assert(BDEV_IRQ_WAIT_NS == 1000000000ull,
+               "the wait lines count timed-out waits as seconds");
 
 /* Bounded transient-fault recovery: a failed request triggers up to this
  * many (device re-init + re-submit) cycles before the bdev is latched
@@ -213,8 +220,9 @@ typedef enum { REQ_READ, REQ_WRITE, REQ_FLUSH } req_kind;
  * and again must not flood the console, nor hide a later failed flush. */
 #define BDEV_REQUEST_ERROR_LINES_MAX 32u
 #define BDEV_TRANSPORT_LINES_MAX     32u
-/* The same for requests still waiting after BDEV_SLOW_LINE_WAITS and for
- * completions seen without their interrupt. */
+/* The same, each kind apart, for slow lines and for completions found on
+ * a timed-out wait. The line every BDEV_STILL_WAITING_WAITS has no cap: it
+ * is the only sign of a device that stopped answering. */
 #define BDEV_WAIT_LINES_MAX          32u
 
 /* Reads of the status register after a reset, waiting for it to read 0. */
@@ -288,8 +296,8 @@ typedef struct {
     /* diagnostics: submissions the device failed alone, per req_kind */
     uint64_t         request_errors[3];
     uint64_t         transport_fails; /* diagnostics: transport failures (io-fail + flush-lost lines, capped) */
-    uint64_t         wait_lines;      /* diagnostics: slow + irq-late lines (capped) */
-    uint64_t         late_completions; /* diagnostics: completions seen without their interrupt */
+    uint64_t         slow_lines;      /* diagnostics: slow lines (capped) */
+    uint64_t         late_completions; /* diagnostics: completions found on a timed-out wait (their lines capped) */
 
     /* VIRTIO_BLK_F_FLUSH negotiated at init -> op_fsync issues a real
      * VIRTIO_BLK_T_FLUSH barrier. When false (device offers no cache),
@@ -347,8 +355,13 @@ static inline int64_t t_dma_map(int64_t handle, uint64_t vaddr, uint32_t prot)
 /* volatile loads/stores at the requested width. dsb_sy() is the              */
 /* descriptor-to-doorbell barrier (DMB OSHST would suffice but DSB SY         */
 /* matches the Rust driver and is the strongest acceptable choice).           */
+/*                                                                            */
+/* A host test (tests/test_bdev_thylacine.c) defines THYLA_BDEV_FAKE_DEVICE   */
+/* and supplies the VAs and these accessors, behind which it runs a scripted  */
+/* device.                                                                    */
 /* ------------------------------------------------------------------------- */
 
+#ifndef THYLA_BDEV_FAKE_DEVICE
 static inline uint32_t mmio_read32(uint64_t addr)
 {
     return *(volatile uint32_t *)addr;
@@ -385,6 +398,7 @@ static inline void virtio_rmb(void)
 {
     __asm__ __volatile__("dmb ishld" ::: "memory");
 }
+#endif
 
 /* ------------------------------------------------------------------------- */
 /* MMIO bank + slot location.                                                 */
@@ -645,18 +659,18 @@ static void bdev_diag(thyla_bdev *d, const char *what, uint64_t lba,
     }
 }
 
-/* Lines about waiting, bounded like the others. Caller holds d->lock. */
-static void bdev_wait_diag(thyla_bdev *d, const char *what, uint64_t lba,
+/* The n-th line of one kind about waiting: shown up to
+ * BDEV_WAIT_LINES_MAX, then `quiet` once. Caller holds d->lock. */
+static void bdev_wait_diag(thyla_bdev *d, uint64_t n, const char *what,
+                           const char *quiet, uint64_t lba,
                            uint32_t sector_count, req_kind kind,
                            uint32_t attempt)
 {
     bdev_fail_info none = {0};
-    uint64_t n = ++d->wait_lines;
     if (n <= BDEV_WAIT_LINES_MAX)
         bdev_diag(d, what, lba, sector_count, kind, attempt, &none);
     else if (n == BDEV_WAIT_LINES_MAX + 1u)
-        bdev_diag(d, "wait lines (later ones not shown)", lba, sector_count,
-                  kind, attempt, &none);
+        bdev_diag(d, quiet, lba, sector_count, kind, attempt, &none);
 }
 
 /* A non-OK status the device wrote on a consistent ring is the request's
@@ -725,10 +739,8 @@ static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
     dsb_sy();
     mmio_write32(d->slot_va + VREG_QUEUE_NOTIFY, 0);
 
-    /* Wait for the device's IRQ, tolerating up to N spurious config-change
-     * wakes. A wait that returns with no interrupt looks at the used ring
-     * (it holds d->avail_idx until the device answers this request) and
-     * the device status, and otherwise goes on: see BDEV_IRQ_WAIT_NS. */
+    /* Wait for the answer: the used ring holds d->avail_idx until the
+     * device answers this request. See BDEV_IRQ_WAIT_NS. */
     uint64_t used_va = THYLA_RING_USER_VA + VQ_USED_OFF;
     uint32_t spurious = 0;
     uint32_t waits = 0;
@@ -747,20 +759,29 @@ static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
 
         uint32_t int_status = mmio_read32(d->slot_va + VREG_INTERRUPT_STATUS);
         mmio_write32(d->slot_va + VREG_INTERRUPT_ACK, int_status);
-        if (int_status & VINT_USED_BUFFER) break;
+        virtio_rmb();
+        if (mmio_read16(used_va + 2) != d->avail_idx) {
+            late = count == 0;
+            break;
+        }
         if (mmio_read32(d->slot_va + VREG_STATUS) & VSTATUS_DEVICE_NEEDS_RESET) {
             fi->arm = 6;
             goto io_fail;
         }
         if (count == 0) {
-            virtio_rmb();
-            if (mmio_read16(used_va + 2) != d->avail_idx) {
-                late = true;
-                break;
-            }
-            if (++waits == BDEV_SLOW_LINE_WAITS)
-                bdev_wait_diag(d, "slow (outstanding 30 s, still waiting)",
+            waits++;
+            if (waits == BDEV_SLOW_LINE_WAITS) {
+                bdev_wait_diag(d, ++d->slow_lines,
+                               "slow (outstanding 30 s, still waiting)",
+                               "slow lines (later ones not shown)",
                                lba, sector_count, kind, attempt);
+            } else if (waits % BDEV_STILL_WAITING_WAITS == 0) {
+                char what[48];
+                bdev_fail_info none = {0};
+                snprintf(what, sizeof what, "still waiting (at least %u s)",
+                         waits);
+                bdev_diag(d, what, lba, sector_count, kind, attempt, &none);
+            }
             continue;
         }
         spurious++;
@@ -772,17 +793,17 @@ static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
      * + data payload. */
     virtio_rmb();
     if (used_idx != new_idx) {
-        /* QEMU's notification of DEVICE_NEEDS_RESET arrives with the
-         * used-buffer bit set, so a used ring that did not move asks. */
-        fi->arm = (mmio_read32(d->slot_va + VREG_STATUS) &
-                   VSTATUS_DEVICE_NEEDS_RESET) ? 6 : 3;
+        /* One request is in flight: a used ring that moved anywhere else
+         * is the transport's failure. */
+        fi->arm = 3;
         fi->used_idx = used_idx;
         fi->want_idx = new_idx;
         goto io_fail;
     }
     if (late) {
-        d->late_completions++;
-        bdev_wait_diag(d, "irq-late (completion seen without its interrupt)",
+        bdev_wait_diag(d, ++d->late_completions,
+                       "irq-late (completion found on a timed-out wait)",
+                       "irq-late lines (later ones not shown)",
                        lba, sector_count, kind, attempt);
     }
 

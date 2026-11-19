@@ -96,8 +96,11 @@ stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
     return label_read_ex(d, label_idx, slot_idx, out_ub, &unreadable, &zero);
 }
 
-/* Re-reads of an unreadable slot that could hold a newer commit. */
-static const uint32_t SB_SCAN_REREADS = 2u;
+/* Reads of a slot that could hold a newer commit, the scan's included,
+ * and how many of them must return bytes that do not decode before the
+ * slot counts as torn. */
+static const uint32_t SB_SLOT_READS_MAX = 3u;
+static const uint32_t SB_SLOT_GARBLED_TORN = 2u;
 
 typedef enum {
     SB_SLOT_VALID = 0,   /* decoded */
@@ -116,11 +119,12 @@ static uint8_t sb_slot_classify(stm_status s, bool unreadable, bool zero)
     return (uint8_t)SB_SLOT_UNDECODED;
 }
 
-/* The state of slot(gen), read again if the device failed it (up to
- * SB_SCAN_REREADS times) or it did not decode (once: a read that came back
- * wrong with no error). A slot that decoded in the scan holds a generation
- * no newer than best; *newer is set when a re-read decodes one above
- * best_gen into *cand. */
+/* The state of slot(gen), read again while the device fails it or it
+ * reads back non-zero and does not decode: it counts as undecoded only
+ * after SB_SLOT_GARBLED_TORN reads returned such bytes, and as unreadable
+ * when SB_SLOT_READS_MAX reads brought neither that nor a decode. A slot
+ * that decoded in the scan holds a generation no newer than best; *newer
+ * is set when a re-read decodes one above best_gen into *cand. */
 static sb_slot_state sb_successor(stm_bdev *d,
                                   uint8_t st[STM_LABELS_PER_DEVICE][STM_UB_SLOTS_PER_LABEL],
                                   uint64_t gen, uint64_t best_gen,
@@ -132,37 +136,40 @@ static sb_slot_state sb_successor(stm_bdev *d,
     sb_slot_state was = (sb_slot_state)st[li][si];
     if (was != SB_SLOT_UNREADABLE && was != SB_SLOT_UNDECODED)
         return was;
-    uint32_t tries = was == SB_SLOT_UNREADABLE ? SB_SCAN_REREADS : 1u;
-    for (uint32_t r = 0; r < tries; r++) {
+    uint32_t garbled = was == SB_SLOT_UNDECODED ? 1u : 0u;
+    for (uint32_t r = 1; r < SB_SLOT_READS_MAX; r++) {
         bool unreadable = false;
         bool zero = false;
         stm_status s = label_read_ex(d, li, si, cand, &unreadable, &zero);
         if (unreadable) continue;
-        st[li][si] = sb_slot_classify(s, false, zero);
+        sb_slot_state now = (sb_slot_state)sb_slot_classify(s, false, zero);
+        if (now == SB_SLOT_UNDECODED && ++garbled < SB_SLOT_GARBLED_TORN)
+            continue;
+        st[li][si] = (uint8_t)now;
         *newer = s == STM_OK && stm_load_le64(cand->ub_gen) > best_gen;
-        return (sb_slot_state)st[li][si];
+        return now;
     }
-    return was;
+    st[li][si] = (uint8_t)SB_SLOT_UNREADABLE;
+    return SB_SLOT_UNREADABLE;
 }
 
 /* Every final stamps ub_repair_log_root_gen with its own generation; a
  * reservation and a mount's claim carry the one they were built from,
- * which is older (sync.c). True of every writer of this version: one that
- * changes the stamp changes this proof. */
-_Static_assert(STM_UB_VERSION == 33u,
+ * which is older (sync.c). The writers of both versions the decode
+ * accepts stamp it so (none of them changed from v32 to v33): a writer
+ * that changes the stamp, or a version range that admits another
+ * writer, changes this proof. */
+_Static_assert(STM_UB_VERSION == 33u && STM_UB_VERSION_MIN_COMPAT == 32u,
                "re-check that only a final has ub_repair_log_root_gen == ub_gen");
-static const uint32_t SB_FINAL_MARK_SINCE = 33u;
 
 /* best is a final when its mark says so, or when best-1 decodes with
  * another merkle_root (a reservation and a claim carry their
- * predecessor's trees unchanged). A v32 uberblock was written by code
- * not in this tree, so only its trees count. Anything less proves
- * nothing: a claim reads as a reservation. */
+ * predecessor's trees unchanged). Anything less proves nothing: a claim
+ * reads as a reservation. */
 static bool sb_best_is_final(stm_bdev *d, const stm_uberblock *best,
                              uint64_t best_gen)
 {
-    if (stm_load_le32(best->ub_version) >= SB_FINAL_MARK_SINCE &&
-        stm_load_le64(best->ub_repair_log_root_gen) == best_gen)
+    if (stm_load_le64(best->ub_repair_log_root_gen) == best_gen)
         return true;
     if (best_gen < 2u) return false;
     uint64_t g = best_gen - 1u;

@@ -99,18 +99,23 @@ static stm_status do_request(thyla_bdev *d, uint64_t lba,
   `DO_REQUEST_MAX_REINIT == 2` -> at most 2 re-inits per request, and
   `DO_REQUEST_MAX_RESUBMIT == 2` -> at most 2 re-submits of a read or write
   the device failed alone. Each
-  `do_request_once` caps wakes with no used buffer (`MAX_NON_USED_BUFFER_WAKES`)
-  and looks at the device once a second while it does not answer: each
-  `t_irq_wait` returns within 1 s, and then a used ring that moved with no
-  interrupt seen completes the request (an `irq-late` line: a lost
-  interrupt), and DEVICE_NEEDS_RESET in the status (VIRTIO 1.2 2.1.2; QEMU
-  sets it on a malformed ring) takes the transport path as
-  `arm=needs-reset`. Otherwise the wait has no end, as in Linux's virtio-blk
-  (no blk-mq timeout handler, so its timer re-arms): a slow host is not a
-  failed device, and a reset cannot hurry a request QEMU is still running
-  (its reset drains it). A request outstanding 30 s gets one `slow` line and
-  goes on waiting. So a slow host costs time, never a failed request (see
-  Known caveats for a device that never answers). Exhaustion -- or a
+  `do_request_once` asks the used ring on every wake, as Linux's
+  `vring_interrupt` does: each `t_irq_wait` returns on an interrupt or after
+  1 s, and the request is done when `used.idx` has moved, whatever the
+  interrupt status says. That status can hold another completion's bit (a
+  completion found on a timed-out wait leaves its bit, and the kernel's count
+  of its edge, to the next request), so an interrupt with no answer is a
+  spurious wake, capped (`MAX_NON_USED_BUFFER_WAKES`). A completion found on
+  a timed-out wait, its interrupt late or lost, is counted (`late=`, an
+  `irq-late` line). An unanswered request with DEVICE_NEEDS_RESET in the
+  status (VIRTIO 1.2 2.1; QEMU sets it on a malformed ring and sends a
+  configuration interrupt) takes the transport path as `arm=needs-reset`.
+  Otherwise the wait has no end, as in Linux's virtio-blk (no blk-mq timeout
+  handler, so its timer re-arms): a slow host is not a failed device, and a
+  reset cannot hurry a request QEMU is still running (its reset drains it).
+  A request outstanding 30 s gets a `slow` line, and a `still waiting` line
+  every 300 s after that. So a slow host costs time, not a failed request
+  (see Known caveats for a device that never answers). Exhaustion -- or a
   re-init that itself fails to re-negotiate — latches `d->failed`
   **permanently** (fail-closed; the genuinely-dead-device case).
 
@@ -281,12 +286,22 @@ Two residuals (Area F focused audit, P3, both v1.0-acceptable):
   a loopback responder returns `Rlerror(ENOSPC)` / `Rlerror(EIO)` for
   Twrite/Tread; asserts `dev9p.write` -> `-28` and `dev9p.read` -> `-5` (not the
   `-1` collapse). Non-vacuous (pre-fix returns `-1`).
-- The `bdev_thylacine` re-init path itself is **Thylacine-only** (not
-  host-compilable; `#error`-guarded on `__NR_mmio_create`). Its happy path is
-  exercised by every Thylacine boot (the live stratumd drives virtio-blk
-  through `do_request` -> `do_request_once`); its re-init path is verified by
-  code review against the VIRTIO 1.2 reset semantics + the in-guest go-build
-  E2E. The request-error path (X9) is verified on
+- **Stratum host, the driver itself** -- `tests/test_bdev_thylacine.c`
+  compiles `bdev_thylacine.c` with `THYLA_BDEV_FAKE_DEVICE`: its fixed VAs and
+  MMIO accessors go to a scripted virtio-mmio device that completes in QEMU's
+  order (the status byte and used element, `used.idx`, then the interrupt
+  bit and one edge for the kernel to count), and whose reset completes the
+  request in flight. It pins a slow request completing on its interrupt; a
+  completion found on a timed-out wait leaving no trap for the next flush or
+  write (the stale bit once failed the flush as `flush-lost`); a completion
+  whose edge was lost counted (`late=1`); DEVICE_NEEDS_RESET with QEMU's
+  configuration interrupt re-initing the device (a write re-submitted, a
+  flush lost); a configuration change taken as a spurious wake; and the
+  `slow` and `irq-late` lines capped apart, with a request that never ends
+  named every 300 s past the cap.
+- **Thylacine** -- the driver's happy path runs on every boot (the live
+  stratumd drives virtio-blk through `do_request` -> `do_request_once`).
+  The request-error path (X9) is verified on
   Thylacine with QEMU's blkdebug filter under the pool drive
   (`THYLACINE_POOL_BLKDEBUG` in Thylacine's `tools/run-vm.sh`), failing reads
   of one sector. A ring slot of an older generation, which the mount's
@@ -312,12 +327,21 @@ Two residuals (Area F focused audit, P3, both v1.0-acceptable):
   rung only after 35 s (one `slow` line at 30 s, then the completion, login,
   no re-init); and a head published out of the queue's range (QEMU: "Guest
   says index 16 is available", DEVICE_NEEDS_RESET, `arm=needs-reset`,
-  re-init, re-submit, login). The stale-ring replay the zeroing closes was not
+  re-init, re-submit, login). Round 4's legs (legs-r4.sh, leg-r4-*.txt)
+  re-ran these on its driver, with the same outcomes, and add a leg-only
+  driver that, until the first flush, leaves a write's interrupt bit unacked
+  and answers the next request's first wait with a stale count of 1, the
+  state a completion found on a timed-out wait leaves behind: the round-3
+  driver took the stale bit for the flush's answer, found the ring unmoved,
+  re-inited and failed the flush (`io-fail` and `flush-lost`,
+  `arm=used-idx`; the mount fails, `rc=-5`), and the round-4 driver takes
+  the wake as spurious (login, no line). The stale-ring replay the zeroing closes was not
   reproduced: the round-1 driver with the same forced re-init still reached
   login (on HVF the vCPU republishes before QEMU's kick runs), so that fix
   rests on VIRTIO 1.2 4.2.3.2 and QEMU's sources, not on a red leg. No leg
   reaches the reset read-back's loop (QEMU's virtio-mmio reset is
-  synchronous, so it exits on its first read) or the 33rd line of a cap.
+  synchronous, so it exits on its first read) or the 33rd line of a cap;
+  the driver's host test reaches the wait lines' caps.
 - **Stratum host, the FS above the driver** (the posix backend answers a
   device error as the driver now does: one request, no latch):
   `test_sb.c::sb_mount_scan_*` and `test_sync.c::sync_mount_*` (the scan's
@@ -341,7 +365,9 @@ Two residuals (Area F focused audit, P3, both v1.0-acceptable):
   rule on the path stratumd mounts through), `fs_mount_names_the_slot_the_open_refuses_on`
   and `fs_mount_zeroes_the_refusal_before_its_argument_check`;
   `test_sync_multi.c::sync_multi_a_device_that_refuses_is_not_a_stale_vote`
-  (the strict rule on a pool of three).
+  (the strict rule on a pool of three). Round 4:
+  `sb_mount_scan_counts_a_slot_torn_after_two_garbled_reads` (a device error
+  and a garble on one slot, in either order, then a clean read).
 
 ## Error paths
 
@@ -395,8 +421,10 @@ stderr, at most 32 per request kind over the process.
   reach the device fail (ref 26).
 - **A device that never answers.** The driver waits on a request with no end,
   as Linux's virtio-blk does, so a device that stops answering without
-  asking for a reset holds stratumd, `d->lock` held, until it answers; the
-  `slow` line at 30 s names the request.
+  asking for a reset holds stratumd, `d->lock` held, until it answers. The
+  `slow` line at 30 s names the request (its lines and the `irq-late` ones
+  are capped apart, 32 each), and a `still waiting` line every 300 s, with no
+  cap, says it is outstanding still.
   A recoverable-suspend that lets a hard-but-recovered device resume
   without a restart is a tracked v1.x enhancement, not an Area F defect.
 - **Stale-pool contamination.** A pool baked by a *buggy* Stratum (e.g.
@@ -421,10 +449,13 @@ stderr, at most 32 per request kind over the process.
   mount failing closed), round 2 (the ring zeroed on re-init, the one-device
   mount rule, the refusal named) and round 3 (a final known by its mark,
   blank only when zero, an undecoded slot read again, the open's refusal
-  named, an IRQ wait with no end that still catches a lost interrupt and
-  DEVICE_NEEDS_RESET) the same day; verified on Thylacine with injected bad
-  sectors, the slot after the newest final unreadable, and leg-only forced
-  faults (see Tests).
+  named, an IRQ wait with no end that still looks for DEVICE_NEEDS_RESET)
+  the same day, and round 4 on 2026-11-19 (every wake asks the used ring, so
+  a stale interrupt bit no longer fails the next request; a slot torn only
+  after two garbled reads; the mark trusted on v32; the wait lines capped
+  apart); verified by the driver's host test and on Thylacine with injected
+  bad sectors, the slot after the newest final unreadable, and leg-only
+  forced faults (see Tests).
 - Layer 2 (FS extent-write recovery): **pre-existing + sound**; now pinned by
   `fs_io_transient_write_eio_flush_recovers`.
 - Layer 3 (commit wedge + remount recovery): **pre-existing + sound** (R154).

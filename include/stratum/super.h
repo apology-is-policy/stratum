@@ -1122,8 +1122,8 @@ typedef struct stm_sb_scan_refusal {
  * stm_sb_mount_scan, told the pool's shape. With one_device (`d` is the
  * pool's only device, so its generations are contiguous) it refuses at
  * slot(best+1) only when best may be a reservation (neither its mark,
- * ub_repair_log_root_gen == ub_gen on a v33 uberblock, nor best-1 decoding
- * with other trees says final; a claim reads as a reservation), and at
+ * ub_repair_log_root_gen == ub_gen, nor best-1 decoding with other trees
+ * says final; a claim reads as a reservation), and at
  * slot(best+2) only when slot(best+1) neither decoded nor read back zero.
  * Without it, either slot unreadable refuses. `why`, if not NULL, says
  * which slot.

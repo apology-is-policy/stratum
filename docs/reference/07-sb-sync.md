@@ -190,20 +190,21 @@ reservation's barrier). A reservation or a claim carries its predecessor's
 final stamps `ub_repair_log_root_gen` with its own generation (its mark). So
 on a one-device pool (`stm_sync_open` and `stm_fs_mount` pass `one_device`)
 the scan refuses at slot(best+1) only when best may be a reservation: neither
-its mark (read on a v33 uberblock only: a v32 one was written by code not in
-this tree) nor best-1 decoding as gen best-1 with another merkle root says
-final. A claim reads as a reservation, so an unreadable slot after a claim
+its mark (the v32 and v33 writers stamp it alike: no writer of the mark
+changed between 7e67ded, the v32 bump, and 4dd19bd, the v33 one) nor best-1
+decoding as gen best-1 with another merkle root says final. A claim reads as a reservation, so an unreadable slot after a claim
 still refuses (a session that crashed before its first commit leaves one).
 It refuses at slot(best+2) only when slot(best+1) neither decoded (as an
 older generation: the ring came round) nor read back all zero (format zeroes
 the labels; a slot with no magic and other bytes may be a generation whose
-magic rotted). Before either counts, a slot that failed to read is read twice
-more, and one that did not decode once more. A device of a multi-device pool
+magic rotted). Before either counts, the slot is read again: it counts as
+torn only after two reads returned bytes that did not decode, and as
+unreadable when three reads brought neither that nor a decode (a failed read
+counts toward unreadable). A device of a multi-device pool
 can miss a generation's write while quorum holds, so there either slot
 unreadable refuses; a refusing device is then no vote for the older
 generation it read (a stale vote could make a false quorum). An unreadable
-slot anywhere else costs nothing (slot(best-1) still counts under a v32
-uberblock). A refusal says which slot (`stm_sb_scan_refusal`: the
+slot anywhere else costs nothing. A refusal says which slot (`stm_sb_scan_refusal`: the
 generation, label, slot, byte offset and the best generation read;
 `stm_fs_mount_opts.scan_refusal`, filled by the mount's first scan or by
 `stm_sync_open_ex`'s own), and stratumd prints it.
