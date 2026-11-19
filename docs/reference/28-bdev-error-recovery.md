@@ -54,7 +54,7 @@ three functions:
 static bool       reinit_device_locked(thyla_bdev *d);
 static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
                                    uint32_t sector_count, req_kind kind,
-                                   bdev_fail_info *fi);
+                                   uint32_t attempt, bdev_fail_info *fi);
 static stm_status do_request(thyla_bdev *d, uint64_t lba,
                               uint32_t sector_count, req_kind kind);
 ```
@@ -103,9 +103,10 @@ static stm_status do_request(thyla_bdev *d, uint64_t lba,
   `vring_interrupt` does: each `t_irq_wait` returns on an interrupt or after
   1 s, and the request is done when `used.idx` has moved, whatever the
   interrupt status says. That status can hold another completion's bit (a
-  completion found on a timed-out wait leaves its bit, and the kernel's count
-  of its edge, to the next request), so an interrupt with no answer is a
-  spurious wake, capped (`MAX_NON_USED_BUFFER_WAKES`). A completion found on
+  completion that lands after a timed-out wait's status read can leave its
+  bit, and the kernel's count of its edge, to the next request) or a
+  configuration change's (QEMU raises one as status 0x3), so an interrupt
+  with no answer is a spurious wake, capped (`MAX_NON_USED_BUFFER_WAKES`). A completion found on
   a timed-out wait, its interrupt late or lost, is counted (`late=`, an
   `irq-late` line). An unanswered request with DEVICE_NEEDS_RESET in the
   status (VIRTIO 1.2 2.1; QEMU sets it on a malformed ring and sends a
@@ -114,7 +115,7 @@ static stm_status do_request(thyla_bdev *d, uint64_t lba,
   handler, so its timer re-arms): a slow host is not a failed device, and a
   reset cannot hurry a request QEMU is still running (its reset drains it).
   A request outstanding 30 s gets a `slow` line, and a `still waiting` line
-  every 300 s after that. So a slow host costs time, not a failed request
+  at 300 s, 600 s and every 300 s on. So a slow host costs time, not a failed request
   (see Known caveats for a device that never answers). Exhaustion -- or a
   re-init that itself fails to re-negotiate — latches `d->failed`
   **permanently** (fail-closed; the genuinely-dead-device case).
@@ -296,7 +297,13 @@ Two residuals (Area F focused audit, P3, both v1.0-acceptable):
   write (the stale bit once failed the flush as `flush-lost`); a completion
   whose edge was lost counted (`late=1`); DEVICE_NEEDS_RESET with QEMU's
   configuration interrupt re-initing the device (a write re-submitted, a
-  flush lost); a configuration change taken as a spurious wake; and the
+  flush lost), and with that interrupt's edge lost (the timed-out wait finds
+  it); a configuration change taken as a spurious wake, as QEMU raises it
+  (status 0x3, the used-buffer bit with it: the driver before round 4 failed
+  a flush on it as `flush-lost`) and with bit 1 alone; a storm of interrupts
+  with no answer capped (`arm=spurious-wakes`: a write re-submitted, a flush
+  lost); a wait the kernel fails (`arm=irq-wait`) and a used ring moved by
+  two (`arm=used-idx`), each re-initing the device and re-submitting; and the
   `slow` and `irq-late` lines capped apart, with a request that never ends
   named every 300 s past the cap.
 - **Thylacine** -- the driver's happy path runs on every boot (the live
@@ -335,7 +342,14 @@ Two residuals (Area F focused audit, P3, both v1.0-acceptable):
   driver took the stale bit for the flush's answer, found the ring unmoved,
   re-inited and failed the flush (`io-fail` and `flush-lost`,
   `arm=used-idx`; the mount fails, `rc=-5`), and the round-4 driver takes
-  the wake as spurious (login, no line). The stale-ring replay the zeroing closes was not
+  the wake as spurious (login, no line). Round 5's legs (legs-r5.sh,
+  leg-r5-*.txt; its scan reads a successor slot again after one wrong read
+  and counts a decode only in its own slot) re-ran the four scan legs with
+  the same outcomes: an older generation's slot failing, login; the newest
+  generation's slot failing every read, the refusal line and `rc=-5`;
+  failing once, one re-submit and login; the slot after the newest final
+  failing every read, login on 159 and the claim written to 160. The
+  stale-ring replay the zeroing closes was not
   reproduced: the round-1 driver with the same forced re-init still reached
   login (on HVF the vCPU republishes before QEMU's kick runs), so that fix
   rests on VIRTIO 1.2 4.2.3.2 and QEMU's sources, not on a red leg. No leg
@@ -453,7 +467,10 @@ stderr, at most 32 per request kind over the process.
   the same day, and round 4 on 2026-11-19 (every wake asks the used ring, so
   a stale interrupt bit no longer fails the next request; a slot torn only
   after two garbled reads; the mark trusted on v32; the wait lines capped
-  apart); verified by the driver's host test and on Thylacine with injected
+  apart), and round 5 the same day (a successor slot blank only after two
+  zero reads, a decode counted only in its generation's ring slot, the fake
+  raising QEMU's configuration interrupt, four more ways a request ends
+  witnessed); verified by the driver's host test and on Thylacine with injected
   bad sectors, the slot after the newest final unreadable, and leg-only
   forced faults (see Tests).
 - Layer 2 (FS extent-write recovery): **pre-existing + sound**; now pinned by

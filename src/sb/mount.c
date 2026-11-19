@@ -97,34 +97,56 @@ stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
 }
 
 /* Reads of a slot that could hold a newer commit, the scan's included,
- * and how many of them must return bytes that do not decode before the
- * slot counts as torn. */
+ * and how many of them must come back wrong with no error (all zero, or
+ * bytes that are not that slot's uberblock) before the slot settles as
+ * blank or undecoded. */
 static const uint32_t SB_SLOT_READS_MAX = 3u;
-static const uint32_t SB_SLOT_GARBLED_TORN = 2u;
+static const uint32_t SB_SLOT_WRONG_SETTLES = 2u;
 
 typedef enum {
-    SB_SLOT_VALID = 0,   /* decoded */
-    SB_SLOT_BLANK,       /* read back all zero: never written (format
-                          * zeroes the labels) */
-    SB_SLOT_UNDECODED,   /* read; did not decode: torn, or a durable
-                          * generation gone bad */
-    SB_SLOT_UNREADABLE   /* the device failed the read */
+    SB_SLOT_VALID = 0,   /* decoded, as the uberblock of a generation
+                          * whose ring slot this is */
+    SB_SLOT_BLANK,       /* read back all zero, twice: never written
+                          * (format zeroes the labels) */
+    SB_SLOT_UNDECODED,   /* read back wrong twice, not both times zero:
+                          * torn, or a durable generation gone bad */
+    SB_SLOT_UNREADABLE,  /* the device failed the reads */
+    /* The scan's one read of a slot, not yet settled: */
+    SB_SLOT_READ_ZERO,
+    SB_SLOT_READ_WRONG,
+    SB_SLOT_READ_FAILED
 } sb_slot_state;
 
-static uint8_t sb_slot_classify(stm_status s, bool unreadable, bool zero)
+/* One read of slot (li, si); *s, if not NULL, is its status. A decode
+ * counts only in its generation's ring slot: every writer puts gen's
+ * uberblock at ring(gen) (sync.c), so another generation's uberblock
+ * here came from a misdirected read or write and says nothing of this
+ * slot. */
+static sb_slot_state sb_slot_read(stm_bdev *d, uint32_t li, uint32_t si,
+                                  stm_uberblock *ub, stm_status *s)
 {
-    if (unreadable)      return (uint8_t)SB_SLOT_UNREADABLE;
-    if (s == STM_OK)     return (uint8_t)SB_SLOT_VALID;
-    if (s == STM_ENOENT && zero) return (uint8_t)SB_SLOT_BLANK;
-    return (uint8_t)SB_SLOT_UNDECODED;
+    bool unreadable = false;
+    bool zero = false;
+    stm_status rs = label_read_ex(d, li, si, ub, &unreadable, &zero);
+    if (s) *s = rs;
+    if (unreadable) return SB_SLOT_READ_FAILED;
+    if (rs == STM_OK) {
+        uint64_t gen = stm_load_le64(ub->ub_gen);
+        if (stm_sb_ring_label_for_gen(gen) == li &&
+            stm_sb_ring_slot_for_gen(gen) == si)
+            return SB_SLOT_VALID;
+        return SB_SLOT_READ_WRONG;
+    }
+    return rs == STM_ENOENT && zero ? SB_SLOT_READ_ZERO : SB_SLOT_READ_WRONG;
 }
 
-/* The state of slot(gen), read again while the device fails it or it
- * reads back non-zero and does not decode: it counts as undecoded only
- * after SB_SLOT_GARBLED_TORN reads returned such bytes, and as unreadable
- * when SB_SLOT_READS_MAX reads brought neither that nor a decode. A slot
- * that decoded in the scan holds a generation no newer than best; *newer
- * is set when a re-read decodes one above best_gen into *cand. */
+/* The state of slot(gen), the scan's read counted and the slot read again
+ * until it settles: valid at a decode; blank once SB_SLOT_WRONG_SETTLES
+ * reads came back all zero; undecoded once that many came back wrong, not
+ * all of them zero; unreadable when SB_SLOT_READS_MAX reads brought
+ * neither. A slot that decoded in the scan holds a generation no newer
+ * than best (the ring came round); *newer is set when a re-read decodes
+ * one above best_gen into *cand. */
 static sb_slot_state sb_successor(stm_bdev *d,
                                   uint8_t st[STM_LABELS_PER_DEVICE][STM_UB_SLOTS_PER_LABEL],
                                   uint64_t gen, uint64_t best_gen,
@@ -133,21 +155,28 @@ static sb_slot_state sb_successor(stm_bdev *d,
     uint32_t li = stm_sb_ring_label_for_gen(gen);
     uint32_t si = stm_sb_ring_slot_for_gen(gen);
     *newer = false;
-    sb_slot_state was = (sb_slot_state)st[li][si];
-    if (was != SB_SLOT_UNREADABLE && was != SB_SLOT_UNDECODED)
-        return was;
-    uint32_t garbled = was == SB_SLOT_UNDECODED ? 1u : 0u;
+    uint32_t zeros = 0;
+    uint32_t wrong = 0;
+    switch ((sb_slot_state)st[li][si]) {
+    case SB_SLOT_READ_ZERO:   zeros = 1; break;
+    case SB_SLOT_READ_WRONG:  wrong = 1; break;
+    case SB_SLOT_READ_FAILED: break;
+    default:                  return (sb_slot_state)st[li][si];
+    }
     for (uint32_t r = 1; r < SB_SLOT_READS_MAX; r++) {
-        bool unreadable = false;
-        bool zero = false;
-        stm_status s = label_read_ex(d, li, si, cand, &unreadable, &zero);
-        if (unreadable) continue;
-        sb_slot_state now = (sb_slot_state)sb_slot_classify(s, false, zero);
-        if (now == SB_SLOT_UNDECODED && ++garbled < SB_SLOT_GARBLED_TORN)
-            continue;
-        st[li][si] = (uint8_t)now;
-        *newer = s == STM_OK && stm_load_le64(cand->ub_gen) > best_gen;
-        return now;
+        sb_slot_state now = sb_slot_read(d, li, si, cand, NULL);
+        if (now == SB_SLOT_VALID) {
+            st[li][si] = (uint8_t)SB_SLOT_VALID;
+            *newer = stm_load_le64(cand->ub_gen) > best_gen;
+            return SB_SLOT_VALID;
+        }
+        if (now == SB_SLOT_READ_ZERO) zeros++;
+        else if (now == SB_SLOT_READ_WRONG) wrong++;
+        if (zeros + wrong >= SB_SLOT_WRONG_SETTLES) {
+            sb_slot_state settled = wrong ? SB_SLOT_UNDECODED : SB_SLOT_BLANK;
+            st[li][si] = (uint8_t)settled;
+            return settled;
+        }
     }
     st[li][si] = (uint8_t)SB_SLOT_UNREADABLE;
     return SB_SLOT_UNREADABLE;
@@ -219,6 +248,7 @@ stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
     stm_uberblock best_ub;
     uint8_t  st[STM_LABELS_PER_DEVICE][STM_UB_SLOTS_PER_LABEL];
     bool     any_unread    = false;
+    bool     any_misplaced = false;
 
     /* Scan every label × every commit-ring slot. We deliberately
      * skip the mirror slot (STM_UB_MIRROR_SLOT) since it carries a
@@ -227,18 +257,18 @@ stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
     for (uint32_t li = 0; li < STM_LABELS_PER_DEVICE; li++) {
         for (uint32_t si = 0; si < STM_UB_SLOTS_PER_LABEL; si++) {
             stm_uberblock candidate;
-            bool unreadable = false;
-            bool zero = false;
-            stm_status s = label_read_ex(d, li, si, &candidate, &unreadable,
-                                         &zero);
-            st[li][si] = sb_slot_classify(s, unreadable, zero);
-            if (s != STM_OK) {
+            stm_status s = STM_OK;
+            sb_slot_state now = sb_slot_read(d, li, si, &candidate, &s);
+            st[li][si] = (uint8_t)now;
+            if (now != SB_SLOT_VALID) {
                 /* Expected: unused slots, corrupted slots. Skip --
                  * but remember a version mismatch so we can surface
-                 * it as a distinct error if no slot decoded OK, and a
-                 * slot the device could not read at all. */
-                if (unreadable) any_unread = true;
+                 * it as a distinct error if no slot decoded OK, a
+                 * slot the device could not read at all, and one
+                 * that held another generation's uberblock. */
+                if (now == SB_SLOT_READ_FAILED) any_unread = true;
                 else if (s == STM_EBADVERSION) saw_bad_version = true;
+                else if (s == STM_OK) any_misplaced = true;
                 continue;
             }
             uint64_t gen = stm_load_le64(candidate.ub_gen);
@@ -259,7 +289,10 @@ stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
      * that just needs an upgrade would be destructive. */
     if (!have_any) {
         if (saw_bad_version) return STM_EBADVERSION;
-        return any_unread ? STM_EIO : STM_ENOENT;
+        if (any_unread) return STM_EIO;
+        /* An uberblock out of its slot is still a pool, never a fresh
+         * device. */
+        return any_misplaced ? STM_ECORRUPT : STM_ENOENT;
     }
 
     /* Each generation's UB is in one ring slot. A commit newer than
@@ -272,13 +305,16 @@ stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
      * stays unreadable. A re-read that finds a newer generation moves
      * best, and its own successors are checked.
      *
+     * A read can come back wrong with no error, so a slot settles as
+     * blank or undecoded only after two such reads (sb_successor).
+     *
      * One device writes its generations in order, each after the last
      * is durable, so it refuses at best+1 only when best may be a
      * reservation (a claim, with nothing behind it, reads as one), and
      * at best+2 only when best+1 neither decoded as an older generation
-     * nor read back zero. A device of a multi-device pool can miss a
-     * generation's write while quorum holds, so there either slot
-     * unreadable refuses. */
+     * of its own slot (the ring came round) nor read back zero twice. A
+     * device of a multi-device pool can miss a generation's write while
+     * quorum holds, so there either slot unreadable refuses. */
     for (;;) {
         stm_uberblock cand;
         bool newer = false;

@@ -63,6 +63,17 @@ void     stm_bdev_inject_read_range(struct stm_bdev *d, uint64_t lo,
 void     stm_bdev_inject_read_range_clear(struct stm_bdev *d);
 uint32_t stm_bdev_inject_read_range_fired(const struct stm_bdev *d);
 
+/* Two reads that come back wrong with no error, for a range armed the
+ * same way (each takes one of the four): _zero reads and hands back all
+ * zero bytes (a lost mapping); _from is misdirected, reading the same
+ * length `from - lo` bytes away, so [lo, hi) reads back the bytes at
+ * [from, from + hi - lo). Fire only in a build with testing hooks. */
+void     stm_bdev_inject_read_range_zero(struct stm_bdev *d, uint64_t lo,
+                                         uint64_t hi, int64_t times);
+void     stm_bdev_inject_read_range_from(struct stm_bdev *d, uint64_t lo,
+                                         uint64_t hi, int64_t times,
+                                         uint64_t from);
+
 /*
  * Area G bench instrumentation. stm_bdev_io_stats reports the running per-op I/O accounting:
  * total state-changing writes, total bytes written to the device, and

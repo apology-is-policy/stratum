@@ -106,6 +106,9 @@ const stm_bdev_caps *stm_bdev_caps_of(const stm_bdev *d)
     return d ? &d->caps : NULL;
 }
 
+/* The kinds of faulted read stm_bdev_inject_read_range* arm. */
+enum { RR_ANSWER = 0, RR_ZERO, RR_FROM };
+
 #ifdef STRATUM_BUILD_TESTING_HOOKS
 static inline bool inject_read_should_fail(stm_bdev *d)
 {
@@ -119,11 +122,21 @@ static inline bool inject_read_should_fail(stm_bdev *d)
     return true;
 }
 
+/* What a faulted read does, by kind: RR_ANSWER answers `answer` without
+ * reading, or with STM_OK reads and inverts the byte at flip_at (the
+ * range's first byte inside the read); RR_ZERO reads and zeroes the
+ * buffer; RR_FROM reads at `at` instead. */
+typedef struct {
+    int        kind;
+    stm_status answer;
+    size_t     flip_at;
+    uint64_t   at;
+} rr_fault;
+
 /* Whether a read of [offset, offset + len) meets an armed range with reads
- * left to fault: *answer is its status (STM_OK: read, then invert the byte
- * at *flip_at in buf, the range's first byte inside the read). */
+ * left to fault, and what it does then (*f). */
 static bool inject_read_range(stm_bdev *d, uint64_t offset, size_t len,
-                              stm_status *answer, size_t *flip_at)
+                              rr_fault *f)
 {
     uint32_t n = (uint32_t)atomic_load_explicit(&d->rr_n, memory_order_acquire);
     for (uint32_t i = 0; i < n && i < 4u; i++) {
@@ -140,8 +153,11 @@ static bool inject_read_range(stm_bdev *d, uint64_t offset, size_t len,
         }
         if (left == 0) continue;
         atomic_fetch_add_explicit(&d->rr_fired, 1, memory_order_relaxed);
-        *flip_at = (size_t)((lo > offset ? lo : offset) - offset);
-        *answer = (stm_status)atomic_load_explicit(&d->rr_answer[i],
+        f->kind = atomic_load_explicit(&d->rr_kind[i], memory_order_relaxed);
+        f->flip_at = (size_t)((lo > offset ? lo : offset) - offset);
+        f->answer = (stm_status)atomic_load_explicit(&d->rr_answer[i],
+                                                     memory_order_relaxed);
+        f->at = offset - lo + atomic_load_explicit(&d->rr_from[i],
                                                    memory_order_relaxed);
         return true;
     }
@@ -155,12 +171,15 @@ stm_status stm_bdev_read(stm_bdev *d, uint64_t offset, void *buf, size_t len)
     if (len == 0) return STM_OK;
 #ifdef STRATUM_BUILD_TESTING_HOOKS
     if (inject_read_should_fail(d)) return STM_EIO;
-    size_t flip_at = 0;
-    stm_status answer = STM_OK;
-    if (inject_read_range(d, offset, len, &answer, &flip_at)) {
-        if (answer != STM_OK) return answer;
+    rr_fault f;
+    if (inject_read_range(d, offset, len, &f)) {
+        if (f.kind == RR_FROM) return d->ops->read(d, f.at, buf, len);
+        if (f.answer != STM_OK) return f.answer;
         stm_status s = d->ops->read(d, offset, buf, len);
-        if (s == STM_OK) ((uint8_t *)buf)[flip_at] ^= 0xFFu;
+        if (s == STM_OK) {
+            if (f.kind == RR_ZERO) memset(buf, 0, len);
+            else ((uint8_t *)buf)[f.flip_at] ^= 0xFFu;
+        }
         return s;
     }
 #endif
@@ -320,19 +339,39 @@ void stm_bdev_inject_read_fail_after(stm_bdev *d, int64_t n_reads)
     atomic_store_explicit(&d->inject_read_countdown, v, memory_order_relaxed);
 }
 
-void stm_bdev_inject_read_range(stm_bdev *d, uint64_t lo, uint64_t hi,
-                                int64_t times, stm_status answer)
+static void rr_arm(stm_bdev *d, uint64_t lo, uint64_t hi, int64_t times,
+                   int kind, stm_status answer, uint64_t from)
 {
     if (!d || lo >= hi) return;
     uint32_t n = (uint32_t)atomic_load_explicit(&d->rr_n, memory_order_relaxed);
     if (n >= 4u) return;
     atomic_store_explicit(&d->rr_lo[n], lo, memory_order_relaxed);
     atomic_store_explicit(&d->rr_hi[n], hi, memory_order_relaxed);
+    atomic_store_explicit(&d->rr_from[n], from, memory_order_relaxed);
     atomic_store_explicit(&d->rr_left[n],
                           times < 0 ? (int_fast64_t)-1 : (int_fast64_t)times,
                           memory_order_relaxed);
     atomic_store_explicit(&d->rr_answer[n], (int)answer, memory_order_relaxed);
+    atomic_store_explicit(&d->rr_kind[n], kind, memory_order_relaxed);
     atomic_store_explicit(&d->rr_n, n + 1u, memory_order_release);
+}
+
+void stm_bdev_inject_read_range(stm_bdev *d, uint64_t lo, uint64_t hi,
+                                int64_t times, stm_status answer)
+{
+    rr_arm(d, lo, hi, times, RR_ANSWER, answer, lo);
+}
+
+void stm_bdev_inject_read_range_zero(stm_bdev *d, uint64_t lo, uint64_t hi,
+                                     int64_t times)
+{
+    rr_arm(d, lo, hi, times, RR_ZERO, STM_OK, lo);
+}
+
+void stm_bdev_inject_read_range_from(stm_bdev *d, uint64_t lo, uint64_t hi,
+                                     int64_t times, uint64_t from)
+{
+    rr_arm(d, lo, hi, times, RR_FROM, STM_OK, from);
 }
 
 void stm_bdev_inject_read_range_clear(stm_bdev *d)

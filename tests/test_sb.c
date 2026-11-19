@@ -320,22 +320,22 @@ STM_TEST(sb_mount_scan_picks_highest_gen) {
     stm_uberblock found;
     STM_ASSERT_ERR(stm_sb_mount_scan(d, &found, NULL, NULL), STM_ENOENT);
 
-    /* Write three uberblocks at different (label, slot, gen) tuples.
-     * The scan must return the highest-gen one regardless of where
-     * it's stored. */
+    /* Write three uberblocks, each in its generation's ring slot (label
+     * gen % 4, slot gen % 63). The scan must return the highest-gen one
+     * wherever its slot is. */
     stm_uberblock ub1;  fill_example(&ub1);  ub1.ub_gen = stm_store_le64(5);
     stm_uberblock ub2;  fill_example(&ub2);  ub2.ub_gen = stm_store_le64(42);
     stm_uberblock ub3;  fill_example(&ub3);  ub3.ub_gen = stm_store_le64(17);
 
-    STM_ASSERT_OK(stm_sb_label_write(d, 0, 5, &ub1));
-    STM_ASSERT_OK(stm_sb_label_write(d, 2, 30, &ub2));   /* highest */
-    STM_ASSERT_OK(stm_sb_label_write(d, 3, 10, &ub3));
+    STM_ASSERT_OK(stm_sb_label_write(d, 1, 5, &ub1));
+    STM_ASSERT_OK(stm_sb_label_write(d, 2, 42, &ub2));   /* highest */
+    STM_ASSERT_OK(stm_sb_label_write(d, 1, 17, &ub3));
 
     uint32_t label = 99, slot = 99;
     STM_ASSERT_OK(stm_sb_mount_scan(d, &found, &label, &slot));
     STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
     STM_ASSERT_EQ(label, 2u);
-    STM_ASSERT_EQ(slot, 30u);
+    STM_ASSERT_EQ(slot, 42u);
 
     stm_bdev_close(d);
     unlink(g_tmp_path);
@@ -345,10 +345,10 @@ STM_TEST(sb_mount_scan_skips_corrupt_slots) {
     stm_bdev *d = open_test_device("cor", 16 * 1024 * 1024);
     STM_ASSERT(d != NULL);
 
-    /* Valid uberblock at label 0 slot 1. */
+    /* Valid uberblock in its ring slot: label 0 slot 37. */
     stm_uberblock good;  fill_example(&good);
     good.ub_gen = stm_store_le64(100);
-    STM_ASSERT_OK(stm_sb_label_write(d, 0, 1, &good));
+    STM_ASSERT_OK(stm_sb_label_write(d, 0, 37, &good));
 
     /* Now corrupt label 1 slot 0 directly via the bdev — doesn't
      * match any valid magic / csum. mount_scan should silently skip. */
@@ -371,14 +371,24 @@ STM_TEST(sb_mount_scan_skips_corrupt_slots) {
 
 STM_TEST(sb_mount_scan_four_label_redundancy) {
     /* Write the same uberblock at the same slot across all 4 labels.
-     * Then smash 3 of them; the 4th should carry the mount through. */
+     * Then smash 3 of them; the 4th should carry the mount through.
+     * Each generation's uberblock is in one ring slot (gen 55: label 3
+     * slot 55), so the copies in labels 0-2 are not its slot and never
+     * count; smashing them changes nothing. */
     stm_bdev *d = open_test_device("red", 16 * 1024 * 1024);
     STM_ASSERT(d != NULL);
 
     stm_uberblock ub;  fill_example(&ub);
     ub.ub_gen = stm_store_le64(55);
     for (uint32_t li = 0; li < STM_LABELS_PER_DEVICE; li++) {
-        STM_ASSERT_OK(stm_sb_label_write(d, li, 3, &ub));
+        STM_ASSERT_OK(stm_sb_label_write(d, li, 55, &ub));
+    }
+    {
+        stm_uberblock found;
+        uint32_t found_label = 99;
+        STM_ASSERT_OK(stm_sb_mount_scan(d, &found, &found_label, NULL));
+        STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 55u);
+        STM_ASSERT_EQ(found_label, 3u);
     }
 
     /* Corrupt labels 0, 1, 2 — label 3 alone must still suffice. */
@@ -850,6 +860,151 @@ STM_TEST(sb_mount_scan_counts_a_slot_torn_after_two_garbled_reads) {
             stm_bdev_close(d);
             unlink(g_tmp_path);
         }
+    }
+}
+
+/* Best is a reservation (42) and best+1 holds its final (43). Faults on
+ * slot 43, in order, then clean: E the device fails the read, G one byte
+ * comes back inverted, Z the read comes back all zero, M the read is
+ * misdirected to slot 41 (a valid uberblock of gen 41). A read that comes
+ * back wrong with no error (G, Z or M) is read again: the slot settles as
+ * blank only after two all-zero reads, as torn after two wrong reads
+ * otherwise, a failed read counts toward unreadable, and three reads bound
+ * it. With fail44, slot 44 (best+2) fails every read: a torn 43 then
+ * refuses there, a blank one would not. */
+STM_TEST(sb_mount_scan_reads_a_silent_wrong_successor_again) {
+    static const struct {
+        const char *faults;
+        bool        fail44;
+        uint64_t    gen;        /* the generation mounted, or 0 */
+        uint64_t    refused;    /* or the slot's generation it refuses at */
+    } cases[] = {
+        { "Z", false, 43, 0 },   { "EZ", false, 43, 0 },
+        { "ZE", false, 43, 0 },  { "ZEE", false, 0, 43 },
+        { "ZZ", false, 42, 0 },  { "GZ", false, 42, 0 },
+        { "ZG", false, 42, 0 },  { "M", false, 43, 0 },
+        { "EM", false, 43, 0 },  { "ME", false, 43, 0 },
+        { "MEE", false, 0, 43 }, { "MM", false, 42, 0 },
+        { "MZ", false, 42, 0 },  { "GM", false, 42, 0 },
+        { "GZ", true, 0, 44 },   { "ZG", true, 0, 44 },
+        { "MZ", true, 0, 44 },
+    };
+    for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+        for (int strict = 0; strict < 2; strict++) {
+            stm_bdev *d = open_test_device("r5wrong", 16 * 1024 * 1024);
+            STM_ASSERT(d != NULL);
+            if (!d) return;
+            sb_put_gen_m(d, 41, 1);
+            sb_put_gen_m(d, 42, 1);
+            sb_put_ub(d, 43, 2, 43, STM_UB_VERSION);
+            uint64_t off = sb_gen_off(d, 43);
+            const char *f = cases[c].faults;
+            for (size_t i = 0; f[i]; i++) {
+                if (f[i] == 'E')
+                    stm_bdev_inject_read_range(d, off, off + STM_UB_SIZE, 1,
+                                               STM_EIO);
+                else if (f[i] == 'G')
+                    stm_bdev_inject_read_range(d, off + 384u, off + 385u, 1,
+                                               STM_OK);
+                else if (f[i] == 'Z')
+                    stm_bdev_inject_read_range_zero(d, off, off + STM_UB_SIZE,
+                                                    1);
+                else
+                    stm_bdev_inject_read_range_from(d, off, off + STM_UB_SIZE,
+                                                    1, sb_gen_off(d, 41));
+            }
+            if (cases[c].fail44) sb_fault_gen(d, 44, -1);
+            uint32_t f0 = stm_bdev_inject_read_range_fired(d);
+            stm_uberblock found;
+            stm_sb_scan_refusal why;
+            memset(&why, 0, sizeof why);
+            stm_status s = strict
+                ? stm_sb_mount_scan(d, &found, NULL, NULL)
+                : stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why);
+            uint32_t fired = stm_bdev_inject_read_range_fired(d) - f0;
+            printf("  %s%s, %s: scan %d gen %llu, faults fired %u\n", f,
+                   cases[c].fail44 ? " (44 unreadable)" : "",
+                   strict ? "strict" : "one device", (int)s,
+                   (unsigned long long)(s == STM_OK
+                                        ? stm_load_le64(found.ub_gen) : 0),
+                   fired);
+            /* Each fault on 43 fires once; a failing 44 is read three times. */
+            STM_ASSERT_EQ(fired, strlen(f) + (cases[c].fail44 ? 3u : 0u));
+            if (cases[c].gen != 0) {
+                STM_ASSERT_OK(s);
+                STM_ASSERT_EQ(stm_load_le64(found.ub_gen), cases[c].gen);
+            } else {
+                STM_ASSERT_ERR(s, STM_EIO);
+                if (!strict) STM_ASSERT_EQ(why.gen, cases[c].refused);
+            }
+            /* Premise: the slot decodes once the faults are spent. */
+            stm_bdev_inject_read_range_clear(d);
+            stm_uberblock again;
+            STM_ASSERT_OK(stm_sb_label_read(d, 3u, 43u, &again));
+            STM_ASSERT_EQ(stm_load_le64(again.ub_gen), 43u);
+            stm_bdev_close(d);
+            unlink(g_tmp_path);
+        }
+    }
+}
+
+/* Every writer puts gen's uberblock in gen's ring slot, so one found in
+ * another slot is no candidate: here a valid gen 50 (its own slot is
+ * label 2 slot 50) in label 0 slot 5, in label 2 slot 7 (its label, not
+ * its slot) and in label 0 slot 50 (its slot, not its label). A device
+ * holding nothing else is still a pool, not a fresh device. */
+STM_TEST(sb_mount_scan_takes_no_uberblock_from_another_slot) {
+    static const uint32_t at[][2] = { { 0, 5 }, { 2, 7 }, { 0, 50 } };
+    for (size_t a = 0; a < sizeof at / sizeof at[0]; a++)
+    for (int strict = 0; strict < 2; strict++) {
+        stm_bdev *d = open_test_device("r5place", 16 * 1024 * 1024);
+        STM_ASSERT(d != NULL);
+        if (!d) return;
+        stm_uberblock stray;
+        fill_example(&stray);
+        stray.ub_gen = stm_store_le64(50);
+        memset(stray.ub_merkle_root, 3, sizeof stray.ub_merkle_root);
+        STM_ASSERT_OK(stm_sb_label_write(d, at[a][0], at[a][1], &stray));
+        stm_uberblock found;
+        stm_status s = strict
+            ? stm_sb_mount_scan(d, &found, NULL, NULL)
+            : stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, NULL);
+        printf("  alone at %u/%u, %s: scan %d\n", at[a][0], at[a][1],
+               strict ? "strict" : "one device", (int)s);
+        STM_ASSERT_ERR(s, STM_ECORRUPT);
+        /* Control, one variable away: the same uberblock in its slot. */
+        STM_ASSERT_OK(stm_sb_label_write(d, 2, 50, &stray));
+        uint32_t label = 99, slot = 99;
+        STM_ASSERT_OK(strict
+            ? stm_sb_mount_scan(d, &found, &label, &slot)
+            : stm_sb_mount_scan_ex(d, true, &found, &label, &slot, NULL));
+        STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 50u);
+        STM_ASSERT_EQ(label, 2u);
+        STM_ASSERT_EQ(slot, 50u);
+        stm_bdev_close(d);
+        unlink(g_tmp_path);
+
+        d = open_test_device("r5place", 16 * 1024 * 1024);
+        STM_ASSERT(d != NULL);
+        if (!d) return;
+        sb_put_gen_m(d, 41, 1);
+        sb_put_gen_m(d, 42, 1);
+        STM_ASSERT_OK(stm_sb_label_write(d, at[a][0], at[a][1], &stray));
+        label = 99;
+        slot = 99;
+        s = strict
+            ? stm_sb_mount_scan(d, &found, &label, &slot)
+            : stm_sb_mount_scan_ex(d, true, &found, &label, &slot, NULL);
+        printf("  beside 41, 42 at %u/%u, %s: scan %d gen %llu\n",
+               at[a][0], at[a][1], strict ? "strict" : "one device", (int)s,
+               (unsigned long long)(s == STM_OK
+                                    ? stm_load_le64(found.ub_gen) : 0));
+        STM_ASSERT_OK(s);
+        STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
+        STM_ASSERT_EQ(label, 2u);
+        STM_ASSERT_EQ(slot, 42u);
+        stm_bdev_close(d);
+        unlink(g_tmp_path);
     }
 }
 

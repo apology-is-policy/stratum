@@ -57,7 +57,14 @@ typedef enum {
                      * after the driver's next interrupt-status read */
     F_LOST_EDGE,    /* completes during the k-th wait with no edge counted */
     F_NEEDS_RESET,  /* refuses it: DEVICE_NEEDS_RESET + a config interrupt */
-    F_CONFIG_FIRST  /* a configuration change, then completes on the next wait */
+    F_NR_NO_EDGE,   /* the same, and the interrupt's edge is lost */
+    F_CONFIG_FIRST, /* a configuration change as QEMU raises it (status
+                     * 0x3), then completes on the next wait */
+    F_CONFIG_BIT1,  /* the same with bit 1 alone, the spec's (VIRTIO 1.2
+                     * 4.2.2) */
+    F_STORM,        /* configuration interrupts, one a wait, no answer */
+    F_WAIT_FAILS,   /* the kernel fails the first wait; completes on the next */
+    F_USED_TWO      /* completes twice over: used.idx moves by two */
 } fake_mode;
 
 #define FAKE_MAX_REQS 128u
@@ -78,6 +85,7 @@ static struct {
     uint32_t waits;             /* waits the device acted in, this request */
     uint32_t blocked;           /* waits with no edge to hand out, this request */
     bool     complete_after_isr_read;
+    bool     wait_failed;       /* F_WAIT_FAILS has failed a wait, this request */
     uint32_t drained;
     uint32_t notifies;
 } F;
@@ -135,6 +143,7 @@ static void fake_reg_write(uint32_t off, uint32_t v)
         F.inflight = true;
         F.waits = 0;
         F.blocked = 0;
+        F.wait_failed = false;
         break;
     case 0x064: F.isr &= ~v; break;
     case 0x070:
@@ -228,9 +237,28 @@ static void fake_device_acts(void)
         F.status |= 64u;                            /* DEVICE_NEEDS_RESET */
         fake_irq(3u, true);                         /* virtio_notify_config */
         break;
+    case F_NR_NO_EDGE:
+        F.inflight = false;
+        F.status |= 64u;
+        fake_irq(3u, false);
+        break;
     case F_CONFIG_FIRST:
+        if (F.waits == 1) fake_irq(3u, true);       /* virtio_notify_config */
+        else fake_complete(true);
+        break;
+    case F_CONFIG_BIT1:
         if (F.waits == 1) fake_irq(2u, true);
         else fake_complete(true);
+        break;
+    case F_STORM:
+        fake_irq(3u, true);
+        break;
+    case F_WAIT_FAILS:
+        fake_complete(true);
+        break;
+    case F_USED_TWO:
+        fake_complete(true);
+        fake_complete(true);
         break;
     }
 }
@@ -245,6 +273,10 @@ static long fake_syscall(long nr, ...)
     case __NR_dma_map:
         return 0x40000000L + (long)(g_dma_maps++) * 0x100000L;
     case __NR_irq_wait: {
+        if (F.inflight && F.mode[F.nreq] == F_WAIT_FAILS && !F.wait_failed) {
+            F.wait_failed = true;
+            return -1;
+        }
         if (F.pending == 0) {
             if (++F.blocked > FAKE_WAITS_MAX) return -5;
             if (F.inflight) fake_device_acts();
@@ -428,18 +460,105 @@ STM_TEST(bdev_thylacine_a_device_that_needs_a_reset_is_reset) {
     stm_bdev_close(bd);
 }
 
-/* A configuration change with no answer is a spurious wake. */
+/* A configuration change with no answer is a spurious wake: as QEMU
+ * raises it (virtio_notify_config sets status 0x3, the used-buffer bit
+ * with it), and with bit 1 alone. */
 STM_TEST(bdev_thylacine_a_configuration_change_is_not_an_answer) {
+    static const fake_mode modes[] = { F_CONFIG_FIRST, F_CONFIG_BIT1 };
+    for (size_t i = 0; i < sizeof modes / sizeof modes[0]; i++) {
+        stm_bdev *bd = fake_open();
+        if (!bd) return;
+        thyla_bdev *d = (thyla_bdev *)bd;
+        fake_script(1, modes[i], 0);
+        lines_begin();
+        STM_ASSERT_OK(stm_bdev_fsync(bd));
+        const char *t = lines_end();
+        STM_ASSERT_EQ(F.notifies, 1u);
+        STM_ASSERT_EQ(F.waits, 2u);
+        STM_ASSERT_EQ(d->reinit_count, 0u);
+        STM_ASSERT_EQ(count_of(t, "BDEVDIAG"), 0u);
+        stm_bdev_close(bd);
+    }
+}
+
+/* DEVICE_NEEDS_RESET whose configuration interrupt never reached the
+ * kernel is found by the wait that times out. */
+STM_TEST(bdev_thylacine_needs_reset_with_a_lost_edge_is_reset) {
     stm_bdev *bd = fake_open();
     if (!bd) return;
     thyla_bdev *d = (thyla_bdev *)bd;
-    fake_script(1, F_CONFIG_FIRST, 0);
+    fake_script(1, F_NR_NO_EDGE, 0);
+    fake_script(2, F_NOW, 0);
     lines_begin();
-    STM_ASSERT_OK(stm_bdev_fsync(bd));
+    STM_ASSERT_OK(stm_bdev_write(bd, 0, g_buf, sizeof g_buf));
     const char *t = lines_end();
-    STM_ASSERT_EQ(F.notifies, 1u);
-    STM_ASSERT_EQ(d->reinit_count, 0u);
-    STM_ASSERT_EQ(count_of(t, "BDEVDIAG"), 0u);
+    STM_ASSERT_EQ(F.notifies, 2u);
+    STM_ASSERT_EQ(d->reinit_count, 1u);
+    STM_ASSERT_EQ(count_of(t, "arm=needs-reset"), 1u);
+    STM_ASSERT_EQ(count_of(t, "still waiting"), 0u);
+    STM_ASSERT_FALSE(d->failed);
+    stm_bdev_close(bd);
+}
+
+/* Wakes that bring an interrupt and no answer are capped: then the
+ * transport path (a write re-submitted, a flush lost). */
+STM_TEST(bdev_thylacine_an_interrupt_storm_with_no_answer_is_capped) {
+    stm_bdev *bd = fake_open();
+    if (!bd) return;
+    thyla_bdev *d = (thyla_bdev *)bd;
+    fake_script(1, F_STORM, 0);
+    fake_script(2, F_NOW, 0);
+    lines_begin();
+    STM_ASSERT_OK(stm_bdev_write(bd, 0, g_buf, sizeof g_buf));
+    const char *t = lines_end();
+    STM_ASSERT_EQ(F.notifies, 2u);
+    STM_ASSERT_EQ(d->reinit_count, 1u);
+    STM_ASSERT_EQ(count_of(t, "io-fail kind=W"), 1u);
+    STM_ASSERT_EQ(count_of(t, "arm=spurious-wakes"), 1u);
+
+    fake_script(1, F_STORM, 0);
+    lines_begin();
+    STM_ASSERT_ERR(stm_bdev_fsync(bd), STM_EIO);
+    t = lines_end();
+    STM_ASSERT_EQ(F.notifies, 3u);
+    STM_ASSERT_EQ(d->reinit_count, 2u);
+    STM_ASSERT_EQ(count_of(t, "flush-lost"), 1u);
+    STM_ASSERT_EQ(count_of(t, "arm=spurious-wakes"), 2u);
+    stm_bdev_close(bd);
+}
+
+/* A wait the kernel fails (a second waiter, a bad handle) takes the
+ * transport path. */
+STM_TEST(bdev_thylacine_a_failed_wait_is_a_transport_failure) {
+    stm_bdev *bd = fake_open();
+    if (!bd) return;
+    thyla_bdev *d = (thyla_bdev *)bd;
+    fake_script(1, F_WAIT_FAILS, 0);
+    fake_script(2, F_NOW, 0);
+    lines_begin();
+    STM_ASSERT_OK(stm_bdev_write(bd, 0, g_buf, sizeof g_buf));
+    const char *t = lines_end();
+    STM_ASSERT_EQ(F.notifies, 2u);
+    STM_ASSERT_EQ(d->reinit_count, 1u);
+    STM_ASSERT_EQ(F.drained, 1u);
+    STM_ASSERT_EQ(count_of(t, "arm=irq-wait"), 1u);
+    stm_bdev_close(bd);
+}
+
+/* One request is in flight, so a used ring that moved by two was not
+ * moved by its answer: the transport path. */
+STM_TEST(bdev_thylacine_a_used_ring_moved_by_two_is_a_transport_failure) {
+    stm_bdev *bd = fake_open();
+    if (!bd) return;
+    thyla_bdev *d = (thyla_bdev *)bd;
+    fake_script(1, F_USED_TWO, 0);
+    fake_script(2, F_NOW, 0);
+    lines_begin();
+    STM_ASSERT_OK(stm_bdev_write(bd, 0, g_buf, sizeof g_buf));
+    const char *t = lines_end();
+    STM_ASSERT_EQ(F.notifies, 2u);
+    STM_ASSERT_EQ(d->reinit_count, 1u);
+    STM_ASSERT_EQ(count_of(t, "arm=used-idx"), 1u);
     stm_bdev_close(bd);
 }
 

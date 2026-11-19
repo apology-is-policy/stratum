@@ -190,9 +190,10 @@ typedef enum { REQ_READ, REQ_WRITE, REQ_FLUSH } req_kind;
 /* Each IRQ wait returns within BDEV_IRQ_WAIT_NS, and every wake asks the
  * used ring first, as Linux's vring_interrupt does: the request is done
  * when used.idx has moved off d->avail_idx, whatever the interrupt status
- * says. That status can hold another completion's bit: a completion found
- * on a timed-out wait leaves its bit, and the kernel's count of its edge,
- * to the next request. An unanswered request then goes down the transport
+ * says. That status can hold another completion's bit (a completion that
+ * lands after a timed-out wait's status read can leave its bit, and the
+ * kernel's count of its edge, to the next request) or a configuration
+ * change's. An unanswered request then goes down the transport
  * path on DEVICE_NEEDS_RESET (VIRTIO 1.2 2.1: the device met an error it
  * cannot recover from), and otherwise waits on. The wait has no end, as in
  * Linux's virtio-blk (no blk-mq timeout handler): a slow host is not a
@@ -390,10 +391,9 @@ static inline void dsb_sy(void)
 {
     __asm__ __volatile__("dsb sy" ::: "memory");
 }
-/* VIRTIO 1.2 sec 2.7.13.2 - reader-side barrier between observing used.idx
- * advance and reading used-ring entries / device-written data. DMB
- * ISHLD is strictly correct (inner-shareable, load-after) but DSB SY
- * is harmless and matches Rust's virtio_rmb. */
+/* Reader-side barrier between observing used.idx advance and reading
+ * used-ring entries / device-written data (VIRTIO 1.2 2.7.14, receiving
+ * used buffers): DMB ISHLD orders those loads after the used.idx load. */
 static inline void virtio_rmb(void)
 {
     __asm__ __volatile__("dmb ishld" ::: "memory");

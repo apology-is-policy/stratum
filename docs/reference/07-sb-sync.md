@@ -170,10 +170,14 @@ stm_status stm_sb_mount_scan(stm_bdev *d,
 
 A slot that fails to decode is skipped: a torn write, or a durable
 generation gone bad, which the scan cannot tell apart (one copy per
-generation: the price below). A slot the device fails to READ is
-different: each generation's uberblock is in one
+generation: the price below). Each generation's uberblock is in one
 ring slot (`stm_sb_ring_label_for_gen` / `stm_sb_ring_slot_for_gen`,
-super.h), and a commit newer than the best one found can only follow it, at
+super.h; every writer puts it there), so an uberblock that decodes in
+another generation's slot came from a misdirected read or write: it is no
+candidate, and the slot counts as one that did not decode (a device holding
+only such uberblocks answers STM_ECORRUPT, never STM_ENOENT, the fresh
+device's answer). A slot the device fails to READ is
+different: a commit newer than the best one found can only follow it, at
 best+1 (best's final when best is a reservation; otherwise a reservation or a
 claim, which carry best's trees) or at best+2 (the final after a reservation
 at best+1). If the device cannot read the slot where it would be, mounting
@@ -194,13 +198,18 @@ its mark (the v32 and v33 writers stamp it alike: no writer of the mark
 changed between 7e67ded, the v32 bump, and 4dd19bd, the v33 one) nor best-1
 decoding as gen best-1 with another merkle root says final. A claim reads as a reservation, so an unreadable slot after a claim
 still refuses (a session that crashed before its first commit leaves one).
-It refuses at slot(best+2) only when slot(best+1) neither decoded (as an
-older generation: the ring came round) nor read back all zero (format zeroes
-the labels; a slot with no magic and other bytes may be a generation whose
-magic rotted). Before either counts, the slot is read again: it counts as
-torn only after two reads returned bytes that did not decode, and as
-unreadable when three reads brought neither that nor a decode (a failed read
-counts toward unreadable). A device of a multi-device pool
+It refuses at slot(best+2) only when slot(best+1) neither decoded (in its
+own slot, as an older generation: the ring came round) nor read back all
+zero (format zeroes the labels; a slot with no magic and other bytes may be
+a generation whose magic rotted). A read can come back wrong with no error
+(all zero from a lost mapping, another sector's bytes from a misdirected
+read, a garble), so before a successor slot counts as anything but valid it
+is read again: it counts as blank only after two reads came back all zero,
+as torn after two reads came back wrong otherwise (one of them may be zero),
+and as unreadable when three reads brought neither two such reads nor a
+decode (a failed read counts toward unreadable). Each blank successor slot
+costs one more 4 KiB read: one a mount on one device whose ring has not come
+round, two under the strict rule (best+1 and best+2). A device of a multi-device pool
 can miss a generation's write while quorum holds, so there either slot
 unreadable refuses; a refusing device is then no vote for the older
 generation it read (a stale vote could make a false quorum). An unreadable

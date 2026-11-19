@@ -1093,7 +1093,9 @@ stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
  * Returns STM_ENOENT if no valid uberblock is found on the device
  * (fresh / never-mounted / irrecoverably corrupt). Per-slot
  * STM_ECORRUPT / STM_EBADVERSION failures are NOT errors — they're
- * expected for unused slots and get silently filtered out.
+ * expected for unused slots and get silently filtered out. An uberblock
+ * counts only in its generation's ring slot; a device whose only
+ * uberblocks sit in other slots returns STM_ECORRUPT, not STM_ENOENT.
  *
  * A slot the device fails to READ is not a torn write. Returns STM_EIO
  * when no slot decoded and some read failed, or when the slot of
@@ -1124,7 +1126,8 @@ typedef struct stm_sb_scan_refusal {
  * slot(best+1) only when best may be a reservation (neither its mark,
  * ub_repair_log_root_gen == ub_gen, nor best-1 decoding with other trees
  * says final; a claim reads as a reservation), and at
- * slot(best+2) only when slot(best+1) neither decoded nor read back zero.
+ * slot(best+2) only when slot(best+1) neither decoded nor read back zero
+ * (each settled by two reads that came back wrong with no error).
  * Without it, either slot unreadable refuses. `why`, if not NULL, says
  * which slot.
  */
