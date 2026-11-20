@@ -834,9 +834,11 @@ still the one read (`stm_extent_same_record`: every field but
 the read counters, under the index lock, which also sees a
 range shift). A record overwritten, promoted, moved or dropped
 meanwhile is left as it is. A failed unlocked read or decrypt
-runs the fully locked body, whose error is the one about the
-data; nothing was written, so the try's blocks go back to the
-allocator, not PENDING. Under fs->global SH the fs callers hold a txn span
+is taken again in a hold, whose read's error is the one about
+the data (nothing was written, so the try's blocks go back to
+the allocator, not PENDING); a record that reads there is
+written and published with the lock released, as in any try.
+Under fs->global SH the fs callers hold a txn span
 across the promote, so the ENOSPC reclaim (which commits under
 SH) waits rather than persist blocks no record names yet.
 `stm_fs_promote_to_hot` ends its span between extents: where
@@ -851,15 +853,19 @@ recordsize, run under fs->global SH by a write or a flush, or
 under EX by the commit's flush) takes the same unlocked try at
 the record at its offset. A drain's passes rec_bad, which
 decides whether a record is bad and drops it, so its checks run
-in the first hold and only the fully locked body may decide on
-a read: a failed read and a record changed meanwhile run it on
-the record there then, in the same hold, and a fifth try in a
-hold of its own. A refused reservation reads the chunk unlocked
-first: a record that reads answers the reservation's error, as
-that body would; one that does not runs the body, which reads
-before it reserves, so a record it cannot read is dropped on a
-full pool too. No commit lands in its unlocked span under fs
-traffic: a direct write covers inside its txn span; a drain
+in the first hold and only a locked read may call it bad:
+a failed read takes the locked body's checks and read on the
+record there then, in a hold, and a record that reads there is
+written and published with the lock released; a record changed
+meanwhile goes again, and a fifth try runs the fully locked
+body in a hold of its own. A refused reservation reads the chunk
+unlocked first: a record that reads answers the reservation's
+error, as that body would; one that does not takes the locked
+read, which comes before its reserve, so a record it cannot
+read is dropped on a full pool too. No commit lands in either
+of its unlocked spans under fs traffic (a try's, or the publish
+after a re-read): a direct write covers inside its txn span; a
+drain
 covers holding the dirty buffer's lock, which the reclaim's own
 drain waits for, and the reclaim takes txn exclusive before
 that drain and holds it across both its commits, while every

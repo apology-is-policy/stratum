@@ -2004,7 +2004,9 @@ stm_status stm_sync_recv_cold_chunk_release(
  *
  * Each extent holds s->lock only to decide (step 2's reservation, for
  * every part, in one hold) and to publish (step 4); steps 1 and 3 run
- * unlocked, as a write's encrypt and store do (RC-3). The swap takes the
+ * unlocked, as a write's encrypt and store do (RC-3), but for a step 1
+ * that failed: it is taken again in a hold, with step 2, and only that
+ * read's error is about the record. The swap takes the
  * record only if it is still the one read: an extent overwritten,
  * promoted, moved or dropped meanwhile is left as it is. A key retired
  * and pruned, or a commit that closed the gen the parts were written in,
@@ -2085,15 +2087,18 @@ stm_status stm_sync_promote_to_hot_bounded(stm_sync *s, uint64_t dataset_id,
  * split such a record before they rewrite part of it. A record whose
  * origin is another, user-sealed dataset is refused (STM_ENOTSUPPORTED):
  * its bytes would go under this dataset's key. It holds s->lock as
- * stm_sync_promote_to_hot's extents do, only to decide and to publish; a
- * read that failed, a record changed meanwhile or a fifth try run the
- * fully locked body on the record at `off` then, and so does a refused
- * reservation whose record does not read (one that reads answers the
- * reservation's error). *out_record_bad is set by the checks of its first
- * hold or by that body's checks or read (the read comes before its
- * reserve), never by an unlocked read. Errors as
- * stm_sync_promote_to_hot's, and STM_ESTALE where a range shift moved the
- * record during the locked body (only a sync-direct caller can meet it);
+ * stm_sync_promote_to_hot's extents do, only to decide and to publish: a
+ * read that failed is taken again in a hold, by the locked body's checks
+ * and read on the record at `off` then, and so is the record of a refused
+ * reservation that does not read (one that reads answers the
+ * reservation's error); a record that reads there is written and
+ * published with the lock released again. A record changed meanwhile
+ * goes again; a fifth try runs the fully locked body. *out_record_bad is
+ * set by the checks of its first hold or by a later hold's checks or read
+ * (the read comes before its reserve), never by an unlocked read. Errors
+ * as stm_sync_promote_to_hot's, and STM_ESTALE where a range shift moved
+ * the record during the fully locked body (only a sync-direct caller can
+ * meet it);
  * *out_record_bad (when non-NULL) as stm_sync_read_extent_ex's, for the
  * record's read.
  */

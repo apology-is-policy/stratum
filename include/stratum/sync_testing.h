@@ -104,10 +104,12 @@ void stm_sync_set_write_phase2_hook_for_test(stm_sync *s,
                                                 void *ctx);
 
 /*
- * The promote's twin of the write hook: invoked by the unlocked try at one
- * COLD record (stm_sync_promote_to_hot, its bounded form, and
- * stm_sync_promote_cold_at) between its chunk read + encrypt + device
- * writes and the locked epilogue that swaps the record. Runs with NO sync
+ * The promote's twin of the write hook: invoked by each try at one COLD
+ * record that writes with s->lock released (stm_sync_promote_to_hot, its
+ * bounded form, and stm_sync_promote_cold_at), between its encrypt +
+ * device writes and the locked epilogue that swaps the record; the chunk
+ * was read before, unlocked, or under the lock once an unlocked read of
+ * it failed. Runs with NO sync
  * locks held and may call any public stm_sync_* API. Reached through
  * stm_fs_promote_to_hot or the login promote, it runs under fs->global
  * SH, the inode's pin and a txn span: an fs call there that needs EX, that
@@ -123,7 +125,7 @@ void stm_sync_set_promote_phase2_hook_for_test(stm_sync *s,
                                                void *ctx);
 
 /*
- * stm_sync_promote_cold_at's locked body alone, in one s->lock hold (the
+ * stm_sync_promote_cold_at's fully locked body alone, in one s->lock hold (the
  * chunk read, the encrypt and the device writes under the lock, as
  * truncate's pre-promote): a control for the tests of the unlocked try.
  */

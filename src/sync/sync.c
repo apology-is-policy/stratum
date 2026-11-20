@@ -11168,13 +11168,55 @@ static stm_status promote_swap_locked(stm_sync *s, sync_promote_job *j)
     return STM_OK;
 }
 
+/* The locked body's verdict on j->rec, found in the caller's hold, and the
+ * reserve that follows it: the checks, the chunk read and the parts'
+ * reservation (promote_reserve_locked). It reads before it reserves, so
+ * with rec_bad a record it cannot read is called bad on a full pool too;
+ * with rec_bad the read takes two passes, and a record is called bad only
+ * by locked checks or this read, never by an unlocked reader. Caller
+ * holds s->lock and has passed the wedged/RO + cas_idx guards. On STM_OK
+ * the parts are reserved and *plain holds the record's bytes (j->rec.len,
+ * the caller's to scrub and free); else nothing is held. */
+static stm_status promote_verdict_locked(stm_sync *s, sync_promote_job *j,
+                                         void **plain, bool *rec_bad)
+{
+    *plain = NULL;
+    stm_status rs = promote_check_locked(s, j, rec_bad);
+    if (rs != STM_OK) return rs;
+    promote_resolve_bdevs(s, j);
+    void *p = malloc(j->rec.len);
+    if (!p) return STM_ENOMEM;
+    rs = promote_read_cold(s, j, p, rec_bad);
+    if (rs == STM_OK) rs = promote_reserve_locked(s, j);
+    if (rs != STM_OK) {
+        stm_ct_memzero(p, j->rec.len);
+        free(p);
+        return rs;
+    }
+    *plain = p;
+    return STM_OK;
+}
+
+/* The verdict's parts encrypted, written and swapped in the caller's same
+ * hold; `plain` is scrubbed and freed. */
+static stm_status promote_finish_locked(stm_sync *s, sync_promote_job *j,
+                                        void *plain)
+{
+    stm_status rs = promote_store_parts(s, j, (const uint8_t *)plain);
+    stm_ct_memzero(plain, j->rec.len);
+    free(plain);
+    if (rs != STM_OK) {
+        promote_rollback(s, j);
+        return rs;
+    }
+    return promote_swap_locked(s, j);
+}
+
 /* Promote one COLD extent to HOT in place, all under the caller's s->lock:
- * the fallback of the unlocked promotes (a drain's cover passes rec_bad:
- * a failed read is judged here and by no unlocked reader, after the same
- * checks its first hold ran), and truncate's prefix, inside its one hold.
- * It reads before it reserves, so with rec_bad a record it cannot read is
- * called bad on a full pool too. Caller has passed the wedged/RO + cas_idx
- * guards.
+ * truncate's prefix, inside its one hold, and promote_one_extent's last
+ * try, which no commit or key death can send round again (the covering
+ * promote's last runs the same steps, promote_cold_at_locked). Caller has
+ * passed the wedged/RO + cas_idx guards.
  *
  * Pipeline: read + decrypt the chunk (promote_read_cold); reserve fresh
  * HOT blocks for every part (promote_reserve_locked); encrypt each part
@@ -11192,21 +11234,10 @@ static stm_status promote_one_extent_locked(stm_sync *s,
     sync_promote_job j;
     j.rec = *C;
     j.n_parts = 0;
-    stm_status cs = promote_check_locked(s, &j, rec_bad);
-    if (cs != STM_OK) return cs;
-    promote_resolve_bdevs(s, &j);
-    void *plain = malloc(C->len);
-    if (!plain) return STM_ENOMEM;
-    stm_status rs = promote_read_cold(s, &j, plain, rec_bad);
-    if (rs == STM_OK) rs = promote_reserve_locked(s, &j);
-    if (rs == STM_OK) {
-        rs = promote_store_parts(s, &j, (const uint8_t *)plain);
-        if (rs != STM_OK) promote_rollback(s, &j);
-    }
-    stm_ct_memzero(plain, C->len);
-    free(plain);
+    void *plain = NULL;
+    stm_status rs = promote_verdict_locked(s, &j, &plain, rec_bad);
     if (rs != STM_OK) return rs;
-    return promote_swap_locked(s, &j);
+    return promote_finish_locked(s, &j, plain);
 }
 
 /* Whether C still sits at its place unchanged; *out takes what is there.
@@ -11267,18 +11298,11 @@ static bool promote_readable(stm_sync *s, sync_promote_job *j)
     return rs == STM_OK;
 }
 
-/* The unlocked span of a promote of j->rec, whose parts the caller
- * reserved (promote_reserve_locked) in a hold it has released: the chunk
- * read, the parts' encrypt and device writes of up to
+/* The rest of an unlocked try of j->rec, whose bytes are in `plain` (taken:
+ * scrubbed and freed here) and whose parts the caller reserved, in a hold
+ * it has released: the parts' encrypt and device writes of up to
  * SYNC_PROMOTE_PIECES_MAX recordsizes, then the hold that publishes them,
- * as a write's (RC-3). Returns HOLDING s->lock, so a caller can run the
- * locked body in the same hold. Meanwhile:
- *   - the chunk is read by promote_read_unlocked: under the pool's
- *     shared lock, passing no rec_bad, as no unlocked reader decides a
- *     record bad. A failed read (or no buffer for it) gives the parts back, as
- *     nothing was written (inside a drain, to the dirty reservation the
- *     drain's next allocation spends: PENDING blocks would leave it short
- *     until a commit): UNREAD (STM_ENOMEM for the buffer: DONE);
+ * as a write's (RC-3). Returns HOLDING s->lock. Meanwhile:
  *   - a wedge or read-only flag set meanwhile is caught in the publishing
  *     hold, and the parts roll back (PENDING, a write having reached
  *     them);
@@ -11291,27 +11315,12 @@ static bool promote_readable(stm_sync *s, sync_promote_job *j)
  *   - the swap takes the record only if it is still the one read
  *     (promote_swap_locked): else STM_ESTALE, rolled back.
  * Every other failure, a device write's, is DONE, rolled back. */
-static stm_status promote_span(stm_sync *s, sync_promote_job *j,
-                               promote_span_end *end)
+static stm_status promote_publish(stm_sync *s, sync_promote_job *j,
+                                  void *plain, promote_span_end *end)
 {
     *end = PROMOTE_SPAN_DONE;
-    const uint64_t len = j->rec.len;
-    void *plain = malloc(len);
-    if (!plain) {
-        pthread_mutex_lock(&s->lock);
-        promote_unreserve_locked(s, j);
-        return STM_ENOMEM;
-    }
-    stm_status rs = promote_read_unlocked(s, j, plain);
-    if (rs != STM_OK) {
-        free(plain);
-        pthread_mutex_lock(&s->lock);
-        promote_unreserve_locked(s, j);
-        *end = PROMOTE_SPAN_UNREAD;
-        return rs;
-    }
-    rs = promote_store_parts(s, j, (const uint8_t *)plain);
-    stm_ct_memzero(plain, len);
+    stm_status rs = promote_store_parts(s, j, (const uint8_t *)plain);
+    stm_ct_memzero(plain, j->rec.len);
     free(plain);
     if (rs != STM_OK) {
         promote_rollback(s, j);
@@ -11340,8 +11349,38 @@ static stm_status promote_span(stm_sync *s, sync_promote_job *j,
     return promote_swap_locked(s, j);
 }
 
-/* promote_one_extent's locked body: C, if still unchanged. Caller holds
- * s->lock. */
+/* An unlocked try of j->rec, whose parts the caller reserved
+ * (promote_reserve_locked) in a hold it has released: the chunk read by
+ * promote_read_unlocked (under the pool's shared lock, passing no rec_bad,
+ * as no unlocked reader decides a record bad), then promote_publish.
+ * Returns HOLDING s->lock, so a caller can take the verdict in the same
+ * hold. A failed read (or no buffer for it) gives the parts back, as
+ * nothing was written (inside a drain, to the dirty reservation the
+ * drain's next allocation spends: PENDING blocks would leave it short
+ * until a commit): UNREAD (STM_ENOMEM for the buffer: DONE). */
+static stm_status promote_span(stm_sync *s, sync_promote_job *j,
+                               promote_span_end *end)
+{
+    *end = PROMOTE_SPAN_DONE;
+    void *plain = malloc(j->rec.len);
+    if (!plain) {
+        pthread_mutex_lock(&s->lock);
+        promote_unreserve_locked(s, j);
+        return STM_ENOMEM;
+    }
+    stm_status rs = promote_read_unlocked(s, j, plain);
+    if (rs != STM_OK) {
+        free(plain);
+        pthread_mutex_lock(&s->lock);
+        promote_unreserve_locked(s, j);
+        *end = PROMOTE_SPAN_UNREAD;
+        return rs;
+    }
+    return promote_publish(s, j, plain, end);
+}
+
+/* promote_one_extent's last try, fully locked: C, if still unchanged.
+ * Caller holds s->lock. */
 static stm_status promote_fallback_locked(stm_sync *s,
                                           const stm_extent_record *C,
                                           bool *promoted)
@@ -11365,12 +11404,13 @@ static stm_status promote_fallback_locked(stm_sync *s,
  * promoted (*promoted false, STM_OK), since its bytes are no longer the
  * ones read. A closed gen or a dead key goes again with fresh blocks, four
  * tries, then the fully locked body. A failed unlocked read may be one of
- * a copy outdated: the locked body runs it again, and only its error is
- * about the data (the HOT fetch's rule). This passes no rec_bad: no reader
- * here drops a record on its own failure. Under fs->global SH the fs
- * callers hold a txn span across each extent's promote, so the ENOSPC
- * reclaim's commits (fs.c) wait for it; under EX (their fallback) no
- * reclaim runs beside it. */
+ * a copy outdated: C is read again in a hold (promote_verdict_locked), and
+ * only that read's error is about the data (the HOT fetch's rule); once
+ * it reads, the parts are written and published with the lock released,
+ * as in any try. This passes no rec_bad: no reader here drops a record on
+ * its own failure. Under fs->global SH the fs callers hold a txn span
+ * across each extent's promote, so the ENOSPC reclaim's commits (fs.c)
+ * wait for it; under EX (their fallback) no reclaim runs beside it. */
 static stm_status promote_one_extent(stm_sync *s, const stm_extent_record *C,
                                      bool *promoted)
 {
@@ -11396,9 +11436,16 @@ static stm_status promote_one_extent(stm_sync *s, const stm_extent_record *C,
         promote_span_end end;
         stm_status rs = promote_span(s, &j, &end);
         if (end == PROMOTE_SPAN_UNREAD) {
-            rs = promote_fallback_locked(s, C, promoted);
+            void *plain = NULL;
+            rs = promote_guards_locked(s);
+            if (rs == STM_OK) rs = promote_find_locked(s, C, &now, &same);
+            if (rs == STM_OK && same) {
+                j.rec = now;
+                rs = promote_verdict_locked(s, &j, &plain, NULL);
+            }
             pthread_mutex_unlock(&s->lock);
-            return rs;
+            if (rs != STM_OK || !plain) return rs;
+            rs = promote_publish(s, &j, plain, &end);
         }
         pthread_mutex_unlock(&s->lock);
         if (end == PROMOTE_SPAN_AGAIN) continue;
@@ -11546,49 +11593,69 @@ stm_status stm_sync_promote_to_hot_bounded(stm_sync *s, uint64_t dataset_id,
     return rc == STM_ENOENT ? STM_OK : rc;
 }
 
-/* The record at (ds, ino, off), if COLD, by the locked body. Caller holds
- * s->lock. */
+/* The covering promote's verdict on the record at (ds, ino, off) now, if
+ * COLD (promote_verdict_locked, into *j); *plain stays NULL where nothing
+ * is left to promote. Caller holds s->lock. */
+static stm_status promote_cold_at_verdict_locked(stm_sync *s, uint64_t ds,
+                                                 uint64_t ino, uint64_t off,
+                                                 sync_promote_job *j,
+                                                 void **plain, bool *rec_bad)
+{
+    *plain = NULL;
+    stm_status rc = promote_guards_locked(s);
+    if (rc != STM_OK) return rc;
+    rc = stm_extent_lookup_at(s->extent_idx, ds, ino, off, &j->rec);
+    if (rc == STM_ENOENT) return STM_OK;
+    if (rc != STM_OK || j->rec.kind != STM_EXTENT_KIND_COLD) return rc;
+    j->n_parts = 0;
+    return promote_verdict_locked(s, j, plain, rec_bad);
+}
+
+/* The record at (ds, ino, off), if COLD, by the fully locked body. Caller
+ * holds s->lock. */
 static stm_status promote_cold_at_locked(stm_sync *s, uint64_t ds,
                                          uint64_t ino, uint64_t off,
                                          bool *rec_bad)
 {
-    stm_status rc = promote_guards_locked(s);
-    if (rc != STM_OK) return rc;
-    stm_extent_record rec;
-    rc = stm_extent_lookup_at(s->extent_idx, ds, ino, off, &rec);
-    if (rc == STM_ENOENT) return STM_OK;
-    if (rc != STM_OK || rec.kind != STM_EXTENT_KIND_COLD) return rc;
-    return promote_one_extent_locked(s, &rec, rec_bad);
+    sync_promote_job j;
+    void *plain = NULL;
+    stm_status rc = promote_cold_at_verdict_locked(s, ds, ino, off, &j,
+                                                   &plain, rec_bad);
+    if (rc != STM_OK || !plain) return rc;
+    return promote_finish_locked(s, &j, plain);
 }
 
 /* As promote_one_extent, for the record at `off` now: the covering write
  * (fs_cover_big_record_locked; a drain's passes rec_bad, a direct write's
  * NULL). The checks before the reserve run in the first hold, so a record
- * they refuse is called as the locked body would call it. A refused
- * reservation reads the chunk unlocked: a record that reads answers the
- * reservation's error, as the locked body would; one that does not runs
- * that body in a fresh hold, which reads before it reserves, so on a full
- * pool a record it cannot read is still dropped rather than left to fail
- * every commit. A failed read and a record changed meanwhile run the
- * locked body on the record at `off` then, in the same hold (with rec_bad
- * its two passes decide the record; whatever is there now is promoted, as
- * the cover expects), and so does a fifth try, in a hold of its own.
- * Under fs traffic no commit lands in the unlocked span: a direct write
- * covers inside its txn span; a drain covers holding the dirty buffer's
- * lock, which the ENOSPC reclaim's own drain waits for, and the reclaim
- * takes txn exclusive before that drain and holds it across both its
- * commits, while every buffered insert takes txn shared, so once the
- * drain has emptied the buffer no range enters it, and no drain callback
- * runs, until the commits are done; every other commit takes fs->global
- * EX. The drain's own reservation is spent and given back on the
- * drainer's thread, between its stm_sync_drain_begin and _end. */
+ * they refuse is called as the locked body would call it. A failed read
+ * takes the locked body's verdict on the record at `off` then, in a hold
+ * (promote_cold_at_verdict_locked: with rec_bad its two passes decide the
+ * record; whatever is there now is promoted, as the cover expects); a
+ * record that reads there is written and published with the lock
+ * released, as in any try. A refused reservation reads the chunk
+ * unlocked: a record that reads answers the reservation's error, as the
+ * locked body would; one that does not takes the verdict in a fresh hold,
+ * which reads before it reserves, so on a full pool a record it cannot
+ * read is still dropped rather than left to fail every commit. A record
+ * changed meanwhile goes again, and a fifth try runs the fully locked
+ * body in a hold of its own. Under fs traffic no commit lands in either
+ * unlocked span (a try's, or the publish after a re-read): a direct write
+ * covers inside its txn span; a drain
+ * covers holding the dirty buffer's lock, which the ENOSPC reclaim's own
+ * drain waits for, and the reclaim takes txn exclusive before that drain
+ * and holds it across both its commits, while every buffered insert takes
+ * txn shared, so once the drain has emptied the buffer no range enters
+ * it, and no drain callback runs, until the commits are done; every other
+ * commit takes fs->global EX. The drain's own reservation is spent and
+ * given back on the drainer's thread, between its stm_sync_drain_begin
+ * and _end. */
 stm_status stm_sync_promote_cold_at(stm_sync *s, uint64_t dataset_id,
                                     uint64_t ino, uint64_t off,
                                     bool *out_record_bad)
 {
     if (out_record_bad) *out_record_bad = false;
     if (!s || dataset_id == 0 || ino == 0) return STM_EINVAL;
-    bool held = false;
     for (unsigned attempt = 0; attempt < 4u; attempt++) {
         sync_promote_job j;
         j.n_parts = 0;
@@ -11607,27 +11674,28 @@ stm_status stm_sync_promote_cold_at(stm_sync *s, uint64_t dataset_id,
             pthread_mutex_unlock(&s->lock);
             return rc;
         }
+        promote_span_end end = PROMOTE_SPAN_UNREAD;
         rc = promote_reserve_locked(s, &j);
-        if (rc != STM_OK) {
-            pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);
+        if (rc == STM_OK) {
+            rc = promote_span(s, &j, &end);
+        } else {
             if (promote_readable(s, &j)) return rc;
             pthread_mutex_lock(&s->lock);
-            held = true;
-            break;
+        }
+        if (end == PROMOTE_SPAN_UNREAD) {
+            void *plain = NULL;
+            rc = promote_cold_at_verdict_locked(s, dataset_id, ino, off, &j,
+                                                &plain, out_record_bad);
+            pthread_mutex_unlock(&s->lock);
+            if (rc != STM_OK || !plain) return rc;
+            rc = promote_publish(s, &j, plain, &end);
         }
         pthread_mutex_unlock(&s->lock);
-
-        promote_span_end end;
-        rc = promote_span(s, &j, &end);
-        if (end == PROMOTE_SPAN_UNREAD || rc == STM_ESTALE) {
-            held = true;
-            break;
-        }
-        pthread_mutex_unlock(&s->lock);
-        if (end == PROMOTE_SPAN_AGAIN) continue;
+        if (end == PROMOTE_SPAN_AGAIN || rc == STM_ESTALE) continue;
         return rc;
     }
-    if (!held) pthread_mutex_lock(&s->lock);
+    pthread_mutex_lock(&s->lock);
     stm_status rc = promote_cold_at_locked(s, dataset_id, ino, off,
                                            out_record_bad);
     pthread_mutex_unlock(&s->lock);
