@@ -511,6 +511,19 @@ unsigned stm_fs_txn_order_violations_for_test(void)
                                 memory_order_relaxed);
 }
 
+unsigned stm_fs_txn_depth_for_test(void)
+{
+    return fs_txn_depth_here;
+}
+
+bool stm_fs_txn_writer_waiting_for_test(stm_fs *fs)
+{
+    if (!fs) return false;
+    if (pthread_rwlock_tryrdlock(&fs->txn) != 0) return true;
+    (void)pthread_rwlock_unlock(&fs->txn);
+    return false;
+}
+
 /* Every blocking pin below is counted; stm_inode_pin_try never waits. */
 #define stm_inode_pin(...) \
     (fs_txn_note_take(), stm_inode_pin(__VA_ARGS__))
@@ -9746,6 +9759,34 @@ stm_status stm_fs_migrate_policy_pass_all(
 /* Promotion (cold → hot) heuristic — P7-CAS-11.                              */
 /* ========================================================================= */
 
+/* Between two extents of a spanned promote every block the first reserved
+ * is indexed or given back (or, once the handle wedged, held by no
+ * commit): a reclaim queued for the txn lock commits here, so it waits for
+ * one extent, not the file -- where the lock hands a queued writer the
+ * lock at the last reader's unlock (glibc with the writer attribute,
+ * macOS). musl's prefers readers: there the reclaim waits for the file. */
+static void fs_promote_yield(void *arg)
+{
+    stm_fs *fs = arg;
+    fs_txn_rd_end(fs);
+    fs_txn_rd(fs);
+}
+
+/* The sync promote under a txn span, one per extent. An extent's promote
+ * holds blocks it reserved and no record names yet while s->lock is free,
+ * and the ENOSPC reclaim commits under fs->global SH
+ * (fs_reclaim_on_enospc_locked): it must wait, not persist them so (a
+ * crash then would leave them allocated, named by nothing). The span ends
+ * before any reclaim this thread runs. */
+static stm_status fs_promote_spanned(stm_fs *fs, uint64_t ds, uint64_t ino)
+{
+    fs_txn_rd(fs);
+    stm_status rc = stm_sync_promote_to_hot_yielding(fs->sync, ds, ino,
+                                                     fs_promote_yield, fs);
+    fs_txn_rd_end(fs);
+    return rc;
+}
+
 /* P7-CAS-11: stm_fs_promote_to_hot — wraps stm_sync_promote_to_hot
  * with the FS-layer guards (wedged/RO via FS_GUARD_WRITE) + the
  * standard fs->lock posture. The sync-layer primitive does its own
@@ -9774,12 +9815,12 @@ stm_status stm_fs_promote_to_hot(stm_fs *fs,
         if (pp == STM_OK) {
             stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
             stm_status rc = (fr == STM_OK)
-                ? stm_sync_promote_to_hot(fs->sync, dataset_id, ino)
+                ? fs_promote_spanned(fs, dataset_id, ino)
                 : fr;
             /* CF-4 C: the hot-tier reserve may recover from deferred
              * PENDING. */
             if (rc == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
-                rc = stm_sync_promote_to_hot(fs->sync, dataset_id, ino);
+                rc = fs_promote_spanned(fs, dataset_id, ino);
             stm_inode_unpin(iidx, h);
             pthread_rwlock_unlock(&fs->global);
             return rc;
@@ -9805,7 +9846,8 @@ stm_status stm_fs_promote_to_hot(stm_fs *fs,
     return rc;
 }
 
-/* The most of one file tried per hold of s->lock (one record at least). */
+/* The most of one file tried per hold of fs->global and the pin (one
+ * record at least). */
 #define FS_PROMOTE_STEP_BYTES (UINT64_C(1) << 20)
 
 /* The errors that stop the login promote's pass: the pool's or the
@@ -9843,11 +9885,11 @@ static stm_status fs_promote_ino_bounded(stm_fs *fs, uint64_t ds, uint64_t ino,
         uint64_t step = budget - *out_spent;
         if (step > FS_PROMOTE_STEP_BYTES) step = FS_PROMOTE_STEP_BYTES;
         stm_sync_promote_step ps = { .next = from };
-        /* fs->global SH and the pin per step, so a commit or a logout waits
-         * for one step, not the file's share. A reused ino between steps is
-         * another file of the same dataset, whose COLD extents past `from`
-         * the pass moves too (the ones before it wait until a pass comes
-         * round to it again). */
+        /* fs->global SH, the pin and a txn span per step, so a commit, a
+         * reclaim or a logout waits for one step, not the file's share.
+         * A reused ino between steps is another file of the same dataset,
+         * whose COLD extents past `from` the pass moves too (the ones
+         * before it wait until a pass comes round to it again). */
         pthread_rwlock_rdlock(&fs->global);
         FS_GUARD_WRITE(fs);
         stm_inode_handle *h = NULL;
@@ -9861,9 +9903,12 @@ static stm_status fs_promote_ino_bounded(stm_fs *fs, uint64_t ds, uint64_t ino,
          * not do. Its ENOSPC stops the pass. */
         rc = stm_dirty_buffer_drain_ino(fs->dirty_buffer, ds, ino,
                                         fs_flush_drain_cb, fs);
-        if (rc == STM_OK)
+        if (rc == STM_OK) {
+            fs_txn_rd(fs);                      /* as fs_promote_spanned */
             rc = stm_sync_promote_to_hot_bounded(fs->sync, ds, ino, from,
                                                  step, &ps);
+            fs_txn_rd_end(fs);
+        }
         stm_inode_unpin(iidx, h);
         pthread_rwlock_unlock(&fs->global);
 #ifdef STRATUM_BUILD_TESTING_HOOKS

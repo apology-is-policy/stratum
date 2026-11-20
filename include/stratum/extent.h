@@ -776,11 +776,12 @@ stm_status stm_extent_migrate_to_cold(stm_extent_index *idx,
  *   - any new_paddrs[i] == 0 OR within-set duplicate (STM_EINVAL).
  *   - gen > current_txg OR link_gen > current_txg (STM_EINVAL).
  *   - off + len OR origin_off + len overflows uint64 (STM_EOVERFLOW).
- *   - No COLD extent at exactly (ds, ino, off) (STM_ENOENT).
- *   - The matching extent has a different `len` than the caller
- *     supplied (STM_EINVAL — partial promote not modeled).
- *   - The matching extent is HOT already (STM_EINVAL — caller bug;
- *     HOT extents need no promotion).
+ *   - expect NULL, or not a COLD record at (ds, ino, off) of `len`
+ *     (STM_EINVAL).
+ *   - No extent at exactly (ds, ino, off) (STM_ENOENT).
+ *   - The extent there is not `expect` (stm_extent_same_record): it
+ *     changed, or another moved there, since the caller read it, as a
+ *     range shift does under the index lock alone (STM_ESTALE).
  *   - out_content_hash == NULL (STM_EINVAL).
  *
  * On STM_OK: out_content_hash holds the dropped COLD extent's
@@ -797,6 +798,7 @@ STM_MUST_USE
 stm_status stm_extent_promote_swap_to_hot(stm_extent_index *idx,
                                             uint64_t dataset_id, uint64_t ino,
                                             uint64_t off, uint64_t len,
+                                            const stm_extent_record *expect,
                                             const uint64_t *new_paddrs,
                                             uint8_t n_replicas,
                                             uint64_t gen, uint64_t key_id,
@@ -805,6 +807,13 @@ stm_status stm_extent_promote_swap_to_hot(stm_extent_index *idx,
                                             uint64_t origin_off,
                                             uint64_t link_gen,
                                             uint8_t out_content_hash[STM_EXTENT_HASH_LEN]);
+
+/*
+ * Whether b is the record a: every field but the read counters, which a
+ * COLD read moves under the index lock alone.
+ */
+bool stm_extent_same_record(const stm_extent_record *a,
+                            const stm_extent_record *b);
 
 /*
  * A HOT piece that replaces part of a COLD record
@@ -832,6 +841,7 @@ stm_status stm_extent_promote_swap_to_hot_pieces(stm_extent_index *idx,
                                                  uint64_t dataset_id,
                                                  uint64_t ino,
                                                  uint64_t off, uint64_t len,
+                                                 const stm_extent_record *expect,
                                                  const stm_extent_hot_piece *pieces,
                                                  size_t n_pieces,
                                                  uint8_t n_replicas,

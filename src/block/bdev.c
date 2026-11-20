@@ -165,11 +165,22 @@ static bool inject_read_range(stm_bdev *d, uint64_t offset, size_t len,
 }
 #endif
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+static void io_observe(stm_bdev *d, bool is_write, uint64_t offset,
+                       size_t len)
+{
+    const stm_bdev_io_observer *o =
+        atomic_load_explicit(&d->io_observer, memory_order_acquire);
+    if (o && o->fn) o->fn(o->ctx, is_write, offset, len);
+}
+#endif
+
 stm_status stm_bdev_read(stm_bdev *d, uint64_t offset, void *buf, size_t len)
 {
     if (!d || !buf) return STM_EINVAL;
     if (len == 0) return STM_OK;
 #ifdef STRATUM_BUILD_TESTING_HOOKS
+    io_observe(d, false, offset, len);
     if (inject_read_should_fail(d)) return STM_EIO;
     rr_fault f;
     if (inject_read_range(d, offset, len, &f)) {
@@ -211,6 +222,9 @@ stm_status stm_bdev_write(stm_bdev *d, uint64_t offset, const void *buf, size_t 
     if (!d || !buf) return STM_EINVAL;
     if (len == 0) return STM_OK;
     if (d->read_only) return STM_EROFS;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    io_observe(d, true, offset, len);
+#endif
     if (inject_should_fail(d)) return STM_EIO;
     atomic_fetch_add_explicit(&d->io_writes, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&d->io_write_bytes, (uint_fast64_t)len,
@@ -372,6 +386,12 @@ void stm_bdev_inject_read_range_from(stm_bdev *d, uint64_t lo, uint64_t hi,
                                      int64_t times, uint64_t from)
 {
     rr_arm(d, lo, hi, times, RR_FROM, STM_OK, from);
+}
+
+void stm_bdev_set_io_observer_for_test(stm_bdev *d,
+                                       const stm_bdev_io_observer *o)
+{
+    if (d) atomic_store_explicit(&d->io_observer, o, memory_order_release);
 }
 
 void stm_bdev_inject_read_range_clear(stm_bdev *d)

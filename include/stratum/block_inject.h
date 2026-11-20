@@ -75,6 +75,18 @@ void     stm_bdev_inject_read_range_from(struct stm_bdev *d, uint64_t lo,
                                          uint64_t from);
 
 /*
+ * Every read and write of d calls o->fn first, on the calling thread, with
+ * what it is about to do; NULL clears it, and *o outlives its arming.
+ * Fires only in a build with testing hooks.
+ */
+typedef struct stm_bdev_io_observer {
+    void (*fn)(void *ctx, bool is_write, uint64_t offset, size_t len);
+    void  *ctx;
+} stm_bdev_io_observer;
+void stm_bdev_set_io_observer_for_test(struct stm_bdev *d,
+                                       const stm_bdev_io_observer *o);
+
+/*
  * Area G bench instrumentation. stm_bdev_io_stats reports the running per-op I/O accounting:
  * total state-changing writes, total bytes written to the device, and
  * total flush (fsync + fdatasync) ops. stm_bdev_io_stats_reset zeroes the

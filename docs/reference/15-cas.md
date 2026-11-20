@@ -804,15 +804,54 @@ Per COLD extent at `(ds, ino, off)`:
 2. Reserve fresh HOT paddrs from the allocator (one per
    replica per the pool's redundancy profile).
 3. Resolve the dataset's CURRENT DEK + key_id; AEAD-encrypt
-   the SAME plaintext under the new `(paddrs[0], current_gen)`
-   nonce + stm_ad_extent.
+   the SAME plaintext under the new `(paddrs[0], write_gen)`
+   nonce + stm_ad_extent, write_gen being the gen the
+   reservation was made in.
 4. `bdev_write` the ciphertext+tag to every fresh replica.
 5. Atomic swap via `stm_extent_promote_swap_to_hot` — drops
    the COLD record, inserts the HOT record at the same
-   coordinates. Returns the dropped COLD's content_hash.
+   coordinates, stamped gen = link_gen = write_gen. Returns
+   the dropped COLD's content_hash.
 6. `stm_cas_deref` the dropped hash. If refcount falls to 0
    (no other live cold extent references the chunk), the
    next commit's auto_gc reclaims the CAS chunk.
+
+Locking (o1b): `stm_sync_promote_to_hot` and its bounded form
+list the ino's COLD records under one `s->lock` hold, then
+promote each as a write goes (RC-3): the record found again
+and every part's reservation made in one hold (so the parts
+share one write_gen, one key and one replica count); steps 1,
+3 and 4 run unlocked, the chunk read under the pool's shared
+lock (a removed device may be closed once its slot clears);
+then, in the hold that swaps, the wedge and read-only flags,
+the gen (a commit closing the gen the parts were written in)
+and the key's liveness (a key rotated and pruned meanwhile)
+are checked again: either of the last two rolls the parts back
+and the promote goes again with fresh blocks, four tries, then
+fully locked, so a record is indexed in the gen it was written
+in under a live key. The swap takes the record only if it is
+still the one read (`stm_extent_same_record`: every field but
+the read counters, under the index lock, which also sees a
+range shift). A record overwritten, promoted, moved or dropped
+meanwhile is left as it is. A failed unlocked read or decrypt
+runs the fully locked body, whose error is the one about the
+data. Under fs->global SH the fs callers hold a txn span
+across the promote, so the ENOSPC reclaim (which commits under
+SH) waits rather than persist blocks no record names yet.
+`stm_fs_promote_to_hot` ends its span between extents: where
+the lock hands a queued writer the lock (glibc's with the
+writer attribute, macOS's) the reclaim waits for one extent;
+musl's prefers readers, so there it waits for the file. The
+login promote holds one span per step of up to 1 MiB (one
+record at least). Their EX fallback needs none, EX keeping
+every other op out. `stm_sync_promote_cold_at` (the covering
+write's split of a legacy record longer than the recordsize,
+run under fs->global SH by a write or a flush, or under EX by
+the commit's flush) stays fully locked: it passes rec_bad,
+which decides whether a record is bad and drops it, so no
+unlocked reader may decide that. Truncate's pre-promote runs
+inside `stm_sync_truncate`'s one hold. Both hold `s->lock`
+across the read and the writes.
 
 Storage cost: promotion REVERSES the dedup compression. A
 chunk shared by N cold extents (CAS refcount = N) becomes a

@@ -343,6 +343,17 @@ void stm_fs_set_clone_of_sealed_for_test(stm_fs *fs, bool on);
  */
 unsigned stm_fs_txn_order_violations_for_test(void);
 
+/* The spans of fs->txn the calling thread holds now. */
+unsigned stm_fs_txn_depth_for_test(void);
+
+/*
+ * Whether a tryrdlock of fs->txn fails right now: a writer holds it or,
+ * where the lock prefers writers (glibc with the attribute, macOS), is
+ * queued for it. musl's lock prefers readers, so there a queued writer
+ * answers false.
+ */
+bool stm_fs_txn_writer_waiting_for_test(stm_fs *fs);
+
 /*
  * Call `fn` in every stm_fs_mount, process-wide, so a test can arm faults
  * on the pool's bdev: with STM_FS_MOUNT_HOOK_PEEK once the bdev is open and

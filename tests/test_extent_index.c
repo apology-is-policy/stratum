@@ -1783,4 +1783,90 @@ STM_TEST(ex_overwrite_pieces_failing_part_way_answers_ewedged) {
     }
 }
 
+/* Both promote swaps take only the record read: a different hash, gen,
+ * link_gen, origin or key answers STM_ESTALE and leaves the index as it
+ * was; a NULL or misplaced `expect` STM_EINVAL; no record STM_ENOENT; a
+ * record whose read counters alone moved is taken. */
+static stm_extent_index *ex_psw_cold_idx(stm_extent_record *out)
+{
+    stm_extent_index *idx = ex_test_idx(100);
+    uint8_t h[STM_EXTENT_HASH_LEN];
+    memset(h, 0x22, sizeof h);
+    STM_ASSERT_OK(stm_extent_write_cold(idx, 1, 1, 0, 2u * 4096u, h,
+                                        /*gen=*/90, /*key_id=*/0,
+                                        1, 1, 0, /*link_gen=*/90));
+    memset(out, 0, sizeof *out);
+    STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, 0, out));
+    STM_ASSERT_EQ(out->kind, STM_EXTENT_KIND_COLD);
+    return idx;
+}
+
+static stm_status ex_psw_swap(stm_extent_index *idx, int pieces,
+                              const stm_extent_record *expect,
+                              uint8_t dropped[STM_EXTENT_HASH_LEN])
+{
+    const uint64_t LEN = 2u * 4096u;
+    if (pieces == 1) {
+        uint64_t p[1] = { 0xB1 };
+        return stm_extent_promote_swap_to_hot(idx, 1, 1, 0, LEN, expect, p, 1,
+                                              100, 0, 1, 1, 0, 100, dropped);
+    }
+    stm_extent_hot_piece pc[2];
+    memset(pc, 0, sizeof pc);
+    pc[0].len = 4096u; pc[0].paddrs[0] = 0xA1;
+    pc[1].len = 4096u; pc[1].paddrs[0] = 0xA2;
+    return stm_extent_promote_swap_to_hot_pieces(idx, 1, 1, 0, LEN, expect,
+                                                 pc, 2, 1, 100, 0, 1, 1, 0,
+                                                 100, dropped);
+}
+
+static void ex_psw_case(int pieces)
+{
+    stm_extent_record c;
+    stm_extent_index *idx = ex_psw_cold_idx(&c);
+    uint8_t dropped[STM_EXTENT_HASH_LEN];
+    stm_extent_record x;
+    x = c; memset(x.content_hash, 0x11, sizeof x.content_hash);
+    STM_ASSERT_ERR(ex_psw_swap(idx, pieces, &x, dropped), STM_ESTALE);
+    x = c; x.gen = 89;
+    STM_ASSERT_ERR(ex_psw_swap(idx, pieces, &x, dropped), STM_ESTALE);
+    x = c; x.link_gen = 91;
+    STM_ASSERT_ERR(ex_psw_swap(idx, pieces, &x, dropped), STM_ESTALE);
+    x = c; x.origin_off = 4096u;
+    STM_ASSERT_ERR(ex_psw_swap(idx, pieces, &x, dropped), STM_ESTALE);
+    x = c; x.key_id = 1;
+    STM_ASSERT_ERR(ex_psw_swap(idx, pieces, &x, dropped), STM_ESTALE);
+    STM_ASSERT_ERR(ex_psw_swap(idx, pieces, NULL, dropped), STM_EINVAL);
+    x = c; x.off = 4096u;
+    STM_ASSERT_ERR(ex_psw_swap(idx, pieces, &x, dropped), STM_EINVAL);
+    stm_extent_record now;
+    memset(&now, 0, sizeof now);
+    STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, 0, &now));
+    STM_ASSERT_EQ(now.kind, STM_EXTENT_KIND_COLD);        /* untouched */
+    STM_ASSERT(stm_extent_same_record(&c, &now));
+    x = c; x.read_count = 7u; x.last_read_gen = 55u;      /* counters only */
+    STM_ASSERT_OK(ex_psw_swap(idx, pieces, &x, dropped));
+    STM_ASSERT_MEM_EQ(dropped, c.content_hash, STM_EXTENT_HASH_LEN);
+    memset(&now, 0, sizeof now);
+    STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, 0, &now));
+    STM_ASSERT_EQ(now.kind, STM_EXTENT_KIND_HOT);
+    STM_ASSERT_EQ(now.gen, (uint64_t)100);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_extent_count(idx, &n));
+    STM_ASSERT_EQ(n, (size_t)pieces);
+    ex_test_idx_close(idx);
+    idx = ex_psw_cold_idx(&c);                            /* gone: ENOENT */
+    uint64_t *dp = NULL;
+    size_t dn = 0;
+    STM_ASSERT_OK(stm_extent_delete_file(idx, 1, 1, &dp, &dn));
+    free(dp);
+    STM_ASSERT_ERR(ex_psw_swap(idx, pieces, &c, dropped), STM_ENOENT);
+    ex_test_idx_close(idx);
+}
+
+STM_TEST(ex_promote_swaps_take_only_the_record_read) {
+    ex_psw_case(1);
+    ex_psw_case(2);
+}
+
 STM_TEST_MAIN("test_extent_index")

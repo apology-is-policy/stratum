@@ -1991,14 +1991,25 @@ stm_status stm_sync_recv_cold_chunk_release(
  *   2. Reserve fresh paddrs across the pool's redundancy profile
  *      from the allocator.
  *   3. AEAD-encrypt the SAME plaintext under the new (paddr_0,
- *      current_gen) nonce + stm_ad_extent + the dataset's CURRENT
+ *      write_gen) nonce + stm_ad_extent + the dataset's CURRENT
  *      DEK; replicate the ciphertext+tag bytewise to every replica.
+ *      write_gen is the gen the reservation was made in; the HOT
+ *      record is stamped with it.
  *   4. Atomic swap via `stm_extent_promote_swap_to_hot` (drops
  *      COLD record, inserts HOT at the same coords). Returns the
  *      dropped COLD's content_hash.
  *   5. `stm_cas_deref` the dropped hash; the chunk's refcount
  *      drops by one. If it reaches zero AND no other live cold
  *      extent references it, the next commit's auto_gc reclaims.
+ *
+ * Each extent holds s->lock only to decide (step 2's reservation, for
+ * every part, in one hold) and to publish (step 4); steps 1 and 3 run
+ * unlocked, as a write's encrypt and store do (RC-3). The swap takes the
+ * record only if it is still the one read: an extent overwritten,
+ * promoted, moved or dropped meanwhile is left as it is. A key retired
+ * and pruned, or a commit that closed the gen the parts were written in,
+ * rolls the parts back and the extent goes again, four tries, then fully
+ * locked.
  *
  * Wedged / read-only refused with STM_EWEDGED / STM_EROFS. The
  * data plane composes the same `cas.tla::RehydrateOnWrite`
@@ -2009,12 +2020,13 @@ stm_status stm_sync_recv_cold_chunk_release(
  *   - NULL s, dataset_id == 0, ino == 0 (STM_EINVAL).
  *   - Wedged or read-only (STM_EWEDGED / STM_EROFS).
  *   - !s->cas_idx (STM_EINVAL).
- *   - Soft errors per-extent (STM_EBADTAG / STM_EIO / STM_ENOSPC /
- *     STM_ECORRUPT) abort the per-ino promote; partial promotion
- *     is rolled back via cas_deref of any newly-bumped CAS refs.
+ *   - An extent that fails (STM_EBADTAG / STM_EIO / STM_ENOSPC /
+ *     STM_ECORRUPT, ...) is left COLD and the next is tried; the
+ *     first error is returned. A failed extent's reserved blocks are
+ *     freed; the extents promoted before it stay HOT.
  *
- * On STM_OK: every COLD extent at (ds, ino) has been replaced by a
- * HOT extent. Subsequent reads go through the HOT path (no CAS
+ * On STM_OK: every COLD extent listed at entry and unchanged at its
+ * swap has been replaced by a HOT extent. Subsequent reads go through the HOT path (no CAS
  * lookup, no metadata-key decrypt). Returns STM_ENOENT if the ino
  * has no live extents OR every extent is already HOT.
  */
@@ -2022,6 +2034,19 @@ STM_MUST_USE
 stm_status stm_sync_promote_to_hot(stm_sync *s,
                                       uint64_t dataset_id,
                                       uint64_t ino);
+
+/*
+ * stm_sync_promote_to_hot, calling `between(ctx)` (when non-NULL) between
+ * one extent's promote and the next's, with no sync lock held and every
+ * block the first reserved indexed or given back (or, once the handle
+ * wedged, held by no commit): a caller that keeps commits out of the
+ * promote (stm_fs_promote_to_hot's txn span) can let one in there.
+ */
+STM_MUST_USE
+stm_status stm_sync_promote_to_hot_yielding(stm_sync *s, uint64_t dataset_id,
+                                            uint64_t ino,
+                                            void (*between)(void *ctx),
+                                            void *ctx);
 
 /* What one step of stm_sync_promote_to_hot_bounded did. */
 typedef struct stm_sync_promote_step {
@@ -2034,8 +2059,10 @@ typedef struct stm_sync_promote_step {
 /*
  * stm_sync_promote_to_hot in steps: the ino's COLD extents starting at or
  * past `from`, in offset order, until the next would take the bytes tried
- * past `max_bytes` (one extent at least), in one hold of s->lock. An
- * extent that fails is passed over and counts as tried, so the next step,
+ * past `max_bytes` (one extent at least), each promoted as
+ * stm_sync_promote_to_hot's are. An extent that fails, or changed since
+ * the step listed it, is passed over and counts as tried (a changed one's
+ * bytes not as moved), so the next step,
  * from `out->next`, does not try it again; an error the next extent would
  * meet too (the pool's or the dataset's: STM_ENOSPC, STM_ELOCKED,
  * STM_EWEDGED, STM_EROFS) stops the step and is returned,
@@ -2058,8 +2085,10 @@ stm_status stm_sync_promote_to_hot_bounded(stm_sync *s, uint64_t dataset_id,
  * split such a record before they rewrite part of it. A record whose
  * origin is another, user-sealed dataset is refused (STM_ENOTSUPPORTED):
  * its bytes would go under this dataset's key. Errors as
- * stm_sync_promote_to_hot's; *out_record_bad (when non-NULL) as
- * stm_sync_read_extent_ex's, for the record's read.
+ * stm_sync_promote_to_hot's, and STM_ESTALE where a range shift moved the
+ * record during the call (only a sync-direct caller can meet it);
+ * *out_record_bad (when non-NULL) as stm_sync_read_extent_ex's, for the
+ * record's read.
  */
 STM_MUST_USE
 stm_status stm_sync_promote_cold_at(stm_sync *s, uint64_t dataset_id,

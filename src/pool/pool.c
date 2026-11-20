@@ -349,6 +349,14 @@ void stm_pool_unlock_exclusive(stm_pool *p) {
     if (p) (void)pthread_rwlock_unlock(&p->lock);
 }
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+bool stm_pool_lock_is_free_for_test(stm_pool *p) {
+    if (!p || pthread_rwlock_trywrlock(&p->lock) != 0) return false;
+    (void)pthread_rwlock_unlock(&p->lock);
+    return true;
+}
+#endif
+
 /* ========================================================================= */
 /* P5-8: replace-in-flight claim.                                             */
 /* ========================================================================= */

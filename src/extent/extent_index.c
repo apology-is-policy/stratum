@@ -2218,9 +2218,27 @@ stm_status stm_extent_migrate_whole_ino_to_cold(
     return last_status != STM_OK ? STM_EWEDGED : STM_OK;
 }
 
+bool stm_extent_same_record(const stm_extent_record *a,
+                            const stm_extent_record *b)
+{
+    if (a->dataset_id != b->dataset_id || a->ino != b->ino ||
+        a->off != b->off || a->len != b->len || a->kind != b->kind ||
+        a->n_replicas != b->n_replicas || a->gen != b->gen ||
+        a->key_id != b->key_id ||
+        a->origin_dataset_id != b->origin_dataset_id ||
+        a->origin_ino != b->origin_ino || a->origin_off != b->origin_off ||
+        a->link_gen != b->link_gen)
+        return false;
+    for (uint8_t i = 0; i < a->n_replicas && i < STM_EXTENT_MAX_REPLICAS; i++)
+        if (a->paddrs[i] != b->paddrs[i]) return false;
+    return memcmp(a->content_hash, b->content_hash,
+                  sizeof a->content_hash) == 0;
+}
+
 stm_status stm_extent_promote_swap_to_hot(stm_extent_index *idx,
                                             uint64_t dataset_id, uint64_t ino,
                                             uint64_t off, uint64_t len,
+                                            const stm_extent_record *expect,
                                             const uint64_t *new_paddrs,
                                             uint8_t n_replicas,
                                             uint64_t gen, uint64_t key_id,
@@ -2237,6 +2255,10 @@ stm_status stm_extent_promote_swap_to_hot(stm_extent_index *idx,
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     if (origin_dataset_id == 0 || origin_ino == 0) return STM_EINVAL;
     if (len == 0) return STM_EINVAL;
+    if (!expect || expect->kind != STM_EXTENT_KIND_COLD ||
+        expect->dataset_id != dataset_id || expect->ino != ino ||
+        expect->off != off || expect->len != len)
+        return STM_EINVAL;
     if (!new_paddrs) return STM_EINVAL;
     if (n_replicas < 1 || n_replicas > STM_EXTENT_MAX_REPLICAS) return STM_EINVAL;
     for (uint8_t i = 0; i < n_replicas; i++) {
@@ -2265,13 +2287,11 @@ stm_status stm_extent_promote_swap_to_hot(stm_extent_index *idx,
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
-    if (src.len != len) {
+    /* Another record moved here, or this one changed, since the caller
+     * read `expect` (a shift moves records under this lock alone). */
+    if (!stm_extent_same_record(expect, &src)) {
         must_unlock(&idx->lock);
-        return STM_EINVAL;
-    }
-    if (src.kind != STM_EXTENT_KIND_COLD) {
-        must_unlock(&idx->lock);
-        return STM_EINVAL;
+        return STM_ESTALE;
     }
 
     memcpy(out_content_hash, src.content_hash, STM_EXTENT_HASH_LEN);
@@ -2301,6 +2321,7 @@ stm_status stm_extent_promote_swap_to_hot_pieces(stm_extent_index *idx,
                                                  uint64_t dataset_id,
                                                  uint64_t ino,
                                                  uint64_t off, uint64_t len,
+                                                 const stm_extent_record *expect,
                                                  const stm_extent_hot_piece *pieces,
                                                  size_t n_pieces,
                                                  uint8_t n_replicas,
@@ -2317,6 +2338,10 @@ stm_status stm_extent_promote_swap_to_hot_pieces(stm_extent_index *idx,
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     if (origin_dataset_id == 0 || origin_ino == 0) return STM_EINVAL;
     if (len == 0 || n_pieces < 1u) return STM_EINVAL;
+    if (!expect || expect->kind != STM_EXTENT_KIND_COLD ||
+        expect->dataset_id != dataset_id || expect->ino != ino ||
+        expect->off != off || expect->len != len)
+        return STM_EINVAL;
     if (n_replicas < 1 || n_replicas > STM_EXTENT_MAX_REPLICAS) return STM_EINVAL;
     if (off > UINT64_MAX - len) return STM_EOVERFLOW;
     if (origin_off > UINT64_MAX - len) return STM_EINVAL;
@@ -2360,9 +2385,9 @@ stm_status stm_extent_promote_swap_to_hot_pieces(stm_extent_index *idx,
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
-    if (src.len != len || src.kind != STM_EXTENT_KIND_COLD) {
+    if (!stm_extent_same_record(expect, &src)) {  /* as the one-piece swap */
         must_unlock(&idx->lock);
-        return STM_EINVAL;
+        return STM_ESTALE;
     }
     memcpy(out_content_hash, src.content_hash, STM_EXTENT_HASH_LEN);
     uint64_t at = 0;

@@ -247,6 +247,11 @@ void stm_pool_unlock_shared(stm_pool *p);
 void stm_pool_lock_exclusive(stm_pool *p);
 void stm_pool_unlock_exclusive(stm_pool *p);
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+/* Whether no thread holds p's lock right now (a trywrlock). */
+bool stm_pool_lock_is_free_for_test(stm_pool *p);
+#endif
+
 /* ========================================================================= */
 /* Device lifecycle (Phase 5 chunk P5-4).                                     */
 /*                                                                             */

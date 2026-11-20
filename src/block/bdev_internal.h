@@ -70,6 +70,10 @@ struct stm_bdev {
     atomic_uint_fast64_t       io_writes;
     atomic_uint_fast64_t       io_write_bytes;
     atomic_uint_fast64_t       io_fsyncs;
+
+    /* Called first by every read and write in a build with testing hooks
+     * (stm_bdev_set_io_observer_for_test). */
+    _Atomic(const struct stm_bdev_io_observer *) io_observer;
 };
 
 #if !defined(__thylacine__)
