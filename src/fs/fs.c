@@ -377,6 +377,7 @@ struct stm_fs {
     void *write_admitted_hook_arg;
     stm_fs_reclaim_hook reclaim_hook;
     void *reclaim_hook_arg;
+    atomic_uint reclaim_drains;
     stm_fs_fresh_pin_hook fresh_pin_hook;
     void *fresh_pin_hook_arg;
     stm_fs_name_read_hook name_read_hook;
@@ -487,7 +488,8 @@ typedef struct {
 #ifdef STRATUM_BUILD_TESTING_HOOKS
 /* The order fs->txn rests on, counted where the tests can see it: the
  * spans this thread holds, every blocking pin or span taken inside one,
- * and every namespace or range mutation made outside one (process-wide). */
+ * and every namespace or range mutation or buffered insert made outside
+ * one (process-wide). */
 static _Thread_local unsigned fs_txn_depth_here;
 static atomic_uint fs_txn_order_violations;
 
@@ -3117,6 +3119,9 @@ static stm_status fs_buffer_insert_locked(stm_fs *fs, uint64_t ds,
                                           uint64_t len, const void *data,
                                           uint64_t hold_end)
 {
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    fs_txn_note_mutation();     /* the reclaim's drain-then-commit needs it */
+#endif
     fs_buffer_insert_gap(fs, ds, ino);
     if (stm_sync_dataset_locked(fs->sync, ds)) return STM_ELOCKED;
     return stm_dirty_buffer_insert_held(fs->dirty_buffer, ds, ino, off, len,
@@ -4475,6 +4480,11 @@ void stm_fs_set_reclaim_hook_for_test(stm_fs *fs, stm_fs_reclaim_hook fn,
     fs->reclaim_hook_arg = arg;
 }
 
+unsigned stm_fs_reclaim_drains_for_test(stm_fs *fs)
+{
+    return atomic_load_explicit(&fs->reclaim_drains, memory_order_relaxed);
+}
+
 void stm_fs_set_name_read_hook_for_test(stm_fs *fs, stm_fs_name_read_hook fn,
                                         void *arg)
 {
@@ -5414,7 +5424,7 @@ static bool fs_freed_inode_cleanup_locked(stm_fs *fs,
  * the allocator's free_gen past committed_gen (R50 P2-1 strict-less-
  * than predicate). Caller MUST hold fs->global. Same posture as the
  * inline double-commit at the original unlink path's reclaim trigger
- * (SWISS-4q P2). Extracted so rename + unlink_anon can reuse it.
+ * (SWISS-4q P2). Its one caller is the ENOSPC reclaim below.
  *
  * Cost: two stm_sync_commit calls (~10-50 ms each on local NVMe).
  * Acceptable; the alternative is permanent PENDING leak per cycle.
@@ -5507,6 +5517,9 @@ static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
 #endif
     stm_status predrain = stm_dirty_buffer_drain_all(fs->dirty_buffer,
                                                         fs_flush_drain_cb, fs);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    atomic_fetch_add_explicit(&fs->reclaim_drains, 1u, memory_order_relaxed);
+#endif
     if (predrain != STM_OK || fs_post_inode_free_reclaim_locked(fs)) {
         fs_mark_wedged_locked(fs);
         pthread_rwlock_unlock(&fs->txn);

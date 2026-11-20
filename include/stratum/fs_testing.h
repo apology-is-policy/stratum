@@ -251,6 +251,10 @@ void stm_fs_set_step_gap_hook_for_test(stm_fs *fs, stm_fs_step_gap_hook fn,
 void stm_fs_set_reclaim_hook_for_test(stm_fs *fs, stm_fs_reclaim_hook fn,
                                       void *arg);
 
+/* How many times the ENOSPC reclaim has finished its drain, the step
+ * before its commits. */
+unsigned stm_fs_reclaim_drains_for_test(stm_fs *fs);
+
 /*
  * Call `fn` with a create's, mkdir's, symlink's or anonymous create's new
  * inode as the op is about to pin it (busy false), with fs->global SH,
@@ -338,8 +342,8 @@ void stm_fs_set_clone_of_sealed_for_test(stm_fs *fs, bool on);
  * blocking inode pin or a second span or left an op with its span still
  * held, or a thread outside one made a namespace mutation (a dirent's
  * install, removal, whiteout or swap, an inode's alloc, free, link count
- * change or materialize). 0 while every op keeps the order fs->txn rests
- * on.
+ * change or materialize) or put a write in the dirty buffer. 0 while
+ * every op keeps the order fs->txn rests on.
  */
 unsigned stm_fs_txn_order_violations_for_test(void);
 

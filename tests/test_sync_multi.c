@@ -3197,14 +3197,16 @@ STM_TEST(sync_multi_cold_read_and_promote_answer_a_device_error_over_a_bad_repli
 
 
 /* One classifying read (or promote) with replica 1's tag failing and
- * replica 0 faulted per pass by two ranges: the first `times1` reads answer
+ * replica 0 faulted per pass by two ranges: its first pass's read answers
  * a1, every later one a2 (STM_OK: read and garbled). */
 static stm_status pass2_try(stm_sync *s, stm_bdev *b0, uint64_t r0, stm_status a1,
                             stm_status a2, uint64_t ino, bool promote,
                             bool *bad)
 {
     stm_bdev_inject_read_range_clear(b0);
-    stm_bdev_inject_read_range(b0, r0, r0 + 4096u, 1, a1);
+    /* A promote's unlocked try reads each replica once before the
+     * classifying passes: a1 outlasts it to reach the first pass. */
+    stm_bdev_inject_read_range(b0, r0, r0 + 4096u, promote ? 2 : 1, a1);
     stm_bdev_inject_read_range(b0, r0, r0 + 4096u, -1, a2);
     stm_sync_dcache_drain_for_test(s);
     uint8_t back[4096];

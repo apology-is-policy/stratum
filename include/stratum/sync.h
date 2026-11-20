@@ -2084,9 +2084,16 @@ stm_status stm_sync_promote_to_hot_bounded(stm_sync *s, uint64_t dataset_id,
  * where no free run holds it. The covering write and truncate use it to
  * split such a record before they rewrite part of it. A record whose
  * origin is another, user-sealed dataset is refused (STM_ENOTSUPPORTED):
- * its bytes would go under this dataset's key. Errors as
+ * its bytes would go under this dataset's key. It holds s->lock as
+ * stm_sync_promote_to_hot's extents do, only to decide and to publish; a
+ * read that failed, a record changed meanwhile or a fifth try run the
+ * fully locked body on the record at `off` then, and so does a refused
+ * reservation whose record does not read (one that reads answers the
+ * reservation's error). *out_record_bad is set by the checks of its first
+ * hold or by that body's checks or read (the read comes before its
+ * reserve), never by an unlocked read. Errors as
  * stm_sync_promote_to_hot's, and STM_ESTALE where a range shift moved the
- * record during the call (only a sync-direct caller can meet it);
+ * record during the locked body (only a sync-direct caller can meet it);
  * *out_record_bad (when non-NULL) as stm_sync_read_extent_ex's, for the
  * record's read.
  */

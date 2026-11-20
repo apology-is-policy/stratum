@@ -4934,8 +4934,10 @@ STM_TEST(corvus_a_write_into_a_big_cold_record_its_content_entry_disowns_is_drop
 
 /* A direct write (over 1 MiB) starting at an older pool's big COLD record
  * whose chunk answers EIO on every read: the direct write promotes the
- * record first, a reader that drops nothing, so it reads each replica
- * once and answers the EIO to its caller; nothing is dropped. */
+ * record first, a reader that drops nothing: its unlocked try reads each
+ * replica once, the locked body once more (one pass, as a reader that
+ * drops nothing reads), and the EIO goes to its caller; nothing is
+ * dropped. */
 STM_TEST(corvus_a_direct_write_into_a_big_cold_record_reads_a_bad_sector_once) {
     seal_pool sp;
     if (!seal_pool_open_sz(&sp, "o1bdirect", UINT64_C(1) << 30,
@@ -4969,7 +4971,7 @@ STM_TEST(corvus_a_direct_write_into_a_big_cold_record_reads_a_bad_sector_once) {
     fprintf(stderr, "  info: direct write %d, faulted reads %u (replicas %u)\n",
             (int)ws, (unsigned)fired, (unsigned)cr.n_replicas);
     STM_ASSERT_ERR(ws, STM_EIO);
-    STM_ASSERT_EQ(fired, (uint32_t)cr.n_replicas);
+    STM_ASSERT_EQ(fired, 2u * (uint32_t)cr.n_replicas);
     STM_ASSERT_OK(stm_fs_fsync(sp.fs, ds, f, NULL));
     seal_pool_close(&sp);
 }
@@ -5223,9 +5225,9 @@ static o1b_gens o1b_gens_of(stm_sync *s, uint64_t ds, uint64_t ino)
  * pieces' bytes found it free (and the promote's seam, once a record). The
  * file reads its bytes, HOT, before and after a remount. Controls: from
  * the evict's seam, under s->lock, the probe answers held; through the
- * same observer, the fully locked promote (stm_sync_promote_cold_at, the
- * drain's covering write) of another file does its chunk read and piece
- * writes with the lock held. */
+ * same observer, the fully locked body (as truncate's pre-promote runs it)
+ * promoting another file does its chunk read and piece writes with the
+ * lock held. */
 STM_TEST(corvus_promote_writes_its_records_with_the_sync_lock_free) {
     seal_pool sp;
     if (!seal_pool_open_sz(&sp, "o1blk", UINT64_C(1) << 30,
@@ -5255,7 +5257,8 @@ STM_TEST(corvus_promote_writes_its_records_with_the_sync_lock_free) {
     o1b_spans kcold = o1b_spans_of(sync, sp.sib.ds, k, true);
     atomic_store(&l->n, 0);
     stm_bdev_set_io_observer_for_test(d, &ob);
-    STM_ASSERT_OK(stm_sync_promote_cold_at(sync, sp.sib.ds, k, 0, NULL));
+    STM_ASSERT_OK(stm_sync_promote_cold_at_locked_for_test(sync, sp.sib.ds, k,
+                                                           0, NULL));
     stm_bdev_set_io_observer_for_test(d, NULL);
     o1b_spans khot = o1b_spans_of(sync, sp.sib.ds, k, false);
     o1b_io_tally kt = o1b_tally(l, &kcold, &khot);
@@ -6066,11 +6069,11 @@ STM_TEST(corvus_promote_yields_with_no_lock_held_and_nothing_outstanding) {
 }
 
 /* A failed unlocked chunk read gives back the blocks its try reserved
- * (the allocator's data blocks around the promote, no commit between).
- * One failure: that try's record goes to pending and the locked body
- * reads the chunk again and swaps (allocated up a record). Every read
- * failing: the locked body reads before it reserves, so only the unlocked
- * try's record reaches pending and allocated is unchanged. */
+ * (the allocator's data blocks around the promote, no commit between):
+ * nothing was written to them, so none goes to pending. One failure: the
+ * locked body reads the chunk again and swaps (allocated up a record).
+ * Every read failing: the locked body reads before it reserves, so
+ * allocated is unchanged too. */
 static void o1b_read_acct_case(int64_t times)
 {
     seal_pool sp;
@@ -6097,13 +6100,13 @@ static void o1b_read_acct_case(int64_t times)
     if (times == 1) {
         STM_ASSERT_OK(rc);
         STM_ASSERT(a1 >= a0 + NB && a1 <= a0 + NB + 1u);
-        STM_ASSERT(p1 >= p0 + NB);
+        STM_ASSERT_EQ(p1, p0);
         STM_ASSERT_EQ(seal_extent_kind(sp.fs, sp.sib.ds, f),
                       STM_EXTENT_KIND_HOT);
     } else {
         STM_ASSERT_ERR(rc, STM_EIO);
         STM_ASSERT_EQ(a1, a0);
-        STM_ASSERT(p1 >= p0 + NB);
+        STM_ASSERT_EQ(p1, p0);
         STM_ASSERT_EQ(seal_extent_kind(sp.fs, sp.sib.ds, f),
                       STM_EXTENT_KIND_COLD);
     }
@@ -6117,9 +6120,10 @@ STM_TEST(corvus_promote_gives_back_its_blocks_when_the_unlocked_read_fails) {
 }
 
 /* The unlocked chunk read runs under the pool's shared lock, which keeps
- * the chunk's devices. Controls: the probe answers held under a shared
- * hold and free without one, and the fully locked body (whose devices
- * s->lock keeps) reads with the pool lock free. */
+ * the chunk's devices: the promote's and the covering promote's. Controls:
+ * the probe answers held under a shared hold and free without one, and the
+ * fully locked body (whose devices s->lock keeps) reads with the pool lock
+ * free. */
 #define O1B_POOL_IO_MAX 4096
 typedef struct {
     stm_pool  *pool;     /* resolved before arming: stm_sync_pool takes s->lock */
@@ -6175,14 +6179,21 @@ STM_TEST(corvus_promote_reads_its_chunk_under_the_pool_lock) {
     stm_extent_record gc;
     uint8_t *gwant = o1b_cold_file(&sp, sp.sib.ds, "pg", LEN, 0x7b7b8c8cull,
                                    &g, &gc);
-    if (!kwant || !gwant) {
-        free(kwant); free(gwant); free(l); seal_pool_close(&sp); return;
+    uint64_t c = 0;
+    stm_extent_record cc;
+    uint8_t *cwant = o1b_cold_file(&sp, sp.sib.ds, "pc", LEN, 0x8c8c9d9dull,
+                                   &c, &cc);
+    if (!kwant || !gwant || !cwant) {
+        free(kwant); free(gwant); free(cwant); free(l); seal_pool_close(&sp);
+        return;
     }
     o1b_spans kcold = o1b_spans_of(sync, sp.sib.ds, k, true);
     o1b_spans gcold = o1b_spans_of(sync, sp.sib.ds, g, true);
+    o1b_spans ccold = o1b_spans_of(sync, sp.sib.ds, c, true);
     atomic_store(&l->n, 0);
     stm_bdev_set_io_observer_for_test(d, &ob);
-    STM_ASSERT_OK(stm_sync_promote_cold_at(sync, sp.sib.ds, k, 0, NULL));
+    STM_ASSERT_OK(stm_sync_promote_cold_at_locked_for_test(sync, sp.sib.ds, k,
+                                                           0, NULL));
     stm_bdev_set_io_observer_for_test(d, NULL);
     int kr = 0, kfree = 0;
     o1b_pool_tally(l, &kcold, &kr, &kfree);
@@ -6192,17 +6203,775 @@ STM_TEST(corvus_promote_reads_its_chunk_under_the_pool_lock) {
     stm_bdev_set_io_observer_for_test(d, NULL);
     int gr = 0, gfree = 0;
     o1b_pool_tally(l, &gcold, &gr, &gfree);
+    atomic_store(&l->n, 0);
+    stm_bdev_set_io_observer_for_test(d, &ob);
+    bool bad = true;
+    STM_ASSERT_OK(stm_sync_promote_cold_at(sync, sp.sib.ds, c, 0, &bad));
+    stm_bdev_set_io_observer_for_test(d, NULL);
+    int cr = 0, cfree = 0;
+    o1b_pool_tally(l, &ccold, &cr, &cfree);
     printf("    locked body: %d chunk reads, %d with the pool lock free; "
-           "unlocked: %d chunk reads, %d free\n", kr, kfree, gr, gfree);
+           "unlocked: %d chunk reads, %d free; covering: %d, %d free\n", kr,
+           kfree, gr, gfree, cr, cfree);
     STM_ASSERT(kr >= 1);
     STM_ASSERT_EQ(kfree, kr);            /* the probe can answer free */
     STM_ASSERT(gr >= 1);
     STM_ASSERT_EQ(gfree, 0);             /* every unlocked read: held */
+    STM_ASSERT(cr >= 1);
+    STM_ASSERT_EQ(cfree, 0);
+    STM_ASSERT(!bad);
     STM_ASSERT_EQ(seal_extent_kind(sp.fs, sp.sib.ds, g), STM_EXTENT_KIND_HOT);
+    STM_ASSERT_EQ(seal_extent_kind(sp.fs, sp.sib.ds, c), STM_EXTENT_KIND_HOT);
     stm_sync_dcache_drain_for_test(sync);
     seal_read_eq(sp.fs, sp.sib.ds, g, 0, gwant, LEN);
+    seal_read_eq(sp.fs, sp.sib.ds, c, 0, cwant, LEN);
     free(kwant);
     free(gwant);
+    free(cwant);
     free(l);
+    seal_pool_close(&sp);
+}
+
+
+/* ========================================================================= */
+/* The drain's covering promote with s->lock free (o1b2).                     */
+/* ========================================================================= */
+
+/* The chunk reads (on `cold`) and the piece writes (on `hot`) an observer
+ * logged, and how many of each found s->lock held. Reads of HOT bytes (a
+ * write's read-modify-write) are not the promote's and are not counted. */
+typedef struct { int reads, writes, held_reads, held_writes; } o1b2_io;
+
+static o1b2_io o1b2_tally(o1b_io_log *l, const o1b_spans *cold,
+                          const o1b_spans *hot)
+{
+    o1b2_io t = { 0, 0, 0, 0 };
+    int n = atomic_load(&l->n);
+    STM_ASSERT(n <= O1B_IO_MAX);
+    if (n > O1B_IO_MAX) n = O1B_IO_MAX;
+    for (int i = 0; i < n; i++) {
+        if (!l->op[i].w && o1b_in(cold, l->op[i].off, l->op[i].len)) {
+            t.reads++;
+            if (!l->op[i].lock_free) t.held_reads++;
+        } else if (l->op[i].w && o1b_in(hot, l->op[i].off, l->op[i].len)) {
+            t.writes++;
+            if (!l->op[i].lock_free) t.held_writes++;
+        }
+    }
+    return t;
+}
+
+/* The covering promote reads its chunk and writes its pieces with s->lock
+ * free: sync-direct (a 256 KiB record; its seam once, the lock free), and
+ * in a drain -- a commit's flush of a 10-byte write near the end of a big
+ * COLD record (over the recordsize) covers it, under fs->global EX and
+ * the dirty buffer's lock. The locked control (the locked body alone) is
+ * corvus_promote_writes_its_records_with_the_sync_lock_free's. */
+STM_TEST(corvus_cover_promote_writes_with_the_sync_lock_free) {
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, "o2lk", UINT64_C(1) << 30,
+                           UINT64_C(128) << 20)) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    struct stm_bdev *d = stm_fs_bdev_for_test(sp.fs);
+    o1b_io_log *l = calloc(1, sizeof *l);
+    STM_ASSERT(l != NULL);
+    if (!l) { seal_pool_close(&sp); return; }
+    l->s = sync;
+    stm_bdev_io_observer ob = { .fn = o1b_io_fn, .ctx = l };
+
+    const size_t LEN = (size_t)256 << 10;
+    uint64_t k = 0;
+    stm_extent_record kc;
+    uint8_t *kwant = o1b_cold_file(&sp, sp.sib.ds, "ck", LEN, 0x2d2d4e4eull,
+                                   &k, &kc);
+    if (!kwant) { free(l); seal_pool_close(&sp); return; }
+    o1b_spans kcold = o1b_spans_of(sync, sp.sib.ds, k, true);
+    o1b_hook h = { .sp = &sp, .mode = O1B_NOTE };
+    bool bad = true;
+    atomic_store(&l->n, 0);
+    stm_bdev_set_io_observer_for_test(d, &ob);
+    stm_sync_set_promote_phase2_hook_for_test(sync, o1b_hook_fn, &h);
+    stm_status rc = stm_sync_promote_cold_at(sync, sp.sib.ds, k, 0, &bad);
+    stm_sync_set_promote_phase2_hook_for_test(sync, NULL, NULL);
+    stm_bdev_set_io_observer_for_test(d, NULL);
+    o1b_spans khot = o1b_spans_of(sync, sp.sib.ds, k, false);
+    o1b2_io kt = o1b2_tally(l, &kcold, &khot);
+    printf("    sync-direct: rc %d, %d chunk reads (%d held), %d piece writes "
+           "(%d held), %d seam calls, %d with the lock free\n", (int)rc,
+           kt.reads, kt.held_reads, kt.writes, kt.held_writes, h.calls,
+           h.lock_free);
+    STM_ASSERT_OK(rc);
+    STM_ASSERT(!bad);
+    STM_ASSERT(kt.reads >= 1);
+    STM_ASSERT(kt.writes >= 1);
+    STM_ASSERT_EQ(kt.held_reads, 0);
+    STM_ASSERT_EQ(kt.held_writes, 0);
+    STM_ASSERT_EQ(h.calls, 1);
+    STM_ASSERT_EQ(h.lock_free, 1);
+    STM_ASSERT_EQ(seal_extent_kind(sp.fs, sp.sib.ds, k), STM_EXTENT_KIND_HOT);
+
+    uint64_t g = 0;
+    uint8_t *want = seal_big_cold_file(sp.fs, sp.sib.ds, "c24", true, &g);
+    if (!want) { free(kwant); free(l); seal_pool_close(&sp); return; }
+    const seal_ext_sum e = seal_extents(sp.fs, sp.sib.ds, g);
+    STM_ASSERT(e.big_len > (uint64_t)STM_FS_RECORDSIZE_MAX);
+    const uint64_t at = e.big_off + e.big_len - 100u;
+    STM_ASSERT_OK(stm_fs_write(sp.fs, sp.sib.ds, g, at, "wwwwwwwwww", 10));
+    memcpy(want + at, "wwwwwwwwww", 10);
+    o1b_spans gcold = o1b_spans_of(sync, sp.sib.ds, g, true);
+    o1b_hook hg = { .sp = &sp, .mode = O1B_NOTE };
+    atomic_store(&l->n, 0);
+    stm_bdev_set_io_observer_for_test(d, &ob);
+    stm_sync_set_promote_phase2_hook_for_test(sync, o1b_hook_fn, &hg);
+    rc = stm_fs_commit(sp.fs);
+    stm_sync_set_promote_phase2_hook_for_test(sync, NULL, NULL);
+    stm_bdev_set_io_observer_for_test(d, NULL);
+    o1b_spans ghot = o1b_spans_of(sync, sp.sib.ds, g, false);
+    o1b2_io gt = o1b2_tally(l, &gcold, &ghot);
+    const seal_ext_sum a = seal_extents(sp.fs, sp.sib.ds, g);
+    printf("    drain: commit %d, big record %llu bytes, %d chunk reads (%d "
+           "held), %d piece writes (%d held), %d seam calls, %d with the lock "
+           "free; COLD records %d -> %d\n", (int)rc,
+           (unsigned long long)e.big_len, gt.reads, gt.held_reads, gt.writes,
+           gt.held_writes, hg.calls, hg.lock_free, e.cold, a.cold);
+    STM_ASSERT_OK(rc);
+    STM_ASSERT(gt.reads >= 1);
+    STM_ASSERT(gt.writes >= 2);
+    STM_ASSERT_EQ(gt.held_reads, 0);
+    STM_ASSERT_EQ(gt.held_writes, 0);
+    STM_ASSERT_EQ(hg.calls, 1);
+    STM_ASSERT_EQ(hg.lock_free, 1);
+    STM_ASSERT_EQ(seal_extent_kind_at(sp.fs, sp.sib.ds, g, e.big_off),
+                  STM_EXTENT_KIND_HOT);
+    STM_ASSERT_EQ(a.cold, e.cold - 1);
+    stm_sync_dcache_drain_for_test(sync);
+    seal_read_eq(sp.fs, sp.sib.ds, g, 0, want, SEAL_BIG_LEN);
+    seal_read_eq(sp.fs, sp.sib.ds, k, 0, kwant, LEN);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    if (seal_pool_remount_session(&sp))
+        seal_read_eq(sp.fs, sp.sib.ds, g, 0, want, SEAL_BIG_LEN);
+    free(want);
+    free(kwant);
+    free(l);
+    seal_pool_close(&sp);
+}
+
+/* A record overwritten and moved to the cold tier again while the
+ * covering promote wrote (the same length at the same place): the swap
+ * refuses the record it no longer finds, and the locked body promotes the
+ * record there now, since a cover expects no COLD record left at its
+ * offset; the file reads the new bytes from a HOT record. One variable
+ * away, nothing landing in the window, the record read is promoted. */
+static void o1b2_replace_case(bool act)
+{
+    seal_pool sp;
+    if (!seal_pool_open(&sp, act ? "o2rp" : "o2rq")) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const size_t LEN = (size_t)256 << 10;
+    uint64_t f = 0;
+    stm_extent_record c;
+    uint8_t *old = o1b_cold_file(&sp, sp.sib.ds, "r", LEN, 0x5353a3a3ull,
+                                 &f, &c);
+    uint8_t *nw = malloc(LEN);
+    STM_ASSERT(old != NULL && nw != NULL);
+    if (!old || !nw) { free(old); free(nw); seal_pool_close(&sp); return; }
+    uint64_t seed = 0x7474b4b4ull;
+    seal_noise(&seed, nw, LEN);
+    o1b_hook h = { .sp = &sp, .mode = act ? O1B_REPLACE : O1B_NOTE,
+                   .ds = sp.sib.ds, .ino = f, .repl = nw, .len = LEN };
+    bool bad = true;
+    stm_sync_set_promote_phase2_hook_for_test(sync, o1b_hook_fn, &h);
+    stm_status rc = stm_sync_promote_cold_at(sync, sp.sib.ds, f, 0, &bad);
+    stm_sync_set_promote_phase2_hook_for_test(sync, NULL, NULL);
+    stm_extent_record r = o1b_rec_at0(&sp, sp.sib.ds, f);
+    printf("    %s: rc %d, seam calls %d, record kind %d\n",
+           act ? "replaced" : "control", (int)rc, h.calls, (int)r.kind);
+    STM_ASSERT_OK(rc);
+    STM_ASSERT(!bad);
+    STM_ASSERT_EQ(h.calls, 1);                 /* the locked body has none */
+    if (act) STM_ASSERT_EQ(h.gen1, h.gen0);    /* no commit: the identity */
+    STM_ASSERT_EQ(r.kind, STM_EXTENT_KIND_HOT);
+    STM_ASSERT_EQ(r.len, (uint64_t)LEN);
+    stm_sync_dcache_drain_for_test(sync);
+    seal_read_eq(sp.fs, sp.sib.ds, f, 0, act ? nw : old, LEN);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    if (seal_pool_remount(&sp))
+        seal_read_eq(sp.fs, sp.sib.ds, f, 0, act ? nw : old, LEN);
+    free(old);
+    free(nw);
+    seal_pool_close(&sp);
+}
+
+STM_TEST(corvus_cover_promote_takes_the_record_there_after_a_change) {
+    o1b2_replace_case(true);
+    o1b2_replace_case(false);
+}
+
+/* A commit while the covering promote wrote closes the gen its parts were
+ * encrypted in: it goes again with fresh blocks (a second seam call), and
+ * the HOT record is indexed in the gen open at its swap. */
+STM_TEST(corvus_cover_promote_goes_again_when_a_commit_closes_its_gen) {
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "o2gn")) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const size_t LEN = (size_t)256 << 10;
+    uint64_t f = 0;
+    stm_extent_record c;
+    uint8_t *want = o1b_cold_file(&sp, sp.sib.ds, "g", LEN, 0x8686c6c6ull,
+                                  &f, &c);
+    if (!want) { seal_pool_close(&sp); return; }
+    o1b_hook h = { .sp = &sp, .mode = O1B_COMMIT };
+    bool bad = true;
+    stm_sync_set_promote_phase2_hook_for_test(sync, o1b_hook_fn, &h);
+    stm_status rc = stm_sync_promote_cold_at(sync, sp.sib.ds, f, 0, &bad);
+    stm_sync_set_promote_phase2_hook_for_test(sync, NULL, NULL);
+    stm_extent_record r = o1b_rec_at0(&sp, sp.sib.ds, f);
+    printf("    rc %d, seam calls %d, gen %llu -> %llu, record kind %d gen "
+           "%llu\n", (int)rc, h.calls, (unsigned long long)h.gen0,
+           (unsigned long long)h.gen1, (int)r.kind,
+           (unsigned long long)r.gen);
+    STM_ASSERT_OK(rc);
+    STM_ASSERT(!bad);
+    STM_ASSERT_EQ(h.fired, 1);
+    STM_ASSERT(h.gen1 > h.gen0);               /* the commit moved it */
+    STM_ASSERT_EQ(h.calls, 2);
+    STM_ASSERT_EQ(r.kind, STM_EXTENT_KIND_HOT);
+    STM_ASSERT_EQ(r.gen, stm_sync_current_gen(sync));
+    STM_ASSERT_EQ(r.link_gen, stm_sync_current_gen(sync));
+    stm_sync_dcache_drain_for_test(sync);
+    seal_read_eq(sp.fs, sp.sib.ds, f, 0, want, LEN);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    if (seal_pool_remount(&sp))
+        seal_read_eq(sp.fs, sp.sib.ds, f, 0, want, LEN);
+    free(want);
+    seal_pool_close(&sp);
+}
+
+/* The key pruned under every unlocked try of the covering promote: four
+ * tries, then the locked body (no seam call) promotes under the key
+ * CURRENT at its end, holding s->lock: of the five chunk reads only its
+ * one finds the lock held, and so does its write, the HOT record's only
+ * one (the tries' blocks went PENDING). */
+STM_TEST(corvus_cover_promote_runs_fully_locked_once_every_try_lost_its_key) {
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "o2ex")) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const size_t LEN = (size_t)256 << 10;
+    uint64_t f = 0;
+    stm_extent_record c;
+    uint8_t *want = o1b_cold_file(&sp, sp.sib.ds, "k4", LEN, 0x4747d7d7ull,
+                                  &f, &c);
+    if (!want) { seal_pool_close(&sp); return; }
+    o1b_prune_all h;
+    memset(&h, 0, sizeof h);
+    h.sp = &sp;
+    h.ds = sp.sib.ds;
+    STM_ASSERT_OK(stm_keyfile_load(sp.key_path, &h.wk));
+    uint64_t nk = 0, ok_ = 0;
+    STM_ASSERT_OK(stm_sync_rotate_dataset_key(sync, sp.sib.ds, &h.wk, NULL,
+                                              &nk, &ok_));
+    bool bad = true;
+    struct stm_bdev *d = stm_fs_bdev_for_test(sp.fs);
+    o1b_io_log *l = calloc(1, sizeof *l);
+    STM_ASSERT(l != NULL);
+    if (!l) {
+        stm_hybrid_keys_wipe(&h.wk); free(want); seal_pool_close(&sp);
+        return;
+    }
+    l->s = sync;
+    stm_bdev_io_observer ob = { .fn = o1b_io_fn, .ctx = l };
+    o1b_spans kcold = o1b_spans_of(sync, sp.sib.ds, f, true);
+    atomic_store(&l->n, 0);
+    stm_bdev_set_io_observer_for_test(d, &ob);
+    stm_sync_set_promote_phase2_hook_for_test(sync, o1b_prune_all_fn, &h);
+    stm_status rc = stm_sync_promote_cold_at(sync, sp.sib.ds, f, 0, &bad);
+    stm_sync_set_promote_phase2_hook_for_test(sync, NULL, NULL);
+    stm_bdev_set_io_observer_for_test(d, NULL);
+    o1b_spans khot = o1b_spans_of(sync, sp.sib.ds, f, false);
+    o1b2_io kt = o1b2_tally(l, &kcold, &khot);
+    printf("    rc %d, seam calls %d, pruned %zu; %d chunk reads (%d held), "
+           "%d writes of the HOT record (%d held)\n", (int)rc, h.calls,
+           h.pruned, kt.reads, kt.held_reads, kt.writes, kt.held_writes);
+    STM_ASSERT_OK(rc);
+    STM_ASSERT(!bad);
+    STM_ASSERT_EQ(h.calls, 4);
+    STM_ASSERT_EQ(h.pruned, (size_t)4);
+    STM_ASSERT_EQ(kt.reads, 5);
+    STM_ASSERT_EQ(kt.held_reads, 1);
+    STM_ASSERT_EQ(kt.writes, 1);
+    STM_ASSERT_EQ(kt.held_writes, 1);
+    stm_extent_record r = o1b_rec_at0(&sp, sp.sib.ds, f);
+    STM_ASSERT_EQ(r.kind, STM_EXTENT_KIND_HOT);
+    STM_ASSERT_EQ(r.key_id, h.last_new);
+    stm_sync_dcache_drain_for_test(sync);
+    seal_read_eq(sp.fs, sp.sib.ds, f, 0, want, LEN);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    if (seal_pool_remount(&sp))
+        seal_read_eq(sp.fs, sp.sib.ds, f, 0, want, LEN);
+    stm_hybrid_keys_wipe(&h.wk);
+    free(want);
+    free(l);
+    seal_pool_close(&sp);
+}
+
+/* The covering promote's unlocked chunk read fails: nothing was written, so
+ * its blocks go back to the allocator (pending unchanged), and the locked
+ * body reads the chunk again and alone judges the record. Once (`times`
+ * 1): the locked body's first read succeeds and the record moves
+ * (allocated up a record), one faulted read in all. Every read failing
+ * (`times` < 0): the unlocked read and the locked body's two passes, then
+ * the record is called bad (STM_EIO, *bad), still COLD, nothing allocated.
+ * No seam call either way. */
+static void o1b2_read_case(int64_t times)
+{
+    seal_pool sp;
+    if (!seal_pool_open(&sp, times == 1 ? "o2rd" : "o2re")) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const size_t LEN = (size_t)256 << 10;
+    const uint64_t NB = o1b_blocks(LEN);
+    uint64_t f = 0;
+    stm_extent_record c;
+    uint8_t *want = o1b_cold_file(&sp, sp.sib.ds, "e", LEN, 0x6f6f3030ull,
+                                  &f, &c);
+    if (!want) { seal_pool_close(&sp); return; }
+    struct stm_bdev *d = stm_fs_bdev_for_test(sp.fs);
+    stm_cas_record cr;
+    memset(&cr, 0, sizeof cr);
+    STM_ASSERT_OK(stm_cas_lookup(stm_sync_cas_index(sync), c.content_hash, &cr));
+    STM_ASSERT_EQ(cr.n_replicas, 1u);
+    o1_fault_chunk(&sp, &c, times, false);
+    o1b_hook h = { .sp = &sp, .mode = O1B_NOTE };
+    uint64_t a0 = 0, p0 = 0, a1 = 0, p1 = 0;
+    o1b_alloc_counts(sync, &a0, &p0);
+    bool bad = (times == 1);
+    stm_sync_set_promote_phase2_hook_for_test(sync, o1b_hook_fn, &h);
+    const uint32_t f0 = stm_bdev_inject_read_range_fired(d);
+    stm_status rc = stm_sync_promote_cold_at(sync, sp.sib.ds, f, 0, &bad);
+    const uint32_t fired = stm_bdev_inject_read_range_fired(d) - f0;
+    stm_sync_set_promote_phase2_hook_for_test(sync, NULL, NULL);
+    o1b_alloc_counts(sync, &a1, &p1);
+    stm_bdev_inject_read_range_clear(d);
+    stm_extent_record r = o1b_rec_at0(&sp, sp.sib.ds, f);
+    printf("    times %lld: rc %d, bad %d, faulted reads %u, allocated %+lld, "
+           "pending %+lld (one record = %llu blocks), seam calls %d\n",
+           (long long)times, (int)rc, (int)bad, (unsigned)fired,
+           (long long)(a1 - a0), (long long)(p1 - p0),
+           (unsigned long long)NB, h.calls);
+    STM_ASSERT_EQ(h.calls, 0);
+    STM_ASSERT_EQ(p1, p0);
+    if (times == 1) {
+        STM_ASSERT_OK(rc);
+        STM_ASSERT(!bad);
+        STM_ASSERT_EQ(fired, 1u);
+        STM_ASSERT(a1 >= a0 + NB && a1 <= a0 + NB + 1u);
+        STM_ASSERT_EQ(r.kind, STM_EXTENT_KIND_HOT);
+    } else {
+        STM_ASSERT_ERR(rc, STM_EIO);
+        STM_ASSERT(bad);
+        STM_ASSERT_EQ(fired, 3u);
+        STM_ASSERT_EQ(a1, a0);
+        STM_ASSERT_EQ(r.kind, STM_EXTENT_KIND_COLD);
+    }
+    stm_sync_dcache_drain_for_test(sync);
+    seal_read_eq(sp.fs, sp.sib.ds, f, 0, want, LEN);
+    free(want);
+    seal_pool_close(&sp);
+}
+
+STM_TEST(corvus_cover_promote_lets_the_locked_body_judge_a_failed_read) {
+    o1b2_read_case(1);
+    o1b2_read_case(-1);
+}
+
+/* The covering promote's reservation refused (a dirty reservation holds
+ * every free block out of any allocation but a drain's): it reads the
+ * chunk with s->lock free, and a record that reads answers the reserve's
+ * STM_ENOSPC (one chunk read, not held); one that does not runs the locked
+ * body, which reads before it reserves, so it is called bad on a full pool
+ * too (STM_EIO, *bad; the unlocked read, then the body's two passes, both
+ * held). COLD either way, and no seam call. */
+static void o1b2_reserve_case(bool faulted)
+{
+    seal_pool sp;
+    if (!seal_pool_open(&sp, faulted ? "o2nf" : "o2nr")) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const size_t LEN = (size_t)256 << 10;
+    uint64_t f = 0;
+    stm_extent_record c;
+    uint8_t *want = o1b_cold_file(&sp, sp.sib.ds, "n", LEN, 0x9191d1d1ull,
+                                  &f, &c);
+    if (!want) { seal_pool_close(&sp); return; }
+    struct stm_bdev *d = stm_fs_bdev_for_test(sp.fs);
+    o1b_io_log *l = calloc(1, sizeof *l);
+    STM_ASSERT(l != NULL);
+    if (!l) { free(want); seal_pool_close(&sp); return; }
+    l->s = sync;
+    stm_bdev_io_observer ob = { .fn = o1b_io_fn, .ctx = l };
+    o1b_spans cold = o1b_spans_of(sync, sp.sib.ds, f, true);
+    o1b_spans none;
+    memset(&none, 0, sizeof none);
+    if (faulted) o1_fault_chunk(&sp, &c, -1, false);
+    const uint64_t room = stm_alloc_avail_blocks(stm_sync_alloc(sync, 0));
+    STM_ASSERT(room > 0u);
+    STM_ASSERT_OK(stm_sync_dirty_reserve(sync, room));
+    uint64_t a0 = 0, q0 = 0, a1 = 0, q1 = 0;
+    o1b_alloc_counts(sync, &a0, &q0);
+    o1b_hook h = { .sp = &sp, .mode = O1B_NOTE };
+    bool bad = !faulted;
+    stm_sync_set_promote_phase2_hook_for_test(sync, o1b_hook_fn, &h);
+    atomic_store(&l->n, 0);
+    stm_bdev_set_io_observer_for_test(d, &ob);
+    const uint32_t f0 = stm_bdev_inject_read_range_fired(d);
+    stm_status rc = stm_sync_promote_cold_at(sync, sp.sib.ds, f, 0, &bad);
+    const uint32_t fired = stm_bdev_inject_read_range_fired(d) - f0;
+    stm_bdev_set_io_observer_for_test(d, NULL);
+    stm_sync_set_promote_phase2_hook_for_test(sync, NULL, NULL);
+    o1b_alloc_counts(sync, &a1, &q1);
+    stm_sync_dirty_release(sync, room);
+    stm_bdev_inject_read_range_clear(d);
+    o1b2_io t = o1b2_tally(l, &cold, &none);
+    printf("    %s: rc %d, bad %d, faulted reads %u, chunk reads %d (%d held), "
+           "seam calls %d (room %llu blocks held)\n",
+           faulted ? "unreadable" : "readable", (int)rc, (int)bad,
+           (unsigned)fired, t.reads, t.held_reads, h.calls,
+           (unsigned long long)room);
+    STM_ASSERT_EQ(h.calls, 0);
+    STM_ASSERT_EQ(a1, a0);
+    STM_ASSERT_EQ(q1, q0);
+    if (faulted) {
+        STM_ASSERT_ERR(rc, STM_EIO);
+        STM_ASSERT(bad);
+        STM_ASSERT_EQ(fired, 3u);
+        STM_ASSERT_EQ(t.reads, 3);
+        STM_ASSERT_EQ(t.held_reads, 2);
+    } else {
+        STM_ASSERT_ERR(rc, STM_ENOSPC);
+        STM_ASSERT(!bad);
+        STM_ASSERT_EQ(fired, 0u);
+        STM_ASSERT_EQ(t.reads, 1);
+        STM_ASSERT_EQ(t.held_reads, 0);
+    }
+    STM_ASSERT_EQ(seal_extent_kind(sp.fs, sp.sib.ds, f), STM_EXTENT_KIND_COLD);
+    stm_sync_dcache_drain_for_test(sync);
+    seal_read_eq(sp.fs, sp.sib.ds, f, 0, want, LEN);
+    free(want);
+    free(l);
+    seal_pool_close(&sp);
+}
+
+STM_TEST(corvus_cover_promote_judges_a_record_it_could_not_reserve_for) {
+    o1b2_reserve_case(true);
+    o1b2_reserve_case(false);
+}
+
+/* A drain's covering promote under fs->global SH (a fallocate's pre-flush
+ * of a 10-byte write near the end of a big COLD record) holds the dirty
+ * buffer's lock and no txn span: an ENOSPC reclaim in another thread takes
+ * txn exclusive during the promote's unlocked span (locked in the window),
+ * yet commits nothing there: its drain, which comes before its commits,
+ * waits on that lock (no reclaim drain done in the window, one after), the
+ * gen holds across the window and the promote swaps on its first try.
+ * Under txn exclusive no write enters the buffer, so that drain leaves
+ * nothing for another drain to cover before the commits: every buffered
+ * insert outside a span counts as a txn order violation (none here). The
+ * reclaim waits at its door (its hook, before the txn lock) until the
+ * promote's seam opens it. */
+typedef struct {
+    seal_pool      *sp;
+    stm_sync       *s;
+    uint64_t        ds, x;
+    pthread_t       tb;
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    int             calls, lock_free, at_door, go, locked;
+    int             locked_in_window;
+    uint64_t        gen0, gen_in_window;
+    unsigned        drains0, drains_in_window;
+    stm_status      b_rc;
+} o1b2_rc;
+
+static void o1b2_rc_reclaim_hook(bool locked, void *arg)
+{
+    o1b2_rc *r = arg;
+    struct timespec until;
+    pthread_mutex_lock(&r->mu);
+    if (locked) {
+        r->locked = 1;
+    } else {
+        stm_fs_fail_drains_for_test(r->sp->fs, STM_OK);
+        r->at_door = 1;
+        pthread_cond_broadcast(&r->cv);
+        o1b_rc_after(&until, 10000);
+        while (!r->go &&
+               pthread_cond_timedwait(&r->cv, &r->mu, &until) == 0) {
+        }
+    }
+    pthread_cond_broadcast(&r->cv);
+    pthread_mutex_unlock(&r->mu);
+}
+
+static void *o1b2_rc_thread(void *arg)
+{
+    o1b2_rc *r = arg;
+    stm_fs_fail_drains_for_test(r->sp->fs, STM_ENOSPC);
+    r->b_rc = stm_fs_fallocate(r->sp->fs, r->ds, r->x, 0, 4096, 0);
+    stm_fs_fail_drains_for_test(r->sp->fs, STM_OK);
+    return NULL;
+}
+
+static void o1b2_rc_seam(void *arg)
+{
+    o1b2_rc *r = arg;
+    struct timespec until;
+    if (stm_sync_lock_is_free_for_test(r->s)) r->lock_free++;
+    if (r->calls++) return;
+    r->gen0 = stm_sync_current_gen(r->s);
+    pthread_mutex_lock(&r->mu);
+    r->go = 1;
+    pthread_cond_broadcast(&r->cv);
+    o1b_rc_after(&until, 10000);
+    while (!r->locked &&
+           pthread_cond_timedwait(&r->cv, &r->mu, &until) == 0) {
+    }
+    r->locked_in_window = r->locked;
+    o1b_rc_after(&until, 300);
+    while (pthread_cond_timedwait(&r->cv, &r->mu, &until) == 0) {
+    }
+    pthread_mutex_unlock(&r->mu);
+    r->gen_in_window = stm_sync_current_gen(r->s);
+    r->drains_in_window = stm_fs_reclaim_drains_for_test(r->sp->fs) -
+                          r->drains0;
+}
+
+STM_TEST(corvus_cover_in_a_drain_holds_off_a_reclaims_commit) {
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, "o2rc", UINT64_C(1) << 30,
+                           UINT64_C(128) << 20)) return;
+    const unsigned v0 = stm_fs_txn_order_violations_for_test();
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const uint64_t ds = sp.sib.ds;
+    uint64_t g = 0;
+    uint8_t *want = seal_big_cold_file(sp.fs, ds, "d24", true, &g);
+    if (!want) { seal_pool_close(&sp); return; }
+    const seal_ext_sum e = seal_extents(sp.fs, ds, g);
+    STM_ASSERT(e.big_len > (uint64_t)STM_FS_RECORDSIZE_MAX);
+    uint64_t x = 0;
+    STM_ASSERT_OK(stm_fs_create_file(sp.fs, ds, 1, (const uint8_t *)"x", 1,
+                                     0600, 1000, 1000, &x));
+    const size_t XL = (size_t)64 << 10;
+    uint8_t *xb = malloc(XL);
+    STM_ASSERT(xb != NULL);
+    if (!xb) { free(want); seal_pool_close(&sp); return; }
+    memset(xb, 0x78, XL);
+    STM_ASSERT_OK(stm_fs_write(sp.fs, ds, x, 0, xb, XL));
+    free(xb);
+    const uint64_t at = e.big_off + e.big_len - 100u;
+    STM_ASSERT_OK(stm_fs_write(sp.fs, ds, g, at, "wwwwwwwwww", 10));
+    memcpy(want + at, "wwwwwwwwww", 10);
+    STM_ASSERT(stm_sync_pending_free_blocks(sync) > 0u);  /* the reclaim's gate */
+    o1b2_rc r;
+    memset(&r, 0, sizeof r);
+    r.sp = &sp;
+    r.s = sync;
+    r.ds = ds;
+    r.x = x;
+    pthread_mutex_init(&r.mu, NULL);
+    pthread_cond_init(&r.cv, NULL);
+    r.drains0 = stm_fs_reclaim_drains_for_test(sp.fs);
+    stm_fs_set_reclaim_hook_for_test(sp.fs, o1b2_rc_reclaim_hook, &r);
+    stm_sync_set_promote_phase2_hook_for_test(sync, o1b2_rc_seam, &r);
+    stm_status rc = STM_EINVAL;
+    int started = 0, at_door = 0;
+    if (pthread_create(&r.tb, NULL, o1b2_rc_thread, &r) == 0) {
+        started = 1;
+        struct timespec until;
+        pthread_mutex_lock(&r.mu);
+        o1b_rc_after(&until, 10000);
+        while (!r.at_door &&
+               pthread_cond_timedwait(&r.cv, &r.mu, &until) == 0) {
+        }
+        at_door = r.at_door;
+        pthread_mutex_unlock(&r.mu);
+        if (at_door) rc = stm_fs_fallocate(sp.fs, ds, g, 0, 4096, 0);
+        pthread_join(r.tb, NULL);
+    }
+    stm_sync_set_promote_phase2_hook_for_test(sync, NULL, NULL);
+    stm_fs_set_reclaim_hook_for_test(sp.fs, NULL, NULL);
+    stm_fs_fail_drains_for_test(sp.fs, STM_OK);
+    const unsigned drains = stm_fs_reclaim_drains_for_test(sp.fs) - r.drains0;
+    const unsigned v1 = stm_fs_txn_order_violations_for_test();
+    printf("    started %d, reclaim at its door %d; fallocate rc %d; seam "
+           "calls %d (%d with the lock free); reclaim held txn in the window "
+           "%d; gen %llu, in the window %llu; reclaim drains in the window "
+           "%u, in all %u; reclaim's op rc %d; txn order violations %u -> "
+           "%u\n", started, at_door, (int)rc, r.calls, r.lock_free,
+           r.locked_in_window, (unsigned long long)r.gen0,
+           (unsigned long long)r.gen_in_window, r.drains_in_window, drains,
+           (int)r.b_rc, v0, v1);
+    STM_ASSERT_EQ(started, 1);
+    STM_ASSERT_EQ(at_door, 1);
+    STM_ASSERT_OK(rc);
+    STM_ASSERT_EQ(r.calls, 1);                 /* one try: the gen held */
+    STM_ASSERT_EQ(r.lock_free, 1);
+    STM_ASSERT_EQ(r.locked_in_window, 1);      /* no span kept it out */
+    STM_ASSERT_EQ(r.gen_in_window, r.gen0);    /* yet no commit inside */
+    STM_ASSERT_EQ(r.drains_in_window, 0u);     /* its drain waited for ours */
+    STM_ASSERT_EQ(drains, 1u);                 /* and ran once ours was done */
+    STM_ASSERT_EQ(v1, v0);                     /* every insert in a span */
+    STM_ASSERT_EQ(r.locked, 1);
+    STM_ASSERT_OK(r.b_rc);
+    STM_ASSERT_EQ(seal_extent_kind_at(sp.fs, ds, g, e.big_off),
+                  STM_EXTENT_KIND_HOT);
+    stm_sync_dcache_drain_for_test(sync);
+    seal_read_eq(sp.fs, ds, g, 0, want, SEAL_BIG_LEN);
+    STM_ASSERT_OK(stm_fs_commit(sp.fs));
+    if (seal_pool_remount(&sp))
+        seal_read_eq(sp.fs, ds, g, 0, want, SEAL_BIG_LEN);
+    free(want);
+    pthread_cond_destroy(&r.cv);
+    pthread_mutex_destroy(&r.mu);
+    seal_pool_close(&sp);
+}
+
+/* The covering promote's first hold: a record that is not COLD (HOT, or
+ * none at the offset) is left as it is, with no seam call; on a wedged
+ * handle the cover answers STM_EWEDGED before it reserves, reads or writes
+ * anything (no chunk read, no device write, the allocator's counts
+ * unchanged), and the record stays COLD. */
+STM_TEST(corvus_cover_promote_takes_nothing_it_must_not) {
+    seal_pool sp;
+    if (!seal_pool_open(&sp, "o2gd")) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    struct stm_bdev *d = stm_fs_bdev_for_test(sp.fs);
+    const size_t LEN = (size_t)256 << 10;
+    uint64_t hf = 0, wf = 0;
+    stm_extent_record hc, wc;
+    uint8_t *hwant = o1b_cold_file(&sp, sp.sib.ds, "gh", LEN, 0xa5a55a5aull,
+                                   &hf, &hc);
+    uint8_t *wwant = o1b_cold_file(&sp, sp.sib.ds, "gw", LEN, 0x5a5aa5a5ull,
+                                   &wf, &wc);
+    o1b_io_log *l = calloc(1, sizeof *l);
+    STM_ASSERT(hwant != NULL && wwant != NULL && l != NULL);
+    if (!hwant || !wwant || !l) {
+        free(hwant); free(wwant); free(l); seal_pool_close(&sp);
+        return;
+    }
+    l->s = sync;
+    stm_bdev_io_observer ob = { .fn = o1b_io_fn, .ctx = l };
+    bool bad = true;
+    STM_ASSERT_OK(stm_sync_promote_cold_at(sync, sp.sib.ds, hf, 0, &bad));
+    STM_ASSERT(!bad);
+    const stm_extent_record h0 = o1b_rec_at0(&sp, sp.sib.ds, hf);
+    STM_ASSERT_EQ(h0.kind, STM_EXTENT_KIND_HOT);
+    o1b_hook h = { .sp = &sp, .mode = O1B_NOTE };
+    stm_sync_set_promote_phase2_hook_for_test(sync, o1b_hook_fn, &h);
+    bad = true;
+    const stm_status hr = stm_sync_promote_cold_at(sync, sp.sib.ds, hf, 0,
+                                                   &bad);
+    const bool hbad = bad;
+    bad = true;
+    const stm_status nr = stm_sync_promote_cold_at(sync, sp.sib.ds, hf,
+                                                   (uint64_t)LEN * 4u, &bad);
+    const bool nbad = bad;
+    const stm_extent_record h1 = o1b_rec_at0(&sp, sp.sib.ds, hf);
+    const int hcalls = h.calls;
+
+    o1b_spans wcold = o1b_spans_of(sync, sp.sib.ds, wf, true);
+    uint64_t a0 = 0, p0 = 0, a1 = 0, p1 = 0;
+    o1b_alloc_counts(sync, &a0, &p0);
+    stm_sync_mark_wedged(sync);
+    atomic_store(&l->n, 0);
+    stm_bdev_set_io_observer_for_test(d, &ob);
+    bad = true;
+    const stm_status wr = stm_sync_promote_cold_at(sync, sp.sib.ds, wf, 0,
+                                                   &bad);
+    stm_bdev_set_io_observer_for_test(d, NULL);
+    stm_sync_set_promote_phase2_hook_for_test(sync, NULL, NULL);
+    o1b_alloc_counts(sync, &a1, &p1);
+    int reads = 0, writes = 0;
+    int n = atomic_load(&l->n);
+    if (n > O1B_IO_MAX) n = O1B_IO_MAX;
+    for (int i = 0; i < n; i++) {
+        if (l->op[i].w) writes++;
+        else if (o1b_in(&wcold, l->op[i].off, l->op[i].len)) reads++;
+    }
+    const stm_extent_record w1 = o1b_rec_at0(&sp, sp.sib.ds, wf);
+    printf("    HOT: rc %d, bad %d; no record: rc %d, bad %d; seam calls %d; "
+           "wedged: rc %d, bad %d, %d chunk reads, %d device writes, "
+           "allocated %+lld, pending %+lld, seam calls %d, record kind %d\n",
+           (int)hr, (int)hbad, (int)nr, (int)nbad, hcalls, (int)wr, (int)bad,
+           reads, writes, (long long)(a1 - a0), (long long)(p1 - p0),
+           h.calls, (int)w1.kind);
+    STM_ASSERT_OK(hr);
+    STM_ASSERT(!hbad);
+    STM_ASSERT_OK(nr);
+    STM_ASSERT(!nbad);
+    STM_ASSERT_EQ(hcalls, 0);
+    STM_ASSERT_EQ(h1.kind, STM_EXTENT_KIND_HOT);
+    STM_ASSERT_EQ(h1.gen, h0.gen);
+    STM_ASSERT_EQ(h1.paddrs[0], h0.paddrs[0]);
+    STM_ASSERT_ERR(wr, STM_EWEDGED);
+    STM_ASSERT(!bad);
+    STM_ASSERT_EQ(reads, 0);
+    STM_ASSERT_EQ(writes, 0);
+    STM_ASSERT_EQ(a1, a0);
+    STM_ASSERT_EQ(p1, p0);
+    STM_ASSERT_EQ(h.calls, 0);
+    STM_ASSERT_EQ(w1.kind, STM_EXTENT_KIND_COLD);
+    free(hwant);
+    free(wwant);
+    free(l);
+    seal_pool_close(&sp);
+}
+
+/* A record of two parts whose second reservation is refused (a dirty
+ * reservation leaves room for the first part and half the second): the
+ * first part's blocks go back (allocated and pending unchanged), the
+ * record reads with s->lock free and answers STM_ENOSPC, still COLD, with
+ * no seam call. */
+STM_TEST(corvus_cover_promote_gives_back_a_part_when_the_next_is_refused) {
+    seal_pool sp;
+    if (!seal_pool_open_sz(&sp, "o2pg", UINT64_C(1) << 30,
+                           UINT64_C(128) << 20)) return;
+    stm_sync *sync = stm_fs_sync(sp.fs);
+    const uint64_t ds = sp.sib.ds;
+    uint64_t g = 0;
+    uint8_t *want = seal_big_cold_file(sp.fs, ds, "p24", true, &g);
+    if (!want) { seal_pool_close(&sp); return; }
+    const seal_ext_sum e = seal_extents(sp.fs, ds, g);
+    const uint64_t REC = (uint64_t)STM_FS_RECORDSIZE_MAX;
+    STM_ASSERT(e.big_len > REC && e.big_len <= 2u * REC);
+    const uint64_t p0 = o1b_blocks((size_t)REC);
+    const uint64_t p1 = o1b_blocks((size_t)(e.big_len - REC));
+    const uint64_t room = stm_alloc_avail_blocks(stm_sync_alloc(sync, 0));
+    const uint64_t keep = p0 + p1 / 2u;
+    STM_ASSERT(room > keep);
+    if (room <= keep) { free(want); seal_pool_close(&sp); return; }
+    STM_ASSERT_OK(stm_sync_dirty_reserve(sync, room - keep));
+    o1b_hook h = { .sp = &sp, .mode = O1B_NOTE };
+    uint64_t a0 = 0, q0 = 0, a1 = 0, q1 = 0;
+    o1b_alloc_counts(sync, &a0, &q0);
+    bool bad = true;
+    stm_sync_set_promote_phase2_hook_for_test(sync, o1b_hook_fn, &h);
+    const stm_status rc = stm_sync_promote_cold_at(sync, ds, g, e.big_off,
+                                                   &bad);
+    stm_sync_set_promote_phase2_hook_for_test(sync, NULL, NULL);
+    o1b_alloc_counts(sync, &a1, &q1);
+    stm_sync_dirty_release(sync, room - keep);
+    printf("    parts of %llu + %llu blocks, %llu left free: rc %d, bad %d, "
+           "allocated %+lld, pending %+lld, seam calls %d\n",
+           (unsigned long long)p0, (unsigned long long)p1,
+           (unsigned long long)keep, (int)rc, (int)bad,
+           (long long)(a1 - a0), (long long)(q1 - q0), h.calls);
+    STM_ASSERT_ERR(rc, STM_ENOSPC);
+    STM_ASSERT(!bad);
+    STM_ASSERT_EQ(a1, a0);
+    STM_ASSERT_EQ(q1, q0);
+    STM_ASSERT_EQ(h.calls, 0);
+    STM_ASSERT_EQ(seal_extent_kind_at(sp.fs, ds, g, e.big_off),
+                  STM_EXTENT_KIND_COLD);
+    stm_sync_dcache_drain_for_test(sync);
+    seal_read_eq(sp.fs, ds, g, 0, want, SEAL_BIG_LEN);
+    free(want);
     seal_pool_close(&sp);
 }

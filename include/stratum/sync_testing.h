@@ -104,20 +104,34 @@ void stm_sync_set_write_phase2_hook_for_test(stm_sync *s,
                                                 void *ctx);
 
 /*
- * The promote's twin of the write hook: invoked by the promote of one
- * COLD record (stm_sync_promote_to_hot and its bounded form) between its
- * unlocked chunk read + encrypt + device writes and the locked epilogue
- * that swaps the record. Runs with NO sync locks held and may call any
- * public stm_sync_* API. Reached through stm_fs_promote_to_hot or the
- * login promote, it runs under fs->global SH, the inode's pin and a txn
- * span: an fs call there that needs EX, that pin or a reclaim deadlocks
- * (a reclaim aborts), and so may one taking fs->global SH or a txn span
- * again (each waits behind a queued EX or reclaim). Pass hook=NULL to
- * clear.
+ * The promote's twin of the write hook: invoked by the unlocked try at one
+ * COLD record (stm_sync_promote_to_hot, its bounded form, and
+ * stm_sync_promote_cold_at) between its chunk read + encrypt + device
+ * writes and the locked epilogue that swaps the record. Runs with NO sync
+ * locks held and may call any public stm_sync_* API. Reached through
+ * stm_fs_promote_to_hot or the login promote, it runs under fs->global
+ * SH, the inode's pin and a txn span: an fs call there that needs EX, that
+ * pin or a reclaim deadlocks (a reclaim aborts), and so may one taking
+ * fs->global SH or a txn span again (each waits behind a queued EX or
+ * reclaim). Reached through a covering write, it runs under fs->global SH
+ * or EX, in a drain under the dirty buffer's lock as well, in a direct
+ * write under the inode's pin and a txn span: an fs call there may not
+ * return. Pass hook=NULL to clear.
  */
 void stm_sync_set_promote_phase2_hook_for_test(stm_sync *s,
                                                void (*hook)(void *ctx),
                                                void *ctx);
+
+/*
+ * stm_sync_promote_cold_at's locked body alone, in one s->lock hold (the
+ * chunk read, the encrypt and the device writes under the lock, as
+ * truncate's pre-promote): a control for the tests of the unlocked try.
+ */
+STM_MUST_USE
+stm_status stm_sync_promote_cold_at_locked_for_test(stm_sync *s,
+                                                    uint64_t dataset_id,
+                                                    uint64_t ino, uint64_t off,
+                                                    bool *out_record_bad);
 
 /* Whether no thread holds the sync handle's lock right now (a trylock). */
 bool stm_sync_lock_is_free_for_test(stm_sync *s);

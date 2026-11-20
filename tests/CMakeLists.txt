@@ -192,6 +192,11 @@ target_link_libraries(test_proxy_9p PRIVATE stm_stratumd)
 stm_add_test(test_corvus_client test_corvus_client.c)
 target_link_libraries(test_corvus_client PRIVATE stm_corvus_client)
 stm_add_test(test_corvus_mount test_corvus_mount.c)
+# test_corvus_mount formats and mounts a pool per test, many of them moving
+# 24 MiB files to the cold tier and back: under the gate's ctest -j4
+# (RelWithDebInfo) its first 85 of 97 tests took 58.2 s (2026-11-20), so
+# the whole binary outran the default 60 s. 180 s, as test_fs.
+set_tests_properties(test_corvus_mount PROPERTIES TIMEOUT 180)
 stm_add_test(test_corvus_provision test_corvus_provision.c test_fs_common.c)
 target_link_libraries(test_corvus_provision PRIVATE stm_stratumd)
 stm_add_test(test_multi_stratumd_crash test_multi_stratumd_crash.c test_fs_common.c)
