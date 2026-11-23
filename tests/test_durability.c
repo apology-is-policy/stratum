@@ -267,7 +267,7 @@ STM_TEST(durability_crash_during_data_commit_is_atomic) {
             STM_ASSERT_OK(stm_fs_unmount(fs2));
         } else {
             /* Clean-error verdict accepted (the structural recovery
-             * contract). With a prior durable commit in the 252-slot UB
+             * contract). With a prior durable commit in the four-copy UB
              * ring this should be rare, but a torn final UB that the MAC
              * rejects could in principle leave only ENOENT-class states. */
             STM_ASSERT(ms == STM_ENOENT || ms == STM_ECORRUPT ||

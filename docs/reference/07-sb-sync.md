@@ -45,24 +45,28 @@ Layout constants (`include/stratum/super.h:103-107`):
 | `STM_UB_MIRROR_SLOT` | 63 | Pool-config mirror (future). |
 | `STM_DEVICE_MIN_BYTES` | 8 MiB | Minimum device size. |
 
-Ring rotation per commit:
+Ring placement per generation (since v34):
 
 ```
-label = gen % STM_LABELS_PER_DEVICE          // 0..3
-slot  = gen % STM_UB_SLOTS_PER_LABEL         // 0..62
+slot = gen % STM_UB_SLOTS_PER_LABEL          // 0..62, in every label
 ```
 
-Consecutive commits land on different labels. After 4 × 63 = 252
-commits the `(label, slot)` pair wraps, but by then the history is
-dense and mount-time selection always picks the newest valid
-uberblock.
+Each generation's uberblock goes to that slot of all four labels: its
+`STM_UB_COPIES` copies (`stm_sb_ub_write_copies`: every copy written,
+then one fsync). A device confirms the write only when all four copies
+were written and the fsync succeeded (`STM_UB_COPIES_REQUIRED`), so a
+successful write leaves no other bytes at the slot, and copies of one
+generation differ only after a write that failed. The ring holds 63
+generations, about 31 commits (a commit spends a reservation and a
+final). Before v34 each generation went to one label (label gen % 4),
+one copy, 252 generations; a v34 build reads no earlier pool.
 
 ## Uberblock format (4096 bytes)
 
 | Offset | Size | Field | Meaning |
 |---|---|---|---|
 | 0 | 8 | `ub_magic` | `0x324d555441525453` (ASCII "STRATUM2"); every version keeps it here (ARCH section 5.4.1). |
-| 8 | 4 | `ub_version` | `STM_UB_VERSION = 33`; `STM_UB_VERSION_MIN_COMPAT = 32` still decodes. Every version keeps it here. |
+| 8 | 4 | `ub_version` | `STM_UB_VERSION = 34`; `STM_UB_VERSION_MIN_COMPAT = 34`: this build reads its own version only (pools of earlier versions are re-created). Every version keeps it here. |
 | 12–20 | 12 | feature flags | `compat` / `ro_compat` / `incompat` (ARCH §5.2). |
 | 24 | 16 | `ub_pool_uuid` | Pool identity. |
 | 40 | 16 | `ub_device_uuid` | This device's identity. |
@@ -144,9 +148,9 @@ stm_status stm_ub_decode(const void *buf, size_t buf_len, stm_uberblock *out_ub)
 `ub_encode` writes `ub_csum`, the BLAKE3-256 of bytes [0, 4064), the
 bytes before it (every version keeps that, ARCH section 5.4.1).
 `ub_decode` rejects `ub_gen == 0` (R14 P3-3 -- zero-gen sentinel) and
-accepts versions `STM_UB_VERSION_MIN_COMPAT`..`STM_UB_VERSION`; a newer
-one is STM_EBADVERSION, and `stm_ub_is_newer` tells a newer build's
-uberblock from a torn one (below).
+accepts versions `STM_UB_VERSION_MIN_COMPAT`..`STM_UB_VERSION`; any other
+is STM_EBADVERSION, and `stm_ub_is_newer` and `stm_ub_is_older` tell a
+newer or an older build's uberblock from a torn one (below).
 
 ### Label scanning
 
@@ -158,14 +162,19 @@ stm_status stm_label_offsets(uint64_t dev_size, uint64_t out_offsets[STM_LABELS_
 stm_status stm_sb_label_read(stm_bdev *d, uint32_t label, uint32_t slot, stm_uberblock *out);
 stm_status stm_sb_label_write(stm_bdev *d, uint32_t label, uint32_t slot, const stm_uberblock *ub);
 
+// Write a generation's uberblock to ring slot `slot` of every label, then
+// fsync once. STM_OK only when STM_UB_COPIES_REQUIRED copies (all four)
+// were written and the fsync succeeded. The commit path's only writer.
+stm_status stm_sb_ub_write_copies(stm_bdev *d, uint32_t slot, const stm_uberblock *ub);
+
 // Scan every (label, slot) on a device, return the single uberblock with
 // highest valid ub_gen. Used at mount. Returns STM_ENOENT if no valid UB,
 // STM_EIO if no slot decoded and the device failed a read, or if a slot
 // that could hold a newer commit still fails after two re-reads (below),
 // STM_EBADVERSION at a newer build's uberblock, or when nothing decodes
-// and a slot held another version. one_device: the device is the pool's
-// only one. why: which slot refused (gen for STM_EIO, version for
-// STM_EBADVERSION).
+// and a copy held another build's uberblock. one_device: the device is
+// the pool's only one. why: which copy refused (gen for STM_EIO, version
+// for STM_EBADVERSION).
 stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
                                 stm_uberblock *out, uint32_t *out_lbl,
                                 uint32_t *out_slot, stm_sb_scan_refusal *why);
@@ -178,11 +187,11 @@ An uberblock a newer build wrote refuses the mount (STM_EBADVERSION): the
 magic, a version above `STM_UB_VERSION` and a csum that verifies
 (`stm_ub_is_newer`; every version keeps those three fields, and its
 uberblocks in the commit-ring slots, where they are: ARCH section 5.4.1).
-The scan reads every commit-ring slot once and, when any holds one,
-refuses naming the first in scan order; it refuses too when a re-read of
-slot(best+1) or slot(best+2) finds one, or the one-device read of
-slot(best-1) (made when slot(best+1) stays unreadable and best is not a
-final by its mark). `why` names the slot
+The scan reads every copy in every commit-ring slot once and, when any
+holds one, refuses naming the first in scan order; it refuses too when a
+re-read of a copy at slot(best+1) or slot(best+2) finds one, or the
+one-device read of slot(best-1)'s copies (made when slot(best+1) does not
+settle and best is not a final by its mark). `why` names the copy
 and the version, and stratumd says so. The newer build's commits may lie
 past every generation this one can read, wherever its layout puts them, so
 mounting what it reads would roll the pool back and the claim would
@@ -190,39 +199,60 @@ overwrite one of them. The rule is stricter than ZFS's, which judges only
 the best uberblock's version: any slot, any generation, read-only mounts
 too.
 
-Its limits. A newer uberblock elsewhere whose one read fails goes unseen;
-a layout that writes each commit to several slots, or keeps this build's
-slot for it among them, makes one failed read harmless. And it protects
-only the builds that have it: a build before it skips a newer uberblock as
-torn and mounts the newest it decodes. A v32 build does that today on a
-pool a v33 build upgraded while v32 uberblocks remain in its ring, so the
-next version that changes the format closes it for the builds before it:
-once its own claim is durable in all four labels, it overwrites every ring
-slot holding an uberblock an older build decodes, with its own uberblocks
-(never zeros, which read as a fresh device).
+Its limits. A newer uberblock goes unseen only when every read of every
+copy of it fails: each generation has four copies (since v34), so one
+failed read no longer hides it. And the rule protects only the builds that
+have it: a build before it skips a newer uberblock as torn and mounts the
+newest it decodes. A v34 pool gives such a build nothing to decode: format
+zeroes all four labels and v34 reads no earlier pool, so its labels hold
+v34 uberblocks only, and every earlier build answers STM_EBADVERSION
+(nothing decodes and a slot held another version).
 
-An uberblock below `STM_UB_VERSION_MIN_COMPAT` is residue and is skipped
-(it answers STM_EBADVERSION only when nothing decodes); one at MIN_COMPAT
-decodes and is a candidate.
+An uberblock below `STM_UB_VERSION_MIN_COMPAT` (34: this build reads its
+own version only; on-disk breaks are free until the format freezes,
+operator decision 2026-11-05, so an earlier pool is re-created) is
+skipped like a torn one. When nothing decodes and a copy held one, the
+scan refuses STM_EBADVERSION naming the first (`stm_ub_is_older`: the
+magic, a version below MIN_COMPAT, a csum that verifies), and stratumd
+says the pool was written by an older build and must be re-created.
 
-A slot that fails to decode is skipped: a torn write, or a durable
-generation gone bad, which the scan cannot tell apart (one copy per
-generation: the price below). Each generation's uberblock is in one
-ring slot (`stm_sb_ring_label_for_gen` / `stm_sb_ring_slot_for_gen`,
-super.h; every writer puts it there), so an uberblock that decodes in
-another generation's slot came from a misdirected read or write: it is no
-candidate, and the slot counts as one that did not decode (a device holding
-only such uberblocks answers STM_ECORRUPT, never STM_ENOENT, the fresh
-device's answer). A slot the device fails to READ is
-different: a commit newer than the best one found can only follow it, at
-best+1 (best's final when best is a reservation; otherwise a reservation or a
-claim, which carry best's trees) or at best+2 (the final after a reservation
-at best+1). If the device cannot read the slot where it would be, mounting
-the best would roll the pool back past an acknowledged commit, and the
-mount's claim at best+1 would overwrite it for good: the scan re-reads the
-slot twice and, while it stays unreadable, refuses (STM_EIO). A re-read that
-finds a newer generation moves the best, and its successors are checked in
-turn.
+A copy that fails to decode is skipped: a torn write, or a durable copy
+gone bad, which the scan cannot tell apart. Each generation's uberblock is
+in slot gen % 63 of every label (`stm_sb_ring_slot_for_gen`, super.h;
+every writer puts it there through `stm_sb_ub_write_copies`), so an
+uberblock that decodes in another generation's slot came from a
+misdirected read or write: it is no candidate, and the copy counts as one
+that did not decode (a device holding only such uberblocks answers
+STM_ECORRUPT, never STM_ENOENT, the fresh device's answer). Copies of one
+generation can differ only after a write of it that failed part-way: the
+scan takes the first in label order. Either names an intact tree, because
+the fs writes nothing after a failed uberblock write until a remount (a
+failed commit wedges the fs, R154; a failed claim fails the mount), and the
+remount's claim replaces every copy of its slot. A multi-device pool
+carries on past a device whose write failed while quorum holds, and a
+library caller's retry can rewrite a generation with new content, so that
+device may hold copies of one generation naming different trees: its pick
+is only its vote, and the content-quorum check at mount treats a
+dissenting device as an orphan, as it did when each generation had one
+copy.
+
+A copy the device fails to READ is different: a commit newer than the best
+one found can only follow it, at best+1 (best's final when best is a
+reservation; otherwise a reservation or a claim, which carry best's trees)
+or at best+2 (the final after a reservation at best+1). If the device
+cannot read the copies where it would be, mounting the best would roll the
+pool back past an acknowledged commit, and the mount's claim at best+1
+would overwrite it for good. So the scan settles each copy of such a slot
+(below) and the slot with them. The slot settles when
+`STM_UB_SETTLE_COPIES` copies hold an older generation of the slot (the
+ring came round) or read back blank: a generation this device confirmed
+is in `STM_UB_COPIES_REQUIRED` copies, all four, so one copy without it
+proves the device never confirmed it (on a multi-device pool the others
+may have, by quorum: this device then votes behind). While the slot is not settled and a copy stays
+unreadable, the scan refuses (STM_EIO). It settles every copy even once one
+settles the slot, since another may hold a newer build's uberblock or a
+later generation. A copy that decodes a newer generation moves the best,
+and its successors are checked in turn.
 
 Where it refuses depends on the pool. One device writes its generations in
 order, each only after the one before is durable (a final waits for its
@@ -231,59 +261,63 @@ reservation's barrier). A reservation or a claim carries its predecessor's
 final stamps `ub_repair_log_root_gen` with its own generation (its mark). So
 on a one-device pool (`stm_sync_open` and `stm_fs_mount` pass `one_device`)
 the scan refuses at slot(best+1) only when best may be a reservation: neither
-its mark (the v32 and v33 writers stamp it alike: no writer of the mark
-changed between 7e67ded, the v32 bump, and 4dd19bd, the v33 one) nor best-1
-decoding as gen best-1 with another merkle root says final. A claim reads as a reservation, so an unreadable slot after a claim
-still refuses (a session that crashed before its first commit leaves one).
-It refuses at slot(best+2) only when slot(best+1) neither decoded (in its
-own slot, as an older generation: the ring came round) nor read back all
-zero (format zeroes the labels; a slot with no magic and other bytes may be
-a generation whose magic rotted). A read can come back wrong with no error
-(all zero from a lost mapping, another sector's bytes from a misdirected
-read, a garble), so before a successor slot counts as anything but valid it
-is read again: it counts as blank only after two reads came back all zero,
-as torn after two reads came back wrong otherwise (one of them may be zero),
-and as unreadable when three reads brought neither two such reads nor a
-decode (a failed read counts toward unreadable). Each blank successor slot
-costs one more 4 KiB read: one a mount on one device whose ring has not come
-round, two under the strict rule (best+1 and best+2). A device of a multi-device pool
-can miss a generation's write while quorum holds, so there either slot
-unreadable refuses; a refusing device is then no vote for the older
+its mark nor a copy of best-1 decoding as gen best-1 with other trees (and
+none with best's) says final. A claim reads as a reservation, so an
+unsettled slot after a claim still refuses (a session that crashed before
+its first commit leaves one). It refuses at slot(best+2) only when
+slot(best+1) did not settle (a blank copy settles it, since format zeroes
+the labels; a copy with no magic and other bytes may be a generation whose
+magic rotted, so it does not). A read can come back wrong with no error (all zero
+from a lost mapping, another sector's bytes from a misdirected read, a
+garble), so before a successor copy counts as anything but valid it is read
+again: it counts as blank only after two reads came back all zero, as torn
+after two reads came back wrong otherwise (one of them may be zero), and as
+unreadable when three reads brought neither two such reads nor a decode (a
+failed read counts toward unreadable). Each blank successor copy costs one
+more 4 KiB read: four a mount on one device whose ring has not come round,
+eight under the strict rule (best+1 and best+2). A device of a multi-device
+pool can miss a generation's write while quorum holds, so there either slot
+unsettled refuses; a refusing device is then no vote for the older
 generation it read (a stale vote could make a false quorum). An unreadable
-slot anywhere else costs nothing. A refusal says which slot (`stm_sb_scan_refusal`: the
-generation, label, slot, byte offset and the best generation read;
+copy anywhere else costs nothing. A refusal says which copy
+(`stm_sb_scan_refusal`: the generation, label, slot, byte offset and the
+best generation read;
 `stm_fs_mount_opts.scan_refusal`, filled by the mount's first scan or by
 `stm_sync_open_ex`'s own), and stratumd prints it.
 
-The price of one copy per generation: while that slot stays unreadable,
-every mount refuses (a refused mount writes nothing, so the sector never
-gets the rewrite that would heal it) until the operator overwrites it,
-accepting the loss of at most the newest commit. Each generation in two or
-more labels, which would remove this, and an explicit opt-in mount that takes
-the newest readable generation, are enqueued for the operator. (o1c review
-rounds 1 and 2, F1; btrfs's `usebackuproot` and ZFS's `zpool import -F` are
-likewise explicit opt-ins to a rollback, never a silent one.)
+With four copies a refusal needs every copy of the successor slot torn
+or unreadable, at least one unreadable; one copy per generation (before
+v34) refused at one unreadable sector. While it lasts every mount refuses
+(a refused mount writes nothing, so nothing rewrites the copies) until the
+operator zeroes any one copy of the slot (any will do; the one stratumd
+names may refuse writes too), accepting the loss of at most the newest
+commit.
+
+The write side pays for it. A label sector that refuses writes fails every
+commit whose reservation or final lands on its slot (a commit writes two
+generations, so about one commit in 31), and the fs wedges; a mount whose
+claim lands there fails once (the next takes that claim as its best: its
+other copies landed). A whole label region that refuses writes leaves the
+device unmountable read-write, since every reservation and every claim
+fails (read-only mounts still work); requiring three copies would ride
+through one dead label but needs a same-generation discriminator in the
+uberblock, since the first-of-differing pick and the final test trust that
+a confirmed write replaced every copy. Transient write errors meet four
+writes per uberblock instead of one. In a multi-device pool such a device
+fails to confirm and quorum carries on. An explicit opt-in mount that takes the newest readable generation is
+enqueued for the operator. (o1c review rounds 1 and 2, F1; btrfs's
+`usebackuproot` and ZFS's `zpool import -F` are likewise explicit opt-ins
+to a rollback, never a silent one.)
 
 ## Commit protocol (sync)
 
 ### Multi-device 2-phase (P5-2, quorum-backed)
 
 ```
-Fresh pool (auth_gen == 0):   1-phase — write UB at gen=1 to all devices.
-Subsequent commits:           2-phase.
+Fresh pool (auth_gen == 0):   1-phase -- write UB at gen=1 to all devices.
+Subsequent commits:           2-phase, in the CF-4 B order below.
 
-Phase 1: Reservation
-    For each pool device in parallel:
-        compute (label, slot) for gen = auth+1
-        build per-device UB (shared bytes + per-device uuid, device_id)
-        stm_bdev_write(bd, offset_of(label, slot), ub)
-        stm_bdev_fsync(bd)
-    Wait for quorum = floor(N/2) + 1 confirmations.
-    If sub-quorum: abort; return STM_EQUORUM.
-    (Reservation UB content = previous authoritative UB's content
-     with gen bumped — pre-flush roots; rollback target.)
-
-Phase 2: Flush
+Phase 2: Flush (first; its node writes and fsyncs go into the defer window)
     stm_keyschema_commit(ks, target_gen)      // persist key-schema if dirty
     For each attached alloc in allocs[]:
         stm_alloc_commit(alloc, target_gen)    // persist per-device tree
@@ -297,9 +331,25 @@ Phase 2: Flush
     stm_xattr_index_commit_flush(target_gen)   // 9.6-impl-4c: btree_engine FLUSH
     compute_merkle_root(... every index csum, incl. extent/inode/dirent/xattr
                             prospective triples ...)
-    stm_bootstrap_commit(boot, target_gen)     // 9.6-impl-4b-iii: explicit
-                                               // durable-bitmap barrier --
-                                               // strictly BEFORE the UB write
+    stm_bootstrap_commit(boot, target_gen)     // RECORDED into the defer
+                                               // window (no COW yet)
+
+Phase 1': Reservation (after the flush, before the barrier)
+    Content built before the flush: the previous authoritative UB's
+    content with gen bumped -- pre-flush roots; the rollback target.
+    For each pool device:
+        slot = (auth+1) % 63
+        build per-device UB (shared bytes + per-device uuid, device_id)
+        stm_sb_ub_write_copies(bd, slot, ub)   // all 4 labels; its fsync
+                                               // is deferred to the barrier
+    Wait for quorum = floor(N/2) + 1 confirmations.
+    If sub-quorum: abort; return STM_EQUORUM.
+
+Barrier
+    Stage each bootstrap's one slot-pair COW, then one data barrier per
+    device: the reservation's copies, the staged pair and every flushed
+    node are durable strictly BEFORE the final UB write. A failed
+    barrier aborts the commit.
 
 Phase 3: Final
     Build final UB: post-flush roots + post-flush Merkle.
@@ -556,8 +606,8 @@ atomically so add / attach / commit / detach composes in one step.
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_sb` | 36 | Encode / decode roundtrip; csum tamper rejected; magic tamper -> STM_ENOENT; version tamper -> STM_EBADVERSION; zero-gen rejected; label offsets; label_read / label_write; mount_scan picks highest valid; the bytes every version keeps (magic, version, the csum's domain, read without `stm_ub_csum`; an uberblock of those fields alone is a newer build's); a newer build's uberblock refuses the mount and the refusal names its slot (best+1, one of the kept fields alone, two in other slots naming the first, re-reads at best+1 and best+2, the one-device read of best-1; a torn one and an older one do not). |
-| `test_sync` | 19 | Single-device commit + remount; MountGenBump; alloc-root tree encoded under correct key; version boundary refusals. |
+| `test_sb` | 47 | Encode / decode roundtrip; csum tamper rejected; magic tamper -> STM_ENOENT; version tamper -> STM_EBADVERSION; zero-gen rejected; label offsets; label_read / label_write; mount_scan picks highest valid; the bytes every version keeps (magic, version, the csum's domain, read without `stm_ub_csum`; an uberblock of those fields alone is a newer build's); a newer build's uberblock refuses the mount and the refusal names its slot (best+1, one of the kept fields alone, two in other slots naming the first, re-reads at best+1 and best+2, the one-device read of best-1; a torn one and an older one do not); every generation in all four labels: the write puts every copy and fails when one fails, a generation is found by any copy, one copy settles a slot, the first of differing copies is taken (in the first pass and when re-reads find them), a later copy beats a blank one before it, a refusal names the first unreadable copy, the one-device final call needs no copy of best-1 with best's trees, an older build's pool is named. |
+| `test_sync` | 45 | Single-device commit + remount; MountGenBump; alloc-root tree encoded under correct key; version boundary refusals; every ring write lands in all four labels, a mount finds the newest generation by any copy, and no one unreadable label hides a commit. |
 | `test_sync_multi` | 55 | 3-device quorum roundtrip; 1-of-3 device loss tolerated; sub-quorum refused (STM_EQUORUM); orphan-ahead-of-quorum ignored; content-quorum tested; alloc-roots indirection; v5/v6/v7 version refusals (the v5 test exercises one prior version; the decode accepts only `STM_UB_VERSION_MIN_COMPAT`..`STM_UB_VERSION`, and a newer build's uberblock refuses the pool); mirror(2) + mirror(3) roundtrips + tampered-replica fallback; reserve refuses NONE profile; attach_alloc arg validation; RO pool refuses write ops; wedge refusal; keyschema idempotent commit produces byte-identical UBs; replace_device_online resume from step-3 commit failure; same-uuid-different-alloc refused; slot-0 spoofing refused; multi-retry converges; **commit succeeds with one FAULTED device** (R21 P1); replace-claim blocks concurrent mutators on the claimed slot via sync-wrapper bypass-closed (R23 P3-4).; a replace whose rollback cannot remove the new slot wedges and answers the wedge; a newer build's uberblock on one device refuses the open and names its slot. |
 
 ## Status

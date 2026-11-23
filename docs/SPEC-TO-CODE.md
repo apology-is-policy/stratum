@@ -24,7 +24,7 @@ same PR; when the mapping is updated, the spec may need to follow.
 |--------------------------|-----------------------------------------------------|-------|
 | `Paddrs`                 | `uint64_t` offsets on `stm_bdev` (ARCH §4.4)        | No structural difference. |
 | `MaxTxg`                 | bounded by `ub_gen` field in uberblock              | Runtime enforces the clamp check from v1 (carries forward to §5.4). |
-| `UBSlots`                | `63` per label (ARCH §5.3); 4 labels → 252 slots    | Spec uses `UBSlots = 2` for state space; invariants are size-independent. |
+| `UBSlots`                | `63` ring slots (ARCH 5.3), each gen in all 4 labels | Spec uses `UBSlots = 2` for state space; invariants are size-independent. |
 | `txg`                    | `stm_fs::gen` (post-sync), `pool_state::cur_txg`    | Volatile, lives in memory only. |
 | `phase`                  | commit coordinator state machine (§3.7.3)           | Implementation uses enum; spec uses string labels. |
 | `pending_ub`             | in-RAM root pointer staged for the next Final       | Corresponds to `stm_sync_ctx::next_uberblock`. |

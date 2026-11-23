@@ -208,19 +208,22 @@ Btrfs pinned-extents + delayed-refs + `flush_space`→`COMMIT_TRANS`; ZFS
 
 ## 31.3 The superblock — redundancy + torn-write defense (`src/sb/mount.c`)
 
-- **Layout:** `STM_LABELS_PER_DEVICE = 4` labels × `STM_UB_SLOTS_PER_LABEL = 63`
-  commit-ring slots = **252 uberblock copies per device**. Labels 0/1 sit at
+- **Layout:** `STM_LABELS_PER_DEVICE = 4` labels x `STM_UB_SLOTS_PER_LABEL = 63`
+  commit-ring slots; each generation's uberblock goes to its slot in **all four
+  labels** (since v34), so a device holds 63 generations, four copies each. Labels 0/1 sit at
   the device head (offsets 0 / 256 KiB); labels 2/3 at the tail — localized so
   a controller scribble / firmware rewrite / cable-induced torn write cannot
   destroy all copies.
 - **Ring rotation:** `slot = gen % 63`. A commit never overwrites the
-  most-recent-prior UB until a full ring cycle (252 commits), so the prior
-  durable state always survives a single torn UB write.
-- **Selection (`stm_sb_mount_scan`):** scan all 4x63 slots, decode each
+  most-recent-prior UB until a full ring cycle (63 generations), so the prior
+  durable state always survives a single torn UB write; a device confirms a
+  write only when all four copies were written and flushed.
+- **Selection (`stm_sb_mount_scan`):** scan all 4x63 copies, decode each
   (a BLAKE3 csum mismatch = torn/partial -> skipped), pick the **highest valid
   `ub_gen`**. A torn final UB fails its MAC and is skipped, so mount falls back
-  to the prior gen automatically. A slot the device cannot READ is not a torn
-  write: if it is a slot that could hold a newer acknowledged commit and two
+  to the prior gen automatically. A copy the device cannot READ is not a torn
+  write: if it is in a slot that could hold a newer acknowledged commit, no
+  other copy there holds an older generation or reads back blank, and two
   re-reads fail, the mount fails closed (STM_EIO) instead (`07-sb-sync.md`
   says which slots).
 
@@ -236,7 +239,7 @@ Every durability barrier is `stm_bdev_fsync`. Since CF-4 B a dirty commit
 issues exactly **two real barriers per device**: the pre-final-UB data
 barrier (`stm_bdev_barrier_defer_end` — covering the reservation UB, the
 staged bootstrap pair, and every phase-3 node write) and the final-UB fsync
-(`stm_sb_label_write`). All intermediate fsyncs issued inside the commit's
+(`stm_sb_ub_write_copies`: the four copies, then one fsync). All intermediate fsyncs issued inside the commit's
 armed window (bootstrap COW fsyncs, reservation-UB fsyncs) are recorded and
 folded into the data barrier; a clean commit issues zero. Outside a commit
 (`stm_sync_mirror_write`, `stm_sync_evacuation_step`, mount/format) fsyncs
@@ -289,7 +292,7 @@ There is **no persistent dirty/wedged flag on disk.** Instead:
 
 So a crash mid-commit costs at most a bounded leak of unreferenced metadata
 nodes, reclaimed on the next remount + commit — never a torn or unmountable
-tree (within the single-torn-write envelope the 252-UB + dual-bitmap/header
+tree (within the single-torn-write envelope the four-copy UB ring + dual-bitmap/header
 redundancy guarantees).
 
 ---

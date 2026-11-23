@@ -491,8 +491,8 @@ STM_TEST(pool_fs_roundtrip_populates_roster) {
      * restated here so a future version bump that forgets to
      * update this test fails loudly. */
     STM_ASSERT_EQ(stm_load_le32(ub.ub_version), STM_UB_VERSION);
-    STM_ASSERT_EQ(STM_UB_VERSION, 33u);  /* 9.8-BE-format message buffers v32 → v33 (chunk 7b) */
-    STM_ASSERT_EQ(STM_UB_VERSION_MIN_COMPAT, 32u);  /* upgrade-on-mount floor */
+    STM_ASSERT_EQ(STM_UB_VERSION, 34u);  /* every uberblock in all four labels, v33 -> v34 */
+    STM_ASSERT_EQ(STM_UB_VERSION_MIN_COMPAT, 34u);  /* no upgrade path */
 
     /* Roster fields are populated. */
     STM_ASSERT_EQ(stm_load_le16(ub.ub_device_count), 1u);
@@ -595,10 +595,10 @@ STM_TEST(pool_sync_open_refuses_wrong_pool_uuid) {
 typedef void (*ub_mutate_fn)(stm_uberblock *ub);
 
 /* Format a fresh pool at `g_tmp_path`, then read the live UB, apply
- * `mutate` to it, and re-write it to the same (label, slot) with a
+ * `mutate` to it, and re-write it to the same slot, every copy, with a
  * fresh csum. A fresh format has exactly ONE populated ring slot
- * (gen=1 → label=1, slot=1); every other slot is zeroed via
- * format_wipe_labels. Tampering the single live slot is therefore
+ * (gen=1: slot 1, a copy in each label); every other slot is zeroed via
+ * format_wipe_labels. Tampering the live slot's copies is therefore
  * sufficient to cover every slot that matters for mount-scan. */
 static void format_and_tamper_live_ub(const char *keyfile, ub_mutate_fn mutate)
 {
@@ -623,18 +623,19 @@ static void format_and_tamper_live_ub(const char *keyfile, ub_mutate_fn mutate)
 
     mutate(&ub);
 
-    /* stm_sb_label_write re-encodes (which recomputes ub_csum) and
+    /* stm_sb_ub_write_copies re-encodes (which recomputes ub_csum) and
      * fsyncs. The tampered UB is bit-perfect and csum-valid. */
-    STM_ASSERT_OK(stm_sb_label_write(d, lbl, slot, &ub));
+    (void)lbl;
+    STM_ASSERT_OK(stm_sb_ub_write_copies(d, slot, &ub));
     stm_bdev_close(d);
 }
 
-static void mutate_version_to_32(stm_uberblock *ub) {
-    ub->ub_version = stm_store_le32(32u);
+static void mutate_version_to_previous(stm_uberblock *ub) {
+    ub->ub_version = stm_store_le32(STM_UB_VERSION - 1u);
 }
 
-static void mutate_version_to_34(stm_uberblock *ub) {
-    ub->ub_version = stm_store_le32(34u);
+static void mutate_version_to_next(stm_uberblock *ub) {
+    ub->ub_version = stm_store_le32(STM_UB_VERSION + 1u);
 }
 
 static void mutate_version_to_4(stm_uberblock *ub) {
@@ -666,45 +667,48 @@ static void mutate_device_id_out_of_range(stm_uberblock *ub) {
     ub->ub_device_id = stm_store_le16(5);
 }
 
-/* 9.8-BE (chunk 7b): the FIRST upgrade-on-mount window. A v32 pool
- * (every internal node's buffer region zero — the strictly-additive
- * claim) MOUNTS under the v33 binary; the ranged gate
- * [STM_UB_VERSION_MIN_COMPAT, STM_UB_VERSION] replaces the old
- * equality. A version PAST the binary's still refuses. */
-STM_TEST(pool_mount_accepts_v32_ub_upgrade_window) {
-    make_tmp("v32_ub");
+/* v34 has no upgrade path (the previous version's pools are re-created):
+ * a pool of the previous version refuses as one, STM_EBADVERSION, not
+ * STM_ENOENT. */
+STM_TEST(pool_mount_refuses_a_pool_of_the_previous_version) {
+    make_tmp("prev_ub");
     char kf[256];
-    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_v32_kf_%d.bin", (int)getpid());
+    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_prev_kf_%d.bin", (int)getpid());
     unlink(kf);
     make_keyfile(kf);
 
-    format_and_tamper_live_ub(kf, mutate_version_to_32);
+    format_and_tamper_live_ub(kf, mutate_version_to_previous);
 
     stm_fs_mount_opts mopts;
     memset(&mopts, 0, sizeof mopts);
     mopts.keyfile_path = kf;
     stm_fs *fs = NULL;
-    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
-    STM_ASSERT(fs != NULL);
-    stm_fs_unmount(fs);
+    STM_ASSERT_ERR(stm_fs_mount(g_tmp_path, &mopts, &fs), STM_EBADVERSION);
+    STM_ASSERT(fs == NULL);
 
     unlink(g_tmp_path);
     unlink(kf);
 }
 
-/* 9.8-BE-flush (chunk 8, R172 F5): the other half of the upgrade
- * window — a v32 pool STAMPS STM_UB_VERSION (33) at its next commit
- * (sync.c builds every UB at the binary's version), read back raw.
- * The live upgrade-on-mount boot proved the mount leg; this pins the
- * stamp leg deterministically. */
-STM_TEST(pool_commit_stamps_current_version_on_v32_pool) {
-    make_tmp("v32_stamp");
+/* A commit stamps STM_UB_VERSION (sync.c builds every UB at the binary's
+ * version) in every copy, read back raw. */
+STM_TEST(pool_commit_stamps_current_version) {
+    make_tmp("cur_stamp");
     char kf[256];
-    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_v32st_kf_%d.bin", (int)getpid());
+    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_curst_kf_%d.bin", (int)getpid());
     unlink(kf);
     make_keyfile(kf);
 
-    format_and_tamper_live_ub(kf, mutate_version_to_32);
+    stm_fs_format_opts fopts;
+    memset(&fopts, 0, sizeof fopts);
+    fopts.device_size_bytes = TEST_DEVICE_BYTES;
+    fopts.bootstrap_size_bytes = TEST_BOOTSTRAP_BYTES;
+    fopts.pool_uuid[0]   = POOL_UUID[0];
+    fopts.pool_uuid[1]   = POOL_UUID[1];
+    fopts.device_uuid[0] = DEVICE_UUID[0];
+    fopts.device_uuid[1] = DEVICE_UUID[1];
+    fopts.keyfile_path   = kf;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
 
     stm_fs_mount_opts mopts;
     memset(&mopts, 0, sizeof mopts);
@@ -724,20 +728,27 @@ STM_TEST(pool_commit_stamps_current_version_on_v32_pool) {
     STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
     STM_ASSERT_EQ((long long)stm_load_le32(ub.ub_version),
                   (long long)STM_UB_VERSION);
+    for (uint32_t li = 0; li < STM_LABELS_PER_DEVICE; li++) {
+        stm_uberblock copy;
+        STM_ASSERT_OK(stm_sb_label_read(d, li, slot, &copy));
+        STM_ASSERT_EQ((long long)stm_load_le32(copy.ub_version),
+                      (long long)STM_UB_VERSION);
+        STM_ASSERT_EQ(stm_load_le64(copy.ub_gen), stm_load_le64(ub.ub_gen));
+    }
     stm_bdev_close(d);
 
     unlink(g_tmp_path);
     unlink(kf);
 }
 
-STM_TEST(pool_mount_refuses_v34_ub_from_the_future) {
-    make_tmp("v34_ub");
+STM_TEST(pool_mount_refuses_a_ub_from_the_future) {
+    make_tmp("next_ub");
     char kf[256];
-    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_v34_kf_%d.bin", (int)getpid());
+    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_next_kf_%d.bin", (int)getpid());
     unlink(kf);
     make_keyfile(kf);
 
-    format_and_tamper_live_ub(kf, mutate_version_to_34);
+    format_and_tamper_live_ub(kf, mutate_version_to_next);
 
     stm_fs_mount_opts mopts;
     memset(&mopts, 0, sizeof mopts);

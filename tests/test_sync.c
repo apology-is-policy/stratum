@@ -188,8 +188,7 @@ STM_TEST(sync_first_commit_writes_uberblock) {
      * at gen=1; auth_gen=1; next commit target is auth+2=3. */
     STM_ASSERT_EQ(info.auth_gen,     1u);
     STM_ASSERT_EQ(info.current_gen,  3u);
-    /* Ring rotation for gen=1: label=1, slot=1. */
-    STM_ASSERT_EQ(info.live_label_idx, 1u);
+    /* Ring rotation for gen=1: slot 1, every label. */
     STM_ASSERT_EQ(info.live_slot_idx,  1u);
     STM_ASSERT(info.alloc_root_paddr != 0);
 
@@ -702,10 +701,9 @@ STM_TEST(sync_xattr_root_csum_tamper_detected) {
                                    (const uint8_t *)"v", 1, 0, NULL));
     STM_ASSERT_OK(stm_sync_commit(s));
 
-    /* Capture the live UB's (label, slot). */
+    /* Capture the live UB's slot. */
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s, &info));
-    uint32_t live_label = info.live_label_idx;
     uint32_t live_slot  = info.live_slot_idx;
 
     teardown(a, s, pool);
@@ -717,14 +715,14 @@ STM_TEST(sync_xattr_root_csum_tamper_detected) {
     STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &bo, &raw));
 
     stm_uberblock ub;
-    STM_ASSERT_OK(stm_sb_label_read(raw, live_label, live_slot, &ub));
+    STM_ASSERT_OK(stm_sb_label_read(raw, 0u, live_slot, &ub));
 
-    /* Tamper one bit of ub_xattr_root.bp_csum. ub_csum auto-recomputes
-     * inside stm_sb_label_write (via stm_ub_encode), so the SB's own
-     * BLAKE3 integrity check passes — only the Merkle recompute at
-     * sync_open should catch it. */
+    /* Tamper one bit of ub_xattr_root.bp_csum in every copy. ub_csum
+     * auto-recomputes inside stm_sb_ub_write_copies (via stm_ub_encode),
+     * so the SB's own BLAKE3 integrity check passes -- only the Merkle
+     * recompute at sync_open should catch it. */
     ub.ub_xattr_root.bp_csum[0] ^= 0x01u;
-    STM_ASSERT_OK(stm_sb_label_write(raw, live_label, live_slot, &ub));
+    STM_ASSERT_OK(stm_sb_ub_write_copies(raw, live_slot, &ub));
     stm_bdev_close(raw);
 
     /* Reopen + try to mount — sync_open's compute_merkle_root MUST
@@ -746,12 +744,13 @@ STM_TEST(sync_xattr_root_csum_tamper_detected) {
 
 STM_TEST(sync_commit_advances_ring_label_slot) {
     /* P5-2: successive commits under the 2-phase protocol land at:
-     *   commit #1 (fresh, 1-phase): final gen=1 → (label 1, slot 1)
-     *   commit #2:                   res=2, final=3 → (label 3, slot 3)
-     *   commit #3:                   res=4, final=5 → (label 1, slot 5)
-     *   commit #4:                   res=6, final=7 → (label 3, slot 7)
-     *   commit #5:                   res=8, final=9 → (label 1, slot 9)
-     * Ring slots for gen = gen%63; labels for gen = gen%4. */
+     *   commit #1 (fresh, 1-phase): final gen=1 -> slot 1
+     *   commit #2:                   res=2, final=3 -> slot 3
+     *   commit #3:                   res=4, final=5 -> slot 5
+     *   commit #4:                   res=6, final=7 -> slot 7
+     *   commit #5:                   res=8, final=9 -> slot 9
+     * Ring slots for gen = gen%63, a copy in every label; each copy of the
+     * final, and of its reservation, decodes as that generation. */
     make_tmp("ring");
     stm_bdev *d = open_fresh_device();
     stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
@@ -769,9 +768,15 @@ STM_TEST(sync_commit_advances_ring_label_slot) {
         STM_ASSERT_OK(stm_sync_info_get(s, &info));
         uint64_t fg = expected_final[i];
         STM_ASSERT_EQ(info.auth_gen,        fg);
-        STM_ASSERT_EQ(info.live_label_idx,  fg % 4u);
         STM_ASSERT_EQ(info.live_slot_idx,   fg % 63u);
         STM_ASSERT_EQ(info.current_gen,     fg + 2u);
+        for (uint64_t g = fg > 1u ? fg - 1u : fg; g <= fg; g++)
+            for (uint32_t li = 0; li < STM_LABELS_PER_DEVICE; li++) {
+                stm_uberblock ub;
+                STM_ASSERT_OK(stm_sb_label_read(d, li, (uint32_t)(g % 63u),
+                                                &ub));
+                STM_ASSERT_EQ(stm_load_le64(ub.ub_gen), g);
+            }
     }
 
     teardown(a, s, pool);
@@ -809,8 +814,7 @@ STM_TEST(sync_ub_alloc_root_matches_tree) {
     STM_ASSERT(info.alloc_root_paddr != tree_root);
 
     stm_uberblock ub;
-    STM_ASSERT_OK(stm_sb_label_read(d, info.live_label_idx,
-                                      info.live_slot_idx, &ub));
+    STM_ASSERT_OK(stm_sb_label_read(d, 0u, info.live_slot_idx, &ub));
     STM_ASSERT_EQ(stm_load_le64(ub.ub_alloc_root.bp_paddr),
                   info.alloc_root_paddr);
     STM_ASSERT_EQ(ub.ub_alloc_root.bp_kind, STM_BPTR_KIND_ALLOC_ROOTS);
@@ -896,8 +900,8 @@ STM_TEST(sync_reserve_across_mount_avoids_overlap) {
 /* ========================================================================= */
 
 /* Read the highest-gen uberblock from disk directly (bypass stm_sync).
- * Scans all 4x63 ring slots and returns the slot with the largest
- * `ub_gen`. The returned uberblock is already BE→host converted. */
+ * Scans all 4x63 ring slots and returns the copy the scan takes, with the
+ * largest `ub_gen`. The returned uberblock is already BE->host converted. */
 static void read_live_ub(const char *path, stm_uberblock *out,
                           uint64_t *out_byte_offset)
 {
@@ -1940,13 +1944,23 @@ static void sync_f1_build(const char *tag)
     stm_bdev_close(d);
 }
 
-/* Faults generation gen's ring slot (label gen % 4, slot gen % 63). */
-static void sync_f1_fault_gen(stm_bdev *d, uint64_t gen, int64_t times)
+/* Faults `copies` of generation gen's ring slot (slot gen % 63, labels 0
+ * up). */
+static void sync_f1_fault_copies(stm_bdev *d, uint64_t gen, uint32_t copies,
+                                 int64_t times)
 {
     uint64_t lo[STM_LABELS_PER_DEVICE];
     STM_ASSERT_OK(stm_label_offsets(stm_bdev_caps_of(d)->size_bytes, lo));
-    uint64_t off = lo[gen % 4u] + (gen % 63u) * (uint64_t)STM_UB_SIZE;
-    stm_bdev_inject_read_range(d, off, off + STM_UB_SIZE, times, STM_EIO);
+    for (uint32_t li = 0; li < copies; li++) {
+        uint64_t off = lo[li] + (gen % 63u) * (uint64_t)STM_UB_SIZE;
+        stm_bdev_inject_read_range(d, off, off + STM_UB_SIZE, times, STM_EIO);
+    }
+}
+
+/* Faults every copy of generation gen's ring slot. */
+static void sync_f1_fault_gen(stm_bdev *d, uint64_t gen, int64_t times)
+{
+    sync_f1_fault_copies(d, gen, STM_UB_COPIES, times);
 }
 
 /* Opens the pool; on STM_OK reports the gen it mounted and the first byte
@@ -1984,7 +1998,7 @@ STM_TEST(sync_mount_rereads_the_newest_ub_after_one_read_error) {
     uint64_t gen = 0;
     uint8_t byte = 0;
     STM_ASSERT_OK(sync_f1_mount(d, &gen, &byte));
-    STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(d), 1u);
+    STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(d), STM_UB_COPIES);
     STM_ASSERT_EQ(gen, 3u);
     STM_ASSERT_EQ(byte, (uint8_t)'B');
     stm_bdev_close(d);
@@ -2003,6 +2017,23 @@ STM_TEST(sync_mount_fails_closed_when_the_newest_ub_stays_unreadable) {
     /* The failed mount wrote nothing over gen 3: a healthy mount has it. */
     d = open_fresh_device();
     STM_ASSERT_OK(sync_f1_mount(d, &gen, &byte));
+    STM_ASSERT_EQ(gen, 3u);
+    STM_ASSERT_EQ(byte, (uint8_t)'B');
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Three copies of the newest uberblock unreadable for good: the fourth
+ * mounts it (sync_mount_fails_closed_when_the_newest_ub_stays_unreadable
+ * is the control, all four). */
+STM_TEST(sync_mount_finds_the_newest_ub_by_any_copy) {
+    sync_f1_build("f1copy");
+    stm_bdev *d = open_fresh_device();
+    sync_f1_fault_copies(d, 3u, STM_UB_COPIES - 1u, -1);
+    uint64_t gen = 0;
+    uint8_t byte = 0;
+    STM_ASSERT_OK(sync_f1_mount(d, &gen, &byte));
+    STM_ASSERT(stm_bdev_inject_read_range_fired(d) >= STM_UB_COPIES - 1u);
     STM_ASSERT_EQ(gen, 3u);
     STM_ASSERT_EQ(byte, (uint8_t)'B');
     stm_bdev_close(d);
@@ -2271,10 +2302,12 @@ STM_TEST(sync_bootstrap_open_says_when_it_cannot_confirm_the_bitmap) {
 }
 
 
-/* o1c round 2 F1: one device refuses only where an acknowledged commit
- * can hide. sync_f1_build's gen 3 is a final (its trees differ from
- * reservation 2's), in label 3. */
-STM_TEST(sync_mount_refuses_only_the_unreadable_label_that_can_hide_a_commit) {
+/* Every generation is in all four labels, so no one unreadable label hides
+ * the newest commit: whichever label the device cannot read, the open
+ * mounts sync_f1_build's gen 3 ('B'). Control:
+ * sync_mount_fails_closed_when_the_newest_ub_stays_unreadable (every copy
+ * of gen 3 unreadable). */
+STM_TEST(sync_mount_one_unreadable_label_hides_no_commit) {
     for (uint32_t L = 0; L < STM_LABELS_PER_DEVICE; L++) {
         sync_f1_build("r2lbl");
         stm_bdev *d = open_fresh_device();
@@ -2284,14 +2317,9 @@ STM_TEST(sync_mount_refuses_only_the_unreadable_label_that_can_hide_a_commit) {
                                    STM_EIO);
         uint64_t gen = 0;
         uint8_t byte = 0;
-        stm_status os = sync_f1_mount(d, &gen, &byte);
-        if (L == 3u) {
-            STM_ASSERT_ERR(os, STM_EIO);
-        } else {
-            STM_ASSERT_OK(os);
-            STM_ASSERT_EQ(gen, 3u);
-            STM_ASSERT_EQ(byte, (uint8_t)'B');
-        }
+        STM_ASSERT_OK(sync_f1_mount(d, &gen, &byte));
+        STM_ASSERT_EQ(gen, 3u);
+        STM_ASSERT_EQ(byte, (uint8_t)'B');
         STM_ASSERT(stm_bdev_inject_read_range_fired(d) >= 1u);
         stm_bdev_close(d);
         unlink(g_tmp_path);

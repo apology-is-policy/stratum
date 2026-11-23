@@ -49,7 +49,7 @@ documents them in depth.
 | Term | Meaning | See |
 |---|---|---|
 | **auth_gen** | Most-recent committed final gen with quorum. 0 on fresh pool. Commits advance by 2; mount-claim by 1. | [07-sb-sync](07-sb-sync.md) |
-| **commit ring** | The circular 63-slot-per-label × 4-label UB rotation. `label = gen % 4; slot = gen % 63`. | [07-sb-sync](07-sb-sync.md) |
+| **commit ring** | The circular 63-slot UB rotation, each generation in all 4 labels (v34). `slot = gen % 63`. | [07-sb-sync](07-sb-sync.md) |
 | **content-quorum** | Byte-level agreement of shared UB fields across ≥quorum devices at `auth_gen`. Violating pools are rejected at mount (R14). | [07-sb-sync](07-sb-sync.md), [10-specs](10-specs.md) |
 | **EvacuationAtomic** | Spec invariant (evac.tla): every block has ≥`MirrorN` replicas on non-REMOVED devices at every reachable state. | [10-specs](10-specs.md) |
 | **gen** | Generation counter — monotonic per commit. 1 for fresh pool's first commit; `auth + 2` for subsequent commits. | [07-sb-sync](07-sb-sync.md) |

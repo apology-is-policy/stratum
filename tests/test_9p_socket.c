@@ -1076,22 +1076,34 @@ static void stamp_pool_version(uint32_t version, bool every)
     stm_bdev_close(d);
 }
 
-/* stratumd on a pool a newer build wrote says so, with the version and the
- * slot, in place of its "unknown format" line. Control: a pool whose every
- * uberblock is below the oldest version this build reads refuses with the
- * same status and gets that line. */
-STM_TEST(p9_socket_stratumd_names_a_newer_builds_pool) {
+/* stratumd on a pool another build wrote says so, with the version and the
+ * slot, in place of its "unknown format" line: a newer build's (one
+ * uberblock, gen 40 in label 0 slot 40), and an older one's (every
+ * uberblock below the oldest version this build reads; the first in scan
+ * order is gen 1's copy in label 0 slot 1). Control: every uberblock at
+ * version 0, no build's, refuses with the same status and gets that line. */
+STM_TEST(p9_socket_stratumd_names_another_builds_pool) {
     char dir[] = "/tmp/stm_socktest_newer_XXXXXX";
     STM_ASSERT_TRUE(mkdtemp(dir) != NULL);
     char fs_path[64];
     snprintf(fs_path, sizeof fs_path, "%s/fs.sock", dir);
     static char err[65536];
-    for (int older = 0; older < 2; older++) {
-        make_tmp(older ? "9p_sock_older" : "9p_sock_newer");
+    char newer_line[160], older_line[160];
+    snprintf(newer_line, sizeof newer_line,
+             "was written by a newer build of Stratum: uberblock version %u in "
+             "label 0 slot 40", STM_UB_VERSION + 1u);
+    snprintf(older_line, sizeof older_line,
+             "was written by an older build of Stratum: uberblock version %u in "
+             "label 0 slot 1", STM_UB_VERSION_MIN_COMPAT - 1u);
+    static const char *const what[] = { "newer", "older", "version 0" };
+    for (int leg = 0; leg < 3; leg++) {
+        make_tmp(leg == 0 ? "9p_sock_newer" : leg == 1 ? "9p_sock_older"
+                                                      : "9p_sock_v0");
         stm_fs_format_opts fopts = default_format_opts();
         STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
-        if (older) stamp_pool_version(STM_UB_VERSION_MIN_COMPAT - 1u, true);
-        else       stamp_pool_version(STM_UB_VERSION + 1u, false);
+        if (leg == 0)      stamp_pool_version(STM_UB_VERSION + 1u, false);
+        else if (leg == 1) stamp_pool_version(STM_UB_VERSION_MIN_COMPAT - 1u, true);
+        else               stamp_pool_version(0u, true);
         atomic_bool stop;
         atomic_init(&stop, false);
         failing_run r;
@@ -1101,21 +1113,15 @@ STM_TEST(p9_socket_stratumd_names_a_newer_builds_pool) {
         r.opts.socket_path = fs_path;
         r.opts.stop_flag   = &stop;
         stm_status rc = STM_OK;
-        stratumd_stderr_of(&r, older ? "an older pool" : "a newer build's pool",
-                           &rc, err, sizeof err);
-        printf("  %s: rc %d, stderr: %s", older ? "older" : "newer", (int)rc, err);
+        stratumd_stderr_of(&r, what[leg], &rc, err, sizeof err);
+        printf("  %s: rc %d, stderr: %s", what[leg], (int)rc, err);
         STM_ASSERT_EQ((int)rc, (int)STM_EBADVERSION);
-        bool named = strstr(err, "was written by a newer build of Stratum: "
-                                 "uberblock version 34 in label 0 slot 40") != NULL;
+        bool newer = strstr(err, newer_line) != NULL;
+        bool older = strstr(err, older_line) != NULL;
         bool generic = strstr(err, "an unknown format") != NULL;
-        STM_ASSERT_EQ(STM_UB_VERSION + 1u, 34u);
-        if (older) {
-            STM_ASSERT(!named);
-            STM_ASSERT(generic);
-        } else {
-            STM_ASSERT(named);
-            STM_ASSERT(!generic);
-        }
+        STM_ASSERT_EQ(newer, leg == 0);
+        STM_ASSERT_EQ(older, leg == 1);
+        STM_ASSERT_EQ(generic, leg == 2);
         unlink(g_tmp_path);
     }
     struct stat st;

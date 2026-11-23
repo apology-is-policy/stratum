@@ -376,7 +376,7 @@ STM_TEST(sync_multi_orphan_ahead_of_quorum_ignored_on_mount) {
      *   1. Fresh pool, commit #1 (fresh 1-phase) → UB at gen=1 on all
      *      3 devices.
      *   2. Manually write a "reservation UB" at gen=2 to devices 0+1
-     *      (2 of 3 = quorum) — using stm_sb_label_write with a
+     *      (2 of 3 = quorum) -- using stm_sb_ub_write_copies with a
      *      prototype from the in-RAM sync state.
      *   3. Manually write a "final UB" at gen=3 to device 0 only
      *      (orphan, below quorum).
@@ -411,7 +411,6 @@ STM_TEST(sync_multi_orphan_ahead_of_quorum_ignored_on_mount) {
     {
         stm_uberblock ub = proto;
         ub.ub_gen = stm_store_le64(2u);
-        uint32_t lbl = (uint32_t)(2u % STM_LABELS_PER_DEVICE);
         uint32_t slot = (uint32_t)(2u % STM_UB_SLOTS_PER_LABEL);
         /* Per-device fields filled in below */
         for (size_t i = 0; i < 2; i++) {
@@ -419,7 +418,7 @@ STM_TEST(sync_multi_orphan_ahead_of_quorum_ignored_on_mount) {
             per.ub_device_id = stm_store_le16((uint16_t)i);
             per.ub_device_uuid[0] = stm_store_le64(DEV_UUID_LO[i]);
             per.ub_device_uuid[1] = stm_store_le64(DEV_UUID_HI);
-            STM_ASSERT_OK(stm_sb_label_write(bds[i], lbl, slot, &per));
+            STM_ASSERT_OK(stm_sb_ub_write_copies(bds[i], slot, &per));
         }
     }
 
@@ -428,9 +427,8 @@ STM_TEST(sync_multi_orphan_ahead_of_quorum_ignored_on_mount) {
         stm_uberblock ub = proto;
         ub.ub_gen = stm_store_le64(3u);
         ub.ub_device_id = stm_store_le16(0);
-        uint32_t lbl = (uint32_t)(3u % STM_LABELS_PER_DEVICE);
         uint32_t slot = (uint32_t)(3u % STM_UB_SLOTS_PER_LABEL);
-        STM_ASSERT_OK(stm_sb_label_write(bds[0], lbl, slot, &ub));
+        STM_ASSERT_OK(stm_sb_ub_write_copies(bds[0], slot, &ub));
     }
 
     stm_sync_close(s);
@@ -483,7 +481,8 @@ STM_TEST(sync_multi_mount_tolerates_minority_content_divergence) {
 
     /* Tamper device 1's alloc_root csum at the gen=1 slot so its
      * shared content diverges from devices 0+2. Recompute ub_csum so
-     * the UB still decodes (stm_sb_label_write handles that). */
+     * the UB still decodes (stm_sb_ub_write_copies handles that), in
+     * every copy. */
     {
         stm_bdev_open_opts bo = stm_bdev_open_opts_default();
         stm_bdev *d = NULL;
@@ -492,7 +491,8 @@ STM_TEST(sync_multi_mount_tolerates_minority_content_divergence) {
         uint32_t lbl, slot;
         STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
         ub.ub_alloc_root.bp_csum[0] ^= 0xffu;
-        STM_ASSERT_OK(stm_sb_label_write(d, lbl, slot, &ub));
+        (void)lbl;
+        STM_ASSERT_OK(stm_sb_ub_write_copies(d, slot, &ub));
         stm_bdev_close(d);
     }
 
@@ -560,7 +560,8 @@ STM_TEST(sync_multi_mount_detects_alloc_root_gen_tamper) {
          * encryption gen (fresh pool's commit ran at gen=1, so
          * 999 is guaranteed wrong). */
         ub.ub_alloc_root_gen = stm_store_le64(999);
-        STM_ASSERT_OK(stm_sb_label_write(d, lbl, slot, &ub));
+        (void)lbl;
+        STM_ASSERT_OK(stm_sb_ub_write_copies(d, slot, &ub));
         stm_bdev_close(d);
     }
 
@@ -621,7 +622,8 @@ STM_TEST(sync_multi_mount_refuses_no_content_quorum) {
         uint32_t lbl, slot;
         STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
         ub.ub_alloc_root.bp_csum[0] ^= (uint8_t)i;   /* 0x01 for i=1, 0x02 for i=2 */
-        STM_ASSERT_OK(stm_sb_label_write(d, lbl, slot, &ub));
+        (void)lbl;
+        STM_ASSERT_OK(stm_sb_ub_write_copies(d, slot, &ub));
         stm_bdev_close(d);
     }
 
@@ -869,25 +871,27 @@ STM_TEST(sync_multi_redundancy_mount_rejects_nonzero_tail_on_none) {
     stm_pool_close(pool);
     close_bdevs(bds);
 
-    /* Directly munge on-disk bytes: for every device's final UB (which
-     * is at label=1 slot=1 per gen=1's ring math), set params[1]=1
-     * (invalid on NONE: tail must be zero) and rebuild ub_csum. */
+    /* Directly munge on-disk bytes: for every copy of every device's
+     * final UB (gen 1: slot 1 of every label), set params[1]=1 (invalid
+     * on NONE: tail must be zero) and rebuild ub_csum. */
     for (size_t i = 0; i < NDEV; i++) {
         FILE *f = fopen(g_paths[i], "rb+");
         STM_ASSERT(f != NULL);
         uint64_t offsets[STM_LABELS_PER_DEVICE];
         STM_ASSERT_OK(stm_label_offsets(TEST_DEVICE_BYTES, offsets));
-        uint64_t slot_off = 0;
-        STM_ASSERT_OK(stm_ub_slot_offset(offsets[1], 1u, &slot_off));
-        uint8_t buf[STM_UB_SIZE];
-        STM_ASSERT_EQ(fseeko(f, (off_t)slot_off, SEEK_SET), 0);
-        STM_ASSERT_EQ(fread(buf, 1, STM_UB_SIZE, f), (size_t)STM_UB_SIZE);
-        /* params field is at offset 425, size 15. Flip params[1]. */
-        buf[425 + 1] ^= 0x01;
-        /* Recompute ub_csum over bytes [0, STM_UB_SIZE-32). */
-        stm_ub_csum(buf, STM_UB_SIZE, buf + (STM_UB_SIZE - 32));
-        STM_ASSERT_EQ(fseeko(f, (off_t)slot_off, SEEK_SET), 0);
-        STM_ASSERT_EQ(fwrite(buf, 1, STM_UB_SIZE, f), (size_t)STM_UB_SIZE);
+        for (uint32_t li = 0; li < STM_UB_COPIES; li++) {
+            uint64_t slot_off = 0;
+            STM_ASSERT_OK(stm_ub_slot_offset(offsets[li], 1u, &slot_off));
+            uint8_t buf[STM_UB_SIZE];
+            STM_ASSERT_EQ(fseeko(f, (off_t)slot_off, SEEK_SET), 0);
+            STM_ASSERT_EQ(fread(buf, 1, STM_UB_SIZE, f), (size_t)STM_UB_SIZE);
+            /* params field is at offset 425, size 15. Flip params[1]. */
+            buf[425 + 1] ^= 0x01;
+            /* Recompute ub_csum over bytes [0, STM_UB_SIZE-32). */
+            stm_ub_csum(buf, STM_UB_SIZE, buf + (STM_UB_SIZE - 32));
+            STM_ASSERT_EQ(fseeko(f, (off_t)slot_off, SEEK_SET), 0);
+            STM_ASSERT_EQ(fwrite(buf, 1, STM_UB_SIZE, f), (size_t)STM_UB_SIZE);
+        }
         fclose(f);
     }
 
@@ -1404,25 +1408,27 @@ STM_TEST(sync_multi_mount_refuses_v5_ub) {
     stm_pool_close(pool);
     close_bdevs(bds);
 
-    /* Rewrite every device's live UB with ub_version=5 (preserving
-     * ub_csum via recompute so only the version check fires, not the
-     * global csum check). */
+    /* Rewrite every copy of every device's live UB (gen 1: slot 1 of
+     * every label) with ub_version=5 (preserving ub_csum via recompute so
+     * only the version check fires, not the global csum check). */
     for (size_t i = 0; i < NDEV; i++) {
         FILE *f = fopen(g_paths[i], "rb+");
         STM_ASSERT(f != NULL);
         uint64_t offsets[STM_LABELS_PER_DEVICE];
         STM_ASSERT_OK(stm_label_offsets(TEST_DEVICE_BYTES, offsets));
-        uint64_t slot_off = 0;
-        STM_ASSERT_OK(stm_ub_slot_offset(offsets[1], 1u, &slot_off));
-        uint8_t buf[STM_UB_SIZE];
-        STM_ASSERT_EQ(fseeko(f, (off_t)slot_off, SEEK_SET), 0);
-        STM_ASSERT_EQ(fread(buf, 1, STM_UB_SIZE, f), (size_t)STM_UB_SIZE);
-        /* ub_version is le32 at offset 8. */
-        buf[8] = 5;
-        buf[9] = 0; buf[10] = 0; buf[11] = 0;
-        stm_ub_csum(buf, STM_UB_SIZE, buf + (STM_UB_SIZE - 32));
-        STM_ASSERT_EQ(fseeko(f, (off_t)slot_off, SEEK_SET), 0);
-        STM_ASSERT_EQ(fwrite(buf, 1, STM_UB_SIZE, f), (size_t)STM_UB_SIZE);
+        for (uint32_t li = 0; li < STM_UB_COPIES; li++) {
+            uint64_t slot_off = 0;
+            STM_ASSERT_OK(stm_ub_slot_offset(offsets[li], 1u, &slot_off));
+            uint8_t buf[STM_UB_SIZE];
+            STM_ASSERT_EQ(fseeko(f, (off_t)slot_off, SEEK_SET), 0);
+            STM_ASSERT_EQ(fread(buf, 1, STM_UB_SIZE, f), (size_t)STM_UB_SIZE);
+            /* ub_version is le32 at offset 8. */
+            buf[8] = 5;
+            buf[9] = 0; buf[10] = 0; buf[11] = 0;
+            stm_ub_csum(buf, STM_UB_SIZE, buf + (STM_UB_SIZE - 32));
+            STM_ASSERT_EQ(fseeko(f, (off_t)slot_off, SEEK_SET), 0);
+            STM_ASSERT_EQ(fwrite(buf, 1, STM_UB_SIZE, f), (size_t)STM_UB_SIZE);
+        }
         fclose(f);
     }
 
@@ -1694,7 +1700,7 @@ STM_TEST(sync_multi_add_device_mid_session_survives_remount) {
     STM_ASSERT_OK(stm_sync_commit(s));
 
     /* Every device's new UB carries device_count=3 + advanced roster
-     * hash. Final gen is 3; (label, slot) = (3 % 4, 3 % 63) = (3, 3). */
+     * hash. Final gen is 3, in slot 3 of every label; read label 3's. */
     for (size_t i = 0; i < NDEV; i++) {
         stm_uberblock ub_post;
         STM_ASSERT_OK(stm_sb_label_read(bds[i], 3u, 3u, &ub_post));
@@ -3474,9 +3480,11 @@ STM_TEST(sync_multi_a_device_that_refuses_is_not_a_stale_vote) {
         STM_ASSERT_OK(stm_label_offsets(TEST_DEVICE_BYTES, lo));
         uint8_t zeros[STM_UB_SIZE];
         memset(zeros, 0, sizeof zeros);
-        STM_ASSERT_EQ(fseeko(f, (off_t)(lo[5u % 4u] + 5u * STM_UB_SIZE),
-                             SEEK_SET), 0);
-        STM_ASSERT_EQ(fwrite(zeros, 1, sizeof zeros, f), sizeof zeros);
+        for (uint32_t li = 0; li < STM_UB_COPIES; li++) {
+            STM_ASSERT_EQ(fseeko(f, (off_t)(lo[li] + 5u * STM_UB_SIZE),
+                                 SEEK_SET), 0);
+            STM_ASSERT_EQ(fwrite(zeros, 1, sizeof zeros, f), sizeof zeros);
+        }
         fclose(f);
     }
     wipe_device_labels(g_paths[1]);
@@ -3484,8 +3492,11 @@ STM_TEST(sync_multi_a_device_that_refuses_is_not_a_stale_vote) {
     open_bdevs(bds);
     uint64_t lo[STM_LABELS_PER_DEVICE];
     STM_ASSERT_OK(stm_label_offsets(TEST_DEVICE_BYTES, lo));
-    uint64_t off4 = lo[4u % 4u] + 4u * (uint64_t)STM_UB_SIZE;
-    stm_bdev_inject_read_range(bds[0], off4, off4 + STM_UB_SIZE, -1, STM_EIO);
+    for (uint32_t li = 0; li < STM_UB_COPIES; li++) {
+        uint64_t off4 = lo[li] + 4u * (uint64_t)STM_UB_SIZE;
+        stm_bdev_inject_read_range(bds[0], off4, off4 + STM_UB_SIZE, -1,
+                                   STM_EIO);
+    }
     /* The premise, device by device. */
     stm_uberblock ub;
     STM_ASSERT_ERR(stm_sb_mount_scan(bds[0], &ub, NULL, NULL), STM_EIO);

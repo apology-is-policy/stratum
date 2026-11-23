@@ -112,11 +112,13 @@ The minimum device is 8 MiB. The block size is fixed at 4 KiB.
 There is no separate superblock. The root of the filesystem is a 4 KiB **uberblock**, little-endian,
 with magic `STRATUM2` and a BLAKE3-256 self-checksum.
 
-- Each label holds 63 ring slots. Generation `g` goes to label `g % 4`, slot `g % 63`, which gives 252
-  positions. A commit spends two generations, so a device retains about 126 commits of history
-  (*derived*).
-- One uberblock goes to one slot per device per generation. Redundancy comes from history and from
-  other devices, not from writing one generation to all four labels.
+- Each label holds 63 ring slots. Generation `g` goes to slot `g % 63` of all four labels (four copies,
+  since v34), which gives 63 positions. A commit spends two generations, so a device retains about 31
+  commits of history (*derived*).
+- A device confirms an uberblock write only when all four copies were written and flushed, so one copy
+  holding an older generation, or reading back blank, proves the device never confirmed the slot's
+  generation. One unreadable copy does not hide a generation. A label region that refuses writes leaves
+  the device unmountable read-write (read-only mounts still work).
 - Mount scans every slot and takes the highest valid generation per device. Across devices, the
   authoritative generation is the quorum-th highest, with quorum `floor(live / 2) + 1` and a check that
   a quorum of devices at that generation hold identical content.
@@ -336,7 +338,7 @@ read again per snapshot; there is no deduplication of the walk.
 | Key schema, repair log | One 128 KiB leaf, when dirty |
 | Allocator statistics | O(allocator entries), in RAM, at least twice per commit |
 
-A minimal metadata commit writes about 212 KiB (*derived*): two uberblocks, the bootstrap copy, the dataset index and
+A minimal metadata commit writes about 236 KiB (*derived*): two uberblocks of four copies each, the bootstrap copy, the dataset index and
 one engine node. A data write adds at least 256 KiB for the allocator and its roots.
 
 ---
@@ -450,7 +452,7 @@ to the filesystem. `corvus`, part of the Thylacine OS, seals per-user dataset ke
 
 ### 9.3 Plaintext on disk
 
-- **Uberblocks,** up to 252 historical copies: UUIDs, generation, device count, capacity, free space, inode, dataset and snapshot counters,
+- **Uberblocks,** up to 63 historical generations, four copies each: UUIDs, generation, device count, capacity, free space, inode, dataset and snapshot counters,
   root addresses and checksums, scrub state.
 - **Bootstrap:** the node allocation bitmap.
 - **Key schema:** dataset ids, key ids, states, wrapper tags, corvus dataset paths (which can name users), wrapped keys.

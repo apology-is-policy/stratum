@@ -9,6 +9,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -139,7 +140,7 @@ static bool inject_read_range(stm_bdev *d, uint64_t offset, size_t len,
                               rr_fault *f)
 {
     uint32_t n = (uint32_t)atomic_load_explicit(&d->rr_n, memory_order_acquire);
-    for (uint32_t i = 0; i < n && i < 4u; i++) {
+    for (uint32_t i = 0; i < n && i < STM_BDEV_INJECT_READ_RANGES; i++) {
         uint64_t lo = atomic_load_explicit(&d->rr_lo[i], memory_order_relaxed);
         uint64_t hi = atomic_load_explicit(&d->rr_hi[i], memory_order_relaxed);
         if (offset >= hi || offset + len <= lo) continue;
@@ -358,7 +359,13 @@ static void rr_arm(stm_bdev *d, uint64_t lo, uint64_t hi, int64_t times,
 {
     if (!d || lo >= hi) return;
     uint32_t n = (uint32_t)atomic_load_explicit(&d->rr_n, memory_order_relaxed);
-    if (n >= 4u) return;
+    /* A test that arms more than the injector holds would run without the
+     * fault it asked for and could pass for the wrong reason: stop it. */
+    if (n >= STM_BDEV_INJECT_READ_RANGES) {
+        fprintf(stderr, "stm_bdev_inject_read_range: more than %u ranges "
+                "armed\n", STM_BDEV_INJECT_READ_RANGES);
+        abort();
+    }
     atomic_store_explicit(&d->rr_lo[n], lo, memory_order_relaxed);
     atomic_store_explicit(&d->rr_hi[n], hi, memory_order_relaxed);
     atomic_store_explicit(&d->rr_from[n], from, memory_order_relaxed);

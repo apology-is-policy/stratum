@@ -924,7 +924,7 @@ From earlier Phase 0 docs and sections:
 
 Decisions taken in this section:
 
-- **Ring of 64 uberblock slots per label**, per device; 4 labels per device for redundancy against localized damage. Total: 256 uberblock slots per device.
+- **Ring of 64 uberblock slots per label**, per device; 4 labels per device for redundancy against localized damage. Total: 256 uberblock slots per device. (As built since v34: slots 0..62 are the commit ring and slot 63 the config mirror; each generation's uberblock goes to the same slot of all four labels, so a device holds 63 generations, four copies each; section 5.3.3.)
 - **Quorum = majority of the roster at commit time**. Device add / remove advances the roster hash; quorum is computed against the active roster.
 - **Label placement**: byte 0, 256 KiB, 256 KiB-before-end, end. 4 × 256 KiB = 1 MiB reserved per device for labels.
 - **BLAKE3-256 everywhere**: uberblock csum, Merkle root.
@@ -987,6 +987,7 @@ Commits advance through the ring round-robin:
 - Commit N writes to slot `N % 63`.
 - Mount computes "current commit" = highest `gen` that both validates (csum) and has quorum across devices.
 - Recent history (last 63 commits) is preserved for forensics and emergency rollback.
+- **As built** (v34, operator vote 151): generation `g`'s uberblock goes to slot `g % 63` of all four labels (`stm_sb_ub_write_copies`: four writes, one fsync), as ZFS writes each uberblock to every label. A device confirms the write only when all four copies were written and the fsync succeeded, so copies of one generation differ only after a write that failed, and one copy at a slot holding an older generation, or reading back blank, proves this device never confirmed the slot's generation; the mount refuses rather than roll back only when every copy of a successor slot is torn or unreadable (section 5.5.3). The cost: a label sector that refuses writes fails every commit whose reservation or final lands on its slot, and a label region that refuses writes leaves the device unmountable read-write (read-only mounts still work); requiring fewer copies would need a same-generation discriminator in the uberblock. The ring holds 63 generations, about 31 commits (a reservation and a final each). v33 put generation `g` in one label (`g % 4`), 252 generations of one copy each; v34 reads no earlier pool.
 
 The ring size (63) is chosen so that a pool-wide panic has a generous window of recoverable history. ZFS uses 128; our 63 is a compromise between recovery window and per-device space.
 
@@ -1105,6 +1106,7 @@ On mount, Stratum reads every device's labels and collects valid uberblocks (csu
 - The highest gen with quorum is the "authoritative gen."
 - Any device at a lower gen is `BEHIND`.
 - Any device at a higher gen than the authoritative gen had a partial commit — its state is discarded and it reconciles to the authoritative gen.
+- **As built**, per device (`stm_sb_mount_scan_ex`): a generation counts at its ring slot in any label; among differing copies of one generation the first in label order is taken. A device's best is not taken while the slot of best+1 or best+2, where the only newer commit could be, is unsettled and a copy stays unreadable (STM_EIO; on a one-device pool, best+1 only when best may be a reservation): the slot settles when one copy holds an older generation or reads back blank (a generation the device confirmed is in all four). Any copy holding a newer build's uberblock refuses the pool (section 5.4.1).
 
 #### 5.5.4 Quorum under roster changes
 
@@ -1199,7 +1201,7 @@ Uberblocks are 4 KiB. Modern NVMe guarantees 4 KiB atomic writes; older hardware
 
 - Every uberblock is csummed (`ub_csum`: BLAKE3-256 of the bytes before it, [0, 4064); section 5.4.1).
 - On mount, csum mismatch → uberblock is discarded.
-- The ring has 63 slots; we won't run out of valid uberblocks unless something catastrophic happened.
+- The ring has 63 slots, each generation in all four labels (as built, v34); we won't run out of valid uberblocks unless something catastrophic happened.
 
 For pre-NVMe hardware without 4 KiB atomicity:
 - Coordinator could write the uberblock with a tagged structure (head/tail copies of the gen) and the csum; a torn write shows up as head/tail mismatch *and* csum mismatch.

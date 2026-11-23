@@ -50,11 +50,16 @@ uint32_t stm_bdev_inject_fired_count(const struct stm_bdev *d);
 void     stm_bdev_inject_read_fail_after(struct stm_bdev *d, int64_t n_reads);
 uint32_t stm_bdev_inject_read_fired_count(const struct stm_bdev *d);
 
+/* Read ranges armed at once (stm_bdev_inject_read_range*): enough for
+ * every copy of an uberblock slot to carry several faults. */
+#define STM_BDEV_INJECT_READ_RANGES 32u
+
 /* A sector that fails: the next `times` reads meeting the device bytes
  * [lo, hi) (every one, when times < 0) answer `answer` without reading,
  * or with STM_OK, read and come back with one byte inverted (the range's
- * first byte inside the read). Up to four ranges, a fifth ignored; armed
- * by one thread while no read runs.
+ * first byte inside the read). The first range armed that a read meets
+ * answers it. Up to STM_BDEV_INJECT_READ_RANGES ranges (arming one more
+ * aborts the process); armed by one thread while no read runs.
  * _clear disarms them all; _fired counts the faulted reads. Fires only in
  * a build with testing hooks. */
 void     stm_bdev_inject_read_range(struct stm_bdev *d, uint64_t lo,
@@ -64,7 +69,7 @@ void     stm_bdev_inject_read_range_clear(struct stm_bdev *d);
 uint32_t stm_bdev_inject_read_range_fired(const struct stm_bdev *d);
 
 /* Two reads that come back wrong with no error, for a range armed the
- * same way (each takes one of the four): _zero reads and hands back all
+ * same way (each takes one of the ranges): _zero reads and hands back all
  * zero bytes (a lost mapping); _from is misdirected, reading the same
  * length `from - lo` bytes away, so [lo, hi) reads back the bytes at
  * [from, from + hi - lo). Fire only in a build with testing hooks. */

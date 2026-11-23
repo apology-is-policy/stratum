@@ -325,9 +325,11 @@ static-asserted equal to the wire ops). The load-bearing pieces:
   `[STM_UB_VERSION_MIN_COMPAT=32, 33]` mounts (upgrade-on-mount — a
   v32 pool's buffer regions are all zero; it stamps v33 at its next
   commit), older/newer refuses (`sb/uberblock.c`). Arc-approved
-  (Thylacine `docs/CONCURRENT-FS.md` §5). Pinned by
-  `pool_mount_accepts_v32_ub_upgrade_window` /
-  `pool_mount_refuses_v34_ub_from_the_future`.
+  (Thylacine `docs/CONCURRENT-FS.md` section 5). v34 (each generation's
+  uberblock in all four labels, `07-sb-sync.md`) closed the window: it
+  reads its own version only, pinned by
+  `pool_mount_refuses_a_pool_of_the_previous_version` /
+  `pool_mount_refuses_a_ub_from_the_future`.
 - **Verify** (`eng_verify_subtree`) decodes buffer-aware — and since
   chunk 8 (R172 F2) runs the SAME (target_child, seq) ORDER gate the
   load path does: pivots are collected as borrowed in-buffer pointers
@@ -496,8 +498,8 @@ mid-batch inline child cascade → leaf split → child eager split →
 peel absorbed into the root family, then commit + reopen), the three
 OOM tests above, `engine_serial_write_refuses_buffered_path`,
 `engine_verify_rejects_disordered_buffer`, and
-`pool_commit_stamps_current_version_on_v32_pool` (the R172 F5 stamp
-leg — the live upgrade boot proved the mount leg).
+`pool_commit_stamps_current_version` (the R172 F5 stamp leg, now on a
+v34 pool: v34 has no upgrade window).
 
 ### The lock-free writer path (9.8-BE-prepend, chunk 9)
 

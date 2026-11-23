@@ -123,10 +123,9 @@ typedef struct {
     /* Highest gen with quorum on-disk at the last open/mount. */
     uint64_t mount_max_durable_gen;
 
-    /* Most-recent final UB's ring location. Same (label, slot) across
-     * every pool device (rotation is gen-indexed, and per-device rings
-     * are synchronized at every commit). */
-    uint32_t live_label_idx;
+    /* Most-recent final UB's ring slot. The same slot in every label of
+     * every pool device (rotation is gen-indexed, each label holds a
+     * copy, and per-device rings are synchronized at every commit). */
     uint32_t live_slot_idx;
 
     /* Allocator-tree root paddr recorded in the last committed uberblock.

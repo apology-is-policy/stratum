@@ -13433,7 +13433,7 @@ STM_TEST(fs_a_bad_sector_with_label_0s_mirror_slot_unreadable_is_the_records) {
 
 /* o1c round 2 F1: a mount that refuses says which slot. The hook finds
  * the newest generation (a final, checked) before any fault and makes its
- * slot unreadable for the mount's own scan. */
+ * slot, every copy, unreadable for the mount's own scan. */
 static uint64_t r2_newest_gen;
 static uint64_t r2_newest_off;
 static bool     r2_newest_is_final;
@@ -13447,15 +13447,17 @@ static void r2_fault_newest_hook(struct stm_bdev *d, int phase, void *arg)
     STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
     r2_newest_gen = stm_load_le64(ub.ub_gen);
     uint64_t g = r2_newest_gen - 1u;
-    STM_ASSERT_OK(stm_sb_label_read(d, (uint32_t)(g % 4u),
-                                    (uint32_t)(g % 63u), &prev));
+    STM_ASSERT_OK(stm_sb_label_read(d, 0u, (uint32_t)(g % 63u), &prev));
     r2_newest_is_final = memcmp(prev.ub_merkle_root, ub.ub_merkle_root,
                                 sizeof ub.ub_merkle_root) != 0;
     uint64_t lo[STM_LABELS_PER_DEVICE];
     STM_ASSERT_OK(stm_label_offsets(stm_bdev_caps_of(d)->size_bytes, lo));
-    r2_newest_off = lo[lbl] + (uint64_t)slot * STM_UB_SIZE;
-    stm_bdev_inject_read_range(d, r2_newest_off, r2_newest_off + STM_UB_SIZE,
-                               -1, STM_EIO);
+    (void)lbl;
+    r2_newest_off = lo[0] + (uint64_t)slot * STM_UB_SIZE;
+    for (uint32_t li = 0; li < STM_UB_COPIES; li++) {
+        uint64_t off = lo[li] + (uint64_t)slot * STM_UB_SIZE;
+        stm_bdev_inject_read_range(d, off, off + STM_UB_SIZE, -1, STM_EIO);
+    }
 }
 
 STM_TEST(fs_mount_names_the_uberblock_slot_it_refuses_on) {
@@ -13484,7 +13486,7 @@ STM_TEST(fs_mount_names_the_uberblock_slot_it_refuses_on) {
     STM_ASSERT_ERR(ms, STM_EIO);
     STM_ASSERT(fs == NULL);
     STM_ASSERT_EQ(why.gen, r2_newest_gen);
-    STM_ASSERT_EQ(why.label_idx, (uint32_t)(r2_newest_gen % 4u));
+    STM_ASSERT_EQ(why.label_idx, 0u);   /* the first copy unreadable */
     STM_ASSERT_EQ(why.slot_idx, (uint32_t)(r2_newest_gen % 63u));
     STM_ASSERT_EQ(why.byte_offset, r2_newest_off);
     STM_ASSERT_EQ(why.best_gen, r2_newest_gen - 1u);
@@ -13503,7 +13505,8 @@ STM_TEST(fs_mount_names_the_uberblock_slot_it_refuses_on) {
 }
 
 /* o1c round 3: the one-device rule on the path stratumd mounts through.
- * The hook, at r3_phase, faults slot(newest+k) for each k in r3_ks. */
+ * The hook, at r3_phase, faults slot(newest+k), every copy, for each k in
+ * r3_ks. */
 static uint64_t r3_newest;
 static uint64_t r3_ks[2];
 static size_t r3_nks;
@@ -13521,8 +13524,10 @@ static void r3_fault_after_newest_hook(struct stm_bdev *d, int phase,
     STM_ASSERT_OK(stm_label_offsets(stm_bdev_caps_of(d)->size_bytes, lo));
     for (size_t i = 0; i < r3_nks; i++) {
         uint64_t g = r3_newest + r3_ks[i];
-        uint64_t off = lo[g % 4u] + (g % 63u) * (uint64_t)STM_UB_SIZE;
-        stm_bdev_inject_read_range(d, off, off + STM_UB_SIZE, -1, STM_EIO);
+        for (uint32_t li = 0; li < STM_UB_COPIES; li++) {
+            uint64_t off = lo[li] + (g % 63u) * (uint64_t)STM_UB_SIZE;
+            stm_bdev_inject_read_range(d, off, off + STM_UB_SIZE, -1, STM_EIO);
+        }
     }
 }
 
@@ -13607,8 +13612,7 @@ STM_TEST(fs_mount_takes_a_noop_final_past_its_unreadable_successor) {
     uint32_t lbl = 0, slot = 0;
     STM_ASSERT_OK(stm_sb_mount_scan(d, &nu, &lbl, &slot));
     uint64_t n = stm_load_le64(nu.ub_gen);
-    STM_ASSERT_OK(stm_sb_label_read(d, (uint32_t)((n - 1u) % 4u),
-                                    (uint32_t)((n - 1u) % 63u), &pu));
+    STM_ASSERT_OK(stm_sb_label_read(d, 0u, (uint32_t)((n - 1u) % 63u), &pu));
     STM_ASSERT_EQ(memcmp(nu.ub_merkle_root, pu.ub_merkle_root,
                          sizeof nu.ub_merkle_root), 0);
     STM_ASSERT_EQ(stm_load_le64(nu.ub_repair_log_root_gen), n);

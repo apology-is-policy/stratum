@@ -365,7 +365,8 @@ Two residuals (Area F focused audit, P3, both v1.0-acceptable):
   fallback), `test_fs.c::fs_a_bad_sector_with_label_0s_mirror_slot_unreadable_is_the_records`
   (the device probe's label loop). Round 2:
   `sb_mount_scan_one_device_refuses_where_a_newer_commit_may_be`,
-  `sync_mount_refuses_only_the_unreadable_label_that_can_hide_a_commit`,
+  `sync_mount_one_unreadable_label_hides_no_commit` (v34: was the label that
+  could hide one),
   `sync_mount_skips_the_unreadable_slot_of_a_generation_never_written` (the
   one-device rule), `sync_bootstrap_open_answers_eio_for_what_the_device_cannot_read`
   and `test_fs.c::fs_mount_names_the_uberblock_slot_it_refuses_on` (the
@@ -413,20 +414,22 @@ stderr, at most 32 per request kind over the process.
   on a read or write (the device heals before the commit wedges), so it bites a
   genuinely-dead device, a failed flush, and a read or write the device fails
   three times.
-- **One copy of each generation's uberblock per device.** A commit writes its
-  final uberblock to one ring slot (label `gen % 4`, slot `gen % 63`), so one
-  unreadable sector there hides the newest commit; the mount then fails closed
-  rather than roll back (`07-sb-sync.md`), and stratumd names the slot. On one
+- **A successor slot whose every copy is torn or unreadable.** A commit
+  writes its final uberblock to slot `gen % 63` of all four labels (since
+  v34; before, to one label, so one unreadable sector hid the newest
+  commit). When no copy of the slot after the newest readable generation
+  holds an older generation or reads back blank and one stays unreadable,
+  the mount fails closed rather than roll back (`07-sb-sync.md`), and
+  stratumd names the copy. On one
   device it refuses at the slot after the newest generation only when that
   generation may be a reservation (a claim, which a session that crashed
   before its first commit leaves, reads as one); a refused mount writes
-  nothing, so it goes on refusing while that sector stays unreadable.
+  nothing, so it goes on refusing while that copy stays unreadable.
   Recovery is then the operator's explicit choice to accept losing at most
-  the newest commit (overwrite that slot with zeros; it then reads back zero
-  and the mount takes the generation before). Writing each generation to two
-  or more labels (ZFS writes all four) would let it mount, and an explicit
-  opt-in mount could take the newest readable generation; both are enqueued
-  for the operator. A multi-device pool can still roll back a commit
+  the newest commit (overwrite a copy of that slot with zeros; it then reads
+  back zero and the mount takes the generation before). An explicit opt-in
+  mount could take the newest readable generation; it is enqueued for the
+  operator. A multi-device pool can still roll back a commit
   acknowledged by exactly a quorum when one of those devices refuses
   (enqueued).
 - **The device probe and a host page cache.** Under QEMU with

@@ -22,12 +22,12 @@
  *     stm_alloc_load_tree_at. This is the ub_alloc_root → durable
  *     handoff from chunk 5d's user_data slot.
  *
- * Ring rotation (MVP):
- *   label = gen % STM_LABELS_PER_DEVICE   (0..3)
- *   slot  = gen % STM_UB_SLOTS_PER_LABEL  (0..62)
- * Consecutive commits land on different labels. After
- * 4 × 63 = 252 commits the (label, slot) pair wraps, but by then the
- * history is dense and mount-time selection always picks the newest.
+ * Ring rotation:
+ *   slot = gen % STM_UB_SLOTS_PER_LABEL  (0..62), in every label
+ * Each generation's uberblock has a copy in each of the four labels
+ * (stm_sb_ub_write_copies), so one damaged label or one failed read hides
+ * no commit. The ring holds 63 generations; mount-time selection picks
+ * the newest.
  */
 
 #include <stratum/sync.h>
@@ -371,8 +371,8 @@ struct stm_sync {
     _Atomic uint64_t current_gen;
     uint64_t   mount_max_durable;   /* auth observed at mount time */
 
-    /* Most recent final UB's ring location (all devices synchronized). */
-    uint32_t   live_label_idx;
+    /* Most recent final UB's ring slot (all devices synchronized; every
+     * label holds a copy). */
     uint32_t   live_slot_idx;
 
     /* Allocator-tree root paddr recorded in the last committed
@@ -1309,8 +1309,8 @@ static stm_status compute_merkle_root(const uint8_t main_csum[32],
 /* Ring rotation.                                                             */
 /* ========================================================================= */
 
-/* stm_sb_ring_label_for_gen / stm_sb_ring_slot_for_gen (super.h): the
- * mount scan shares the placement to know where a newer commit can be. */
+/* stm_sb_ring_slot_for_gen (super.h): the mount scan shares the placement
+ * to know where a newer commit can be. */
 
 /* ========================================================================= */
 /* Uberblock construction.                                                    */
@@ -1644,7 +1644,9 @@ static inline size_t sync_quorum_n(const stm_sync *s)
 }
 
 /* Write an uberblock carrying `shared` content to every device in the
- * pool at (label, slot). The per-device ub_device_id / ub_device_uuid
+ * pool at ring slot `slot`, every copy (stm_sb_ub_write_copies: a device
+ * confirms only when STM_UB_COPIES_REQUIRED copies are durable). The
+ * per-device ub_device_id / ub_device_uuid
  * / class / role fields are filled from the pool's roster entry for
  * each target. Returns STM_OK if ≥ quorum devices confirmed the write
  * (successful fsync); STM_EQUORUM if not.
@@ -1660,7 +1662,7 @@ static inline size_t sync_quorum_n(const stm_sync *s)
  * before writing each device's UB. */
 static stm_status write_ub_to_all_devices(stm_sync *s,
                                             const stm_uberblock *prototype_ub,
-                                            uint32_t label, uint32_t slot)
+                                            uint32_t slot)
 {
     size_t n = stm_pool_device_count(s->pool);
     size_t confirmed = 0;
@@ -1691,7 +1693,7 @@ static stm_status write_ub_to_all_devices(stm_sync *s,
         }
         ub.ub_device_id = stm_store_le16((uint16_t)i);
 
-        stm_status sw = stm_sb_label_write(d, label, slot, &ub);
+        stm_status sw = stm_sb_ub_write_copies(d, slot, &ub);
         if (sw == STM_OK) {
             confirmed++;
         } else if (sw == STM_EROFS) {
@@ -2912,24 +2914,21 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
                          /*cas_index_gen=*/     s2->cas_index_root_gen,
                          /*merkle_root=*/       ub.ub_merkle_root,
                          &astats_claim);
-        uint32_t lbl  = stm_sb_ring_label_for_gen(auth_gen + 1);
         uint32_t slot = stm_sb_ring_slot_for_gen(auth_gen + 1);
-        stm_status cw = write_ub_to_all_devices(s2, &claim_prototype, lbl, slot);
+        stm_status cw = write_ub_to_all_devices(s2, &claim_prototype, slot);
         if (cw == STM_OK) {
             s2->auth_gen       = auth_gen + 1;
             s2->current_gen    = auth_gen + 3;
-            s2->live_label_idx = lbl;
             s2->live_slot_idx  = slot;
         } else if (cw == STM_EROFS) {
             /* RO pool: leave auth_gen at the durable value (pre-claim).
-             * Remember the canonical UB's (label, slot) for info.
+             * Remember the canonical UB's slot for info.
              * R15 F5 P2: persist the RO state so mutating APIs
              * (reserve_mirror, mirror_write, commit) short-circuit
              * instead of reaching the bdev and getting STM_EROFS
              * after having done in-RAM mutation. */
             s2->read_only      = true;
             uint64_t canon_gen = stm_load_le64(ub.ub_gen);
-            s2->live_label_idx = stm_sb_ring_label_for_gen(canon_gen);
             s2->live_slot_idx  = stm_sb_ring_slot_for_gen(canon_gen);
         } else {
             stm_sync_close(s2);
@@ -3487,10 +3486,8 @@ stm_status stm_sync_commit(stm_sync *s)
      * strictly before the final UB write — the same durable ordering as
      * the old position (reservation durable-before final, quorum.tla). */
     if (!is_fresh) {
-        uint32_t res_label = stm_sb_ring_label_for_gen(reservation_gen);
         uint32_t res_slot  = stm_sb_ring_slot_for_gen(reservation_gen);
-        stm_status rw = write_ub_to_all_devices(s, &res_prototype,
-                                                    res_label, res_slot);
+        stm_status rw = write_ub_to_all_devices(s, &res_prototype, res_slot);
         if (rw != STM_OK) {
             (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
             { out_rc = rw; goto out_cancel; }
@@ -3551,10 +3548,8 @@ stm_status stm_sync_commit(stm_sync *s)
         if (ai) stm_bootstrap_commit_defer_finalize(stm_alloc_bootstrap(ai));
     }
 
-    uint32_t fin_label = stm_sb_ring_label_for_gen(target_gen);
     uint32_t fin_slot  = stm_sb_ring_slot_for_gen(target_gen);
-    stm_status fw = write_ub_to_all_devices(s, &fin_prototype,
-                                                fin_label, fin_slot);
+    stm_status fw = write_ub_to_all_devices(s, &fin_prototype, fin_slot);
     if (fw != STM_OK) {
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         { out_rc = fw; goto out_cancel; }
@@ -3588,7 +3583,6 @@ stm_status stm_sync_commit(stm_sync *s)
      * tree). */
     s->auth_gen              = target_gen;
     s->current_gen           = target_gen + 2;
-    s->live_label_idx        = fin_label;
     s->live_slot_idx         = fin_slot;
     s->alloc_root_paddr      = roots_paddr;
     s->alloc_root_gen        = roots_gen;
@@ -3678,7 +3672,6 @@ stm_status stm_sync_info_get(const stm_sync *s, stm_sync_info *out)
     out->auth_gen              = s->auth_gen;
     out->current_gen           = s->current_gen;
     out->mount_max_durable_gen = s->mount_max_durable;
-    out->live_label_idx        = s->live_label_idx;
     out->live_slot_idx         = s->live_slot_idx;
     out->alloc_root_paddr      = s->alloc_root_paddr;
 

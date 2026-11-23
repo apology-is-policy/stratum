@@ -1758,12 +1758,13 @@ static void say_why_mount_failed(const stm_stratumd_opts *opts, stm_status rc)
 }
 
 /* A mount that stops rather than roll back past a commit it cannot read, or
- * past a newer build's, says where that uberblock is, so the slot can be found
- * and dealt with. Returns whether it said anything. */
+ * past a newer build's, or that finds only an older build's pool, says where
+ * that uberblock is, so the slot can be found and dealt with. Returns whether
+ * it said anything. */
 static bool say_scan_refusal(const stm_stratumd_opts *opts, stm_status rc,
                              const stm_sb_scan_refusal *why)
 {
-    if (rc == STM_EBADVERSION && why->version != 0) {
+    if (rc == STM_EBADVERSION && why->version > STM_UB_VERSION) {
         fprintf(stderr, "stratumd: %s was written by a newer build of Stratum: uberblock "
                         "version %u in label %u slot %u (byte offset %llu); this build "
                         "reads versions %u to %u and does not mount it\n",
@@ -1772,11 +1773,22 @@ static bool say_scan_refusal(const stm_stratumd_opts *opts, stm_status rc,
                 (unsigned)STM_UB_VERSION);
         return true;
     }
+    if (rc == STM_EBADVERSION && why->version != 0) {
+        fprintf(stderr, "stratumd: %s was written by an older build of Stratum: uberblock "
+                        "version %u in label %u slot %u (byte offset %llu); this build "
+                        "reads versions %u to %u and cannot upgrade it: re-create the "
+                        "pool\n",
+                opts->fs_path, why->version, why->label_idx, why->slot_idx,
+                (unsigned long long)why->byte_offset, (unsigned)STM_UB_VERSION_MIN_COMPAT,
+                (unsigned)STM_UB_VERSION);
+        return true;
+    }
     if (rc != STM_EIO || why->gen == 0) return false;
     fprintf(stderr, "stratumd: %s: the newest commit may be generation %llu, in uberblock "
-                    "label %u slot %u (byte offset %llu), which the device cannot read; "
-                    "the mount stops rather than go back to generation %llu\n",
-            opts->fs_path, (unsigned long long)why->gen, why->label_idx, why->slot_idx,
+                    "slot %u, whose copy in label %u (byte offset %llu) the device cannot "
+                    "read and whose other copies do not rule it out; the mount stops "
+                    "rather than go back to generation %llu\n",
+            opts->fs_path, (unsigned long long)why->gen, why->slot_idx, why->label_idx,
             (unsigned long long)why->byte_offset, (unsigned long long)why->best_gen);
     return true;
 }

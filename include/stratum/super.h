@@ -522,25 +522,24 @@ extern "C" {
  * STM_EBADVERSION. An all-zero triple is the "empty dataset"
  * snapshot (mirrors the dataset entry's empty sentinel).
  *
+ * v32->v33 (9.8-BE-format): internal btree-engine nodes may carry a
+ * persisted Be message region (n_buffer_used becomes load-bearing);
+ * additive, so a v33 build mounted v32 pools and upgraded them on mount.
+ *
+ * v33->v34: each generation's uberblock goes to slot gen % 63 of all
+ * four labels, not to one label, so one failed read or one damaged label
+ * no longer hides a commit (ARCHITECTURE section 5.3.1). Uberblock fields
+ * are unchanged; the placement is the break. No upgrade path: pools are
+ * re-created (on-disk format breaks are free until the format freezes,
+ * operator decision 2026-11-05), so a v33 pool answers STM_EBADVERSION and
+ * a v34 pool holds no older uberblocks (format zeroes the labels).
+ *
  * See `docs/phase-9.7-design.md` section 3.1 / section 3.3 + section 4 + section 5 for the
  * staging. */
-#define STM_UB_VERSION        33u
+#define STM_UB_VERSION        34u
 
-/* 9.8-BE-format (chunk 7b; STM_UB_VERSION 32 -> 33): internal btree-
- * engine nodes may carry a persisted Be message region (n_buffer_used
- * becomes load-bearing). The extension is strictly additive, so
- * UPGRADE-ON-MOUNT applies for the first time: a pool at
- * STM_UB_VERSION_MIN_COMPAT (v32 -- every internal node's buffer
- * region is zero) mounts under this binary and becomes v33 at its
- * next commit (sync stamps STM_UB_VERSION). No downgrade: a v32
- * binary's equality gate rejects a v33 uberblock, but its scan then
- * mounts the newest v32 one left in the ring, rolling back past the v33
- * commits; a build with stm_ub_is_newer refuses a newer build's pool
- * instead. (Anything older that ignored the field would mis-read a
- * v33-written buffered node -- which is why the bump is real even though
- * the format is additive.) Pre-release; no converter. The bump is arc-approved
- * (Thylacine docs/CONCURRENT-FS.md section 5, user 2026-07-05). */
-#define STM_UB_VERSION_MIN_COMPAT  32u
+/* The oldest version this build reads: this one alone. */
+#define STM_UB_VERSION_MIN_COMPAT  34u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */
@@ -549,15 +548,36 @@ extern "C" {
 #define STM_UB_SLOTS_PER_LABEL 63u                       /* commit ring */
 #define STM_UB_MIRROR_SLOT    63u                        /* pool-config mirror */
 
-/* Commit-ring placement: generation `gen` lives in label gen % 4, slot
- * gen % 63. 4 and 63 are coprime, so 252 consecutive generations take 252
- * distinct slots. */
-static inline uint32_t stm_sb_ring_label_for_gen(uint64_t gen) {
-    return (uint32_t)(gen % (uint64_t)STM_LABELS_PER_DEVICE);
-}
+/* Commit-ring placement: generation `gen` lives in slot gen % 63 of every
+ * label, STM_UB_COPIES copies, so the ring holds 63 generations. */
 static inline uint32_t stm_sb_ring_slot_for_gen(uint64_t gen) {
     return (uint32_t)(gen % (uint64_t)STM_UB_SLOTS_PER_LABEL);
 }
+#define STM_UB_COPIES  STM_LABELS_PER_DEVICE
+
+/* How many of a generation's copies a device must have written, its
+ * fsync succeeding, before it confirms the uberblock write (a
+ * reservation's fsync is deferred to the commit's barrier, which comes
+ * before the final is written). All of them. Then a successful write
+ * leaves no other bytes at its slot, so copies of one generation differ
+ * only after a write of it that failed, after which the fs writes nothing
+ * until a remount (a device of a multi-device pool is outvoted instead);
+ * the scan takes the first of differing copies and trusts that a final's
+ * copies agree (mount.c asserts this value: fewer would need a
+ * same-generation discriminator in the uberblock), and one copy that
+ * holds an older generation or reads back blank proves this device never
+ * confirmed the slot's generation (STM_UB_SETTLE_COPIES). The cost: a
+ * label sector that refuses writes fails every commit whose reservation
+ * or final lands on its slot, and a whole label that refuses writes
+ * leaves the device unmountable read-write. */
+#define STM_UB_COPIES_REQUIRED  STM_UB_COPIES
+
+/* Copies at a slot that must hold an older generation, or read back
+ * blank, before the scan takes it that this device never confirmed the
+ * slot's generation (on a multi-device pool the others may have, by
+ * quorum: this device then votes behind): a confirmed one left at most
+ * STM_UB_COPIES - STM_UB_COPIES_REQUIRED copies without it. */
+#define STM_UB_SETTLE_COPIES  (STM_UB_COPIES - STM_UB_COPIES_REQUIRED + 1u)
 
 /* Minimum device size: 4 × labels + some user-data breathing room.
  * Labels are 2 × 256 KiB at head + 2 × 256 KiB at tail, so 1 MiB each
@@ -1009,7 +1029,8 @@ stm_status stm_ub_encode(const stm_uberblock *ub, void *buf, size_t buf_len);
  *   - buf_len == STM_UB_SIZE.
  *   - ub_magic matches STM_UB_MAGIC.
  *   - ub_version is supported (STM_UB_VERSION_MIN_COMPAT..STM_UB_VERSION;
- *     stm_ub_is_newer tells a newer build's uberblock from a torn one).
+ *     stm_ub_is_newer and stm_ub_is_older tell another build's uberblock
+ *     from a torn one).
  *   - ub_csum matches BLAKE3-256 over bytes [0, STM_UB_SIZE - 32).
  *
  * R13 P2-1: status taxonomy for failures:
@@ -1040,6 +1061,11 @@ void stm_ub_csum(const void *buf, size_t buf_len, uint8_t out[32]);
  * newer commits.
  */
 bool stm_ub_is_newer(const void *buf, size_t buf_len);
+
+/* Whether `buf` holds an uberblock an OLDER build wrote: the magic, a
+ * version below STM_UB_VERSION_MIN_COMPAT, and a csum that verifies (the
+ * fields stm_ub_is_newer reads). The scan names it when nothing decodes. */
+bool stm_ub_is_older(const void *buf, size_t buf_len);
 
 /* ========================================================================= */
 /* Label placement.                                                           */
@@ -1084,11 +1110,24 @@ typedef struct stm_bdev stm_bdev;   /* forward from block.h */
 /*
  * Encode `ub` and write it to (label_idx, slot_idx) on `d`. Fsyncs
  * before returning. Caller must ensure label_idx < STM_LABELS_PER_DEVICE
- * and slot_idx <= STM_UB_MIRROR_SLOT.
+ * and slot_idx <= STM_UB_MIRROR_SLOT. One copy only, for tests and
+ * repair: a commit-ring writer uses stm_sb_ub_write_copies, since the
+ * scan takes one copy holding an older generation as proof that the
+ * slot's generation was never confirmed.
  */
 STM_MUST_USE
 stm_status stm_sb_label_write(stm_bdev *d, uint32_t label_idx,
                                uint32_t slot_idx, const stm_uberblock *ub);
+
+/*
+ * Encode `ub` and write it to commit-ring slot `slot_idx` of every label
+ * on `d`, its STM_UB_COPIES copies, then fsync once. Every copy is
+ * attempted; returns STM_OK only when STM_UB_COPIES_REQUIRED copies were
+ * written and the fsync succeeded, else the first failure.
+ */
+STM_MUST_USE
+stm_status stm_sb_ub_write_copies(stm_bdev *d, uint32_t slot_idx,
+                                  const stm_uberblock *ub);
 
 /*
  * Read the uberblock at (label_idx, slot_idx) from `d` and decode it
@@ -1112,7 +1151,8 @@ stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
  * decode (STM_ECORRUPT, or a version below STM_UB_VERSION_MIN_COMPAT) is
  * skipped, and STM_EBADVERSION answers only when nothing decodes and some
  * slot held another version. An uberblock counts only in its
- * generation's ring slot; a device whose only uberblocks sit in other
+ * generation's ring slot (slot gen % 63, in any label: each generation
+ * has a copy in every label); a device whose only uberblocks sit in other
  * slots returns STM_ECORRUPT, not STM_ENOENT.
  *
  * Returns STM_EBADVERSION when a slot it reads holds an uberblock a newer
@@ -1120,16 +1160,17 @@ stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
  * read; slot(best+1) and slot(best+2) at their re-reads; and, with
  * one_device, slot(best-1), read when slot(best+1) stays unreadable and
  * best's mark does not say final. A newer uberblock elsewhere whose one
- * read fails goes unseen; a layout that writes each commit to several
- * slots (or keeps this one's slot among them) makes one failed read
- * harmless.
+ * read fails goes unseen; its other copies are read too.
  *
  * A slot the device fails to READ is not a torn write. Returns STM_EIO
  * when no slot decoded and some read failed, or when the slot of
- * generation best+1 or best+2 (where the only newer commit could be)
- * still fails after a bounded re-read: mounting the older generation
- * would roll back an acknowledged commit. This is the strict rule, for
- * a device whose pool may have others: stm_sb_mount_scan_ex(d, false).
+ * generation best+1 or best+2 (where the only newer commit could be) is
+ * not settled and a copy still fails after a bounded re-read: mounting
+ * the older generation would roll back an acknowledged commit. The slot
+ * settles when STM_UB_SETTLE_COPIES of its copies hold an older
+ * generation or read back blank (a generation this device confirmed is in
+ * STM_UB_COPIES_REQUIRED of them). This is the strict rule, for a device
+ * whose pool may have others: stm_sb_mount_scan_ex(d, false).
  */
 STM_MUST_USE
 stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
@@ -1138,10 +1179,13 @@ stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
 
 /* Why a scan refused, at (label_idx, slot_idx), byte_offset on the
  * device; best_gen is the newest generation it read. gen != 0: the slot
- * of gen, which may hold a commit newer than best_gen, stayed unreadable
- * (STM_EIO). version != 0: the slot holds an uberblock of that version, a
- * newer build's (STM_EBADVERSION; gen is 0). Both are 0 when the scan
- * refused for another reason. */
+ * of gen, which may hold a commit newer than best_gen, was not settled
+ * and the copy in label_idx stayed unreadable (STM_EIO). version != 0:
+ * the copy holds an uberblock of that version, which this build does not
+ * read (STM_EBADVERSION; gen is 0): a newer build's, above STM_UB_VERSION,
+ * or, when nothing decoded, an older build's, below
+ * STM_UB_VERSION_MIN_COMPAT. Both are 0 when the scan refused for another
+ * reason. */
 typedef struct stm_sb_scan_refusal {
     uint64_t gen;
     uint32_t label_idx;
@@ -1155,12 +1199,12 @@ typedef struct stm_sb_scan_refusal {
  * stm_sb_mount_scan, told the pool's shape. With one_device (`d` is the
  * pool's only device, so its generations are contiguous) it refuses at
  * slot(best+1) only when best may be a reservation (neither its mark,
- * ub_repair_log_root_gen == ub_gen, nor best-1 decoding with other trees
- * says final; a claim reads as a reservation), and at
- * slot(best+2) only when slot(best+1) neither decoded nor read back zero
- * (each settled by two reads that came back wrong with no error).
+ * ub_repair_log_root_gen == ub_gen, nor a copy of best-1 decoding with
+ * other trees, none with best's, says final; a claim reads as a
+ * reservation), and at slot(best+2) only when slot(best+1) did not settle
+ * (each copy settled by two reads that came back wrong with no error).
  * Without it, either slot unreadable refuses. `why`, if not NULL, says
- * which slot refused (STM_EIO, or STM_EBADVERSION at a newer build's
+ * which copy refused (STM_EIO, or STM_EBADVERSION at another build's
  * uberblock).
  */
 STM_MUST_USE

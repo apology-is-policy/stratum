@@ -100,18 +100,30 @@ _Static_assert(offsetof(stm_uberblock, ub_magic) == 0u &&
                offsetof(stm_uberblock, ub_csum) == STM_UB_SIZE - 32u,
                "a newer build's uberblock is told by these three fields");
 
-bool stm_ub_is_newer(const void *buf, size_t buf_len)
+/* The version of the uberblock in `buf` when its kept fields verify (the
+ * magic and the csum), 0 when they do not. */
+static uint32_t ub_kept_version(const void *buf, size_t buf_len)
 {
-    if (!buf || buf_len != STM_UB_SIZE) return false;
+    if (!buf || buf_len != STM_UB_SIZE) return 0u;
     const stm_uberblock *on_disk = (const stm_uberblock *)buf;
-    if (stm_load_le64(on_disk->ub_magic) != STM_UB_MAGIC) return false;
-    if (stm_load_le32(on_disk->ub_version) <= STM_UB_VERSION) return false;
+    if (stm_load_le64(on_disk->ub_magic) != STM_UB_MAGIC) return 0u;
     uint8_t expected[32];
     stm_ub_csum(buf, STM_UB_SIZE, expected);
     uint8_t diff = 0;
     for (size_t i = 0; i < 32; i++)
         diff |= (uint8_t)(expected[i] ^ on_disk->ub_csum[i]);
-    return diff == 0;
+    return diff == 0 ? stm_load_le32(on_disk->ub_version) : 0u;
+}
+
+bool stm_ub_is_newer(const void *buf, size_t buf_len)
+{
+    return ub_kept_version(buf, buf_len) > STM_UB_VERSION;
+}
+
+bool stm_ub_is_older(const void *buf, size_t buf_len)
+{
+    uint32_t version = ub_kept_version(buf, buf_len);
+    return version != 0u && version < STM_UB_VERSION_MIN_COMPAT;
 }
 
 /* ========================================================================= */
