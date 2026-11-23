@@ -22,9 +22,9 @@
  *
  * Lock hierarchy (held in this order, never reversed):
  *
- *   fs->global (rwlock, EX or SH; writer-preference attr on glibc
- *               per R133 P1-1 to prevent EX-taker starvation under
- *               sustained SH-traffic) →
+ *   fs->global (rwlock, EX or SH; prefers writers on every C library,
+ *               stm_rwlock, so sustained SH traffic cannot starve an
+ *               EX taker, R133 P1-1) ->
  *      [per-inode handle->mu  →]      (PARALLEL-3 impl-1: SH path only)
  *      [fs->txn  →]                   (SH spans + the ENOSPC reclaim's EX;
  *                                      no blocking pin and no second span
@@ -36,8 +36,8 @@
  * fs->promote_cur_mu is a leaf, taken with no other lock held.
  *
  * NEVER call stm_fs_mark_wedged from inside a held fs->global —
- * it takes the wrlock itself, and a recursive same-thread lock is
- * POSIX-undefined and deadlocks on glibc (R133 P1-2). A path that must
+ * it takes the wrlock itself, and a recursive same-thread lock
+ * deadlocks (hooks builds abort on it; R133 P1-2). A path that must
  * wedge while holding fs->global calls fs_mark_wedged_locked, the
  * in-place latch, BEFORE it unlocks: a wedge fired after the unlock
  * leaves a window in which a writer queued on fs->global (a commit
@@ -115,6 +115,7 @@
 #include <stratum/janus.h>
 #include <stratum/keyfile.h>
 #include <stratum/pool.h>
+#include <stratum/rwlock.h>
 #include <stratum/super.h>
 #include <stratum/cas.h>
 #include <stratum/snapshot.h>
@@ -208,7 +209,7 @@ struct stm_fs {
      * per the design doc §3. impl-2..5 progressively port the remaining
      * ops; impl-5 drops the residual EX takes that were just the
      * big-fs-lock semantics. */
-    pthread_rwlock_t global;
+    stm_rwlock global;
     /* The transaction lock: what the reclaim-on-ENOSPC commit family,
      * the only committer that runs under fs->global SH, waits for
      * (stm_fs_commit / snapshot / unmount hold EX, which excludes every
@@ -234,7 +235,7 @@ struct stm_fs {
      * any reclaim queued meanwhile), and none takes txn twice (the
      * nested RDLOCK waits behind that reclaim the same way); the drain
      * cbs + commits take no pins. */
-    pthread_rwlock_t txn;
+    stm_rwlock txn;
     /* Held across any rename of a directory, from the check that the target is not under it to the
      * dirent update. Two moves that each pass alone can together make a cycle, so they take turns,
      * as Linux's s_vfs_rename_mutex does. A rename within one parent takes its turn too, unlike
@@ -399,7 +400,7 @@ struct stm_fs {
  * caller's happy path is responsible for its own unlock; the guard only
  * takes ownership of the unlock when it bails.
  *
- * The same pthread_rwlock_unlock() call works for both SH and EX holders,
+ * The same stm_rwlock_unlock() call works for both SH and EX holders,
  * so the guard composes with EITHER the pre-PARALLEL-3 EX (wrlock) sites
  * or the new SH (rdlock) per-inode-op sites.
  *
@@ -414,18 +415,18 @@ struct stm_fs {
  * 21 pure-read ops that drop fs->global SH per the design doc §7.1.    */
 #define FS_GUARD_READ(fs) do {                                             \
     if (atomic_load_explicit(&(fs)->wedged, memory_order_acquire)) {       \
-        pthread_rwlock_unlock(&(fs)->global);                              \
+        stm_rwlock_unlock(&(fs)->global);                              \
         return STM_EWEDGED;                                                \
     }                                                                      \
 } while (0)
 
 #define FS_GUARD_WRITE(fs) do {                                            \
     if (atomic_load_explicit(&(fs)->wedged, memory_order_acquire)) {       \
-        pthread_rwlock_unlock(&(fs)->global);                              \
+        stm_rwlock_unlock(&(fs)->global);                              \
         return STM_EWEDGED;                                                \
     }                                                                      \
     if (atomic_load_explicit(&(fs)->read_only, memory_order_acquire)) {    \
-        pthread_rwlock_unlock(&(fs)->global);                              \
+        stm_rwlock_unlock(&(fs)->global);                              \
         return STM_EROFS;                                                  \
     }                                                                      \
 } while (0)
@@ -521,9 +522,14 @@ unsigned stm_fs_txn_depth_for_test(void)
 bool stm_fs_txn_writer_waiting_for_test(stm_fs *fs)
 {
     if (!fs) return false;
-    if (pthread_rwlock_tryrdlock(&fs->txn) != 0) return true;
-    (void)pthread_rwlock_unlock(&fs->txn);
+    if (stm_rwlock_tryrdlock(&fs->txn) != 0) return true;
+    (void)stm_rwlock_unlock(&fs->txn);
     return false;
+}
+
+bool stm_fs_global_on_rp_for_test(stm_fs *fs)
+{
+    return fs && fs->global.on_rp;
 }
 
 /* Every blocking pin below is counted; stm_inode_pin_try never waits. */
@@ -577,7 +583,7 @@ static void fs_txn_rd(stm_fs *fs)
     fs_txn_note_take();
     fs_txn_depth_here++;
 #endif
-    pthread_rwlock_rdlock(&fs->txn);
+    stm_rwlock_rdlock(&fs->txn);
 }
 
 static void fs_txn_rd_end(stm_fs *fs)
@@ -585,7 +591,7 @@ static void fs_txn_rd_end(stm_fs *fs)
 #ifdef STRATUM_BUILD_TESTING_HOOKS
     fs_txn_depth_here--;
 #endif
-    pthread_rwlock_unlock(&fs->txn);
+    stm_rwlock_unlock(&fs->txn);
 }
 
 static void fs_txn_begin(stm_fs *fs, fs_txn *tx)
@@ -604,7 +610,7 @@ static void fs_txn_end(stm_fs *fs, fs_txn *tx)
 static void fs_txn_unlock_global(stm_fs *fs, fs_txn *tx)
 {
     fs_txn_end(fs, tx);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
 }
 
 /* Between a data op's first change and the inode update that completes
@@ -1443,6 +1449,14 @@ static void fs_sync_wedged(void *user)
                           memory_order_release);
 }
 
+/* fs_new's unwind of the three mutexes it initialises first. */
+static void fs_new_mutexes_destroy(stm_fs *fs)
+{
+    pthread_mutex_destroy(&fs->promote_cur_mu);
+    pthread_mutex_destroy(&fs->werr_mu);
+    pthread_mutex_destroy(&fs->dir_move_mu);
+}
+
 static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
                        stm_alloc *a, stm_sync *sync, bool ro,
                        const char *keyfile_path,
@@ -1465,60 +1479,29 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         free(fs);
         return NULL;
     }
-    /* R133 P1-1: glibc default rwlock attribute is reader-preference;
-     * a continuous stream of SH-takers (the new PARALLEL-3 ported ops)
-     * can starve a queued EX-taker (stm_fs_unmount, stm_fs_commit,
-     * stm_fs_mark_wedged, every still-unported op) indefinitely. Set
-     * writer-preference where the attr is available (Linux/glibc).
-     * macOS / other POSIX: default attrs already give reasonable
-     * scheduler fairness; pass NULL. Same posture as pool.c:274. */
-#if defined(__linux__) && defined(PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)
-    pthread_rwlockattr_t rwattr;
-    pthread_rwlockattr_init(&rwattr);
-    pthread_rwlockattr_setkind_np(&rwattr,
-        PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-    int rwrc = pthread_rwlock_init(&fs->global, &rwattr);
-    pthread_rwlockattr_destroy(&rwattr);
-#else
-    int rwrc = pthread_rwlock_init(&fs->global, NULL);
-#endif
-    if (rwrc != 0) {
+    /* Both prefer writers on every C library (stm_rwlock): a stream of
+     * SH takers (the PARALLEL-3 ops) must not starve a queued EX taker
+     * (stm_fs_unmount, stm_fs_commit, stm_fs_mark_wedged, every unported
+     * op; R133 P1-1), nor the txn readers (sub-threshold writes on N
+     * worker threads) the ENOSPC reclaim's wrlock at pool-full (R3-F1).
+     * musl's and glibc's default locks prefer readers. */
+    if (stm_rwlock_init(&fs->global) != 0) {
+        fs_new_mutexes_destroy(fs);
         free(fs);
         return NULL;
     }
-    /* R3-F1: txn gets the SAME R133 writer-preference posture as
-     * fs->global -- its rd-takers are the hottest op class (sub-threshold
-     * writes on N worker threads) and its sole wr-taker is the rare
-     * ENOSPC reclaim; glibc/musl reader-preference would let the rd
-     * stream starve the queued wrlock at pool-full (an availability
-     * livelock, live on the Linux sanitizer VMs). macOS/musl residual =
-     * the shared R133 posture (scheduler fairness), not new debt. */
-#if defined(__linux__) && defined(PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)
-    {
-        pthread_rwlockattr_t txnattr;
-        pthread_rwlockattr_init(&txnattr);
-        pthread_rwlockattr_setkind_np(&txnattr,
-            PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-        int txnrc = pthread_rwlock_init(&fs->txn, &txnattr);
-        pthread_rwlockattr_destroy(&txnattr);
-        if (txnrc != 0) {
-            pthread_rwlock_destroy(&fs->global);
-            free(fs);
-            return NULL;
-        }
-    }
-#else
-    if (pthread_rwlock_init(&fs->txn, NULL) != 0) {
-        pthread_rwlock_destroy(&fs->global);
+    if (stm_rwlock_init(&fs->txn) != 0) {
+        stm_rwlock_destroy(&fs->global);
+        fs_new_mutexes_destroy(fs);
         free(fs);
         return NULL;
     }
-#endif
     if (keyfile_path) {
         fs->keyfile_path = strdup(keyfile_path);
         if (!fs->keyfile_path) {
-            pthread_rwlock_destroy(&fs->txn);
-            pthread_rwlock_destroy(&fs->global);
+            stm_rwlock_destroy(&fs->txn);
+            stm_rwlock_destroy(&fs->global);
+            fs_new_mutexes_destroy(fs);
             free(fs);
             return NULL;
         }
@@ -1527,8 +1510,9 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         fs->janus_socket = strdup(janus_socket);
         if (!fs->janus_socket) {
             free(fs->keyfile_path);
-            pthread_rwlock_destroy(&fs->txn);
-            pthread_rwlock_destroy(&fs->global);
+            stm_rwlock_destroy(&fs->txn);
+            stm_rwlock_destroy(&fs->global);
+            fs_new_mutexes_destroy(fs);
             free(fs);
             return NULL;
         }
@@ -1550,8 +1534,9 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
     if (!fs->locks) {
         free(fs->janus_socket);
         free(fs->keyfile_path);
-        pthread_rwlock_destroy(&fs->txn);
-        pthread_rwlock_destroy(&fs->global);
+        stm_rwlock_destroy(&fs->txn);
+        stm_rwlock_destroy(&fs->global);
+        fs_new_mutexes_destroy(fs);
         free(fs);
         return NULL;
     }
@@ -1566,8 +1551,9 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         stm_lock_table_close(fs->locks);
         free(fs->janus_socket);
         free(fs->keyfile_path);
-        pthread_rwlock_destroy(&fs->txn);
-        pthread_rwlock_destroy(&fs->global);
+        stm_rwlock_destroy(&fs->txn);
+        stm_rwlock_destroy(&fs->global);
+        fs_new_mutexes_destroy(fs);
         free(fs);
         return NULL;
     }
@@ -1968,7 +1954,7 @@ stm_status stm_fs_unmount(stm_fs *fs)
 {
     if (!fs) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
 
     stm_status commit_status = STM_OK;
     /* 9.8-LF-3: read under fs->global EX; relaxed is sufficient (no
@@ -2032,9 +2018,9 @@ stm_status stm_fs_unmount(stm_fs *fs)
      * that unmount does not invoke. */
     stm_dirty_buffer_destroy(fs->dirty_buffer);
 
-    pthread_rwlock_unlock(&fs->global);
-    pthread_rwlock_destroy(&fs->txn);
-    pthread_rwlock_destroy(&fs->global);
+    stm_rwlock_unlock(&fs->global);
+    stm_rwlock_destroy(&fs->txn);
+    stm_rwlock_destroy(&fs->global);
     pthread_mutex_destroy(&fs->dir_move_mu);
     pthread_mutex_destroy(&fs->werr_mu);
     pthread_mutex_destroy(&fs->promote_cur_mu);
@@ -2061,7 +2047,7 @@ stm_status stm_fs_reserve(stm_fs *fs, uint64_t nblocks, uint64_t hint_paddr,
                            uint64_t *out_paddr)
 {
     if (!fs) return STM_EINVAL;
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
     stm_status s = stm_alloc_reserve(fs->alloc, nblocks, hint_paddr, out_paddr);
     /* CF-4 C (audit F1): the raw data-reserve API gets the same reclaim-on-
@@ -2070,17 +2056,17 @@ stm_status stm_fs_reserve(stm_fs *fs, uint64_t nblocks, uint64_t hint_paddr,
      * so this is future-proofing rather than a live gap. */
     if (s == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
         s = stm_alloc_reserve(fs->alloc, nblocks, hint_paddr, out_paddr);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
 stm_status stm_fs_free(stm_fs *fs, uint64_t paddr, uint64_t free_gen)
 {
     if (!fs) return STM_EINVAL;
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
     stm_status s = stm_alloc_free(fs->alloc, paddr, free_gen);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -2219,7 +2205,7 @@ static stm_status stm_fs_commit_inner(stm_fs *fs,
                                       const struct fs_fsync_target *t)
 {
     if (!fs) return STM_EINVAL;
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
     /* SWISS-4q-flush: drain the dirty buffer FIRST so every buffered
      * write becomes a committed extent before the three-phase sync
@@ -2233,7 +2219,7 @@ static stm_status stm_fs_commit_inner(stm_fs *fs,
      * un-swept freed blocks is handled here without an extra retry. */
     stm_status fr = fs_flush_all_locked(fs);
     if (fr != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return fr;
     }
     stm_status s = stm_sync_commit(fs->sync);
@@ -2250,7 +2236,7 @@ static stm_status stm_fs_commit_inner(stm_fs *fs,
      * unrecoverable. */
     if (s != STM_OK) fs_mark_wedged_locked(fs);
     else if (t) s = fs_take_write_error_locked(fs, t);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -3713,7 +3699,7 @@ static stm_status fs_refuse_unlock(stm_fs *fs, uint64_t dataset_id,
         atomic_fetch_add_explicit(&fs_txn_order_violations, 1u,
                                   memory_order_relaxed);
 #endif
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -3739,7 +3725,7 @@ static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * inodes so legacy direct-extent callers (older tests + dataset
      * metadata test seam) and non-S_IFREG inode kinds keep going
      * through the unbuffered stm_sync_write_extent path verbatim. */
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 #ifdef STRATUM_BUILD_TESTING_HOOKS
     if (fs->write_guard_hook)
@@ -3789,14 +3775,14 @@ static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                         *out_written = done + more;
                     }
                     stm_inode_unpin(iidx, h);
-                    pthread_rwlock_unlock(&fs->global);
+                    stm_rwlock_unlock(&fs->global);
                     return rs;
                 }
                 /* Not a regular file — drop SH and fall through to EX. */
             }
             stm_inode_unpin(iidx, h);
         } else if (pp != STM_ENOENT) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return pp;
         }
         /* STM_ENOENT or non-S_IFREG — fall through to legacy EX path. */
@@ -3804,17 +3790,17 @@ static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     /* The legacy path serves in-process callers; an identity-checked
      * write names a live regular file, checked under its pin above. */
     if (gen) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
     /* Legacy direct-extent / non-regular fallback: release SH and
      * reacquire EX so concurrent unported writers still serialize.
      * Same shape as impl-4 reflink/cfr. */
-    pthread_rwlock_unlock(&fs->global);
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
     if (off > STM_FS_FILE_MAX || (uint64_t)len > STM_FS_FILE_MAX - off) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EOVERFLOW;
     }
     stm_status s = stm_sync_write_extent(fs->sync, dataset_id, ino, off,
@@ -3822,7 +3808,7 @@ static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (s == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))  /* CF-4 C */
         s = stm_sync_write_extent(fs->sync, dataset_id, ino, off, buf, len);
     if (s == STM_OK) *out_written = len;
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -3853,28 +3839,28 @@ static stm_status fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      *     proceed in parallel; pre-PARALLEL-3 EX mutators + commit
      *     are excluded by fs->global SH as before. */
     if (fs_ino_is_synth(ino)) {
-        pthread_rwlock_rdlock(&fs->global);
+        stm_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
 
         if (fs_ino_is_snaps_parent(ino)) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EISDIR;
         }
         uint64_t snap_id    = fs_synth_snap_id(ino);
         uint64_t frozen_ino = fs_synth_frozen_ino(ino);
         if (snap_id == 0u || frozen_ino == 0u) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EINVAL;
         }
         stm_snapshot_entry e;
         stm_status ss = fs_synth_snap_lookup(fs, dataset_id, snap_id, &e);
         if (ss != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return ss;
         }
         stm_inode_index *snap_iidx = stm_sync_inode_index(fs->sync);
         if (!snap_iidx) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EINVAL;
         }
         struct stm_inode_value iv = {0};
@@ -3883,26 +3869,26 @@ static stm_status fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                                     e.root_gen, e.root_csum,
                                                     frozen_ino, &iv);
         if (is != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return is;
         }
         uint32_t smode = stm_load_le32(iv.si_mode);
         if ((smode & (uint32_t)S_IFMT) == (uint32_t)S_IFDIR) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EISDIR;
         }
         if ((smode & (uint32_t)S_IFMT) != (uint32_t)S_IFREG) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EINVAL;
         }
         uint64_t cur_size = stm_load_le64(iv.si_size);
         if (off >= cur_size) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_OK;
         }
         if (iv.si_data_kind == STM_DATA_INLINE) {
             if (iv.si_data_len > STM_INODE_INLINE_MAX) {
-                pthread_rwlock_unlock(&fs->global);
+                stm_rwlock_unlock(&fs->global);
                 return STM_ECORRUPT;
             }
             size_t avail = (size_t)(cur_size - off);
@@ -3911,7 +3897,7 @@ static stm_status fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                 memcpy(buf, iv.si_data.inline_data + off, copy_n);
             }
             if (out_read) *out_read = copy_n;
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_OK;
         }
         if (iv.si_data_kind == STM_DATA_EXTENT) {
@@ -3922,19 +3908,19 @@ static stm_status fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                                    frozen_ino, off,
                                                    (uint8_t *)buf, want,
                                                    out_read);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return rs;
         }
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
 
     if (gen) {
-        pthread_rwlock_rdlock(&fs->global);
+        stm_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
         stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
         if (!iidx) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EINVAL;
         }
         stm_inode_handle *h = NULL;
@@ -3952,7 +3938,7 @@ static stm_status fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             }
             stm_inode_unpin(iidx, h);
         }
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return gs;
     }
 
@@ -4027,7 +4013,7 @@ static stm_status fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * the split-branch comment above). The legacy fallback needs no
      * pin: its only mutator (the legacy direct-extent write arm) takes
      * fs->global EX, which our SH already excludes. */
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
@@ -4048,7 +4034,7 @@ static stm_status fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                 stm_status pp = stm_inode_pin_shared(iidx, dataset_id,
                                                         ino, &h);
                 if (pp != STM_OK) {
-                    pthread_rwlock_unlock(&fs->global);
+                    stm_rwlock_unlock(&fs->global);
                     return pp;
                 }
                 stm_status rs = stm_inode_lookup(iidx, dataset_id, ino, &iv);
@@ -4067,7 +4053,7 @@ static stm_status fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                     }
                 }
                 stm_inode_unpin(iidx, h);
-                pthread_rwlock_unlock(&fs->global);
+                stm_rwlock_unlock(&fs->global);
                 return rs;
             }
         }
@@ -4075,7 +4061,7 @@ static stm_status fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 
     stm_status s = stm_sync_read_extent(fs->sync, dataset_id, ino, off,
                                            buf, len, out_read);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -4193,33 +4179,33 @@ static stm_status fs_lookup(stm_fs *fs, uint64_t dataset_id,
      * 3. Lookup under a SNAP_VIEW inode routes through the snapshot's
      *    frozen tree via stm_dirent_lookup_at_root. */
     if (parent_ino == 1u && fs_name_eq_snaps(name, name_len)) {
-        pthread_rwlock_rdlock(&fs->global);
+        stm_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
         stm_inode_index *iidx_chk = stm_sync_inode_index(fs->sync);
         if (!iidx_chk) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EINVAL;
         }
         struct stm_inode_value pv = {0};
         stm_status pcs = fs_load_parent_dir(iidx_chk, dataset_id, 1u, &pv);
         if (pcs != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             /* STM_ENOENT for uninit'd dataset / freed root */
             return fs_gen_status(pcs, gen);
         }
         if (!fs_gen_matches(&pv, gen)) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_ESTALE;
         }
         if (out_child_iv)
             pcs = fs_snap_view_stat(fs, dataset_id, FS_SNAPS_PARENT_INO,
                                     out_child_iv);
         if (pcs == STM_OK) *out_child_ino = FS_SNAPS_PARENT_INO;
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return pcs;
     }
     if (fs_ino_is_snaps_parent(parent_ino)) {
-        pthread_rwlock_rdlock(&fs->global);
+        stm_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
         stm_status s = fs_snaps_parent_lookup_by_name(fs, dataset_id,
                                                           name, name_len,
@@ -4228,11 +4214,11 @@ static stm_status fs_lookup(stm_fs *fs, uint64_t dataset_id,
             s = fs_snap_view_stat(fs, dataset_id, *out_child_ino,
                                   out_child_iv);
         if (s != STM_OK) *out_child_ino = 0;
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return s;
     }
     if (fs_ino_is_synth(parent_ino)) {
-        pthread_rwlock_rdlock(&fs->global);
+        stm_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
         stm_status s = fs_snap_view_lookup(fs, dataset_id, parent_ino,
                                               name, name_len,
@@ -4241,7 +4227,7 @@ static stm_status fs_lookup(stm_fs *fs, uint64_t dataset_id,
             s = fs_snap_view_stat(fs, dataset_id, *out_child_ino,
                                   out_child_iv);
         if (s != STM_OK) *out_child_ino = 0;
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return s;
     }
 
@@ -4308,12 +4294,12 @@ static stm_status fs_lookup(stm_fs *fs, uint64_t dataset_id,
      * it, so a live name's child read here is the one the name names,
      * and a dead name (fs_name_live_locked) is absent. */
 lookup_fallback:
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
     iidx = stm_sync_inode_index(fs->sync);
     didx = stm_sync_dirent_index(fs->sync);
     if (!iidx || !didx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
     {
@@ -4321,7 +4307,7 @@ lookup_fallback:
         stm_status ps2 = fs_pin_shared_if_gen(fs, iidx, dataset_id,
                                               parent_ino, gen, &h);
         if (ps2 != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return ps2;
         }
         struct stm_inode_value pv2 = {0};
@@ -4340,7 +4326,7 @@ lookup_fallback:
             if (ds2 == STM_OK && out_child_iv) *out_child_iv = cv;
         }
         stm_inode_unpin(iidx, h);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         if (ds2 == STM_OK) *out_child_ino = ci;
         return ds2;
     }
@@ -4792,7 +4778,7 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
      * the parent, out of ascending order: tried, never waited for while
      * the parent is held (fs_txn_pin_fresh). */
     fs_txn tx = { false };
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -4980,12 +4966,12 @@ stm_status stm_fs_init_dataset_root(stm_fs *fs, uint64_t dataset_id,
     if (dataset_id == 0u) return STM_EINVAL;
     uint32_t effective_mode = (mode & 07777u) | (uint32_t)S_IFDIR;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
 
@@ -4994,11 +4980,11 @@ stm_status stm_fs_init_dataset_root(stm_fs *fs, uint64_t dataset_id,
     struct stm_inode_value probe = {0};
     stm_status ps = stm_inode_lookup(iidx, dataset_id, /*ino=*/1u, &probe);
     if (ps == STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EEXIST;
     }
     if (ps != STM_ENOENT) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return ps;
     }
 
@@ -5007,14 +4993,14 @@ stm_status stm_fs_init_dataset_root(stm_fs *fs, uint64_t dataset_id,
     stm_status as = (stm_inode_alloc)(iidx, dataset_id, effective_mode,
                                            uid, gid, &new_ino);
     if (as != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return as;
     }
     /* Allocator state on a fresh dataset MUST yield ino=1. If not,
      * the dataset was non-fresh in a way the EEXIST probe missed
      * (e.g., ino=2 exists but ino=1 doesn't — pathological). */
     if (new_ino != 1u) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
 
@@ -5028,7 +5014,7 @@ stm_status stm_fs_init_dataset_root(stm_fs *fs, uint64_t dataset_id,
     }
 
     *out_root_ino = new_ino;
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return STM_OK;
 }
 
@@ -5062,7 +5048,7 @@ stm_status stm_fs_create_anon(stm_fs *fs, uint64_t dataset_id,
      * fid-bind hook for janus/9p before stamp completes) doesn't
      * become a latent race. */
     fs_txn tx = { false };
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
@@ -5150,7 +5136,7 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
      * ids known upfront — use sorted pin to prevent the 2-cycle
      * deadlock with a concurrent linkat_anon on the swapped pair. */
     fs_txn tx = { false };
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -5266,7 +5252,7 @@ stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
 
     /* PARALLEL-3 impl-2: single-inode op (just the orphan). SH + pin. */
     fs_txn tx = { false };
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
@@ -5511,7 +5497,7 @@ static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
     if (fs_txn_depth_here != 0u) abort();
     if (fs->reclaim_hook) fs->reclaim_hook(false, fs->reclaim_hook_arg);
 #endif
-    pthread_rwlock_wrlock(&fs->txn);
+    stm_rwlock_wrlock(&fs->txn);
 #ifdef STRATUM_BUILD_TESTING_HOOKS
     if (fs->reclaim_hook) fs->reclaim_hook(true, fs->reclaim_hook_arg);
 #endif
@@ -5522,10 +5508,10 @@ static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
 #endif
     if (predrain != STM_OK || fs_post_inode_free_reclaim_locked(fs)) {
         fs_mark_wedged_locked(fs);
-        pthread_rwlock_unlock(&fs->txn);
+        stm_rwlock_unlock(&fs->txn);
         return false;
     }
-    pthread_rwlock_unlock(&fs->txn);
+    stm_rwlock_unlock(&fs->txn);
     return true;
 }
 
@@ -5550,7 +5536,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
                                                   bool expect_dir)
 {
     fs_txn tx = { false };
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -5863,10 +5849,10 @@ stm_status stm_fs_stat(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (fs_ino_is_synth(ino)) {
         /* Throwaway-engine path. v1.0 keeps the rwlock path for this
          * branch; lift to EBR at LF-3 follow-on. */
-        pthread_rwlock_rdlock(&fs->global);
+        stm_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
         stm_status s = fs_snap_view_stat(fs, dataset_id, ino, out_value);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return s;
     }
 
@@ -5909,15 +5895,15 @@ stm_status stm_fs_stat(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * serial scan_range holds serial_mu for the whole walk.
      * Unreachable single-connection (the mini runs inline in the
      * writer's own call); load-bearing under the CF-2 pool. */
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
     iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
     s = stm_inode_lookup(iidx, dataset_id, ino, out_value);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -5956,19 +5942,19 @@ static stm_status fs_chmod(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     /* 9.7-impl-5: snap-view inodes are read-only. */
     if (fs_ino_is_synth(ino)) return STM_EROFS;
 
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
 
     stm_inode_handle *h = NULL;
     stm_status ps = fs_pin_if_gen(fs, iidx, dataset_id, ino, gen, &h);
     if (ps != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return ps;
     }
 
@@ -5976,7 +5962,7 @@ static stm_status fs_chmod(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &v);
     if (ls != STM_OK) {
         stm_inode_unpin(iidx, h);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return ls;
     }
     /* Preserve the existing file-type bits. Caller may pass either a
@@ -5987,7 +5973,7 @@ static stm_status fs_chmod(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     uint32_t new_type = mode & (uint32_t)S_IFMT;
     if (new_type != 0u && new_type != cur_type) {
         stm_inode_unpin(iidx, h);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
     uint32_t new_mode = cur_type | (mode & 07777u);
@@ -5999,7 +5985,7 @@ static stm_status fs_chmod(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 
     stm_status ss = stm_inode_set(iidx, dataset_id, ino, &v);
     stm_inode_unpin(iidx, h);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return ss;
 }
 
@@ -6011,19 +5997,19 @@ static stm_status fs_chown(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
 
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
 
     stm_inode_handle *h = NULL;
     stm_status ps = fs_pin_if_gen(fs, iidx, dataset_id, ino, gen, &h);
     if (ps != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return ps;
     }
 
@@ -6031,7 +6017,7 @@ static stm_status fs_chown(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &v);
     if (ls != STM_OK) {
         stm_inode_unpin(iidx, h);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return ls;
     }
     /* POSIX chown(-1, ...) semantics: UINT32_MAX leaves the field
@@ -6049,7 +6035,7 @@ static stm_status fs_chown(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 
     stm_status ss = stm_inode_set(iidx, dataset_id, ino, &v);
     stm_inode_unpin(iidx, h);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return ss;
 }
 
@@ -6070,19 +6056,19 @@ static stm_status fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (!fs_utime_nsec_ok(atime_nsec) || !fs_utime_nsec_ok(mtime_nsec))
         return STM_EINVAL;
 
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
 
     stm_inode_handle *h = NULL;
     stm_status ps = fs_pin_if_gen(fs, iidx, dataset_id, ino, gen, &h);
     if (ps != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return ps;
     }
 
@@ -6090,13 +6076,13 @@ static stm_status fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &v);
     if (ls != STM_OK) {
         stm_inode_unpin(iidx, h);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return ls;
     }
     /* Both omitted changes nothing, ctime included (utimensat(2)). */
     if (atime_nsec == STM_UTIME_OMIT && mtime_nsec == STM_UTIME_OMIT) {
         stm_inode_unpin(iidx, h);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_OK;
     }
     /* One clock read serves a NOW field and ctime, so a NOW atime, a NOW
@@ -6119,7 +6105,7 @@ static stm_status fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 
     stm_status ss = stm_inode_set(iidx, dataset_id, ino, &v);
     stm_inode_unpin(iidx, h);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return ss;
 }
 
@@ -6148,7 +6134,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
      * src_ino is discovered via dirent lookup, use the TOCTOU
      * re-verify loop pattern from fs_unlink_inode_and_dirent. */
     fs_txn tx = { false };
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -6389,7 +6375,7 @@ static stm_status fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
     /* PARALLEL-3 impl-2: 2-inode op (src + dst_parent) with both ids
      * known upfront. SH + sorted pin. */
     fs_txn tx = { false };
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -6552,7 +6538,7 @@ static stm_status fs_symlink(stm_fs *fs, uint64_t dataset_id,
     /* PARALLEL-3 impl-2: CREATE-shape — SH + parent pin + fresh-child pin
      * (same posture as fs_create_inode_and_link). */
     fs_txn tx = { false };
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -6687,17 +6673,17 @@ static stm_status fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * stat), which still need fs->global SH; live-tree branch uses
      * the wait-free EBR path. */
     if (fs_ino_is_synth(ino)) {
-        pthread_rwlock_rdlock(&fs->global);
+        stm_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
         stm_status vs = fs_snap_view_stat(fs, dataset_id, ino, &iv);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         if (vs != STM_OK) return vs;
     } else if (gen) {
-        pthread_rwlock_rdlock(&fs->global);
+        stm_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
         stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
         if (!iidx) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EINVAL;
         }
         stm_inode_handle *h = NULL;
@@ -6707,7 +6693,7 @@ static stm_status fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
             stm_inode_unpin(iidx, h);
         }
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         if (ls != STM_OK) return ls;
     } else {
         FS_GUARD_READ_LOCKLESS(fs);
@@ -6721,15 +6707,15 @@ static stm_status fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         stm_ebr_exit(ebr);
         if (ls == STM_ECORRUPT || ls == STM_EBUSY) {
             /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
-            pthread_rwlock_rdlock(&fs->global);
+            stm_rwlock_rdlock(&fs->global);
             FS_GUARD_READ(fs);
             iidx = stm_sync_inode_index(fs->sync);
             if (!iidx) {
-                pthread_rwlock_unlock(&fs->global);
+                stm_rwlock_unlock(&fs->global);
                 return STM_EINVAL;
             }
             ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
         }
         if (ls != STM_OK) return ls;       /* STM_ENOENT */
     }
@@ -6794,19 +6780,19 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * truncated — they have no si_size to update). On STM_ENOENT from
      * pin, surface ENOENT (preserves the pre-impl-5 contract). */
     fs_txn tx = { false };
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
 
     stm_inode_handle *h = NULL;
     stm_status pp = fs_pin_if_gen(fs, iidx, dataset_id, ino, gen, &h);
     if (pp != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return pp;       /* STM_ENOENT */
     }
 
@@ -6818,7 +6804,7 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
         if (fr != STM_OK) {
             stm_inode_unpin(iidx, h);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return fr;
         }
     }
@@ -6998,19 +6984,19 @@ stm_status stm_fs_add_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * on every set bit being a known seal. */
     if ((seals & ~(uint32_t)STM_FS_SEAL_MASK) != 0u) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
 
     struct stm_inode_value iv = {0};
     stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
     if (ls != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return ls;
     }
 
@@ -7022,7 +7008,7 @@ stm_status stm_fs_add_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * EPERM regardless of the requested mask). The exception is
      * `seals == 0` which is a trivial no-op + allowed. */
     if ((cur_flags & STM_INO_FLAG_SEAL_SEAL) && seals != 0u) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EPERM;
     }
 
@@ -7031,7 +7017,7 @@ stm_status stm_fs_add_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * bump, no inode_set call, no persistence churn. */
     uint32_t new_flags = cur_flags | seals;
     if (new_flags == cur_flags) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_OK;
     }
 
@@ -7043,7 +7029,7 @@ stm_status stm_fs_add_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * touched are si_flags + ctime. */
     fs_stamp_ctime_now(&iv);
     stm_status rs = stm_inode_set(iidx, dataset_id, ino, &iv);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return rs;
 }
 
@@ -7077,15 +7063,15 @@ stm_status stm_fs_get_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     stm_ebr_exit(ebr);
     if (ls == STM_ECORRUPT || ls == STM_EBUSY) {
         /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
-        pthread_rwlock_rdlock(&fs->global);
+        stm_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
         iidx = stm_sync_inode_index(fs->sync);
         if (!iidx) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EINVAL;
         }
         ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
     }
     if (ls != STM_OK) return ls;
 
@@ -7189,17 +7175,17 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
 
     if (need_fallback) {
         /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
-        pthread_rwlock_rdlock(&fs->global);
+        stm_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
         iidx = stm_sync_inode_index(fs->sync);
         didx = stm_sync_dirent_index(fs->sync);
         if (!iidx || !didx) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EINVAL;
         }
         stm_status ps2 = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
         if (ps2 != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return ps2;
         }
         stm_status ds2 = stm_dirent_lookup(didx, dataset_id, parent_ino,
@@ -7212,7 +7198,7 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
                                       &live, NULL);
             if (ds2 == STM_OK && !live) ds2 = STM_ENOENT;
         }
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         if (ds2 != STM_OK) return ds2;
     }
 
@@ -7297,15 +7283,15 @@ stm_status stm_fs_open_by_handle(stm_fs *fs,
     stm_ebr_exit(ebr);
     if (ls == STM_ECORRUPT || ls == STM_EBUSY) {
         /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
-        pthread_rwlock_rdlock(&fs->global);
+        stm_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
         iidx = stm_sync_inode_index(fs->sync);
         if (!iidx) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EINVAL;
         }
         ls = stm_inode_lookup(iidx, ds, ino, &v);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
     }
     if (ls == STM_ENOENT) {
         /* stm_inode_next_ino takes its own subsystem-internal mutex;
@@ -7363,19 +7349,19 @@ static stm_status fs_rename_onto_itself(stm_fs *fs, uint64_t dataset_id,
                                         const uint8_t *name,
                                         uint8_t name_len, uint32_t flags)
 {
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
     stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
     if (!iidx || !didx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
     stm_inode_handle *h = NULL;
     stm_status s = fs_pin_shared_if_gen(fs, iidx, dataset_id, parent_ino,
                                         gen, &h);
     if (s != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return s;
     }
     struct stm_inode_value pv = {0};
@@ -7393,7 +7379,7 @@ static stm_status fs_rename_onto_itself(stm_fs *fs, uint64_t dataset_id,
     }
     if (s == STM_OK && (flags & STM_FS_RENAME_NOREPLACE)) s = STM_EEXIST;
     stm_inode_unpin(iidx, h);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -7574,7 +7560,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
      * compound_ops_per_inode.tla becomes load-bearing under more
      * than 2 inodes. */
     fs_txn tx = { false };
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -8237,7 +8223,7 @@ static stm_status fs_readdir(stm_fs *fs, uint64_t dataset_id,
      * the SNAPS_PARENT + SNAP_VIEW paths use snapshot index lookups +
      * throwaway-engine readdirs that are not yet on the LF path. */
     if (fs_ino_is_synth(dir_ino)) {
-        pthread_rwlock_rdlock(&fs->global);
+        stm_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
 
         bool no_dots = (flags & STM_FS_READDIR_FLAG_NO_DOTS) != 0u;
@@ -8287,7 +8273,7 @@ static stm_status fs_readdir(stm_fs *fs, uint64_t dataset_id,
                                                 1, &got1);
                 }
                 if (s != STM_OK) {
-                    pthread_rwlock_unlock(&fs->global);
+                    stm_rwlock_unlock(&fs->global);
                     return s;
                 }
                 if (got1 == 0) {
@@ -8313,7 +8299,7 @@ static stm_status fs_readdir(stm_fs *fs, uint64_t dataset_id,
         }
         *cursor = local_cursor;
         *out_returned = emitted;
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_OK;
     }
 
@@ -8432,12 +8418,12 @@ static stm_status fs_readdir(stm_fs *fs, uint64_t dataset_id,
         /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale.
          * Reset emitted + local_cursor so the serial path replays
          * the synth-dot + scan from the caller's *cursor. */
-        pthread_rwlock_rdlock(&fs->global);
+        stm_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
         iidx = stm_sync_inode_index(fs->sync);
         didx = stm_sync_dirent_index(fs->sync);
         if (!iidx || !didx) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EINVAL;
         }
         /* The dir's shared pin keeps the listing within one
@@ -8445,7 +8431,7 @@ static stm_status fs_readdir(stm_fs *fs, uint64_t dataset_id,
         stm_inode_handle *h = NULL;
         ds = fs_pin_shared_if_gen(fs, iidx, dataset_id, dir_ino, gen, &h);
         if (ds != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return ds;
         }
         memset(&dv, 0, sizeof dv);
@@ -8523,7 +8509,7 @@ static stm_status fs_readdir(stm_fs *fs, uint64_t dataset_id,
         }
 fallback_out:
         stm_inode_unpin(iidx, h);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         if (ds != STM_OK) return ds;
     }
 
@@ -8615,19 +8601,19 @@ static stm_status fs_setxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if ((flags & STM_FS_XATTR_CREATE) &&
         (flags & STM_FS_XATTR_REPLACE)) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_status ps = fs_gen_check_locked(fs, dataset_id, ino, gen);
     if (ps == STM_OK) ps = fs_xattr_require_inode(fs, dataset_id, ino);
     if (ps != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return ps;
     }
 
     stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
     if (!xidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
     /* Map fs flags to xattr flags. Values are the same (POSIX-aligned)
@@ -8658,7 +8644,7 @@ static stm_status fs_setxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             }
         }
     }
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -8747,25 +8733,25 @@ static stm_status fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * xattrs, one incarnation: a free drops them under the exclusive
      * pin, and the xattr writers run under fs->global EX. */
 getxattr_locked:
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
     iidx = stm_sync_inode_index(fs->sync);
     xidx = stm_sync_xattr_index(fs->sync);
     if (!iidx || !xidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
     stm_inode_handle *h = NULL;
     stm_status is2 = fs_pin_shared_if_gen(fs, iidx, dataset_id, ino, gen, &h);
     if (is2 != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return is2;
     }
     if (out_size) *out_size = 0;
     s = stm_xattr_get(xidx, dataset_id, ino, name, name_len,
                          value_buf, value_max, out_size);
     stm_inode_unpin(iidx, h);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -8917,50 +8903,50 @@ static stm_status fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
          * it also re-validates that the inode still exists, answering
          * ENOENT for one freed meanwhile. See stm_fs_stat for the
          * general SH-fallback rationale. */
-        pthread_rwlock_rdlock(&fs->global);
+        stm_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
         iidx = stm_sync_inode_index(fs->sync);
         xidx = stm_sync_xattr_index(fs->sync);
         if (!iidx || !xidx) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EINVAL;
         }
         stm_inode_handle *h = NULL;
         stm_status pp = fs_pin_shared_if_gen(fs, iidx, dataset_id, ino, gen,
                                              &h);
         if (pp != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return pp;
         }
         memset(&iv, 0, sizeof iv);
         stm_status ps2 = stm_inode_lookup(iidx, dataset_id, ino, &iv);
         if (ps2 != STM_OK) {
             stm_inode_unpin(iidx, h);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return ps2;
         }
         stm_status ls2 = stm_xattr_list(xidx, dataset_id, ino, NULL, 0,
                                              &n_total);
         if (ls2 != STM_OK) {
             stm_inode_unpin(iidx, h);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return ls2;
         }
         if (n_total == 0) {
             *out_total_len = 0;
             stm_inode_unpin(iidx, h);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_OK;
         }
         if (n_total > SIZE_MAX / sizeof(stm_xattr_entry)) {
             stm_inode_unpin(iidx, h);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_ENOMEM;
         }
         batch = malloc(n_total * sizeof *batch);
         if (!batch) {
             stm_inode_unpin(iidx, h);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_ENOMEM;
         }
 #ifdef STRATUM_BUILD_TESTING_HOOKS
@@ -8969,7 +8955,7 @@ static stm_status fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 #endif
         ls2 = stm_xattr_list(xidx, dataset_id, ino, batch, n_total, &got);
         stm_inode_unpin(iidx, h);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         if (ls2 != STM_OK || got != n_total) {
             free(batch);
             return (ls2 != STM_OK) ? ls2 : STM_ECORRUPT;
@@ -9030,18 +9016,18 @@ stm_status stm_fs_removexattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (name_len == 0u || name_len > STM_FS_XATTR_NAME_MAX) return STM_EINVAL;
     if (!fs_xattr_name_in_posix_namespace(name, name_len)) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_status ps = fs_xattr_require_inode(fs, dataset_id, ino);
     if (ps != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return ps;
     }
 
     stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
     if (!xidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
     stm_status s = stm_xattr_remove(xidx, dataset_id, ino, name, name_len);
@@ -9057,7 +9043,7 @@ stm_status stm_fs_removexattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             }
         }
     }
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -9259,7 +9245,7 @@ static stm_status fs_reflink(stm_fs *fs,
      * line 1227). pin_two requires both inodes to exist in the index;
      * absent that, the legacy mode still requires full big-lock
      * serialization because there's no per-inode mutex to acquire. */
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     stm_status ps = STM_EINVAL;
@@ -9287,24 +9273,24 @@ static stm_status fs_reflink(stm_fs *fs,
             }
             stm_inode_unpin(iidx, h_dst);
             stm_inode_unpin(iidx, h_src);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return s;
         }
         /* STM_ENOENT (either inode missing from index) ⇒ legacy mode;
          * other errors propagate. */
         if (ps != STM_ENOENT) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return ps;
         }
     }
     /* A gen names an inode in the index: no legacy path. */
     if (src_gen || dst_gen) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return (src_gen && ps == STM_ENOENT) ? STM_ESTALE : ps;
     }
     /* Legacy / transitional EX path: release SH and reacquire EX. */
-    pthread_rwlock_unlock(&fs->global);
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
     stm_status s = fs_flush_source_locked(fs, src_dataset_id, src_ino);
     if (s == STM_OK) {
@@ -9314,7 +9300,7 @@ static stm_status fs_reflink(stm_fs *fs,
         s = fs_reflink_locked(fs, src_dataset_id, src_ino,
                                   dst_dataset_id, dst_ino);
     }
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -9362,7 +9348,7 @@ stm_status stm_fs_copy_file_range(stm_fs *fs,
     /* P9.5-PARALLEL-3 impl-4: try SH+pin_two; fall back to EX for
      * legacy direct-extent inodes (see stm_fs_reflink for the same
      * pattern + rationale). */
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
@@ -9394,20 +9380,20 @@ stm_status stm_fs_copy_file_range(stm_fs *fs,
             }
             stm_inode_unpin(iidx, h_dst);
             stm_inode_unpin(iidx, h_src);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             if (s != STM_OK) return s;
             if (out_copied) *out_copied = src_size;
             return STM_OK;
         }
         if (ps != STM_ENOENT) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return ps;
         }
     }
 
     /* Legacy / transitional EX path. */
-    pthread_rwlock_unlock(&fs->global);
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_status s = fs_flush_source_locked(fs, src_dataset_id, src_ino);
@@ -9417,24 +9403,24 @@ stm_status stm_fs_copy_file_range(stm_fs *fs,
     if (s == STM_OK) {
         iidx = stm_sync_inode_index(fs->sync);
         if (!iidx) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EINVAL;
         }
         struct stm_inode_value siv = {0};
         stm_status sls = stm_inode_lookup(iidx, src_dataset_id, src_ino, &siv);
         if (sls != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return sls;
         }
         src_size = stm_load_le64(siv.si_size);
         if (len != src_size) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_ENOTSUPPORTED;
         }
         s = fs_reflink_locked(fs, src_dataset_id, src_ino,
                                   dst_dataset_id, dst_ino);
     }
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     if (s != STM_OK) return s;
     if (out_copied) *out_copied = src_size;
     return STM_OK;
@@ -9456,7 +9442,7 @@ stm_status stm_fs_migrate_to_cold(stm_fs *fs,
      * Falls back to EX (wrlock — pre-impl-5 posture) on STM_ENOENT
      * from pin so legacy direct-extent inodes (no index record) keep
      * working — same shape as impl-4 reflink/cfr. */
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (iidx) {
@@ -9474,27 +9460,27 @@ stm_status stm_fs_migrate_to_cold(stm_fs *fs,
             if (s == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
                 s = stm_sync_migrate_to_cold(fs->sync, dataset_id, ino);
             stm_inode_unpin(iidx, h);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return s;
         }
         if (pp != STM_ENOENT) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return pp;
         }
     }
     /* Legacy / transitional EX path. */
-    pthread_rwlock_unlock(&fs->global);
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
     stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
     if (fr != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return fr;
     }
     stm_status s = stm_sync_migrate_to_cold(fs->sync, dataset_id, ino);
     if (s == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))  /* CF-4 C */
         s = stm_sync_migrate_to_cold(fs->sync, dataset_id, ino);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -9555,7 +9541,7 @@ stm_status stm_fs_migrate_policy_step(stm_fs *fs,
     /* Step 1: take fs->lock, run the wedged/RO guards (RO is a hard
      * refusal — the policy mutates state), read current_gen, compute
      * cutoff, run the collect. Drop fs->lock. */
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     uint64_t cur_gen = stm_sync_current_gen(fs->sync);
@@ -9574,7 +9560,7 @@ stm_status stm_fs_migrate_policy_step(stm_fs *fs,
                                                        cutoff,
                                                        &cands, &n_cands,
                                                        &inos_visited);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
 
     if (cs != STM_OK) {
         /* On collect failure, stats reflect zero work — leave the
@@ -9670,14 +9656,14 @@ stm_status stm_fs_migrate_policy_pass_all(
      * resolution runs AFTER iter returns (still under fs->lock so
      * the dataset_index handle stays stable). Filter compacts the
      * id array in-place: enabled ids occupy [0, enabled_n). */
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_dataset_index *idx = stm_sync_dataset_index(fs->sync);
     pass_all_id_collect_ctx ctx = { .err = STM_OK };
     stm_status its = stm_dataset_iter(idx, pass_all_id_collect_cb, &ctx);
     if (its != STM_OK || ctx.err != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         free(ctx.ids);
         return (ctx.err != STM_OK) ? ctx.err : its;
     }
@@ -9698,7 +9684,7 @@ stm_status stm_fs_migrate_policy_pass_all(
             ctx.ids[enabled_n++] = ctx.ids[i];
         }
     }
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
 
     stats->datasets_visited  = (uint64_t)ctx.n;
     stats->datasets_eligible = (uint64_t)enabled_n;
@@ -9775,9 +9761,9 @@ stm_status stm_fs_migrate_policy_pass_all(
 /* Between two extents of a spanned promote every block the first reserved
  * is indexed or given back (or, once the handle wedged, held by no
  * commit): a reclaim queued for the txn lock commits here, so it waits for
- * one extent, not the file -- where the lock hands a queued writer the
- * lock at the last reader's unlock (glibc with the writer attribute,
- * macOS). musl's prefers readers: there the reclaim waits for the file. */
+ * one extent, not the file -- the txn lock's gate holds the next span back
+ * while the reclaim is queued (stm_rwlock prefers writers on every C
+ * library). */
 static void fs_promote_yield(void *arg)
 {
     stm_fs *fs = arg;
@@ -9819,7 +9805,7 @@ stm_status stm_fs_promote_to_hot(stm_fs *fs,
      * with stm_fs_migrate_to_cold (clause 18 of CLAUDE.md inode-alloc
      * row carries; impl-5 adds the migrate/promote pair). Legacy EX
      * fallback on STM_ENOENT from pin. */
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (iidx) {
@@ -9835,27 +9821,27 @@ stm_status stm_fs_promote_to_hot(stm_fs *fs,
             if (rc == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
                 rc = fs_promote_spanned(fs, dataset_id, ino);
             stm_inode_unpin(iidx, h);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return rc;
         }
         if (pp != STM_ENOENT) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return pp;
         }
     }
     /* Legacy / transitional EX path. */
-    pthread_rwlock_unlock(&fs->global);
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
     stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
     if (fr != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return fr;
     }
     stm_status rc = stm_sync_promote_to_hot(fs->sync, dataset_id, ino);
     if (rc == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))  /* CF-4 C */
         rc = stm_sync_promote_to_hot(fs->sync, dataset_id, ino);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return rc;
 }
 
@@ -9903,12 +9889,12 @@ static stm_status fs_promote_ino_bounded(stm_fs *fs, uint64_t ds, uint64_t ino,
          * A reused ino between steps is another file of the same dataset,
          * whose COLD extents past `from` the pass moves too (the ones
          * before it wait until a pass comes round to it again). */
-        pthread_rwlock_rdlock(&fs->global);
+        stm_rwlock_rdlock(&fs->global);
         FS_GUARD_WRITE(fs);
         stm_inode_handle *h = NULL;
         rc = stm_inode_pin(iidx, ds, ino, &h);
         if (rc != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             break;
         }
         /* The raw drain, not fs_flush_ino_locked: its reclaim on
@@ -9923,7 +9909,7 @@ static stm_status fs_promote_ino_bounded(stm_fs *fs, uint64_t ds, uint64_t ino,
             fs_txn_rd_end(fs);
         }
         stm_inode_unpin(iidx, h);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
 #ifdef STRATUM_BUILD_TESTING_HOOKS
         if (fs->promote_step_hook)
             fs->promote_step_hook(ino, ps.bytes, fs->promote_step_hook_arg);
@@ -10026,14 +10012,14 @@ stm_status stm_fs_promote_sealed_cold(stm_fs *fs, uint64_t dataset_id,
     rc = stm_sync_dataset_has_cold(fs->sync, dataset_id, &has_cold);
     if (rc != STM_OK || !has_cold) return rc;
 
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
     stm_sync_promote_candidate *cands = NULL;
     size_t   n_cands = 0u;
     uint64_t visited = 0u;
     rc = stm_sync_promote_policy_collect(fs->sync, dataset_id, 0u, 0u,
                                          &cands, &n_cands, &visited);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     if (rc != STM_OK) return rc;
     st->inos_visited  = visited;
     st->inos_eligible = (uint64_t)n_cands;
@@ -10119,7 +10105,7 @@ stm_status stm_fs_promote_policy_step(stm_fs *fs,
     stm_fs_promote_policy_stats local_stats = {0};
     stm_fs_promote_policy_stats *stats = out_stats ? out_stats : &local_stats;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     uint64_t cur_gen = stm_sync_current_gen(fs->sync);
@@ -10139,7 +10125,7 @@ stm_status stm_fs_promote_policy_step(stm_fs *fs,
                                                        cutoff,
                                                        &cands, &n_cands,
                                                        &inos_visited);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     if (cs != STM_OK) return cs;
 
     stats->inos_visited  = inos_visited;
@@ -10197,14 +10183,14 @@ stm_status stm_fs_promote_policy_pass_all(
     stm_fs_promote_policy_pass_all_stats local_stats = {0};
     stm_fs_promote_policy_pass_all_stats *stats = out_stats ? out_stats : &local_stats;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_dataset_index *idx = stm_sync_dataset_index(fs->sync);
     pass_all_id_collect_ctx ctx = { .err = STM_OK };
     stm_status its = stm_dataset_iter(idx, pass_all_id_collect_cb, &ctx);
     if (its != STM_OK || ctx.err != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         free(ctx.ids);
         return (ctx.err != STM_OK) ? ctx.err : its;
     }
@@ -10223,7 +10209,7 @@ stm_status stm_fs_promote_policy_pass_all(
             ctx.ids[enabled_n++] = ctx.ids[i];
         }
     }
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
 
     stats->datasets_visited  = (uint64_t)ctx.n;
     stats->datasets_eligible = (uint64_t)enabled_n;
@@ -10341,15 +10327,15 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
         if (js != STM_OK) return js;
     }
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     if (atomic_load_explicit(&fs->wedged, memory_order_relaxed)) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return STM_EWEDGED;
     }
     if (atomic_load_explicit(&fs->read_only, memory_order_relaxed)) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return STM_EROFS;
@@ -10360,7 +10346,7 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
         /* sync_open always populates the dataset index; a NULL here
          * means a sync-internal corruption that we surface rather
          * than dereferencing. */
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return STM_ECORRUPT;
@@ -10374,7 +10360,7 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
                                                     &parent_sealed);
     if (s == STM_OK && parent_sealed) s = STM_ENOTSUPPORTED;
     if (s != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return s;
@@ -10383,7 +10369,7 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
     uint64_t new_id = 0;
     s = stm_dataset_create_child(didx, parent_id, name, &new_id);
     if (s != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return s;
@@ -10404,14 +10390,14 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
          * failure mode, a regression test on fs_create_dataset's
          * rollback path will catch it. */
         (void)stm_dataset_destroy(didx, new_id);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return s;
     }
 
     *out_id = new_id;
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     stm_hybrid_keys_wipe(&wk);
     if (janus) stm_janus_client_disconnect(janus);
     return STM_OK;
@@ -10438,16 +10424,16 @@ stm_status stm_fs_lookup_child_dataset(stm_fs *fs, uint64_t parent_id,
                                           uint64_t *out_id)
 {
     if (!fs || !name || !out_id) return STM_EINVAL;
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
     if (!didx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
     stm_status s = stm_dataset_lookup_child_by_name(didx, parent_id,
                                                       name, name_len, out_id);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -10465,7 +10451,7 @@ stm_status stm_fs_create_dataset_corvus(stm_fs *fs, uint64_t parent_id,
      * stm_sync_add_dataset_key_corvus -> validate_corvus_path, which
      * refuse STM_EINVAL on any violation. */
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
@@ -10473,14 +10459,14 @@ stm_status stm_fs_create_dataset_corvus(stm_fs *fs, uint64_t parent_id,
         /* sync_open always populates the dataset index; a NULL here
          * means sync-internal corruption — surface it rather than
          * dereferencing. */
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
 
     uint64_t new_id = 0;
     stm_status s = stm_dataset_create_child(didx, parent_id, name, &new_id);
     if (s != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return s;
     }
 
@@ -10497,12 +10483,12 @@ stm_status stm_fs_create_dataset_corvus(stm_fs *fs, uint64_t parent_id,
          * unreachable here); same argument as stm_fs_create_dataset's
          * R45 P3-2 rollback. */
         (void)stm_dataset_destroy(didx, new_id);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return s;
     }
 
     *out_id = new_id;
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return STM_OK;
 }
 
@@ -10599,15 +10585,15 @@ stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
         if (js != STM_OK) return js;
     }
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     if (atomic_load_explicit(&fs->wedged, memory_order_relaxed)) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return STM_EWEDGED;
     }
     if (atomic_load_explicit(&fs->read_only, memory_order_relaxed)) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return STM_EROFS;
@@ -10616,7 +10602,7 @@ stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
     stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
     if (!didx || !sidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return STM_ECORRUPT;
@@ -10628,7 +10614,7 @@ stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
     stm_snapshot_entry origin;
     stm_status s = stm_snapshot_lookup(sidx, origin_snap_id, &origin);
     if (s != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return s;
@@ -10653,7 +10639,7 @@ stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
                                              &parent_sealed);
     if (s == STM_OK && parent_sealed) s = STM_ENOTSUPPORTED;
     if (s != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return s;
@@ -10669,7 +10655,7 @@ stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
     s = stm_dataset_create_clone(didx, parent_id, name, origin_snap_id,
                                     &new_id);
     if (s != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return s;
@@ -10687,7 +10673,7 @@ stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
          * therefore STM_ECORRUPT or an unexpected internal error. Roll
          * back the freshly-created clone. */
         (void)stm_dataset_destroy(didx, new_id);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return s;
@@ -10708,7 +10694,7 @@ stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
     if (s != STM_OK) {
         (void)stm_snapshot_release(sidx, origin_snap_id);
         (void)stm_dataset_destroy(didx, new_id);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return s;
@@ -10730,14 +10716,14 @@ stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
     if (s != STM_OK) {
         (void)stm_snapshot_release(sidx, origin_snap_id);
         (void)stm_dataset_destroy(didx, new_id);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return s;
     }
 
     *out_clone_id = new_id;
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     stm_hybrid_keys_wipe(&wk);
     if (janus) stm_janus_client_disconnect(janus);
     return STM_OK;
@@ -10771,17 +10757,17 @@ stm_status stm_fs_set_dataset_property(stm_fs *fs, uint64_t dataset_id,
 {
     if (!fs) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
     if (!didx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
 
     stm_status s = stm_dataset_set_property(didx, dataset_id, prop, value);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -10790,17 +10776,17 @@ stm_status stm_fs_clear_dataset_property(stm_fs *fs, uint64_t dataset_id,
 {
     if (!fs) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
     if (!didx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
 
     stm_status s = stm_dataset_clear_property(didx, dataset_id, prop);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -10981,7 +10967,7 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
     memcpy(nbuf, name, name_len);
     nbuf[name_len] = '\0';
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     /* R128 P2-3 + SWISS-4q-flush-snapshot close: drain ALL buffered
@@ -10996,7 +10982,7 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
     {
         stm_status fr = fs_flush_all_locked(fs);
         if (fr != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return fr;
         }
     }
@@ -11018,14 +11004,14 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
      * API and a surprising "failed op bumped fs->gen". */
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
     if (!didx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
     {
         stm_dataset_entry de_gate;
         stm_status pgrc = stm_dataset_lookup(didx, dataset_id, &de_gate);
         if (pgrc != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return pgrc;     /* STM_ENOENT for a missing dataset */
         }
         /* 9.7-impl-6e: snap-of-clone refusal — phase-9.7-design.md
@@ -11039,7 +11025,7 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
          * side effect (R160 P1-1 doctrine — same posture as the
          * presence gate above). */
         if (de_gate.origin_snap_id != STM_DATASET_NO_ORIGIN) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_ENOTSUPPORTED;
         }
     }
@@ -11062,7 +11048,7 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
         stm_status cr = stm_sync_commit(fs->sync);
         if (cr != STM_OK) {
             fs_mark_wedged_locked(fs);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return cr;
         }
     }
@@ -11076,13 +11062,13 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
     stm_dataset_entry de;
     stm_status drc = stm_dataset_lookup(didx, dataset_id, &de);
     if (drc != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return drc;     /* propagates STM_ENOENT for missing dataset */
     }
 
     stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
     if (!sidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
 
@@ -11098,7 +11084,7 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
                                           de.di_root_gen,
                                           de.di_root_csum,
                                           cur_gen, out_id);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -11121,12 +11107,12 @@ stm_status stm_fs_delete_snapshot(stm_fs *fs, uint64_t snapshot_id,
     if (!fs) return STM_EINVAL;
     if (snapshot_id == 0) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
     if (!sidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
 
@@ -11151,7 +11137,7 @@ stm_status stm_fs_delete_snapshot(stm_fs *fs, uint64_t snapshot_id,
         free(freed);
         free(cold_hashes);
         free(freed_boot);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return del;
     }
 
@@ -11225,7 +11211,7 @@ stm_status stm_fs_delete_snapshot(stm_fs *fs, uint64_t snapshot_id,
     free(freed);
     free(cold_hashes);
     free(freed_boot);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return first_err;
 }
 
@@ -11246,17 +11232,17 @@ stm_status stm_fs_hold_snapshot(stm_fs *fs, uint64_t snapshot_id)
     if (!fs) return STM_EINVAL;
     if (snapshot_id == 0) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
     if (!sidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
 
     stm_status s = stm_snapshot_hold(sidx, snapshot_id);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -11265,17 +11251,17 @@ stm_status stm_fs_release_snapshot(stm_fs *fs, uint64_t snapshot_id)
     if (!fs) return STM_EINVAL;
     if (snapshot_id == 0) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
     if (!sidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
 
     stm_status s = stm_snapshot_release(sidx, snapshot_id);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -11294,12 +11280,12 @@ static stm_status fs_set_snapshot_compromised(stm_fs *fs,
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0 || snapshot_id == 0) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
     if (!sidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
 
@@ -11309,11 +11295,11 @@ static stm_status fs_set_snapshot_compromised(stm_fs *fs,
     stm_snapshot_entry entry;
     stm_status s = stm_snapshot_lookup(sidx, snapshot_id, &entry);
     if (s != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return s;
     }
     if (entry.dataset_id != dataset_id) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ENOENT;
     }
 
@@ -11323,7 +11309,7 @@ static stm_status fs_set_snapshot_compromised(stm_fs *fs,
             : stm_snapshot_unmark_compromised(sidx, snapshot_id);
     if (s == STM_OK && out_changed)
         *out_changed = (was_set != set);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -11353,10 +11339,10 @@ stm_status stm_fs_install_dek(stm_fs *fs, uint64_t dataset_id,
                                 const stm_corvus_mount_cfg *corvus)
 {
     if (!fs) return STM_EINVAL;
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
     stm_status s = stm_sync_install_dek(fs->sync, dataset_id, corvus);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -11368,7 +11354,7 @@ bool stm_fs_dataset_locked(stm_fs *fs, uint64_t dataset_id)
 stm_status stm_fs_evict_dek(stm_fs *fs, uint64_t dataset_id)
 {
     if (!fs) return STM_EINVAL;
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
     /* D7-R4: encrypt this dataset's buffered writes while its key is still
      * installed. Otherwise logout strands a dirty range and every subsequent
@@ -11381,7 +11367,7 @@ stm_status stm_fs_evict_dek(stm_fs *fs, uint64_t dataset_id)
      * retry; no new lock order or commit protocol. */
     stm_status s = fs_flush_dataset_locked(fs, dataset_id);
     if (s == STM_OK) s = stm_sync_evict_dek(fs->sync, dataset_id);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -12468,12 +12454,12 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0 || snapshot_id == 0) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
     if (!sidx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
 
@@ -12481,13 +12467,13 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
     stm_snapshot_entry entry;
     stm_status s = stm_snapshot_lookup(sidx, snapshot_id, &entry);
     if (s != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return s;
     }
     /* Dataset-bind: the rollback cannot cross the dataset boundary
      * the /ctl/ verb was addressed to (R146 P2-2). */
     if (entry.dataset_id != dataset_id) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ENOENT;
     }
 
@@ -12497,7 +12483,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * fs->global EX, so a racing unmark either fully precedes (gate
      * sees clear) or fully follows (gate sees set) — never torn. */
     if ((entry.flags & STM_SNAP_FLAG_ROLLBACK_COMPROMISED) && !force) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ECOMPROMISED;
     }
 
@@ -12565,7 +12551,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * a true no-op (no destructive step taken). */
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
     if (!didx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
     uint64_t *newer_ids = NULL;
@@ -12573,7 +12559,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
     s = stm_snapshot_collect_newer(sidx, dataset_id, snapshot_id,
                                       &newer_ids, &n_newer);
     if (s != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return s;
     }
     for (size_t i = 0; i < n_newer; i++) {
@@ -12585,12 +12571,12 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
              * (we hold fs->global EX through both the collect and the
              * lookup), so a lookup miss here is STM_ECORRUPT. Refuse. */
             free(newer_ids);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return ls == STM_ENOENT ? STM_ECORRUPT : ls;
         }
         if (ne.hold_count > 0) {
             free(newer_ids);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EBUSY;
         }
         /* 9.7-impl-6e clone-refusal: refuse if any PRESENT clone
@@ -12605,12 +12591,12 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
                                                              &n_clones);
         if (cs != STM_OK) {
             free(newer_ids);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return cs;
         }
         if (n_clones > 0) {
             free(newer_ids);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_EBUSY;
         }
     }
@@ -12633,7 +12619,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
                                               entry.root_csum);
     if (s != STM_OK) {
         free(newer_ids);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return s;
     }
 
@@ -12645,7 +12631,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
                                           entry.root_csum, &view_data);
         if (s != STM_OK) {
             free(newer_ids);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return s;
         }
     }
@@ -12659,7 +12645,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         if (!detached) {
             free(view_data.v);
             free(newer_ids);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return STM_ENOMEM;
         }
     }
@@ -12677,7 +12663,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
             free(view_data.v);
             free(newer_ids);
             free(detached);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return fr;
         }
     }
@@ -12696,7 +12682,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
             free(newer_ids);
             free(detached);
             fs_mark_wedged_locked(fs);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return cr;
         }
     }
@@ -12726,7 +12712,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         free(view_data.v);
         free(newer_ids);
         free(detached);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return s;
     }
 
@@ -12760,7 +12746,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         free(view_data.v);
         free(newer_ids);
         free(detached);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return s;
     }
 
@@ -12776,7 +12762,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         free(newer_ids);
         free(detached);
         fs_mark_wedged_locked(fs);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return s;
     }
 
@@ -12795,7 +12781,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         fs_rb_detached_free(detached, n_newer);
         free(newer_ids);
         fs_mark_wedged_locked(fs);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EBUSY;
     }
 
@@ -12902,7 +12888,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         fs_rb_detached_free(detached, n_newer);
         free(newer_ids);
         fs_mark_wedged_locked(fs);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return s;
     }
 
@@ -12954,12 +12940,12 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         stm_status cr = stm_sync_commit(fs->sync);
         if (cr != STM_OK) {
             fs_mark_wedged_locked(fs);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return cr;
         }
     }
 
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return STM_OK;
 }
 
@@ -12968,17 +12954,17 @@ stm_status stm_fs_set_dataset_pool_default(stm_fs *fs, stm_property prop,
 {
     if (!fs) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
     if (!didx) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
 
     stm_status s = stm_dataset_set_pool_default(didx, prop, value);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -13087,19 +13073,19 @@ static stm_status fs_fallocate(stm_fs *fs,
      * UNSHARE_RANGE drops the lock + pin BEFORE chaining into
      * stm_fs_promote_to_hot — see that branch below. */
     fs_txn tx = { false };
-    pthread_rwlock_rdlock(&fs->global);
+    stm_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index *iidx_pin = stm_sync_inode_index(fs->sync);
     if (!iidx_pin) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
     stm_inode_handle *h_falloc = NULL;
     stm_status pp_falloc = fs_pin_if_gen(fs, iidx_pin, dataset_id, ino, gen,
                                          &h_falloc);
     if (pp_falloc != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return pp_falloc;       /* STM_ENOENT */
     }
 
@@ -13113,7 +13099,7 @@ static stm_status fs_fallocate(stm_fs *fs,
         stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
         if (fr != STM_OK) {
             stm_inode_unpin(iidx_pin, h_falloc);
-            pthread_rwlock_unlock(&fs->global);
+            stm_rwlock_unlock(&fs->global);
             return fr;
         }
     }
@@ -13122,7 +13108,7 @@ static stm_status fs_fallocate(stm_fs *fs,
     stm_status vs = fs_fallocate_validate_target(fs, dataset_id, ino, &iv);
     if (vs != STM_OK) {
         stm_inode_unpin(iidx_pin, h_falloc);
-        pthread_rwlock_unlock(&fs->global);
+        stm_rwlock_unlock(&fs->global);
         return vs;
     }
 
@@ -13346,14 +13332,14 @@ static stm_status fs_lock(stm_fs *fs,
      * refuse a successor on the same ino, whatever frees this one (an
      * unlink drops it at once; a rollback leaves it inert until its
      * owner closes). */
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_READ(fs);
     uint64_t live_gen = 0;
     stm_status s = fs_live_gen_locked(fs, dataset_id, ino, gen, &live_gen);
     if (s == STM_OK)
         s = stm_lock_acquire_as(fs->locks, dataset_id, ino, live_gen,
                                 owner_id, client, type, off, len);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -13366,11 +13352,11 @@ stm_status stm_fs_unlock(stm_fs *fs,
     /* 9.7-impl-5 R166 P2-2: symmetric to lock — synth ino refusal. */
     if (fs_ino_is_synth(ino)) return STM_EROFS;
 
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     FS_GUARD_READ(fs);
     stm_status s = stm_lock_release(fs->locks, dataset_id, ino,
                                           owner_id, off, len);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -13418,9 +13404,9 @@ stm_status stm_fs_release_lock_owner(stm_fs *fs, uint64_t owner_id)
      * table grows unbounded as long as the wedged fs stays mounted).
      * Take the lock to serialize against unmount, then release without
      * the wedge guard. */
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     stm_status s = stm_lock_release_owner(fs->locks, owner_id);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -14014,9 +14000,9 @@ void stm_fs_mark_wedged(stm_fs *fs)
      * wait-free readers (which check this WITHOUT taking fs->global)
      * synchronise via acquire-load. EX excludes other writers; the atomic
      * provides the reader-side pairing. */
-    pthread_rwlock_wrlock(&fs->global);
+    stm_rwlock_wrlock(&fs->global);
     fs_mark_wedged_locked(fs);
-    pthread_rwlock_unlock(&fs->global);
+    stm_rwlock_unlock(&fs->global);
 }
 
 stm_status stm_fs_verify(const stm_fs *fs)

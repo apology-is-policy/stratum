@@ -78,9 +78,10 @@ void stm_pool_lock_exclusive  (stm_pool *p);
 void stm_pool_unlock_exclusive(stm_pool *p);
 ```
 
-Readers nest; writers are exclusive; a shared-lock request blocks
-if a writer is waiting (Linux uses `PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`
-to prevent reader starvation — R18 P2-1).
+Readers share it; writers are exclusive; a shared-lock request waits
+while a writer is waiting, on every C library (the lock is an
+`stm_rwlock`, so readers cannot starve a writer -- R18 P2-1). A thread
+holding the shared side therefore must not take it again.
 
 **Lock order** (global): `POOL OUTER, SYNC INNER, ALLOC LEAF`.
 Any reversal → deadlock. Pool mutators take the exclusive side
@@ -369,7 +370,7 @@ EVACUATING / REMOVED transitions are implemented.
 ## Status
 
 - [x] Pool open + close + scalar/pointer readers.
-- [x] Per-pool rwlock with writer-preference (Linux).
+- [x] Per-pool rwlock that prefers writers (`stm_rwlock`, every C library).
 - [x] `add_device` + `remove_device` + burned-UUID tracking.
 - [x] `begin_evacuation` + `finish_evacuation`.
 - [x] `fail_device` + `rejoin_device` (P5-4d-α).

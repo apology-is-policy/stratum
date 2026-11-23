@@ -321,12 +321,11 @@ latency — flagged by R20 P3-4 as a γ-scope throttling concern.
 
 The cb is invoked from inside `verify_range_locked`, with both
 `sc->lock` and `pool->rdlock` held. **The pool's rwlock is
-non-reentrant** — initialized with
-`PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP` on Linux
-(`pool.c:274-280`); a thread already holding rdlock that calls a
-pool API which re-acquires the rdlock will deadlock if any writer
-is queued. The cb must therefore avoid every pool API that takes
-the rwlock internally (read OR write side).
+non-reentrant** -- an `stm_rwlock`, which prefers writers on every C
+library; a thread already holding rdlock that calls a pool API which
+re-acquires the rdlock will deadlock if any writer is queued (hooks
+builds abort on the re-acquisition). The cb must therefore avoid
+every pool API that takes the rwlock internally (read OR write side).
 
 Forbidden from the cb:
 
@@ -335,19 +334,26 @@ Forbidden from the cb:
   `_fail_device`, `_rejoin_device`, `_begin_evacuation`,
   `_finish_evacuation`, `_set_replace_claim`, `_clear_replace_claim`)
   — block forever waiting for our rdlock.
-- Pool read APIs that internally call `pthread_rwlock_rdlock`:
-  `stm_pool_replace_claim` (`pool.c:454`). Use the `_locked` variant
-  if needed (it doesn't re-lock).
+- Pool read APIs that take the lock themselves:
+  `stm_pool_replace_claim`. Use the `_locked` variant if needed (it
+  doesn't re-lock).
+- Sync APIs that take the pool lock themselves: shared,
+  `stm_sync_commit`, `_attach_alloc`, `_reserve_mirror`,
+  `_mirror_write`, `_mirror_read`, `_evacuation_step`,
+  `_cas_gc_sweep` and the cold promotes (their unlocked chunk read);
+  exclusive, `_remove_device` and `_finish_evacuation`; both,
+  `_replace_device_online`. A test hook that needs one runs it on a
+  thread of its own (`tests/test_scrub.c`, `srb_off_thread`).
 
 Allowed from the cb (no internal locking — pure pointer dereference
 of the already-locked pool struct):
 
-- `stm_pool_device_info(pool, dev)` (`pool.c:498-501`).
-- `stm_pool_device_bdev(pool, dev)` (`pool.c:493-496`).
+- `stm_pool_device_info(pool, dev)`.
+- `stm_pool_device_bdev(pool, dev)`.
 - `stm_pool_device_count(pool)`, `stm_pool_uuid(pool)`,
   `stm_pool_live_device_count(pool)` (all pure dereferences).
-- `stm_pool_replace_claim_locked(pool)` (`pool.c:460-465`) — the
-  caller-locked variant.
+- `stm_pool_replace_claim_locked(pool)` -- the caller-locked
+  variant.
 - `stm_sync_alloc(sync, dev)`: takes sync.lock briefly (pool order
   is OUTER -> SYNC, so this is correct under our held rdlock), and so
   not from inside a cb's own hold of sync.lock: the production cb,

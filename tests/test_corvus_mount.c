@@ -5857,8 +5857,10 @@ STM_TEST(corvus_promote_across_a_snapshot_lists_no_block_the_snapshot_never_had)
  * over a file of several records stm_fs_promote_to_hot lets the reclaim in
  * between two of them, so it has committed by the second record's seam.
  * Every seam runs inside exactly one span, and none is left after. The
- * controls need a txn lock that prefers writers (macOS; glibc with the
- * attribute): on musl's a queued writer is not seen, nor let in. */
+ * controls need a txn lock that prefers writers, which stm_rwlock's gate
+ * makes it on every C library; the test_corvus_mount_rp_* ctest entries
+ * run them over a lock that prefers readers, where only the gate shows
+ * the reclaim queued and lets it in. */
 typedef struct {
     seal_pool      *sp;
     uint64_t        ds, x;

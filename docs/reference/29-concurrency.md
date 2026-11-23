@@ -119,13 +119,12 @@ The full as-built stack, outermost first:
 
 ```
 s->lock / pool locks        (9P layer; NEVER held across a core call)
-fs->global                  (rwlock; EX compound, SH per-inode + reads;
-                             writer-preference, R133 P1-1)
+fs->global                  (stm_rwlock; EX compound, SH per-inode +
+                             reads; prefers writers, R133 P1-1)
    -> per-inode handle->rw  (PARALLEL-3 SH path; stm_inode_pin = wrlock,
                              stm_inode_pin_shared = rdlock since RC-2 — the
-                             extent-read side; glibc slots init
-                             PREFER_WRITER_NONRECURSIVE)
-   -> fs->txn               (rwlock, writer-preference like fs->global; SH
+                             extent-read side; an stm_rwlock)
+   -> fs->txn               (stm_rwlock, prefers writers like fs->global; SH
                              spans: a writer's {insert or extent; iset},
                              a namespace op's mutations and a data op's
                              extent change + inode update; EX: the ENOSPC
@@ -158,6 +157,37 @@ the one-in-flight `bdev d->lock` (invariant B-2). Deadlock-avoidance rules:
   it is still a directory) and starts a new span (`fs_txn_pin_fresh`).
   Hooks builds count every breach, and every namespace or range mutation
   made outside a span (`stm_fs_txn_order_violations_for_test`).
+- Every rwlock in `src/` is an `stm_rwlock` (`src/util/rwlock.c`):
+  `fs->global`, `fs->txn`, the inode slot locks, the pool's roster lock and
+  `btree_mt`'s tree lock. It prefers writers on every C library: a writer
+  counts itself in before it waits for the `pthread_rwlock_t` underneath
+  and out once it holds it, and a new reader waits at the gate while any
+  writer is counted. musl's lock and glibc's default one prefer readers,
+  so a stream of SH ops would otherwise starve an EX taker on Thylacine;
+  macOS's prefers writers by itself. Readers wait at the gate in a
+  parking lot (one of 64 static mutex and condvar stripes, by the lock's
+  address), so a lock carries no mutex or condvar of its own. A reader
+  pays one relaxed load more; a writer two atomic read-modify-writes and
+  a load, and the stripe's lock and broadcast only when a reader waits
+  (measured 2026-11-20 and 11-23, macOS arm64: an uncontended
+  wrlock+unlock 7.8 -> 14.5 ns, rdlock+unlock 8.2 -> 8.3 ns; a 64 B write
+  +4% and chmod +2% on one thread, four threads within the runs' own
+  spread). So **a shared hold is a hold**: no
+  thread takes, blocking, a gated lock it already holds, in either mode
+  (a second read hold waits behind a writer queued on the first), and no
+  thread holding one shared waits for anything a later reader of it may
+  hold or be about to do -- a join or condvar wait on a thread that will
+  take it shared, or another lock (a gated one, shared or exclusive, a
+  mutex) that such a reader takes in the other order. Hooks builds track
+  each thread's held gated locks and abort on a blocking re-take, on an
+  unlock by a thread that does not hold the lock, on a thread exiting or
+  destroying a lock while it holds it, and past 64 holds; the
+  `check_rwlocks` ctest (`tools/check-rwlocks.py`) fails on a
+  `pthread_rwlock_` name in `src/` outside the gate. In hooks builds
+  `stm_rwlock_prefer_readers_for_test` (or `STM_RWLOCK_PREFER_READERS=1`)
+  puts the gated locks initialised while it is on onto a lock that
+  prefers readers, so a test sees the gate as it works over musl's on any
+  host.
 - Dirty-buffer drain callbacks run under `buf->mu`; no re-entry.
 - `serial_mu -> commit_mu` (engine_internal.h:631, R170 P3-2); the mini
   realizes it via **trylock** only, so it bails rather than blocks.
@@ -390,6 +420,19 @@ in-flight tags — is real but not yet demonstrated by this workload.
   fails exactly the 9 retry-dependent tests.
 - `tests/test_concurrent_lf_read.c` + `tests/bench_concurrent_write.c`
   (Area D) — the wait-free-read stress + the §29.9 core scaling probe.
+- `tests/test_rwlock.c`, `test_rwlock_under.c`, `test_rwlock_fs.c` --
+  `stm_rwlock`: each of the hooks' aborts (by its message, in a child),
+  sharing and exclusion, `tryrdlock` refused while a writer waits, and a
+  writer getting in under a stream of readers that never lets go of the
+  lock as a whole. `test_rwlock_under.c` runs the gate in its test mode,
+  over a lock that prefers readers, so the gate's preference is what it
+  sees on every host: the same stream starving a writer on that lock bare
+  is its control; a new reader waits for a waiting writer, and for every
+  writer counted; no reader is lost at a count-out (a 2 s stress over
+  each lock); and a reader woken for another lock on its stripe waits
+  again. `test_rwlock_fs.c` lets a commit in under a stream of writes
+  holding `fs->global` shared; the ctest entries `test_corvus_mount_rp_*`
+  run the ENOSPC reclaim's witnesses in the test mode.
 
 **Sanitizer posture:** macOS ASan + TSan are host-broken (hello-world-proven
 environmental breakage, task #52); guard-malloc + UBSan are the local

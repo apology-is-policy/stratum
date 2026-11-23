@@ -43,6 +43,7 @@
 #include <stratum/ebr.h>            /* 9.8-LF-3: stm_inode_lookup_concurrent */
 #include <stratum/metakey.h>
 #include <stratum/types.h>
+#include <stratum/rwlock.h>
 
 #include <errno.h>
 #include <pthread.h>
@@ -144,8 +145,8 @@ struct stm_inode_handle {
      * EXCLUSIVE side (stm_inode_pin) — same-inode readers proceed in
      * parallel with each other and exclude same-inode write/truncate/
      * punch mid-read (RC-I2, docs/rc-design.md). unpin is mode-blind
-     * (pthread_rwlock_unlock releases either side). */
-    pthread_rwlock_t          rw;           /* the per-inode lock */
+     * (stm_rwlock_unlock releases either side). */
+    stm_rwlock                rw;           /* the per-inode lock */
     struct stm_inode_handle  *next;         /* hash-chain link, under idx->lock */
 };
 
@@ -765,7 +766,7 @@ void stm_inode_index_close(stm_inode_index *idx) {
         struct stm_inode_handle *h = idx->handle_buckets[b];
         while (h) {
             struct stm_inode_handle *next = h->next;
-            pthread_rwlock_destroy(&h->rw);
+            stm_rwlock_destroy(&h->rw);
             free(h);
             h = next;
         }
@@ -1526,29 +1527,14 @@ handle_get_or_alloc_locked(stm_inode_index *idx,
     h->next       = idx->handle_buckets[b];
 
     /* RC-2 posture note: the pre-RC mutex was ERRORCHECK so a buggy
-     * same-thread double-pin aborted loudly. pthread rwlocks have no
-     * errorcheck attr — a same-thread double-wrlock returns EDEADLK on
-     * macOS (surfaced as STM_EBACKEND by the pin) and deadlocks on
-     * glibc; either way the bug stays loud rather than silently
-     * recursive. On glibc, prefer writers so a stream of shared
+     * same-thread double-pin aborted loudly. A rwlock has no errorcheck
+     * attr: a same-thread double-wrlock returns EDEADLK on macOS and
+     * glibc (surfaced as STM_EBACKEND by the pin) and deadlocks on musl,
+     * and hooks builds abort on any same-thread double pin (stm_rwlock);
+     * either way the bug stays loud rather than silently recursive. The
+     * lock prefers writers on every C library, so a stream of shared
      * readers cannot starve a truncate/write pin indefinitely. */
-    int rc;
-#ifdef PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP
-    {
-        pthread_rwlockattr_t attr;
-        if (pthread_rwlockattr_init(&attr) != 0) {
-            free(h);
-            return NULL;
-        }
-        (void)pthread_rwlockattr_setkind_np(
-                &attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-        rc = pthread_rwlock_init(&h->rw, &attr);
-        pthread_rwlockattr_destroy(&attr);
-    }
-#else
-    rc = pthread_rwlock_init(&h->rw, NULL);
-#endif
-    if (rc != 0) {
+    if (stm_rwlock_init(&h->rw) != 0) {
         free(h);
         return NULL;
     }
@@ -1572,7 +1558,7 @@ static void handle_release_locked(stm_inode_index *idx,
      * (handle_get_or_alloc_locked is the only inserter). */
     if (*pp != h) abort();
     *pp = h->next;
-    pthread_rwlock_destroy(&h->rw);
+    stm_rwlock_destroy(&h->rw);
     free(h);
 }
 
@@ -1620,9 +1606,9 @@ static stm_status inode_pin_mode(stm_inode_index *idx, uint64_t dataset_id,
     /* Acquire the per-inode lock; may block on a concurrent holder.
      * The slot remains live (refcount >= 1 thanks to our bump) for
      * the duration of this wait. */
-    int lrc = shared   ? pthread_rwlock_rdlock(&h->rw)
-            : try_only ? pthread_rwlock_trywrlock(&h->rw)
-                       : pthread_rwlock_wrlock(&h->rw);
+    int lrc = shared   ? stm_rwlock_rdlock(&h->rw)
+            : try_only ? stm_rwlock_trywrlock(&h->rw)
+                       : stm_rwlock_wrlock(&h->rw);
     if (lrc != 0) {
         must_lock(idx_lock(idx));
         handle_release_locked(idx, h);
@@ -1640,7 +1626,7 @@ static stm_status inode_pin_mode(stm_inode_index *idx, uint64_t dataset_id,
         (stm_load_le32(v.si_flags) & STM_INO_FLAG_FREED)) {
         stm_status rc = (gs != STM_OK) ? gs : STM_ENOENT;
         must_unlock(idx_lock(idx));
-        pthread_rwlock_unlock(&h->rw);
+        stm_rwlock_unlock(&h->rw);
         must_lock(idx_lock(idx));
         handle_release_locked(idx, h);
         must_unlock(idx_lock(idx));
@@ -1673,7 +1659,7 @@ stm_status stm_inode_pin_shared(stm_inode_index *idx, uint64_t dataset_id,
 
 void stm_inode_unpin(stm_inode_index *idx, stm_inode_handle *handle) {
     if (!idx || !handle) return;
-    pthread_rwlock_unlock(&handle->rw);
+    stm_rwlock_unlock(&handle->rw);
     must_lock(idx_lock(idx));
     handle_release_locked(idx, handle);
     must_unlock(idx_lock(idx));

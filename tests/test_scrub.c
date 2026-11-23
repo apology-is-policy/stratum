@@ -1403,11 +1403,11 @@ STM_TEST(scrub_durable_fresh_pool_starts_idle) {
  *      but bounded.
  *   4. The mutator made progress: toggle_count > 0.
  *
- * Lock ordering exercised: scrub holds sc.lock + pool.rdlock; mutator
- * takes pool.wrlock. Linux's PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP
- * (pool.c:274-280) means a queued writer blocks new readers — scrub's
- * outer loop drops + reacquires pool.rdlock between devices, so
- * progress on both threads is preserved. */
+ * Lock ordering exercised: scrub holds sc.lock + the pool lock shared;
+ * the mutator takes it exclusive. The pool's stm_rwlock prefers writers
+ * (a queued writer holds new readers at its gate) -- scrub's outer loop
+ * drops + reacquires its read hold between devices, so progress on both
+ * threads is preserved. */
 typedef struct {
     stm_scrub        *sc;
     _Atomic int       done;        /* 1 = exit loop */
@@ -1431,13 +1431,10 @@ static void *scrub_thread_fn(void *arg)
         /* PAUSED would be unusual here (we don't pause); fall through.
          *
          * R25 P3 (portability hardening): yield briefly between scrub
-         * iterations so the mutator gets a wrlock window even on
-         * platforms where pool's rwlock isn't writer-preferring.
-         * Linux uses PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP
-         * (pool.c:274-280) so writers preempt new readers, but macOS
-         * falls back to the default rwlock attribute (`pool.c:281-283`)
-         * which is reader-favoring. A 1µs sleep is enough to release
-         * scrub's tight reacquire loop without bloating the test. */
+         * iterations, so the mutator's window does not rest on the
+         * pool lock's preference alone (its stm_rwlock prefers writers
+         * on every host). A 1 us sleep is enough to release scrub's
+         * tight reacquire loop without bloating the test. */
         struct timespec yield_ts = { 0, 1000L };  /* 1µs */
         nanosleep(&yield_ts, NULL);
     }
@@ -2049,7 +2046,34 @@ static void srb_pread(const char *path, uint64_t paddr, uint8_t *out, size_t n)
     STM_ASSERT_EQ(close(fd), 0);
 }
 
-static void srb_hook(void *arg)
+/* The scrub calls the verify hook holding the pool lock shared, and a
+ * thread must not take, blocking, a gated lock it holds
+ * (include/stratum/rwlock.h): a commit takes it. So a hook that writes or
+ * commits does the work on a thread of its own, as a commit racing the
+ * scrub would, and waits for it. No pool writer queues in these tests, so
+ * that thread's read hold goes in beside the scrub's. */
+typedef struct {
+    void (*fn)(void *);
+    void  *arg;
+} srb_off;
+
+static void *srb_off_main(void *p)
+{
+    srb_off *o = p;
+    o->fn(o->arg);
+    return NULL;
+}
+
+static void srb_off_thread(void (*fn)(void *), void *arg)
+{
+    srb_off o = { fn, arg };
+    pthread_t t;
+    int rc = pthread_create(&t, NULL, srb_off_main, &o);
+    STM_ASSERT_EQ(rc, 0);
+    if (rc == 0) (void)pthread_join(t, NULL);
+}
+
+static void srb_hook_body(void *arg)
 {
     srb_ctx *h = arg;
     if (h->fired++) return;
@@ -2105,6 +2129,8 @@ static void srb_hook(void *arg)
         srb_pread(h->fx->paths[1], h->old_p1, h->taker1_disk,
                   sizeof h->taker1_disk);
 }
+
+static void srb_hook(void *arg) { srb_off_thread(srb_hook_body, arg); }
 
 static void scrub_stale_record_case(const char *tag, srb_mode mode,
                                     bool pin_dev0)
@@ -2224,12 +2250,17 @@ STM_TEST(scrub_moved_extent_answers_at_its_own_base) {
  * pass: its hook takes s->lock (a commit), which the second look holds. */
 typedef struct { stm_sync *s; int fired; stm_status st; } srb_count_ctx;
 
-static void srb_count_hook(void *arg)
+static void srb_count_hook_body(void *arg)
 {
     srb_count_ctx *c = arg;
     c->fired++;
     stm_status r = stm_sync_commit(c->s);
     if (c->st == STM_OK) c->st = r;
+}
+
+static void srb_count_hook(void *arg)
+{
+    srb_off_thread(srb_count_hook_body, arg);
 }
 
 STM_TEST(scrub_repair_seam_fires_outside_the_lock) {
@@ -2284,7 +2315,7 @@ typedef struct {
     uint8_t    disk[2 * SRB_LEN];   /* its replica 1, before the pass */
 } t87_again_ctx;
 
-static void t87_again_hook(void *arg)
+static void t87_again_hook_body(void *arg)
 {
     t87_again_ctx *h = arg;
     if (h->fired++) return;
@@ -2307,6 +2338,11 @@ static void t87_again_hook(void *arg)
         corrupt_replica_on_disk(h->fx->paths[1], h->fx->extent_rec.paddrs[1]);
     if (h->st == STM_OK)
         srb_pread(h->fx->paths[1], h->now.paddrs[1], h->disk, sizeof h->disk);
+}
+
+static void t87_again_hook(void *arg)
+{
+    srb_off_thread(t87_again_hook_body, arg);
 }
 
 static void t87_again_case(const char *tag, bool same_gen)

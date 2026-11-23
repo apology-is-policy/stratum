@@ -351,12 +351,15 @@ unsigned stm_fs_txn_order_violations_for_test(void);
 unsigned stm_fs_txn_depth_for_test(void);
 
 /*
- * Whether a tryrdlock of fs->txn fails right now: a writer holds it or,
- * where the lock prefers writers (glibc with the attribute, macOS), is
- * queued for it. musl's lock prefers readers, so there a queued writer
- * answers false.
+ * Whether a tryrdlock of fs->txn fails right now: a writer holds it or is
+ * queued for it (stm_rwlock_tryrdlock refuses while a writer is counted,
+ * on every C library).
  */
 bool stm_fs_txn_writer_waiting_for_test(stm_fs *fs);
+
+/* Whether fs->global stands on stm_rwlock_rp: it was initialised while
+ * stm_rwlock_prefer_readers_for_test was on (include/stratum/rwlock.h). */
+bool stm_fs_global_on_rp_for_test(stm_fs *fs);
 
 /*
  * Call `fn` in every stm_fs_mount, process-wide, so a test can arm faults

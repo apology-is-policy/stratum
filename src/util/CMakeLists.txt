@@ -1,6 +1,7 @@
 add_library(stm_util STATIC
     status.c
     listen.c
+    rwlock.c
     takename.c)
 
 target_include_directories(stm_util PUBLIC

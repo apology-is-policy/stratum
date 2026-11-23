@@ -81,6 +81,10 @@ stm_add_test(test_cas_index    test_cas_index.c)
 stm_add_test(test_p9         test_p9.c)
 stm_add_test(test_janus      test_janus.c)
 stm_add_test(test_takename   test_takename.c)
+# test_rwlock_under.c and test_rwlock_fs.c run the gate over a lock that
+# prefers readers (its test mode, stm_rwlock_prefer_readers_for_test).
+stm_add_test(test_rwlock     test_rwlock.c test_rwlock_under.c
+                             test_rwlock_fs.c test_fs_common.c)
 stm_add_test(test_accept     test_accept.c)
 stm_add_test(test_keyschema_rotate test_keyschema_rotate.c)
 stm_add_test(test_keyfile_passphrase test_keyfile_passphrase.c)
@@ -197,6 +201,14 @@ stm_add_test(test_corvus_mount test_corvus_mount.c)
 # (RelWithDebInfo) its first 85 of 97 tests took 58.2 s (2026-11-20), so
 # the whole binary outran the default 60 s. 180 s, as test_fs.
 set_tests_properties(test_corvus_mount PROPERTIES TIMEOUT 180)
+# The ENOSPC reclaim's witnesses with every gated lock on a lock that
+# prefers readers (as musl's and glibc's default ones do): there only the
+# gate shows the reclaim queued at fs->txn and lets it in.
+foreach(t holds_off_a_reclaims_commit lets_a_reclaim_in_between_records)
+    add_test(NAME test_corvus_mount_rp_${t} COMMAND test_corvus_mount)
+    set_tests_properties(test_corvus_mount_rp_${t} PROPERTIES TIMEOUT 120
+        ENVIRONMENT "STM_RWLOCK_PREFER_READERS=1;STM_TEST_ONLY=corvus_promote_through_the_fs_${t}")
+endforeach()
 stm_add_test(test_corvus_provision test_corvus_provision.c test_fs_common.c)
 target_link_libraries(test_corvus_provision PRIVATE stm_stratumd)
 stm_add_test(test_multi_stratumd_crash test_multi_stratumd_crash.c test_fs_common.c)
@@ -271,6 +283,11 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME test_dek_leases
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/../tools/test-dek-leases.py)
+    # Every rwlock in src/ is an stm_rwlock (writer-preferring on every libc).
+    add_test(NAME check_rwlocks
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/../tools/check-rwlocks.py)
 else()
-    message(WARNING "python3 not found: test_dek_leases is not registered")
+    message(WARNING "python3 not found: test_dek_leases and check_rwlocks "
+                    "are not registered")
 endif()

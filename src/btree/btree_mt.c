@@ -2,7 +2,8 @@
 /*
  * Concurrent Bε-tree — Phase 2 fallback implementation.
  *
- * Strategy: tree-wide pthread_rwlock_t. Readers (lookup, scan) take a
+ * Strategy: tree-wide rwlock (stm_rwlock, writer-preferring on every C
+ * library). Readers (lookup, scan) take a
  * shared lock; mutators (insert, delete) take exclusive. Scan's
  * flush-all-before-walk step is a MUTATION in the single-threaded tree,
  * so stm_btree_mt_scan must hold the exclusive lock. We accept the
@@ -21,13 +22,14 @@
  *     retire-and-reclaim at this layer.
  */
 #include <stratum/btree.h>
+#include <stratum/rwlock.h>
 
 #include <pthread.h>
 #include <stdlib.h>
 
 struct stm_btree_mt {
     stm_btree        *inner;
-    pthread_rwlock_t  lock;
+    stm_rwlock        lock;
 };
 
 stm_status stm_btree_mt_new(const stm_btree_opts *opts, stm_btree_mt **out)
@@ -39,7 +41,7 @@ stm_status stm_btree_mt_new(const stm_btree_opts *opts, stm_btree_mt **out)
     stm_status s = stm_btree_new(opts, &t->inner);
     if (s != STM_OK) { free(t); return s; }
 
-    if (pthread_rwlock_init(&t->lock, NULL) != 0) {
+    if (stm_rwlock_init(&t->lock) != 0) {
         stm_btree_free(t->inner);
         free(t);
         return STM_EBACKEND;
@@ -52,7 +54,7 @@ stm_status stm_btree_mt_new(const stm_btree_opts *opts, stm_btree_mt **out)
 void stm_btree_mt_free(stm_btree_mt *t)
 {
     if (!t) return;
-    pthread_rwlock_destroy(&t->lock);
+    stm_rwlock_destroy(&t->lock);
     stm_btree_free(t->inner);
     free(t);
 }
@@ -62,9 +64,9 @@ stm_status stm_btree_mt_insert(stm_btree_mt *t,
                                const void *value, size_t value_len)
 {
     if (!t) return STM_EINVAL;
-    pthread_rwlock_wrlock(&t->lock);
+    stm_rwlock_wrlock(&t->lock);
     stm_status s = stm_btree_insert(t->inner, key, key_len, value, value_len);
-    pthread_rwlock_unlock(&t->lock);
+    stm_rwlock_unlock(&t->lock);
     return s;
 }
 
@@ -74,10 +76,10 @@ stm_status stm_btree_mt_lookup(stm_btree_mt *t,
                                size_t *out_value_len)
 {
     if (!t) return STM_EINVAL;
-    pthread_rwlock_rdlock(&t->lock);
+    stm_rwlock_rdlock(&t->lock);
     stm_status s = stm_btree_lookup(t->inner, key, key_len,
                                      buf, buf_cap, out_value_len);
-    pthread_rwlock_unlock(&t->lock);
+    stm_rwlock_unlock(&t->lock);
     return s;
 }
 
@@ -85,9 +87,9 @@ stm_status stm_btree_mt_delete(stm_btree_mt *t,
                                const void *key, size_t key_len)
 {
     if (!t) return STM_EINVAL;
-    pthread_rwlock_wrlock(&t->lock);
+    stm_rwlock_wrlock(&t->lock);
     stm_status s = stm_btree_delete(t->inner, key, key_len);
-    pthread_rwlock_unlock(&t->lock);
+    stm_rwlock_unlock(&t->lock);
     return s;
 }
 
@@ -98,9 +100,9 @@ stm_status stm_btree_mt_scan(stm_btree_mt *t,
 {
     if (!t) return STM_EINVAL;
     /* Scan flush-all mutates, so take exclusive lock. */
-    pthread_rwlock_wrlock(&t->lock);
+    stm_rwlock_wrlock(&t->lock);
     stm_status s = stm_btree_scan(t->inner, lo_key, lo_key_len,
                                    hi_key, hi_key_len, cb, ctx);
-    pthread_rwlock_unlock(&t->lock);
+    stm_rwlock_unlock(&t->lock);
     return s;
 }

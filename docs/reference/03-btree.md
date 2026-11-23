@@ -119,9 +119,9 @@ Plain Bε-tree, mutable in place:
 
 ### Rwlock variant — `src/btree/btree_mt.c` (106 lines)
 
-Trivial wrapper: one `pthread_rwlock_t` per tree, acquired on every
-public op. Writer-preference to prevent reader starvation (macOS
-default; Linux gets `PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`).
+Trivial wrapper: one `stm_rwlock` per tree, acquired on every public
+op. It prefers writers on every C library, so a stream of lookups cannot
+starve a mutator.
 Used where the tree is the single-writer bottleneck (alloc tree,
 keyschema sub-tree, alloc-roots).
 

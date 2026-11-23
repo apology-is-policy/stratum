@@ -841,10 +841,10 @@ written and published with the lock released, as in any try.
 Under fs->global SH the fs callers hold a txn span
 across the promote, so the ENOSPC reclaim (which commits under
 SH) waits rather than persist blocks no record names yet.
-`stm_fs_promote_to_hot` ends its span between extents: where
-the lock hands a queued writer the lock (glibc's with the
-writer attribute, macOS's) the reclaim waits for one extent;
-musl's prefers readers, so there it waits for the file. The
+`stm_fs_promote_to_hot` ends its span between extents, and
+the txn lock's gate (an `stm_rwlock`, writer-preferring on
+every C library) holds the next span back while the reclaim
+is queued, so the reclaim waits for one extent. The
 login promote holds one span per step of up to 1 MiB (one
 record at least). Their EX fallback needs none, EX keeping
 every other op out. `stm_sync_promote_cold_at` (o1b2: the

@@ -24,6 +24,7 @@
 #include <stratum/pool.h>
 #include <stratum/hash.h>
 #include <stratum/block.h>
+#include <stratum/rwlock.h>
 
 #include <pthread.h>
 #include <stdio.h>
@@ -52,7 +53,7 @@ struct stm_pool {
      * the public stm_pool_lock_* APIs. Lock order (global): POOL
      * OUTER, SYNC INNER — every composite critical section takes
      * pool first. Deadlock-by-reversal is a contract violation. */
-    pthread_rwlock_t lock;
+    stm_rwlock lock;
     /* P5-8: replace-in-flight claim. UINT16_MAX = unclaimed; else the
      * slot id claimed by an in-flight stm_sync_replace_device_online.
      * Protected by the rwlock above. Non-_locked mutators refuse
@@ -264,24 +265,10 @@ stm_status stm_pool_open(const stm_pool_open_opts *opts, stm_pool **out)
     stm_pool *p = calloc(1, sizeof *p);
     if (!p) return STM_ENOMEM;
 
-    /* rwlock init — must land BEFORE any publish of `p`.
-     *
-     * R18 P2-1: on Linux, the default rwlock attrs favor readers,
-     * allowing writer starvation under sustained sync-side traffic.
-     * Set writer preference explicitly where the attr is available.
-     * macOS / other POSIX: default attrs already give reasonable
-     * scheduler fairness; pass NULL. */
-#if defined(__linux__) && defined(PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)
-    pthread_rwlockattr_t attr;
-    pthread_rwlockattr_init(&attr);
-    pthread_rwlockattr_setkind_np(&attr,
-        PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-    int rc = pthread_rwlock_init(&p->lock, &attr);
-    pthread_rwlockattr_destroy(&attr);
-#else
-    int rc = pthread_rwlock_init(&p->lock, NULL);
-#endif
-    if (rc != 0) { free(p); return STM_ENOMEM; }
+    /* rwlock init -- must land BEFORE any publish of `p`. It prefers
+     * writers on every C library (stm_rwlock), so sustained sync-side
+     * readers cannot starve a roster mutator (R18 P2-1). */
+    if (stm_rwlock_init(&p->lock) != 0) { free(p); return STM_ENOMEM; }
 
     p->pool_uuid[0] = opts->pool_uuid[0];
     p->pool_uuid[1] = opts->pool_uuid[1];
@@ -312,7 +299,7 @@ void stm_pool_close(stm_pool *p)
      * into a visible crash. trywrlock returns 0 if acquired, EBUSY
      * if held, or other errno for malformed rwlock. The subsequent
      * destroy is then safe. */
-    int trc = pthread_rwlock_trywrlock(&p->lock);
+    int trc = stm_rwlock_trywrlock(&p->lock);
     if (trc != 0) {
         fprintf(stderr,
                 "stm_pool_close: rwlock held at destroy time "
@@ -321,8 +308,8 @@ void stm_pool_close(stm_pool *p)
                 trc);
         abort();
     }
-    pthread_rwlock_unlock(&p->lock);
-    (void)pthread_rwlock_destroy(&p->lock);
+    stm_rwlock_unlock(&p->lock);
+    (void)stm_rwlock_destroy(&p->lock);
     /* Borrowers of stm_bdev — we don't close them; wiping the roster
      * is belt-and-braces against lingering pointers. */
     memset(p->devices, 0, sizeof p->devices);
@@ -334,25 +321,25 @@ void stm_pool_close(stm_pool *p)
 /* ========================================================================= */
 
 void stm_pool_lock_shared(stm_pool *p) {
-    if (p) (void)pthread_rwlock_rdlock(&p->lock);
+    if (p) (void)stm_rwlock_rdlock(&p->lock);
 }
 
 void stm_pool_unlock_shared(stm_pool *p) {
-    if (p) (void)pthread_rwlock_unlock(&p->lock);
+    if (p) (void)stm_rwlock_unlock(&p->lock);
 }
 
 void stm_pool_lock_exclusive(stm_pool *p) {
-    if (p) (void)pthread_rwlock_wrlock(&p->lock);
+    if (p) (void)stm_rwlock_wrlock(&p->lock);
 }
 
 void stm_pool_unlock_exclusive(stm_pool *p) {
-    if (p) (void)pthread_rwlock_unlock(&p->lock);
+    if (p) (void)stm_rwlock_unlock(&p->lock);
 }
 
 #ifdef STRATUM_BUILD_TESTING_HOOKS
 bool stm_pool_lock_is_free_for_test(stm_pool *p) {
-    if (!p || pthread_rwlock_trywrlock(&p->lock) != 0) return false;
-    (void)pthread_rwlock_unlock(&p->lock);
+    if (!p || stm_rwlock_trywrlock(&p->lock) != 0) return false;
+    (void)stm_rwlock_unlock(&p->lock);
     return true;
 }
 #endif
@@ -379,9 +366,9 @@ stm_status stm_pool_set_replace_claim_locked(stm_pool *p, uint16_t slot)
 stm_status stm_pool_set_replace_claim(stm_pool *p, uint16_t slot)
 {
     if (!p) return STM_EINVAL;
-    pthread_rwlock_wrlock(&p->lock);
+    stm_rwlock_wrlock(&p->lock);
     stm_status s = stm_pool_set_replace_claim_locked(p, slot);
-    pthread_rwlock_unlock(&p->lock);
+    stm_rwlock_unlock(&p->lock);
     return s;
 }
 
@@ -403,9 +390,9 @@ stm_status stm_pool_clear_replace_claim_locked(stm_pool *p, uint16_t expected_sl
 stm_status stm_pool_clear_replace_claim(stm_pool *p, uint16_t expected_slot)
 {
     if (!p) return STM_EINVAL;
-    pthread_rwlock_wrlock(&p->lock);
+    stm_rwlock_wrlock(&p->lock);
     stm_status s = stm_pool_clear_replace_claim_locked(p, expected_slot);
-    pthread_rwlock_unlock(&p->lock);
+    stm_rwlock_unlock(&p->lock);
     return s;
 }
 
@@ -459,9 +446,9 @@ uint16_t stm_pool_replace_claim(const stm_pool *p)
 {
     if (!p) return STM_POOL_REPLACE_CLAIM_NONE;
     stm_pool *mp = (stm_pool *)p;
-    pthread_rwlock_rdlock(&mp->lock);
+    stm_rwlock_rdlock(&mp->lock);
     uint16_t v = mp->replace_claim;
-    pthread_rwlock_unlock(&mp->lock);
+    stm_rwlock_unlock(&mp->lock);
     return v;
 }
 
@@ -586,7 +573,7 @@ stm_status stm_pool_add_device_locked(stm_pool *p,
 stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device)
 {
     if (!p) return STM_EINVAL;
-    pthread_rwlock_wrlock(&p->lock);
+    stm_rwlock_wrlock(&p->lock);
     /* R23 P3-2: an in-flight replace claims one specific slot. The new
      * slot index from add_device_locked is `p->device_count` (the next
      * tail position). Refuse only when the claim collides with that
@@ -601,11 +588,11 @@ stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device)
      * device). Per R23 P3-2 close: only collision matters. */
     if (p->replace_claim != STM_POOL_REPLACE_CLAIM_NONE &&
         (size_t)p->replace_claim == p->device_count) {
-        pthread_rwlock_unlock(&p->lock);
+        stm_rwlock_unlock(&p->lock);
         return STM_EBUSY;
     }
     stm_status s = stm_pool_add_device_locked(p, new_device);
-    pthread_rwlock_unlock(&p->lock);
+    stm_rwlock_unlock(&p->lock);
     return s;
 }
 
@@ -689,13 +676,13 @@ stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
                                       size_t redundancy_floor)
 {
     if (!p) return STM_EINVAL;
-    pthread_rwlock_wrlock(&p->lock);
+    stm_rwlock_wrlock(&p->lock);
     if (claim_blocks(p, device_id)) {
-        pthread_rwlock_unlock(&p->lock);
+        stm_rwlock_unlock(&p->lock);
         return STM_EBUSY;
     }
     stm_status s = stm_pool_remove_device_locked(p, device_id, redundancy_floor);
-    pthread_rwlock_unlock(&p->lock);
+    stm_rwlock_unlock(&p->lock);
     return s;
 }
 
@@ -761,14 +748,14 @@ stm_status stm_pool_begin_evacuation(stm_pool *p, uint16_t device_id,
                                          size_t redundancy_floor)
 {
     if (!p) return STM_EINVAL;
-    pthread_rwlock_wrlock(&p->lock);
+    stm_rwlock_wrlock(&p->lock);
     if (claim_blocks(p, device_id)) {
-        pthread_rwlock_unlock(&p->lock);
+        stm_rwlock_unlock(&p->lock);
         return STM_EBUSY;
     }
     stm_status s = stm_pool_begin_evacuation_locked(p, device_id,
                                                        redundancy_floor);
-    pthread_rwlock_unlock(&p->lock);
+    stm_rwlock_unlock(&p->lock);
     return s;
 }
 
@@ -814,13 +801,13 @@ stm_status stm_pool_finish_evacuation_locked(stm_pool *p, uint16_t device_id)
 stm_status stm_pool_finish_evacuation(stm_pool *p, uint16_t device_id)
 {
     if (!p) return STM_EINVAL;
-    pthread_rwlock_wrlock(&p->lock);
+    stm_rwlock_wrlock(&p->lock);
     if (claim_blocks(p, device_id)) {
-        pthread_rwlock_unlock(&p->lock);
+        stm_rwlock_unlock(&p->lock);
         return STM_EBUSY;
     }
     stm_status s = stm_pool_finish_evacuation_locked(p, device_id);
-    pthread_rwlock_unlock(&p->lock);
+    stm_rwlock_unlock(&p->lock);
     return s;
 }
 
@@ -853,13 +840,13 @@ stm_status stm_pool_fail_device_locked(stm_pool *p, uint16_t device_id)
 stm_status stm_pool_fail_device(stm_pool *p, uint16_t device_id)
 {
     if (!p) return STM_EINVAL;
-    pthread_rwlock_wrlock(&p->lock);
+    stm_rwlock_wrlock(&p->lock);
     if (claim_blocks(p, device_id)) {
-        pthread_rwlock_unlock(&p->lock);
+        stm_rwlock_unlock(&p->lock);
         return STM_EBUSY;
     }
     stm_status s = stm_pool_fail_device_locked(p, device_id);
-    pthread_rwlock_unlock(&p->lock);
+    stm_rwlock_unlock(&p->lock);
     return s;
 }
 
@@ -885,12 +872,12 @@ stm_status stm_pool_rejoin_device_locked(stm_pool *p, uint16_t device_id)
 stm_status stm_pool_rejoin_device(stm_pool *p, uint16_t device_id)
 {
     if (!p) return STM_EINVAL;
-    pthread_rwlock_wrlock(&p->lock);
+    stm_rwlock_wrlock(&p->lock);
     if (claim_blocks(p, device_id)) {
-        pthread_rwlock_unlock(&p->lock);
+        stm_rwlock_unlock(&p->lock);
         return STM_EBUSY;
     }
     stm_status s = stm_pool_rejoin_device_locked(p, device_id);
-    pthread_rwlock_unlock(&p->lock);
+    stm_rwlock_unlock(&p->lock);
     return s;
 }

@@ -1425,7 +1425,11 @@ STM_TEST(p9_write_o_append_overrides_offset) {
 }
 
 /* The hook runs inside the first appender's write, past anything the 9P server
- * read beforehand, so a size read there is stale by exactly the second's bytes. */
+ * read beforehand, so a size read there is stale by exactly the second's bytes.
+ * The first write holds fs->global shared there, which its own thread must not
+ * take again (include/stratum/rwlock.h): the rival writes from a thread of its
+ * own, as a second client would, and the hook waits for it. No writer queues on
+ * fs->global here, and the first write has not pinned the file yet. */
 typedef struct {
     stm_9p_server *second;
     uint32_t       fid;
@@ -1434,12 +1438,9 @@ typedef struct {
     uint8_t        rtype;
 } append_rival;
 
-static void append_rival_guard(uint64_t ino, void *arg)
+static void *append_rival_write(void *arg)
 {
-    (void)ino;
     append_rival *r = arg;
-    if (r->fired) return;
-    r->fired = true;
     uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 20, r->fid, 0, "CCC", 3);
@@ -1447,6 +1448,18 @@ static void append_rival_guard(uint64_t ino, void *arg)
     r->rtype = resp[4];
     free(req);
     free(resp);
+    return NULL;
+}
+
+static void append_rival_guard(uint64_t ino, void *arg)
+{
+    (void)ino;
+    append_rival *r = arg;
+    if (r->fired) return;
+    r->fired = true;
+    pthread_t t;
+    if (pthread_create(&t, NULL, append_rival_write, r) == 0)
+        (void)pthread_join(t, NULL);
 }
 
 STM_TEST(p9_a_rival_append_cannot_be_overwritten) {

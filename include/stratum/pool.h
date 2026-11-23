@@ -203,7 +203,7 @@ uint64_t stm_pool_roster_hash_of_bytes(
 /* ========================================================================= */
 /* Per-pool lock (P5-4b-ii-β — R16 F4 discharge).                            */
 /*                                                                             */
-/* Internally, `stm_pool` carries a pthread_rwlock_t protecting the roster  */
+/* Internally, `stm_pool` carries an stm_rwlock protecting the roster      */
 /* (`devices[]`, `device_count`, `roster_hash`, per-slot `state`/`bdev`).   */
 /* Mutating operations (add_device / remove_device / begin_evacuation /    */
 /* finish_evacuation) acquire the exclusive side internally.                */
@@ -230,16 +230,18 @@ uint64_t stm_pool_roster_hash_of_bytes(
 /* internal mutex MUST NOT acquire pool's lock; pool's lock is always      */
 /* acquired first. Ordering reversal → deadlock.                           */
 /*                                                                             */
-/* Readers nest (multiple concurrent shared holders OK). Writers are       */
-/* exclusive. A writer blocks until every shared holder releases; a        */
-/* shared-lock request blocks if a writer is waiting — POSIX's writer-     */
-/* preference variant avoids writer starvation.                             */
+/* Shared holders run together; a writer is exclusive and waits until      */
+/* every shared holder releases. The lock is an stm_rwlock: a shared       */
+/* request waits while a writer is queued, on every C library, so a thread */
+/* holding it shared must not take it again, in either mode, nor wait on a */
+/* thread that will take it shared (include/stratum/rwlock.h; hooks builds */
+/* abort on a re-take).                                                    */
 /*                                                                             */
 /* The pool mutators do NOT require the caller to pre-lock; they manage    */
 /* the exclusive side internally. Callers composing a shared-read with a   */
 /* mutation (e.g., "check device count, then remove") must release the     */
-/* shared lock BEFORE the mutator call, since recursive write-after-read   */
-/* is UB under POSIX rwlocks.                                               */
+/* shared lock BEFORE the mutator call: a write after a read on one thread */
+/* deadlocks.                                                              */
 /* ========================================================================= */
 
 void stm_pool_lock_shared(stm_pool *p);

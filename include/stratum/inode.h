@@ -593,10 +593,9 @@ stm_status stm_inode_pin_try(stm_inode_index *idx, uint64_t dataset_id,
  * are stm_fs_read and stm_fs_listxattr's SH fallback, neither invoked
  * under a held pin.
  *
- * Writer starvation posture: on glibc the slot rwlock is initialized
- * PREFER_WRITER_NONRECURSIVE so a stream of readers cannot starve a
- * pinned mutator; macOS fairness is implementation-managed (roughly
- * FIFO). Documented in docs/reference/29-concurrency.md.
+ * Writer starvation posture: the slot lock prefers writers on every C
+ * library (stm_rwlock), so a stream of readers cannot starve a pinned
+ * mutator. Documented in docs/reference/29-concurrency.md.
  */
 STM_MUST_USE
 stm_status stm_inode_pin_shared(stm_inode_index *idx, uint64_t dataset_id,
