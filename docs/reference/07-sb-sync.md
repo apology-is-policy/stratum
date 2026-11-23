@@ -61,8 +61,8 @@ uberblock.
 
 | Offset | Size | Field | Meaning |
 |---|---|---|---|
-| 0 | 8 | `ub_magic` | `0x324d555441525453` (ASCII "STRATUM2"). |
-| 8 | 4 | `ub_version` | Currently `STM_UB_VERSION = 8`. |
+| 0 | 8 | `ub_magic` | `0x324d555441525453` (ASCII "STRATUM2"); every version keeps it here (ARCH section 5.4.1). |
+| 8 | 4 | `ub_version` | `STM_UB_VERSION = 33`; `STM_UB_VERSION_MIN_COMPAT = 32` still decodes. Every version keeps it here. |
 | 12–20 | 12 | feature flags | `compat` / `ro_compat` / `incompat` (ARCH §5.2). |
 | 24 | 16 | `ub_pool_uuid` | Pool identity. |
 | 40 | 16 | `ub_device_uuid` | This device's identity. |
@@ -135,15 +135,18 @@ stm_status stm_ub_encode(const stm_uberblock *ub, void *buf, size_t buf_len);
 
 // Decode 4 KiB → struct. Verifies magic, version, csum.
 // Returns STM_ENOENT on magic-mismatch (empty slot),
-//         STM_EBADVERSION on version mismatch,
+//         STM_EBADVERSION on a version outside MIN_COMPAT..STM_UB_VERSION,
 //         STM_ECORRUPT on csum mismatch,
-//         STM_EINVAL on size-mismatch.
+//         STM_ERANGE on size mismatch.
 stm_status stm_ub_decode(const void *buf, size_t buf_len, stm_uberblock *out_ub);
 ```
 
-`ub_encode` zeroes `ub_csum`, BLAKE3s the rest, writes the digest.
-`ub_decode` rejects `ub_gen == 0` (R14 P3-3 — zero-gen sentinel),
-checks version == `STM_UB_VERSION` strictly (no forward-compat).
+`ub_encode` writes `ub_csum`, the BLAKE3-256 of bytes [0, 4064), the
+bytes before it (every version keeps that, ARCH section 5.4.1).
+`ub_decode` rejects `ub_gen == 0` (R14 P3-3 -- zero-gen sentinel) and
+accepts versions `STM_UB_VERSION_MIN_COMPAT`..`STM_UB_VERSION`; a newer
+one is STM_EBADVERSION, and `stm_ub_is_newer` tells a newer build's
+uberblock from a torn one (below).
 
 ### Label scanning
 
@@ -158,8 +161,11 @@ stm_status stm_sb_label_write(stm_bdev *d, uint32_t label, uint32_t slot, const 
 // Scan every (label, slot) on a device, return the single uberblock with
 // highest valid ub_gen. Used at mount. Returns STM_ENOENT if no valid UB,
 // STM_EIO if no slot decoded and the device failed a read, or if a slot
-// that could hold a newer commit still fails after two re-reads (below).
-// one_device: the device is the pool's only one. why: which slot refused.
+// that could hold a newer commit still fails after two re-reads (below),
+// STM_EBADVERSION at a newer build's uberblock, or when nothing decodes
+// and a slot held another version. one_device: the device is the pool's
+// only one. why: which slot refused (gen for STM_EIO, version for
+// STM_EBADVERSION).
 stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
                                 stm_uberblock *out, uint32_t *out_lbl,
                                 uint32_t *out_slot, stm_sb_scan_refusal *why);
@@ -167,6 +173,37 @@ stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
 stm_status stm_sb_mount_scan(stm_bdev *d,
                               stm_uberblock *out, uint32_t *out_lbl, uint32_t *out_slot);
 ```
+
+An uberblock a newer build wrote refuses the mount (STM_EBADVERSION): the
+magic, a version above `STM_UB_VERSION` and a csum that verifies
+(`stm_ub_is_newer`; every version keeps those three fields, and its
+uberblocks in the commit-ring slots, where they are: ARCH section 5.4.1).
+The scan reads every commit-ring slot once and, when any holds one,
+refuses naming the first in scan order; it refuses too when a re-read of
+slot(best+1) or slot(best+2) finds one, or the one-device read of
+slot(best-1) (made when slot(best+1) stays unreadable and best is not a
+final by its mark). `why` names the slot
+and the version, and stratumd says so. The newer build's commits may lie
+past every generation this one can read, wherever its layout puts them, so
+mounting what it reads would roll the pool back and the claim would
+overwrite one of them. The rule is stricter than ZFS's, which judges only
+the best uberblock's version: any slot, any generation, read-only mounts
+too.
+
+Its limits. A newer uberblock elsewhere whose one read fails goes unseen;
+a layout that writes each commit to several slots, or keeps this build's
+slot for it among them, makes one failed read harmless. And it protects
+only the builds that have it: a build before it skips a newer uberblock as
+torn and mounts the newest it decodes. A v32 build does that today on a
+pool a v33 build upgraded while v32 uberblocks remain in its ring, so the
+next version that changes the format closes it for the builds before it:
+once its own claim is durable in all four labels, it overwrites every ring
+slot holding an uberblock an older build decodes, with its own uberblocks
+(never zeros, which read as a fresh device).
+
+An uberblock below `STM_UB_VERSION_MIN_COMPAT` is residue and is skipped
+(it answers STM_EBADVERSION only when nothing decodes); one at MIN_COMPAT
+decodes and is a candidate.
 
 A slot that fails to decode is skipped: a torn write, or a durable
 generation gone bad, which the scan cannot tell apart (one copy per
@@ -519,9 +556,9 @@ atomically so add / attach / commit / detach composes in one step.
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_sb` | 18 | Encode / decode roundtrip; csum tamper rejected; magic tamper → STM_ENOENT; version tamper → STM_EBADVERSION; zero-gen rejected; label offsets; label_read / label_write; mount_scan picks highest valid. |
+| `test_sb` | 36 | Encode / decode roundtrip; csum tamper rejected; magic tamper -> STM_ENOENT; version tamper -> STM_EBADVERSION; zero-gen rejected; label offsets; label_read / label_write; mount_scan picks highest valid; the bytes every version keeps (magic, version, the csum's domain, read without `stm_ub_csum`; an uberblock of those fields alone is a newer build's); a newer build's uberblock refuses the mount and the refusal names its slot (best+1, one of the kept fields alone, two in other slots naming the first, re-reads at best+1 and best+2, the one-device read of best-1; a torn one and an older one do not). |
 | `test_sync` | 19 | Single-device commit + remount; MountGenBump; alloc-root tree encoded under correct key; version boundary refusals. |
-| `test_sync_multi` | 46 | 3-device quorum roundtrip; 1-of-3 device loss tolerated; sub-quorum refused (STM_EQUORUM); orphan-ahead-of-quorum ignored; content-quorum tested; alloc-roots indirection; v5/v6/v7 version refusals (the v5 test exercises one prior version; impl rejects all non-`STM_UB_VERSION` uniformly); mirror(2) + mirror(3) roundtrips + tampered-replica fallback; reserve refuses NONE profile; attach_alloc arg validation; RO pool refuses write ops; wedge refusal; keyschema idempotent commit produces byte-identical UBs; replace_device_online resume from step-3 commit failure; same-uuid-different-alloc refused; slot-0 spoofing refused; multi-retry converges; **commit succeeds with one FAULTED device** (R21 P1); replace-claim blocks concurrent mutators on the claimed slot via sync-wrapper bypass-closed (R23 P3-4).; a replace whose rollback cannot remove the new slot wedges and answers the wedge |
+| `test_sync_multi` | 55 | 3-device quorum roundtrip; 1-of-3 device loss tolerated; sub-quorum refused (STM_EQUORUM); orphan-ahead-of-quorum ignored; content-quorum tested; alloc-roots indirection; v5/v6/v7 version refusals (the v5 test exercises one prior version; the decode accepts only `STM_UB_VERSION_MIN_COMPAT`..`STM_UB_VERSION`, and a newer build's uberblock refuses the pool); mirror(2) + mirror(3) roundtrips + tampered-replica fallback; reserve refuses NONE profile; attach_alloc arg validation; RO pool refuses write ops; wedge refusal; keyschema idempotent commit produces byte-identical UBs; replace_device_online resume from step-3 commit failure; same-uuid-different-alloc refused; slot-0 spoofing refused; multi-retry converges; **commit succeeds with one FAULTED device** (R21 P1); replace-claim blocks concurrent mutators on the claimed slot via sync-wrapper bypass-closed (R23 P3-4).; a replace whose rollback cannot remove the new slot wedges and answers the wedge; a newer build's uberblock on one device refuses the open and names its slot. |
 
 ## Status
 

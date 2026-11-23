@@ -13637,6 +13637,89 @@ STM_TEST(fs_mount_names_the_slot_the_open_refuses_on) {
     unlink(g_tmp_path);
 }
 
+/* A newer build's uberblock, on the path stratumd mounts through: the
+ * hook puts a newer build's copy of the newest uberblock, as gen
+ * newest+1, in slot(newest+1) -- torn (its csum fails) when o1_torn. */
+static uint64_t o1_newest;
+static uint64_t o1_off;
+static bool o1_torn;
+static uint8_t o1_put[STM_UB_SIZE];
+static void o1_put_newer_hook(struct stm_bdev *d, int phase, void *arg)
+{
+    (void)arg;
+    if (phase != STM_FS_MOUNT_HOOK_PEEK) return;
+    stm_uberblock ub;
+    uint32_t lbl = 0, slot = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
+    o1_newest = stm_load_le64(ub.ub_gen);
+    uint64_t g = o1_newest + 1u;
+    ub.ub_gen = stm_store_le64(g);
+    ub.ub_version = stm_store_le32(STM_UB_VERSION + 1u);
+    STM_ASSERT_OK(stm_ub_encode(&ub, o1_put, sizeof o1_put));
+    if (o1_torn) o1_put[384] ^= 0xffu;
+    uint64_t lo[STM_LABELS_PER_DEVICE];
+    STM_ASSERT_OK(stm_label_offsets(stm_bdev_caps_of(d)->size_bytes, lo));
+    o1_off = lo[g % 4u] + (g % 63u) * (uint64_t)STM_UB_SIZE;
+    STM_ASSERT_OK(stm_bdev_write(d, o1_off, o1_put, sizeof o1_put));
+    STM_ASSERT_OK(stm_bdev_fsync(d));
+}
+
+/* It refuses the mount (STM_EBADVERSION), names the slot and leaves it as
+ * it was. Control, one variable away: torn, the pool mounts its newest
+ * generation, and the mount's claim overwrites the slot. */
+STM_TEST(fs_mount_refuses_a_pool_a_newer_build_wrote) {
+    for (int torn = 0; torn < 2; torn++) {
+        stm_fs_mount_opts mopts;
+        r3_make_written_pool(torn ? "o1fstorn" : "o1fsnewer", &mopts);
+        stm_sb_scan_refusal why;
+        memset(&why, 0xa5, sizeof why);
+        mopts.scan_refusal = &why;
+        o1_torn = torn;
+        stm_fs_set_mount_open_hook_for_test(o1_put_newer_hook, NULL);
+        stm_fs *fs = NULL;
+        stm_status ms = stm_fs_mount(g_tmp_path, &mopts, &fs);
+        stm_fs_set_mount_open_hook_for_test(NULL, NULL);
+        mopts.scan_refusal = NULL;
+        uint64_t mounted = 0;
+        if (ms == STM_OK && fs) {
+            stm_sync_info info;
+            STM_ASSERT_OK(stm_sync_info_get(stm_fs_sync_for_test(fs), &info));
+            mounted = info.mount_max_durable_gen;
+            STM_ASSERT_OK(stm_fs_unmount(fs));
+        }
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        stm_bdev *d = NULL;
+        uint8_t now[STM_UB_SIZE];
+        memset(now, 0, sizeof now);
+        STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &bo, &d));
+        if (d) {
+            STM_ASSERT_OK(stm_bdev_read(d, o1_off, now, sizeof now));
+            stm_bdev_close(d);
+        }
+        bool same = memcmp(now, o1_put, sizeof now) == 0;
+        printf("  %s: mount %d, gen %llu of newest %llu, slot unchanged %d\n",
+               torn ? "torn" : "newer", (int)ms, (unsigned long long)mounted,
+               (unsigned long long)o1_newest, (int)same);
+        if (torn) {
+            STM_ASSERT_OK(ms);
+            STM_ASSERT_EQ(mounted, o1_newest);
+            STM_ASSERT_EQ(why.version, 0u);
+            STM_ASSERT(!same);
+        } else {
+            STM_ASSERT_ERR(ms, STM_EBADVERSION);
+            STM_ASSERT(fs == NULL);
+            STM_ASSERT_EQ(why.version, STM_UB_VERSION + 1u);
+            STM_ASSERT_EQ(why.gen, 0u);
+            STM_ASSERT_EQ(why.label_idx, (uint32_t)((o1_newest + 1u) % 4u));
+            STM_ASSERT_EQ(why.slot_idx, (uint32_t)((o1_newest + 1u) % 63u));
+            STM_ASSERT_EQ(why.byte_offset, o1_off);
+            STM_ASSERT_EQ(why.best_gen, o1_newest);
+            STM_ASSERT(same);
+        }
+        unlink(g_tmp_path);
+    }
+}
+
 STM_TEST(fs_mount_zeroes_the_refusal_before_its_argument_check) {
     make_tmp("r3fsarg");
     stm_fs_mount_opts mopts = rw_mount_opts();

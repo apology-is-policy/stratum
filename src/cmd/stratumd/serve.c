@@ -1503,7 +1503,7 @@ static stm_status stratumd_run_client(const stm_stratumd_opts *opts)
  * --ctl-listen refused (one-shot, nothing to serve). */
 static stm_status image_must_exist(const char *path);
 
-static void say_scan_refusal(const stm_stratumd_opts *opts, stm_status rc,
+static bool say_scan_refusal(const stm_stratumd_opts *opts, stm_status rc,
                              const stm_sb_scan_refusal *why);
 
 static stm_status stratumd_run_provision(const stm_stratumd_opts *opts, const int *claimed_fd)
@@ -1596,7 +1596,7 @@ static stm_status stratumd_run_provision(const stm_stratumd_opts *opts, const in
         fprintf(stderr,
             "stratumd: provisioning: mount of %s failed (rc=%d)\n",
             opts->fs_path, (int)rc);
-        say_scan_refusal(opts, rc, &refusal);
+        (void)say_scan_refusal(opts, rc, &refusal);
         return rc;
     }
 
@@ -1757,17 +1757,28 @@ static void say_why_mount_failed(const stm_stratumd_opts *opts, stm_status rc)
                     "or it is damaged\n", opts->fs_path);
 }
 
-/* A mount that stops rather than roll back past a commit it cannot read says
- * where that commit would be, so the slot can be found and dealt with. */
-static void say_scan_refusal(const stm_stratumd_opts *opts, stm_status rc,
+/* A mount that stops rather than roll back past a commit it cannot read, or
+ * past a newer build's, says where that uberblock is, so the slot can be found
+ * and dealt with. Returns whether it said anything. */
+static bool say_scan_refusal(const stm_stratumd_opts *opts, stm_status rc,
                              const stm_sb_scan_refusal *why)
 {
-    if (rc != STM_EIO || why->gen == 0) return;
+    if (rc == STM_EBADVERSION && why->version != 0) {
+        fprintf(stderr, "stratumd: %s was written by a newer build of Stratum: uberblock "
+                        "version %u in label %u slot %u (byte offset %llu); this build "
+                        "reads versions %u to %u and does not mount it\n",
+                opts->fs_path, why->version, why->label_idx, why->slot_idx,
+                (unsigned long long)why->byte_offset, (unsigned)STM_UB_VERSION_MIN_COMPAT,
+                (unsigned)STM_UB_VERSION);
+        return true;
+    }
+    if (rc != STM_EIO || why->gen == 0) return false;
     fprintf(stderr, "stratumd: %s: the newest commit may be generation %llu, in uberblock "
                     "label %u slot %u (byte offset %llu), which the device cannot read; "
                     "the mount stops rather than go back to generation %llu\n",
             opts->fs_path, (unsigned long long)why->gen, why->label_idx, why->slot_idx,
             (unsigned long long)why->byte_offset, (unsigned long long)why->best_gen);
+    return true;
 }
 
 static stm_status stratumd_run_locked(const stm_stratumd_opts *opts, const int *claimed_fd);
@@ -1838,8 +1849,8 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts, const int *
     if (rc != STM_OK) return rc;
     rc = stm_fs_mount(opts->fs_path, &mopts, &fs);
     if (rc != STM_OK) {
-        say_why_mount_failed(opts, rc);
-        say_scan_refusal(opts, rc, &refusal);
+        if (!say_scan_refusal(opts, rc, &refusal))
+            say_why_mount_failed(opts, rc);
         if (rc == STM_ESERIAL && opts->bind_pool_serial) {
             /* TLY-A1: log the truncated observed serial + truncated
              * expected serial. Full values stay out of the public

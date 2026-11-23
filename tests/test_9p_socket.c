@@ -16,9 +16,11 @@
 #include "test_fs_common.h"
 
 #include <stratum/9p.h>
+#include <stratum/block.h>
 #include <stratum/fs.h>
 #include <stratum/listen.h>
 #include <stratum/stratumd.h>
+#include <stratum/super.h>
 #include <stratum/types.h>
 
 #include <errno.h>
@@ -1003,6 +1005,121 @@ STM_TEST(p9_socket_stratumd_whose_start_fails_past_its_ctl_ends) {
     STM_ASSERT_EQ((int)rc, (int)STM_EINVAL);
 
     /* Neither path, nor the name the FS socket was bound under. */
+    STM_ASSERT_EQ(rmdir(dir), 0);
+}
+
+/* The status of a run that should fail, and what it wrote to stderr (at
+ * most cap - 1 bytes). A run still going after ten seconds is not coming
+ * back: the program ends there, failed, saying so on the real stderr with
+ * what the run had written. */
+static void stratumd_stderr_of(failing_run *r, const char *what,
+                               stm_status *rc, char *out, size_t cap)
+{
+    char path[] = "/tmp/stm_socktest_err_XXXXXX";
+    int fd = mkstemp(path);
+    STM_ASSERT_TRUE(fd >= 0);
+    out[0] = 0;
+    if (fd < 0) return;
+    fflush(stderr);
+    int saved = dup(2);
+    STM_ASSERT_TRUE(saved >= 0);
+    if (saved < 0) { close(fd); unlink(path); return; }
+    STM_ASSERT_EQ(dup2(fd, 2), 2);
+    atomic_init(&r->done, false);
+    r->rc = STM_OK;
+    pthread_t tid;
+    int pc = pthread_create(&tid, NULL, failing_run_thread, r);
+    for (int i = 0; pc == 0 && i < 1000 && !atomic_load(&r->done); i++)
+        usleep(10 * 1000);
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    ssize_t n = pread(fd, out, cap - 1u, 0);
+    out[n > 0 ? (size_t)n : 0u] = 0;
+    close(fd);
+    unlink(path);
+    STM_ASSERT_EQ(pc, 0);
+    if (pc == 0 && !atomic_load(&r->done)) {
+        fprintf(stderr, "  FAIL %s: stm_stratumd_run has not returned after 10 s; "
+                        "its stderr: %s\n", what, out);
+        _exit(1);
+    }
+    if (pc == 0) pthread_join(tid, NULL);
+    *rc = r->rc;
+}
+
+/* Every uberblock of the pool at g_tmp_path re-stamped `version` (its csum
+ * recomputed), or only the newest, written again as gen 40 in gen 40's
+ * slot (label 0, slot 40). */
+static void stamp_pool_version(uint32_t version, bool every)
+{
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    stm_bdev *d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &bo, &d));
+    if (!d) return;
+    if (!every) {
+        stm_uberblock ub;
+        STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, NULL, NULL));
+        STM_ASSERT(stm_load_le64(ub.ub_gen) < 38u);
+        ub.ub_gen = stm_store_le64(40u);
+        ub.ub_version = stm_store_le32(version);
+        STM_ASSERT_OK(stm_sb_label_write(d, 0u, 40u, &ub));
+    } else {
+        for (uint32_t li = 0; li < STM_LABELS_PER_DEVICE; li++)
+            for (uint32_t si = 0; si < STM_UB_SLOTS_PER_LABEL; si++) {
+                stm_uberblock ub;
+                if (stm_sb_label_read(d, li, si, &ub) != STM_OK) continue;
+                ub.ub_version = stm_store_le32(version);
+                STM_ASSERT_OK(stm_sb_label_write(d, li, si, &ub));
+            }
+    }
+    stm_bdev_close(d);
+}
+
+/* stratumd on a pool a newer build wrote says so, with the version and the
+ * slot, in place of its "unknown format" line. Control: a pool whose every
+ * uberblock is below the oldest version this build reads refuses with the
+ * same status and gets that line. */
+STM_TEST(p9_socket_stratumd_names_a_newer_builds_pool) {
+    char dir[] = "/tmp/stm_socktest_newer_XXXXXX";
+    STM_ASSERT_TRUE(mkdtemp(dir) != NULL);
+    char fs_path[64];
+    snprintf(fs_path, sizeof fs_path, "%s/fs.sock", dir);
+    static char err[65536];
+    for (int older = 0; older < 2; older++) {
+        make_tmp(older ? "9p_sock_older" : "9p_sock_newer");
+        stm_fs_format_opts fopts = default_format_opts();
+        STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+        if (older) stamp_pool_version(STM_UB_VERSION_MIN_COMPAT - 1u, true);
+        else       stamp_pool_version(STM_UB_VERSION + 1u, false);
+        atomic_bool stop;
+        atomic_init(&stop, false);
+        failing_run r;
+        memset(&r.opts, 0, sizeof r.opts);
+        r.opts.fs_path     = g_tmp_path;
+        r.opts.keyfile_path = g_key_path;
+        r.opts.socket_path = fs_path;
+        r.opts.stop_flag   = &stop;
+        stm_status rc = STM_OK;
+        stratumd_stderr_of(&r, older ? "an older pool" : "a newer build's pool",
+                           &rc, err, sizeof err);
+        printf("  %s: rc %d, stderr: %s", older ? "older" : "newer", (int)rc, err);
+        STM_ASSERT_EQ((int)rc, (int)STM_EBADVERSION);
+        bool named = strstr(err, "was written by a newer build of Stratum: "
+                                 "uberblock version 34 in label 0 slot 40") != NULL;
+        bool generic = strstr(err, "an unknown format") != NULL;
+        STM_ASSERT_EQ(STM_UB_VERSION + 1u, 34u);
+        if (older) {
+            STM_ASSERT(!named);
+            STM_ASSERT(generic);
+        } else {
+            STM_ASSERT(named);
+            STM_ASSERT(!generic);
+        }
+        unlink(g_tmp_path);
+    }
+    struct stat st;
+    STM_ASSERT_TRUE(lstat(fs_path, &st) != 0 && errno == ENOENT);
     STM_ASSERT_EQ(rmdir(dir), 0);
 }
 

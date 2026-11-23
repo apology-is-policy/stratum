@@ -254,9 +254,11 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                           stm_sync **out_sync);
 
 /*
- * stm_sync_open, and on a pool with one live device `why`, if not NULL,
- * says which uberblock slot its scan refused on (STM_EIO; see
- * stm_sb_mount_scan_ex). Zeroed at entry; gen stays 0 otherwise.
+ * stm_sync_open, and `why`, if not NULL, says which uberblock slot a scan
+ * refused on (see stm_sb_mount_scan_ex): on a pool with one live device
+ * an unreadable one (STM_EIO, why->gen), on any pool one holding a newer
+ * build's uberblock (STM_EBADVERSION, why->version). Zeroed at entry; gen
+ * and version stay 0 otherwise.
  */
 struct stm_sb_scan_refusal;
 STM_MUST_USE

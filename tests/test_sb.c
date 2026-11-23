@@ -12,6 +12,7 @@
 #include <stratum/super.h>
 #include <stratum/block.h>
 #include <stratum/block_inject.h>
+#include <stratum/hash.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -1003,6 +1004,295 @@ STM_TEST(sb_mount_scan_takes_no_uberblock_from_another_slot) {
         STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
         STM_ASSERT_EQ(label, 2u);
         STM_ASSERT_EQ(slot, 42u);
+        stm_bdev_close(d);
+        unlink(g_tmp_path);
+    }
+}
+
+/* OPEN-BUGS 2026-11-19T07:33Z (O1): an uberblock a newer build wrote. buf
+ * holds an encoded uberblock: its csum recomputed, or it re-stamped
+ * `version` with its csum recomputed. */
+static void sb_recsum(uint8_t *buf)
+{
+    uint8_t c[32];
+    stm_ub_csum(buf, STM_UB_SIZE, c);
+    memcpy(buf + STM_UB_SIZE - 32u, c, sizeof c);
+}
+
+static void sb_restamp(uint8_t *buf, uint32_t version)
+{
+    le32 v = stm_store_le32(version);
+    memcpy(buf + offsetof(stm_uberblock, ub_version), v.v, sizeof v.v);
+    sb_recsum(buf);
+}
+
+STM_TEST(sb_ub_is_newer_needs_the_magic_a_later_version_and_its_csum) {
+    stm_uberblock ub;
+    fill_example(&ub);
+    uint8_t buf[STM_UB_SIZE];
+    STM_ASSERT_OK(stm_ub_encode(&ub, buf, sizeof buf));
+    STM_ASSERT(!stm_ub_is_newer(buf, sizeof buf));
+    sb_restamp(buf, STM_UB_VERSION + 1u);
+    STM_ASSERT(stm_ub_is_newer(buf, sizeof buf));
+    STM_ASSERT_ERR(stm_ub_decode(buf, sizeof buf, &ub), STM_EBADVERSION);
+    STM_ASSERT(!stm_ub_is_newer(buf, sizeof buf - 1u));
+    buf[384] ^= 0xffu;                              /* its csum fails */
+    STM_ASSERT(!stm_ub_is_newer(buf, sizeof buf));
+    buf[384] ^= 0xffu;
+    buf[0] ^= 0xffu;                                /* not the magic, */
+    STM_ASSERT(!stm_ub_is_newer(buf, sizeof buf));
+    sb_recsum(buf);                                 /* its csum good */
+    STM_ASSERT(!stm_ub_is_newer(buf, sizeof buf));
+    buf[0] ^= 0xffu;
+    sb_recsum(buf);
+    STM_ASSERT(stm_ub_is_newer(buf, sizeof buf));
+    sb_restamp(buf, STM_UB_VERSION);
+    STM_ASSERT(!stm_ub_is_newer(buf, sizeof buf));
+    sb_restamp(buf, STM_UB_VERSION_MIN_COMPAT - 1u);
+    STM_ASSERT(!stm_ub_is_newer(buf, sizeof buf));
+}
+
+/* An uberblock of version STM_UB_VERSION + 1 made from ARCHITECTURE
+ * section 5.4.1 alone: "STRATUM2" at byte 0, the version le32 at byte 8,
+ * the BLAKE3-256 of bytes [0, 4064) in [4064, 4096), every other byte
+ * `fill`. */
+static void sb_kept_fields_only(uint8_t z[STM_UB_SIZE], uint8_t fill)
+{
+    memset(z, fill, STM_UB_SIZE);
+    memcpy(z, "STRATUM2", 8);
+    uint32_t v = STM_UB_VERSION + 1u;
+    for (int i = 0; i < 4; i++) z[8 + i] = (uint8_t)(v >> (8 * i));
+    stm_blake3_hash h;
+    stm_blake3(z, 4064, &h);
+    memcpy(z + 4064, h.bytes, 32);
+}
+
+/* ARCHITECTURE section 5.4.1, what every version keeps, read from the
+ * bytes rather than through stm_ub_csum: STM_UB_MAGIC ("STRATUM2") at byte
+ * 0, ub_version le32 at byte 8, ub_csum the BLAKE3-256 of bytes [0, 4064)
+ * in [4064, 4096). An uberblock a newer build makes by those rules alone
+ * is told as one. */
+STM_TEST(sb_ub_keeps_what_every_version_keeps) {
+    stm_uberblock ub;
+    fill_example(&ub);
+    uint8_t buf[STM_UB_SIZE];
+    STM_ASSERT_EQ(sizeof buf, (size_t)4096);
+    STM_ASSERT_OK(stm_ub_encode(&ub, buf, sizeof buf));
+    STM_ASSERT_EQ(memcmp(buf, "STRATUM2", 8), 0);
+    uint32_t v = (uint32_t)buf[8] | (uint32_t)buf[9] << 8 |
+                 (uint32_t)buf[10] << 16 | (uint32_t)buf[11] << 24;
+    STM_ASSERT_EQ(v, STM_UB_VERSION);
+    stm_blake3_hash h;
+    stm_blake3(buf, 4064, &h);
+    STM_ASSERT_EQ(memcmp(h.bytes, buf + 4064, 32), 0);
+    v = STM_UB_VERSION + 1u;
+    for (int i = 0; i < 4; i++) buf[8 + i] = (uint8_t)(v >> (8 * i));
+    STM_ASSERT(!stm_ub_is_newer(buf, sizeof buf));  /* the old csum */
+    stm_blake3(buf, 4064, &h);
+    memcpy(buf + 4064, h.bytes, 32);
+    STM_ASSERT(stm_ub_is_newer(buf, sizeof buf));
+    /* Nothing but the kept fields, every other byte zero, then 0xa5. */
+    for (int fill = 0; fill < 2; fill++) {
+        uint8_t z[STM_UB_SIZE];
+        sb_kept_fields_only(z, fill ? 0xa5u : 0u);
+        STM_ASSERT(stm_ub_is_newer(z, sizeof z));
+    }
+}
+
+/* gen's uberblock re-stamped `version`, in the ring slot of `at`; its csum
+ * recomputed (csum_ok) or left as it was, so it fails. */
+static void sb_put_version(stm_bdev *d, uint64_t at, uint64_t gen,
+                           uint32_t version, bool csum_ok)
+{
+    stm_uberblock ub;
+    fill_example(&ub);
+    ub.ub_gen = stm_store_le64(gen);
+    uint8_t buf[STM_UB_SIZE];
+    STM_ASSERT_OK(stm_ub_encode(&ub, buf, sizeof buf));
+    if (csum_ok) {
+        sb_restamp(buf, version);
+    } else {
+        le32 v = stm_store_le32(version);
+        memcpy(buf + offsetof(stm_uberblock, ub_version), v.v, sizeof v.v);
+    }
+    STM_ASSERT_OK(stm_bdev_write(d, sb_gen_off(d, at), buf, sizeof buf));
+}
+
+static void sb_zero_gen(stm_bdev *d, uint64_t gen)
+{
+    uint8_t z[STM_UB_SIZE];
+    memset(z, 0, sizeof z);
+    STM_ASSERT_OK(stm_bdev_write(d, sb_gen_off(d, gen), z, sizeof z));
+}
+
+/* A refusal at a newer build's uberblock in the ring slot of `at`, best
+ * 42. */
+static void sb_why_newer(stm_bdev *d, const stm_sb_scan_refusal *why,
+                         uint64_t at)
+{
+    STM_ASSERT_EQ(why->version, STM_UB_VERSION + 1u);
+    STM_ASSERT_EQ(why->gen, 0u);
+    STM_ASSERT_EQ(why->label_idx, (uint32_t)(at % 4u));
+    STM_ASSERT_EQ(why->slot_idx, (uint32_t)(at % 63u));
+    STM_ASSERT_EQ(why->byte_offset, sb_gen_off(d, at));
+    STM_ASSERT_EQ(why->best_gen, 42u);
+}
+
+/* Both scans, strict and one device: STM_OK at best 42, or `want`; a
+ * refusal at a newer build's uberblock names the ring slot of `at`. */
+static void sb_scan_both(stm_bdev *d, stm_status want, uint64_t at,
+                         const char *what)
+{
+    for (int strict = 0; strict < 2; strict++) {
+        stm_uberblock found;
+        stm_sb_scan_refusal why;
+        memset(&found, 0, sizeof found);
+        memset(&why, 0xa5, sizeof why);
+        stm_status s = stm_sb_mount_scan_ex(d, !strict, &found, NULL, NULL,
+                                            &why);
+        printf("  %s, %s: scan %d, gen %llu\n", what,
+               strict ? "strict" : "one device", (int)s,
+               (unsigned long long)stm_load_le64(found.ub_gen));
+        STM_ASSERT_EQ(s, want);
+        if (want == STM_OK) {
+            STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
+            STM_ASSERT_EQ(why.version, 0u);
+        }
+        if (want == STM_EBADVERSION) sb_why_newer(d, &why, at);
+    }
+}
+
+/* A newer build's uberblock anywhere refuses the mount: mounting what this
+ * build reads would roll the pool back past the newer commits, and the
+ * claim at best+1 would overwrite one. */
+STM_TEST(sb_mount_scan_refuses_a_pool_a_newer_build_wrote) {
+    stm_bdev *d = open_test_device("o1newer", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    if (!d) return;
+    sb_put_gen(d, 41);
+    sb_put_gen(d, 42);
+    sb_scan_both(d, STM_OK, 0, "this build's only");
+    /* Control, one variable away: its csum fails, so best+1 is torn. */
+    sb_put_version(d, 43, 43, STM_UB_VERSION + 1u, false);
+    sb_scan_both(d, STM_OK, 0, "a torn newer one at best+1");
+    sb_put_version(d, 43, 43, STM_UB_VERSION + 1u, true);
+    sb_scan_both(d, STM_EBADVERSION, 43, "a newer one at best+1");
+    /* One made of the kept fields alone (ARCHITECTURE section 5.4.1),
+     * every other byte zero: a newer layout may move ub_gen. */
+    uint8_t z[STM_UB_SIZE];
+    sb_kept_fields_only(z, 0u);
+    STM_ASSERT_OK(stm_bdev_write(d, sb_gen_off(d, 43), z, sizeof z));
+    sb_scan_both(d, STM_EBADVERSION, 43, "only the kept fields at best+1");
+    sb_zero_gen(d, 43);
+    sb_scan_both(d, STM_OK, 0, "best+1 blank again");
+    /* At any generation, out of this build's ring order (a newer layout
+     * places its uberblocks as it likes): gen 99 in gen 7's slot (label
+     * 3) at a version two above, gen 98 in gen 4's (label 0) at one
+     * above. The refusal names the first in scan order. */
+    sb_put_version(d, 7, 99, STM_UB_VERSION + 2u, true);
+    sb_put_version(d, 4, 98, STM_UB_VERSION + 1u, true);
+    sb_scan_both(d, STM_EBADVERSION, 4, "two newer ones in other slots");
+    sb_zero_gen(d, 4);
+    /* An uberblock below MIN_COMPAT is residue. */
+    sb_put_version(d, 7, 7, STM_UB_VERSION_MIN_COMPAT - 1u, true);
+    sb_scan_both(d, STM_OK, 0, "an older one in gen 7's slot");
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* The scan's read of best+1 fails; the re-read finds the newer build's
+ * uberblock there. */
+STM_TEST(sb_mount_scan_refuses_a_newer_uberblock_a_reread_finds) {
+    stm_bdev *d = open_test_device("o1reread", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    if (!d) return;
+    sb_put_gen(d, 41);
+    sb_put_gen(d, 42);
+    sb_put_version(d, 43, 43, STM_UB_VERSION + 1u, true);
+    for (int strict = 0; strict < 2; strict++) {
+        uint32_t f0 = stm_bdev_inject_read_range_fired(d);
+        sb_fault_gen(d, 43, 1);
+        stm_uberblock found;
+        stm_sb_scan_refusal why;
+        stm_status s = stm_sb_mount_scan_ex(d, !strict, &found, NULL, NULL,
+                                            &why);
+        STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(d) - f0, 1u);
+        STM_ASSERT_ERR(s, STM_EBADVERSION);
+        sb_why_newer(d, &why, 43);
+        stm_bdev_inject_read_range_clear(d);
+    }
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* best+1 torn; best+2 holds a newer build's uberblock whose first read
+ * fails: the re-read refuses. Control: the same uberblock torn. */
+STM_TEST(sb_mount_scan_refuses_a_newer_uberblock_a_reread_at_best_plus_2_finds) {
+    for (int torn = 0; torn < 2; torn++)
+    for (int strict = 0; strict < 2; strict++) {
+        stm_bdev *d = open_test_device("o1rr2", 16 * 1024 * 1024);
+        STM_ASSERT(d != NULL);
+        if (!d) return;
+        sb_put_gen(d, 41);
+        sb_put_gen(d, 42);
+        uint8_t buf[STM_UB_SIZE];
+        memset(buf, 0x5a, sizeof buf);
+        STM_ASSERT_OK(stm_bdev_write(d, sb_gen_off(d, 43), buf, sizeof buf));
+        sb_put_version(d, 44, 44, STM_UB_VERSION + 1u, !torn);
+        uint32_t f0 = stm_bdev_inject_read_range_fired(d);
+        sb_fault_gen(d, 44, 1);
+        stm_uberblock found;
+        stm_sb_scan_refusal why;
+        memset(&found, 0, sizeof found);
+        stm_status s = stm_sb_mount_scan_ex(d, !strict, &found, NULL, NULL,
+                                            &why);
+        STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(d) - f0, 1u);
+        if (torn) {
+            STM_ASSERT_OK(s);
+            STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
+        } else {
+            STM_ASSERT_ERR(s, STM_EBADVERSION);
+            sb_why_newer(d, &why, 44);
+        }
+        stm_bdev_inject_read_range_clear(d);
+        stm_bdev_close(d);
+        unlink(g_tmp_path);
+    }
+}
+
+/* One device, slot(best+1) unreadable and best not a final by its mark:
+ * the read of best-1, asking whether best is a final, finds a newer
+ * build's uberblock whose scan read failed, and refuses as one, naming
+ * that slot. Control: the same uberblock torn, so slot(best+1) refuses
+ * (STM_EIO). The strict rule reads no best-1 and refuses at
+ * slot(best+1). */
+STM_TEST(sb_mount_scan_refuses_a_newer_uberblock_the_read_of_best_minus_1_finds) {
+    for (int torn = 0; torn < 2; torn++)
+    for (int strict = 0; strict < 2; strict++) {
+        stm_bdev *d = open_test_device("o1prev", 16 * 1024 * 1024);
+        STM_ASSERT(d != NULL);
+        if (!d) return;
+        sb_put_gen(d, 40);
+        sb_put_version(d, 41, 41, STM_UB_VERSION + 1u, !torn);
+        sb_put_gen(d, 42);
+        sb_fault_gen(d, 41, 1);
+        sb_fault_gen(d, 43, -1);
+        stm_uberblock found;
+        stm_sb_scan_refusal why;
+        stm_status s = stm_sb_mount_scan_ex(d, !strict, &found, NULL, NULL,
+                                            &why);
+        printf("  %s, %s: scan %d, refusal gen %llu version %u\n",
+               torn ? "torn" : "newer", strict ? "strict" : "one device",
+               (int)s, (unsigned long long)why.gen, why.version);
+        if (strict || torn) {
+            STM_ASSERT_ERR(s, STM_EIO);
+            STM_ASSERT_EQ(why.gen, 43u);
+            STM_ASSERT_EQ(why.version, 0u);
+        } else {
+            STM_ASSERT_ERR(s, STM_EBADVERSION);
+            sb_why_newer(d, &why, 41);
+        }
+        stm_bdev_inject_read_range_clear(d);
         stm_bdev_close(d);
         unlink(g_tmp_path);
     }

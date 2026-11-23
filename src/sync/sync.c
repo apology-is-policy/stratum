@@ -2264,12 +2264,17 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
         stm_bdev *di = stm_pool_device_bdev(p, (uint16_t)i);
         if (!di) continue;
         uint32_t lbl = 0, slot = 0;
+        /* A device of a multi-device pool refuses by its own scan's rule,
+         * which is not the pool's (quorum decides) -- except at a newer
+         * build's uberblock, which any device names. */
+        stm_sb_scan_refusal dwhy;
+        stm_sb_scan_refusal *dw = !why ? NULL : one_device ? why : &dwhy;
         stm_status sc = stm_sb_mount_scan_ex(di, one_device, &scans[i].ub,
-                                             &lbl, &slot,
-                                             one_device ? why : NULL);
+                                             &lbl, &slot, dw);
         if (sc == STM_OK) {
             scans[i].valid = true;
         } else if (sc == STM_EBADVERSION) {
+            if (dw == &dwhy) *why = dwhy;
             free(scans);
             return STM_EBADVERSION;
         } else if (sc != STM_ENOENT) {

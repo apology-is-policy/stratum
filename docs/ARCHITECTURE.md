@@ -978,6 +978,7 @@ Each 256 KiB label contains:
 
 - **63 uberblock slots** of 4 KiB each: ~256 KiB of ring, holding the last 63 commits' worth of state.
 - **Slot 63 (or whichever we pick)**: pool-config mirror. Used when uberblock ring data is damaged but the pool config needs to be recovered.
+- **As built**, and fixed for every version by section 5.4.1: a label is 64 slots of 4 KiB and nothing else (no device info block). Slots 0..62 are the commit ring and slot 63 the pool-config mirror; slot k lies at the label's offset + k x 4096.
 
 #### 5.3.3 Ring rotation
 
@@ -991,7 +992,7 @@ The ring size (63) is chosen so that a pool-wide panic has a generous window of 
 
 ### 5.4 Uberblock format
 
-An uberblock is a 4 KiB block containing the pool's state as of one commit.
+An uberblock is a 4 KiB block containing the pool's state as of one commit. The listing below is the design sketch: the as-built layout is `stm_uberblock` in `include/stratum/super.h` (its field sizes and offsets differ), and section 5.4.1 fixes what every version keeps.
 
 ```c
 struct stm_uberblock {
@@ -1044,7 +1045,7 @@ struct stm_uberblock {
     // Reserved
     uint8_t ub_reserved[1024];
 
-    // Checksum (BLAKE3-256 over the rest of the uberblock with this field zeroed)
+    // Checksum (BLAKE3-256 of bytes [0, 4064); section 5.4.1)
     uint8_t ub_csum[32];           // 32 B
 };
 
@@ -1056,7 +1057,19 @@ Key design choices:
 - **Every uberblock is self-describing**: contains the roster, feature flags, key schema. A single-device recovery scenario (all peers lost) can bootstrap from any valid uberblock on the surviving device.
 - **Merkle root is always present**: every commit produces a new Merkle root of all metadata; this is the anchor for integrity verification (§7).
 - **Compact roster embedded**: up to 64 devices' worth of identity, enough for every realistic pool.
-- **BLAKE3 csum** over the whole block (with csum field zeroed) — self-verifying.
+- **BLAKE3 csum** of every byte before it (bytes [0, 4064)) -- self-verifying.
+
+#### 5.4.1 What every version keeps
+
+Every pool-format version, this one's successors included, keeps these where an older build reads them (binding; operator decision 2026-11-23):
+
+- `ub_magic` holds `STM_UB_MAGIC` (`0x324d555441525453`, "STRATUM2") at byte 0;
+- `ub_version` is a le32 at byte 8;
+- `ub_csum`, bytes [4064, 4096), is the unkeyed BLAKE3-256 of bytes [0, 4064) as stored;
+- an uberblock is 4 KiB, written into commit-ring slots: slot k (0..62) of label L lies at byte `label_offset[L] + k x 4096`, the label offsets being 0, 262144, size - 524288 and size - 262144 (section 5.3.1; slot 63 of each label is the mirror, section 5.3.2);
+- each version's number is greater than every earlier version's.
+
+So a build that reads an uberblock a newer one wrote tells it from a torn or foreign slot (`stm_ub_is_newer`: the magic, a version above its own, a csum that verifies) and refuses the pool, rather than mount an older generation under the newer commits and overwrite one of them with its claim (`stm_sb_mount_scan_ex`). A version may change anything else in the block, and which ring slots a generation's copies go to.
 
 ### 5.5 Quorum semantics
 
@@ -1184,7 +1197,7 @@ Every crash state is recoverable. Either the previous commit's state or the curr
 
 Uberblocks are 4 KiB. Modern NVMe guarantees 4 KiB atomic writes; older hardware may not.
 
-- Every uberblock is csummed (BLAKE3-256 over the block with `ub_csum` zeroed).
+- Every uberblock is csummed (`ub_csum`: BLAKE3-256 of the bytes before it, [0, 4064); section 5.4.1).
 - On mount, csum mismatch → uberblock is discarded.
 - The ring has 63 slots; we won't run out of valid uberblocks unless something catastrophic happened.
 

@@ -3514,5 +3514,74 @@ STM_TEST(sync_multi_a_device_that_refuses_is_not_a_stale_vote) {
     unlink_paths();
 }
 
+/* A newer build's uberblock on one device of three refuses the open
+ * (STM_EBADVERSION) though the other two hold a quorum, and `why` names
+ * its slot. Control, one variable away: the same uberblock torn, the
+ * pool opens. */
+STM_TEST(sync_multi_a_newer_builds_uberblock_on_one_device_refuses_the_open) {
+    for (int torn = 0; torn < 2; torn++) {
+        make_paths(torn ? "o1mtorn" : "o1mnewer");
+        stm_bdev *bds[NDEV] = {0};
+        open_bdevs(bds);
+        stm_pool *pool = make_multi_pool(bds);
+        stm_alloc *a = NULL;
+        STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID,
+                                         (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
+                                         TEST_BOOTSTRAP_BYTES, &a));
+        stm_sync *s = NULL;
+        STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
+        STM_ASSERT_OK(stm_sync_commit(s));
+        stm_sync_close(s);
+        stm_alloc_close(a);
+        stm_pool_close(pool);
+        close_bdevs(bds);
+
+        /* Device 1's newest uberblock, as a newer build's, in gen 40's
+         * slot. */
+        open_bdevs(bds);
+        stm_uberblock ub;
+        STM_ASSERT_OK(stm_sb_mount_scan(bds[1], &ub, NULL, NULL));
+        uint64_t newest = stm_load_le64(ub.ub_gen);
+        STM_ASSERT(newest < 38u);
+        ub.ub_gen = stm_store_le64(40u);
+        ub.ub_version = stm_store_le32(STM_UB_VERSION + 1u);
+        uint8_t buf[STM_UB_SIZE];
+        STM_ASSERT_OK(stm_ub_encode(&ub, buf, sizeof buf));
+        if (torn) buf[384] ^= 0xffu;
+        uint64_t lo[STM_LABELS_PER_DEVICE];
+        STM_ASSERT_OK(stm_label_offsets(TEST_DEVICE_BYTES, lo));
+        uint64_t off = lo[40u % 4u] + 40u * (uint64_t)STM_UB_SIZE;
+        STM_ASSERT_OK(stm_bdev_write(bds[1], off, buf, sizeof buf));
+        STM_ASSERT_OK(stm_bdev_fsync(bds[1]));
+
+        pool = make_multi_pool(bds);
+        stm_alloc *a2 = NULL;
+        STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
+        stm_sync *s2 = NULL;
+        stm_sb_scan_refusal why;
+        memset(&why, 0xab, sizeof why);
+        stm_status os = stm_sync_open_ex(pool, a2, make_wk(), NULL, NULL,
+                                         &why, &s2);
+        printf("  %s: open %d, refusal version %u\n",
+               torn ? "torn" : "newer", (int)os, why.version);
+        if (torn) {
+            STM_ASSERT_OK(os);
+            STM_ASSERT_EQ(why.version, 0u);
+        } else {
+            STM_ASSERT_ERR(os, STM_EBADVERSION);
+            STM_ASSERT_EQ(why.version, STM_UB_VERSION + 1u);
+            STM_ASSERT_EQ(why.gen, 0u);
+            STM_ASSERT_EQ(why.label_idx, 0u);
+            STM_ASSERT_EQ(why.slot_idx, 40u);
+            STM_ASSERT_EQ(why.byte_offset, off);
+            STM_ASSERT_EQ(why.best_gen, newest);
+        }
+        if (os == STM_OK) stm_sync_close(s2);
+        stm_alloc_close(a2);
+        stm_pool_close(pool);
+        close_bdevs(bds);
+        unlink_paths();
+    }
+}
 
 STM_TEST_MAIN("sync_multi")

@@ -532,11 +532,13 @@ extern "C" {
  * UPGRADE-ON-MOUNT applies for the first time: a pool at
  * STM_UB_VERSION_MIN_COMPAT (v32 -- every internal node's buffer
  * region is zero) mounts under this binary and becomes v33 at its
- * next commit (sync stamps STM_UB_VERSION). No downgrade: a
- * v33-written buffered node would be rejected by a v32 binary's
- * equality gate (and silently mis-read by anything older that ignored
- * the field -- which is why the bump is real even though the format
- * is additive). Pre-release; no converter. The bump is arc-approved
+ * next commit (sync stamps STM_UB_VERSION). No downgrade: a v32
+ * binary's equality gate rejects a v33 uberblock, but its scan then
+ * mounts the newest v32 one left in the ring, rolling back past the v33
+ * commits; a build with stm_ub_is_newer refuses a newer build's pool
+ * instead. (Anything older that ignored the field would mis-read a
+ * v33-written buffered node -- which is why the bump is real even though
+ * the format is additive.) Pre-release; no converter. The bump is arc-approved
  * (Thylacine docs/CONCURRENT-FS.md section 5, user 2026-07-05). */
 #define STM_UB_VERSION_MIN_COMPAT  32u
 
@@ -864,9 +866,10 @@ typedef struct {
     /* Reserved for future fields + alignment to csum. */
     uint8_t ub_reserved[544];                   /* 3520 : 544 */
 
-    /* Checksum: BLAKE3-256 over the rest of the uberblock with this
-     * field zeroed. Self-verifying; a blob whose first 4064 bytes
-     * hash to ub_csum is structurally valid. */
+    /* Checksum: BLAKE3-256 of bytes [0, 4064) as stored, the bytes
+     * before this field (ARCHITECTURE section 5.4.1). Self-verifying;
+     * a blob whose first 4064 bytes hash to ub_csum is structurally
+     * valid. */
     uint8_t ub_csum[32];                        /* 4064 : 32 */
 } stm_uberblock;
 
@@ -1005,7 +1008,8 @@ stm_status stm_ub_encode(const stm_uberblock *ub, void *buf, size_t buf_len);
  * Decode `buf` (STM_UB_SIZE bytes expected) into `*out_ub`. Verifies:
  *   - buf_len == STM_UB_SIZE.
  *   - ub_magic matches STM_UB_MAGIC.
- *   - ub_version is supported (== STM_UB_VERSION; future: feature-flag check).
+ *   - ub_version is supported (STM_UB_VERSION_MIN_COMPAT..STM_UB_VERSION;
+ *     stm_ub_is_newer tells a newer build's uberblock from a torn one).
  *   - ub_csum matches BLAKE3-256 over bytes [0, STM_UB_SIZE - 32).
  *
  * R13 P2-1: status taxonomy for failures:
@@ -1023,6 +1027,19 @@ stm_status stm_ub_decode(const void *buf, size_t buf_len, stm_uberblock *out_ub)
 /* Compute just the csum of an encoded buffer (bytes [0, size-32) →
  * BLAKE3-256 into out[32]). Exposed for tests and emergency tools. */
 void stm_ub_csum(const void *buf, size_t buf_len, uint8_t out[32]);
+
+/*
+ * Whether `buf` holds an uberblock a NEWER build wrote: the magic, a
+ * version above STM_UB_VERSION, and a csum that verifies. Every version,
+ * this one's successors included, keeps STM_UB_MAGIC at byte 0,
+ * ub_version (le32) at byte 8 and ub_csum, the unkeyed BLAKE3-256 of
+ * bytes [0, 4064) as stored, in bytes [4064, 4096), in 4 KiB commit-ring
+ * slots (ARCHITECTURE section 5.4.1), so a build tells a newer one's
+ * uberblock from a torn or foreign slot and refuses the pool
+ * (stm_sb_mount_scan_ex) rather than mount an older generation under the
+ * newer commits.
+ */
+bool stm_ub_is_newer(const void *buf, size_t buf_len);
 
 /* ========================================================================= */
 /* Label placement.                                                           */
@@ -1091,11 +1108,21 @@ stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
  * where to write the NEXT commit's ring slot).
  *
  * Returns STM_ENOENT if no valid uberblock is found on the device
- * (fresh / never-mounted / irrecoverably corrupt). Per-slot
- * STM_ECORRUPT / STM_EBADVERSION failures are NOT errors — they're
- * expected for unused slots and get silently filtered out. An uberblock
- * counts only in its generation's ring slot; a device whose only
- * uberblocks sit in other slots returns STM_ECORRUPT, not STM_ENOENT.
+ * (fresh / never-mounted / irrecoverably corrupt). A slot that does not
+ * decode (STM_ECORRUPT, or a version below STM_UB_VERSION_MIN_COMPAT) is
+ * skipped, and STM_EBADVERSION answers only when nothing decodes and some
+ * slot held another version. An uberblock counts only in its
+ * generation's ring slot; a device whose only uberblocks sit in other
+ * slots returns STM_ECORRUPT, not STM_ENOENT.
+ *
+ * Returns STM_EBADVERSION when a slot it reads holds an uberblock a newer
+ * build wrote (stm_ub_is_newer): every commit-ring slot at the first
+ * read; slot(best+1) and slot(best+2) at their re-reads; and, with
+ * one_device, slot(best-1), read when slot(best+1) stays unreadable and
+ * best's mark does not say final. A newer uberblock elsewhere whose one
+ * read fails goes unseen; a layout that writes each commit to several
+ * slots (or keeps this one's slot among them) makes one failed read
+ * harmless.
  *
  * A slot the device fails to READ is not a torn write. Returns STM_EIO
  * when no slot decoded and some read failed, or when the slot of
@@ -1109,15 +1136,19 @@ stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
                               uint32_t *out_label_idx,
                               uint32_t *out_slot_idx);
 
-/* Why a scan refused: the slot of `gen`, which may hold a commit newer
- * than best_gen (the newest it read), stayed unreadable. gen is 0 when
- * the scan refused for another reason. */
+/* Why a scan refused, at (label_idx, slot_idx), byte_offset on the
+ * device; best_gen is the newest generation it read. gen != 0: the slot
+ * of gen, which may hold a commit newer than best_gen, stayed unreadable
+ * (STM_EIO). version != 0: the slot holds an uberblock of that version, a
+ * newer build's (STM_EBADVERSION; gen is 0). Both are 0 when the scan
+ * refused for another reason. */
 typedef struct stm_sb_scan_refusal {
     uint64_t gen;
     uint32_t label_idx;
     uint32_t slot_idx;
     uint64_t byte_offset;
     uint64_t best_gen;
+    uint32_t version;
 } stm_sb_scan_refusal;
 
 /*
@@ -1129,7 +1160,8 @@ typedef struct stm_sb_scan_refusal {
  * slot(best+2) only when slot(best+1) neither decoded nor read back zero
  * (each settled by two reads that came back wrong with no error).
  * Without it, either slot unreadable refuses. `why`, if not NULL, says
- * which slot.
+ * which slot refused (STM_EIO, or STM_EBADVERSION at a newer build's
+ * uberblock).
  */
 STM_MUST_USE
 stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
