@@ -8,15 +8,17 @@
 #   tests/mkfs_disk_smoke.sh path/to/build/src/cmd     a build's stratum-mkfs, stratumd, stratum-fs
 set -u
 B=${1:?usage: mkfs_disk_smoke.sh path/to/stratum | path/to/build/src/cmd}
+# SERVE execs: it runs as a background pipeline element, where $! must be the daemon
+# a TERM reaches, not the subshell bash forks for a function.
 if [ -d "$B" ]; then
     B=$(cd "$B" && pwd)
     MKFS() { "$B/stratum-mkfs/stratum-mkfs" "$@"; }
-    SERVE() { "$B/stratumd/stratumd" "$@"; }
+    SERVE() { exec "$B/stratumd/stratumd" "$@"; }
     FS() { "$B/stratum-fs/stratum-fs" "$@"; }
 elif [ -x "$B" ]; then
     case "$B" in /*) ;; *) B=$PWD/$B ;; esac
     MKFS() { "$B" mkfs "$@"; }
-    SERVE() { "$B" serve "$@"; }
+    SERVE() { exec "$B" serve "$@"; }
     FS() { "$B" fs "$@"; }
 else
     echo "FAIL: $B is neither the stratum binary nor a build's src/cmd"
