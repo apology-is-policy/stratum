@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define TEST_DEVICE_BYTES      (UINT64_C(16) * 1024u * 1024u)
@@ -340,6 +341,31 @@ STM_TEST(sync_open_refuses_a_device_smaller_than_its_recorded_size) {
     STM_ASSERT_EQ(after, writes);
     stm_alloc_close(a2);
     stm_pool_close(pool2);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* The one device's image is cut under the open pool, above its data area:
+ * the commit's uberblock takes no copy, so the commit fails STM_ERANGE
+ * instead of being acknowledged on a device no later open could mount, and
+ * the file keeps the size it was cut to. */
+STM_TEST(sync_commit_refuses_a_device_cut_under_the_pool) {
+    make_tmp("cutopen");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    const uint64_t cut = TEST_DEVICE_BYTES - UINT64_C(300) * 1024u;
+    STM_ASSERT_EQ(truncate(g_tmp_path, (off_t)cut), 0);
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p));
+    STM_ASSERT_ERR(stm_sync_commit(s), STM_ERANGE);
+    struct stat st;
+    STM_ASSERT_EQ(stat(g_tmp_path, &st), 0);
+    STM_ASSERT_EQ((uint64_t)st.st_size, cut);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }

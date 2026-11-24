@@ -144,6 +144,57 @@ STM_TEST(bdev_sync_read_past_eof_is_eio) {
     unlink(g_tmp_path);
 }
 
+/* A write the device's size does not hold is refused before the backend:
+ * a file would grow to take it and leave caps.size_bytes behind. */
+STM_TEST(bdev_write_past_the_end_is_refused) {
+    make_tmp("wend");
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    stm_bdev *d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d));
+    uint8_t b[4096], c[4096], r[2048], want[2048];
+    memset(b, 0x5a, sizeof b);
+    memset(want, 0x5a, sizeof want);
+    memset(c, 0xc3, sizeof c);
+    struct stat st;
+
+    /* A new file is a device of no bytes. */
+    STM_ASSERT_EQ(stm_bdev_caps_of(d)->size_bytes, 0u);
+    STM_ASSERT_ERR(stm_bdev_write(d, 0, b, 1), STM_EINVAL);
+    STM_ASSERT_EQ(stat(g_tmp_path, &st), 0);
+    STM_ASSERT_EQ((uint64_t)st.st_size, 0u);
+
+    const uint64_t size = 64u * 1024u;
+    STM_ASSERT_OK(stm_bdev_resize(d, size));
+    STM_ASSERT_OK(stm_bdev_write(d, size - sizeof b, b, sizeof b));
+    stm_bdev_io_stats_reset(d);
+    STM_ASSERT_ERR(stm_bdev_write(d, size - sizeof r, c, sizeof c), STM_EINVAL);
+    STM_ASSERT_ERR(stm_bdev_write(d, size, c, 1), STM_EINVAL);
+    STM_ASSERT_ERR(stm_bdev_write(d, UINT64_MAX - 100u, c, sizeof c), STM_EINVAL);
+    uint64_t writes = 1;
+    stm_bdev_io_stats(d, &writes, NULL, NULL);
+    STM_ASSERT_EQ(writes, 0u);
+
+    STM_ASSERT_OK(stm_bdev_read(d, size - sizeof r, r, sizeof r));
+    STM_ASSERT(memcmp(r, want, sizeof r) == 0);
+    STM_ASSERT_EQ(stat(g_tmp_path, &st), 0);
+    STM_ASSERT_EQ((uint64_t)st.st_size, size);
+    STM_ASSERT_EQ(stm_bdev_caps_of(d)->size_bytes, size);
+
+    /* A refused write is no I/O: an armed failure waits for the next one. */
+    stm_bdev_inject_fail_after(d, 1);
+    STM_ASSERT_ERR(stm_bdev_write(d, size, c, 1), STM_EINVAL);
+    STM_ASSERT_EQ(stm_bdev_inject_fired_count(d), 0u);
+    STM_ASSERT_ERR(stm_bdev_write(d, 0, c, 1), STM_EIO);
+    STM_ASSERT_EQ(stm_bdev_inject_fired_count(d), 1u);
+    stm_bdev_close(d);
+
+    opts.read_only = true;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d));
+    STM_ASSERT_ERR(stm_bdev_write(d, size, c, 1), STM_EROFS);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST(bdev_resize_grow_only) {
     make_tmp("resz");
     stm_bdev_open_opts opts = stm_bdev_open_opts_default();

@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 typedef struct {
@@ -156,6 +157,52 @@ STM_TEST(async_read_error_propagates) {
     STM_ASSERT(s.status != STM_OK || s.bytes < sizeof buf);
 
     stm_bdev_close(d);
+    unlink(g_path);
+}
+
+/* A submit the device's size does not hold is refused at the call, and its
+ * callback never runs. */
+STM_TEST(async_write_past_the_end_is_refused_at_submit) {
+    make_tmp("wend");
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    stm_bdev *d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_path, &opts, &d));
+    const uint64_t size = 64u * 1024u;
+    STM_ASSERT_OK(stm_bdev_resize(d, size));
+    uint8_t wbuf[4096];
+    memset(wbuf, 0x5a, sizeof wbuf);
+
+    cb_state past = { 0 };
+    STM_ASSERT_ERR(stm_bdev_submit_write(d, size - 2048u, wbuf, sizeof wbuf,
+                                         on_complete, &past), STM_EINVAL);
+    cb_state fits = { 0 };
+    stm_status sub = stm_bdev_submit_write(d, size - sizeof wbuf, wbuf,
+                                           sizeof wbuf, on_complete, &fits);
+    STM_ASSERT_OK(sub);
+    while (sub == STM_OK && fits.hits == 0) {
+        int n = stm_bdev_wait_completion(d, 4);
+        STM_ASSERT(n >= 1);
+    }
+    STM_ASSERT_EQ(fits.hits, 1);
+    STM_ASSERT_EQ(fits.status, STM_OK);
+    STM_ASSERT_EQ(past.hits, 0);
+
+    /* A write of no bytes fits anywhere, as the synchronous one does. */
+    cb_state none = { 0 };
+    STM_ASSERT_OK(stm_bdev_write(d, size + 4096u, wbuf, 0));
+    sub = stm_bdev_submit_write(d, size + 4096u, wbuf, 0, on_complete, &none);
+    STM_ASSERT_OK(sub);
+    while (sub == STM_OK && none.hits == 0) {
+        int n = stm_bdev_wait_completion(d, 4);
+        STM_ASSERT(n >= 1);
+    }
+    STM_ASSERT_EQ(none.status, STM_OK);
+    STM_ASSERT_EQ(stm_bdev_caps_of(d)->size_bytes, size);
+
+    stm_bdev_close(d);
+    struct stat st;
+    STM_ASSERT_EQ(stat(g_path, &st), 0);
+    STM_ASSERT_EQ((uint64_t)st.st_size, size);
     unlink(g_path);
 }
 

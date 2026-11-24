@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* The size of every device these tests open (open_test_device), which
@@ -1984,6 +1985,80 @@ STM_TEST(sb_mount_scan_checks_the_layout_an_uberblock_records) {
     STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 43u);
     STM_ASSERT_EQ(stm_bdev_layout_bytes(d), SB_DEVICE_BYTES);
     stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Cuts the device's file to SB_SHRUNK_BYTES at the first write it sees. */
+static void sb_cut_at_first_write(void *ctx, bool is_write, uint64_t off,
+                                  size_t len)
+{
+    (void)off; (void)len;
+    int *armed = ctx;
+    if (!is_write || *armed != 1) return;
+    *armed = truncate(g_tmp_path, (off_t)SB_SHRUNK_BYTES) == 0 ? 0 : -1;
+}
+
+/* A device shorter than its layout takes no copy of an uberblock: cut while
+ * open (only the file says so), cut before the open (its caps say so),
+ * grown back under a handle opened short (its caps still say so), or cut
+ * while its copies are written (asked again after them). Read-only answers
+ * STM_EROFS, as each of its writes would. Each leg has its own slot. */
+STM_TEST(sb_ub_write_copies_refuses_a_device_shorter_than_its_layout) {
+    stm_bdev *d = open_test_device("short", SB_DEVICE_BYTES);
+    STM_ASSERT(d != NULL);
+    if (!d) return;
+    stm_uberblock ub, back;
+    fill_example(&ub);
+    struct stat st;
+    STM_ASSERT_OK(stm_sb_ub_write_copies(d, 42u, &ub));
+    STM_ASSERT_OK(stm_sb_label_read(d, 0, 42u, &back));
+
+    STM_ASSERT_EQ(truncate(g_tmp_path, (off_t)SB_SHRUNK_BYTES), 0);
+    uint64_t now = 0;
+    STM_ASSERT_OK(stm_bdev_current_bytes(d, &now));
+    STM_ASSERT_EQ(now, SB_SHRUNK_BYTES);
+    STM_ASSERT_EQ(stm_bdev_caps_of(d)->size_bytes, SB_DEVICE_BYTES);
+    STM_ASSERT_ERR(stm_sb_ub_write_copies(d, 43u, &ub), STM_ERANGE);
+    STM_ASSERT_ERR(stm_sb_label_read(d, 0, 43u, &back), STM_ENOENT);
+    STM_ASSERT_EQ(stat(g_tmp_path, &st), 0);
+    STM_ASSERT_EQ((uint64_t)st.st_size, SB_SHRUNK_BYTES);
+    stm_bdev_close(d);
+
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d));
+    stm_bdev_set_layout_bytes(d, SB_DEVICE_BYTES);
+    STM_ASSERT_ERR(stm_sb_ub_write_copies(d, 44u, &ub), STM_ERANGE);
+    STM_ASSERT_ERR(stm_sb_label_read(d, 0, 44u, &back), STM_ENOENT);
+    STM_ASSERT_EQ(stat(g_tmp_path, &st), 0);
+    STM_ASSERT_EQ((uint64_t)st.st_size, SB_SHRUNK_BYTES);
+
+    STM_ASSERT_EQ(truncate(g_tmp_path, (off_t)SB_DEVICE_BYTES), 0);
+    STM_ASSERT_OK(stm_bdev_current_bytes(d, &now));
+    STM_ASSERT_EQ(now, SB_DEVICE_BYTES);
+    STM_ASSERT_ERR(stm_sb_ub_write_copies(d, 45u, &ub), STM_ERANGE);
+    STM_ASSERT_ERR(stm_sb_label_read(d, 0, 45u, &back), STM_ENOENT);
+    stm_bdev_close(d);
+
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d));
+    STM_ASSERT_OK(stm_sb_ub_write_copies(d, 46u, &ub));
+    int armed = 1;
+    stm_bdev_io_observer cut = { sb_cut_at_first_write, &armed };
+    stm_bdev_set_io_observer_for_test(d, &cut);
+    STM_ASSERT_ERR(stm_sb_ub_write_copies(d, 47u, &ub), STM_ERANGE);
+    stm_bdev_set_io_observer_for_test(d, NULL);
+    STM_ASSERT_EQ(armed, 0);
+    STM_ASSERT_EQ(stat(g_tmp_path, &st), 0);
+    STM_ASSERT((uint64_t)st.st_size < SB_DEVICE_BYTES);
+    stm_bdev_close(d);
+
+    STM_ASSERT_EQ(truncate(g_tmp_path, (off_t)SB_SHRUNK_BYTES), 0);
+    opts.read_only = true;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d));
+    stm_bdev_set_layout_bytes(d, SB_DEVICE_BYTES);
+    STM_ASSERT_ERR(stm_sb_ub_write_copies(d, 48u, &ub), STM_EROFS);
+    stm_bdev_close(d);
+    STM_ASSERT_EQ(stat(g_tmp_path, &st), 0);
+    STM_ASSERT_EQ((uint64_t)st.st_size, SB_SHRUNK_BYTES);
     unlink(g_tmp_path);
 }
 

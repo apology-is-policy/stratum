@@ -17,6 +17,9 @@ struct stm_bdev_ops {
     stm_status (*fdatasync)  (stm_bdev *d);
     stm_status (*discard)    (stm_bdev *d, uint64_t off, uint64_t len);
     stm_status (*resize)     (stm_bdev *d, uint64_t new_size);
+    /* The device's size now; NULL answers caps.size_bytes (a device that
+     * refuses a write past its end rather than growing to take it). */
+    stm_status (*current_size)(stm_bdev *d, uint64_t *out);
 
     stm_status (*submit_read)  (stm_bdev *d, uint64_t offset, void *buf,
                                 size_t len, stm_bdev_completion_cb cb, void *user);

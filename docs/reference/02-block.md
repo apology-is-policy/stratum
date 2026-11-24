@@ -48,7 +48,8 @@ Open options:
 
 `stm_bdev_caps` reports the backend actually selected, logical size,
 physical block size, max single-op size, whether TRIM / SQPOLL / DAX /
-fixed-buffers are available. Caps are frozen after open.
+fixed-buffers are available. Caps are frozen after open, except the
+size, which `stm_bdev_resize` moves.
 
 ### Sync ops
 
@@ -64,6 +65,21 @@ stm_status stm_bdev_resize  (d, new_size);        // grow only; ENOTSUPPORTED fo
 Offsets are byte-flat. The backend auto-splits requests larger than
 `caps->max_io_bytes`. Alignment to `caps->block_size` is required
 only when `direct = true`.
+
+A write whose span `[offset, offset + len)` is not within
+`caps->size_bytes` is refused `STM_EINVAL` in `bdev.c`, before the
+backend, and nothing is written; `STM_EROFS` on a read-only device comes
+first; a write of no bytes fits anywhere. A `pwrite` past a file's end grows the file and leaves the size
+behind it, where a block device refuses the same write; the bound makes
+every backend refuse it (the Thylacine driver also bounds its own sector
+span). The size is the handle's: from the open, or the last
+`stm_bdev_resize` through it.
+
+`stm_bdev_current_bytes` answers the device's size now: a regular
+file's length (cut or grown under the handle, which `caps->size_bytes`
+does not see), else `caps->size_bytes`. `stm_bdev_is_read_only` answers
+whether every write would be refused `STM_EROFS`. The uberblock writer
+asks both before and after its copies (07-sb-sync).
 
 ### Async ops
 
@@ -90,6 +106,9 @@ Completions:
 Result struct is stack-valid only for the duration of the callback;
 copy if you need to retain.
 
+`stm_bdev_submit_write` refuses a span past the device's end at the call,
+as the synchronous write does, and the callback never runs.
+
 ### Fixed buffers (zero-copy)
 
 ```c
@@ -111,7 +130,7 @@ Three source files under `src/block/`:
 - `posix.c` — POSIX backend. Sync ops use `pread`/`pwrite`. Async is
   simulated via a fixed thread pool that drains an internal queue;
   completion delivery is via per-device lockless queue + condvar.
-  Host of fault-injection (`include/stratum/block_inject.h`).
+  Its sizing (`op_current_size`) fstats a regular file.
 - `iouring.c` — Linux io_uring backend. Sync ops issue a single SQE,
   wait in the same thread for its CQE. Async ops submit + return,
   driving completion via user-thread `poll_completions` +
@@ -119,7 +138,8 @@ Three source files under `src/block/`:
   supports it.
 
 The vtable has one entry per operation — `open`, `close`, `caps`,
-`read`, `write`, `fsync`, `fdatasync`, `discard`, `resize`, six
+`read`, `write`, `fsync`, `fdatasync`, `discard`, `resize`,
+`current_size` (optional: the size now; NULL answers `caps->size_bytes`), six
 submit entry points, `poll_completions`, `wait_completion`,
 `register_buffers`. New backends (DAX, libaio) plug in by filling out
 the same table.
@@ -138,14 +158,16 @@ void     stm_bdev_inject_fail_after(stm_bdev *d, int64_t n_ops);
 uint32_t stm_bdev_inject_fired_count(const stm_bdev *d);
 ```
 
-Arms a countdown on the POSIX backend — the N-th state-changing op
-(write / fsync / fdatasync) after arming returns `STM_EIO` without
-performing I/O. Used by `test_crash_inject` to synthesize torn-write
-scenarios. POSIX-only; a no-op on other backends.
+Arms a countdown in `bdev.c`, ahead of every backend: the N-th
+state-changing op (write / fsync / fdatasync) after arming returns
+`STM_EIO` without performing I/O. A write refused before it reaches the
+device (read-only, or past the device's end) is not an op and leaves the
+countdown as it was; a deferred barrier's fsync counts only when it is
+issued. Used by `test_crash_inject` to synthesize torn-write scenarios.
 
-**Read ops do NOT fire inject** (posix.c:163). The P5-5-α scrub test
-uses file truncation to force read failures instead (see
-`tests/test_scrub.c::scrub_step_counts_io_error_as_failed`).
+Reads are faulted by their own countdown and byte ranges
+(`stm_bdev_inject_read_fail_after`, `stm_bdev_inject_read_range`), in a
+build with testing hooks only.
 
 ## Cross-layer integration
 
@@ -154,7 +176,7 @@ uses file truncation to force read failures instead (see
 | `sb` (label + uberblock I/O) | `stm_bdev_read` / `_write` + `_fsync`. No async. |
 | `bootstrap` (header + bitmap slots) | Sync ops only. Slots A/B ping-pong for torn-write safety. |
 | `btree_store` (AEAD-encrypted node serialization) | `stm_bdev_read` / `_write` of a 4 KiB ciphertext payload per node. |
-| `sync` (commit protocol) | Fan-out parallel writes across devices via `stm_bdev_submit_write` + `_submit_fsync`; wait for quorum. |
+| `sync` (commit protocol) | Sync `stm_bdev_write` + `_fsync`, one device after another (each uberblock through `stm_sb_ub_write_copies`); a quorum of devices must confirm. |
 | `sync` (mirror read) | Sync `stm_bdev_read`; csum-verify above. |
 | `scrub` (P5-5-α) | Per-block sync `stm_bdev_read`; failures counted. |
 
@@ -187,8 +209,8 @@ by bdev's contract:
 
 | Suite | Coverage |
 |---|---|
-| `test_bdev` (see `tests/test_bdev.c`) | Sync roundtrip on file-backed bdev; caps sanity; resize; discard (no-op on file); read past EOF returns STM_EIO via `posix_pread_full` short-read check. |
-| `test_bdev_async` (see `tests/test_bdev_async.c`) | Async submit + poll_completions on POSIX backend; fsync ordering; submit queue saturation. |
+| `test_bdev` (see `tests/test_bdev.c`) | Sync roundtrip on file-backed bdev; caps sanity; resize; discard (no-op on file); read past EOF returns STM_EIO via `posix_pread_full` short-read check; a write past the end refused `STM_EINVAL` (a new file's 0 bytes, straddling, wholly past, wrapping past 2^64), counted as no write, the file and caps unchanged, a write ending at the end accepted, read-only answering `STM_EROFS` first. |
+| `test_bdev_async` (see `tests/test_bdev_async.c`) | Async submit + poll_completions on POSIX backend; fsync ordering; submit queue saturation; a submit past the end refused at the call with no callback, one ending at the end completing, a write of no bytes past the end fitting, sync and async. |
 | `test_crash_inject` (separate module) | Uses `stm_bdev_inject_fail_after` to force write/fsync failures and verify sync's rollback + remount paths converge. ~168 cycles; TSan timeout 180s. |
 
 ## Status
@@ -204,8 +226,8 @@ by bdev's contract:
       not started.
 - [ ] DAX / PMEM backend: planned, not started (Phase 9+ when PMEM
       target exists).
-- [ ] Read-op fault injection: intentionally not wired; scrub tests
-      use file truncation instead.
+- [x] Read-op fault injection: a countdown and byte ranges, in a
+      build with testing hooks (`block_inject.h`).
 
 ## Known caveats
 
@@ -214,6 +236,10 @@ by bdev's contract:
   file while the bdev is open, `stm_bdev_resize` to the original
   size will re-extend with zeros (scrub's io-fail test exploits this
   to stage read failures).
+- **The write bound is the handle's size.** A file truncated while a
+  handle is open keeps the old size in `caps->size_bytes`, so a write
+  between the new end and the old one still grows it back; one grown
+  by another process is written only up to the size the handle has.
 - **io_uring polling requires a user thread**. There is no internal
   thread that drains completions; if the caller stops calling
   `poll_completions` / `wait_completion`, submitted ops accumulate

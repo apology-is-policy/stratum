@@ -107,6 +107,21 @@ const stm_bdev_caps *stm_bdev_caps_of(const stm_bdev *d)
     return d ? &d->caps : NULL;
 }
 
+bool stm_bdev_is_read_only(const stm_bdev *d)
+{
+    return d && d->read_only;
+}
+
+stm_status stm_bdev_current_bytes(stm_bdev *d, uint64_t *out)
+{
+    if (!d || !out) return STM_EINVAL;
+    if (!d->ops->current_size) {
+        *out = d->caps.size_bytes;
+        return STM_OK;
+    }
+    return d->ops->current_size(d, out);
+}
+
 uint64_t stm_bdev_layout_bytes(const stm_bdev *d)
 {
     if (!d) return 0;
@@ -231,11 +246,21 @@ static stm_status do_fsync(stm_bdev *d)
     return d->ops->fsync(d);
 }
 
+/* A file takes a write past its end by growing, which leaves caps.size_bytes
+ * behind it and puts the bytes where no layout of the device has a place; a
+ * block device refuses the same write. Every backend refuses it here. */
+static bool write_span_fits(const stm_bdev *d, uint64_t offset, size_t len)
+{
+    uint64_t size = d->caps.size_bytes;
+    return len == 0 || ((uint64_t)len <= size && offset <= size - (uint64_t)len);
+}
+
 stm_status stm_bdev_write(stm_bdev *d, uint64_t offset, const void *buf, size_t len)
 {
     if (!d || !buf) return STM_EINVAL;
     if (len == 0) return STM_OK;
     if (d->read_only) return STM_EROFS;
+    if (!write_span_fits(d, offset, len)) return STM_EINVAL;
 #ifdef STRATUM_BUILD_TESTING_HOOKS
     io_observe(d, true, offset, len);
 #endif
@@ -495,6 +520,7 @@ stm_status stm_bdev_submit_write(stm_bdev *d, uint64_t offset, const void *buf,
 {
     if (!d || !buf || !cb) return STM_EINVAL;
     if (d->read_only) return STM_EROFS;
+    if (!write_span_fits(d, offset, len)) return STM_EINVAL;
     return d->ops->submit_write(d, offset, buf, len, cb, user);
 }
 

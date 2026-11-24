@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define TEST_DEVICE_BYTES      (UINT64_C(16) * 1024u * 1024u)
@@ -577,6 +578,76 @@ STM_TEST(sync_multi_a_dissenting_copys_size_does_not_place_the_pools_writes) {
     STM_ASSERT_OK(stm_ub_slot_offset(lo[2], cs, &off));
     STM_ASSERT_OK(stm_bdev_read(bds[2], off, buf, sizeof buf));
     STM_ASSERT_ERR(stm_ub_decode(buf, sizeof buf, &got), STM_ENOENT);
+
+    stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
+/* A device truncated below the size the pool recorded for it: the other two
+ * make quorum, the pool writes it no uberblock (not even its head labels'
+ * copies), so its file keeps the size it was cut to, and it never counts
+ * toward a commit's quorum: with one more device failing a write, the
+ * commit fails. */
+STM_TEST(sync_multi_a_device_smaller_than_recorded_is_not_regrown) {
+    make_paths("shrunk");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool *pool = make_multi_pool(bds);
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+
+    const uint64_t shrunk = TEST_DEVICE_BYTES - UINT64_C(4) * 1024u * 1024u;
+    STM_ASSERT_EQ(truncate(g_paths[2], (off_t)shrunk), 0);
+    for (size_t i = 0; i < NDEV; i++) {
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        STM_ASSERT_OK(stm_bdev_open(g_paths[i], &bo, &bds[i]));
+    }
+    STM_ASSERT_EQ(stm_bdev_caps_of(bds[2])->size_bytes, shrunk);
+    pool = make_multi_pool(bds);
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, NULL, &s2));
+    STM_ASSERT_EQ(stm_bdev_layout_bytes(bds[2]), TEST_DEVICE_BYTES);
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s2, &info));
+    uint64_t lo[STM_LABELS_PER_DEVICE], off = 0;
+    uint8_t buf[STM_UB_SIZE];
+    stm_uberblock got;
+    STM_ASSERT_OK(stm_label_offsets(TEST_DEVICE_BYTES, lo));
+    STM_ASSERT_OK(stm_ub_slot_offset(lo[0],
+                                     stm_sb_ring_slot_for_gen(info.auth_gen), &off));
+    STM_ASSERT_OK(stm_bdev_read(bds[0], off, buf, sizeof buf));
+    STM_ASSERT_OK(stm_ub_decode(buf, sizeof buf, &got));
+    STM_ASSERT_EQ(stm_load_le64(got.ub_gen), info.auth_gen);
+    STM_ASSERT_OK(stm_bdev_read(bds[2], off, buf, sizeof buf));
+    bool claim_on_2 = stm_ub_decode(buf, sizeof buf, &got) == STM_OK &&
+                      stm_load_le64(got.ub_gen) == info.auth_gen;
+    STM_ASSERT(!claim_on_2);
+
+    { uint64_t dp = 0; STM_ASSERT_OK(stm_alloc_reserve(a2, 4u, 0, &dp)); }
+    STM_ASSERT_OK(stm_sync_commit(s2));
+    struct stat st;
+    STM_ASSERT_EQ(stat(g_paths[2], &st), 0);
+    STM_ASSERT_EQ((uint64_t)st.st_size, shrunk);
+    STM_ASSERT_EQ(stm_bdev_caps_of(bds[2])->size_bytes, shrunk);
+
+    stm_bdev_inject_fail_after(bds[1], 1);
+    { uint64_t dp = 0; STM_ASSERT_OK(stm_alloc_reserve(a2, 4u, 0, &dp)); }
+    STM_ASSERT_ERR(stm_sync_commit(s2), STM_EQUORUM);
+    STM_ASSERT_EQ(stm_bdev_inject_fired_count(bds[1]), 1u);
 
     stm_sync_close(s2);
     stm_alloc_close(a2);

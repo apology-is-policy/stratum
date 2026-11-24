@@ -144,7 +144,7 @@ const stm_bdev_caps *stm_bdev_caps_of(const stm_bdev *d);
  * stm_pool_open and stm_pool_add_device (the size the roster records),
  * the mount's scan (from labels 0 and 1, stm_sb_mount_scan_ex) and
  * stm_sync_open (from the canonical roster). Until set, or once set to 0,
- * the device's current size. */
+ * caps.size_bytes. */
 uint64_t stm_bdev_layout_bytes(const stm_bdev *d);
 void stm_bdev_set_layout_bytes(stm_bdev *d, uint64_t bytes);
 
@@ -155,6 +155,9 @@ void stm_bdev_set_layout_bytes(stm_bdev *d, uint64_t bytes);
 STM_MUST_USE
 stm_status stm_bdev_read (stm_bdev *d, uint64_t offset, void       *buf, size_t len);
 
+/* A write whose span is not within caps.size_bytes is refused STM_EINVAL and
+ * nothing is written (a file-backed device would grow to take it); a
+ * read-only device answers STM_EROFS first. A write of no bytes fits. */
 STM_MUST_USE
 stm_status stm_bdev_write(stm_bdev *d, uint64_t offset, const void *buf, size_t len);
 
@@ -187,9 +190,19 @@ stm_status stm_bdev_barrier_defer_end   (stm_bdev *d);
 void       stm_bdev_barrier_defer_cancel(stm_bdev *d);
 bool       stm_bdev_barrier_defer_armed (const stm_bdev *d);
 
-/* Grow only. Returns STM_ENOTSUPPORTED for non-file backends. */
+/* Grow only. Returns STM_ENOTSUPPORTED for non-file backends. Not concurrent
+ * with I/O on the device: it moves caps.size_bytes, which every write reads. */
 STM_MUST_USE
 stm_status stm_bdev_resize(stm_bdev *d, uint64_t new_size);
+
+/* True when the device was opened read-only (every write answers STM_EROFS). */
+bool stm_bdev_is_read_only(const stm_bdev *d);
+
+/* The device's size now: a file's current length, which may differ from
+ * caps.size_bytes once the file is cut or grown under the handle; any other
+ * device's caps.size_bytes. */
+STM_MUST_USE
+stm_status stm_bdev_current_bytes(stm_bdev *d, uint64_t *out);
 
 /*
  * Claim an image for one process. STM_EBUSY: another process holds it.
@@ -231,6 +244,8 @@ stm_status stm_bdev_submit_read (stm_bdev *d, uint64_t offset,
                                  void *buf, size_t len,
                                  stm_bdev_completion_cb cb, void *user);
 
+/* Refused at the call as stm_bdev_write refuses; the callback then never
+ * runs. */
 STM_MUST_USE
 stm_status stm_bdev_submit_write(stm_bdev *d, uint64_t offset,
                                  const void *buf, size_t len,

@@ -291,6 +291,8 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
  * unreachable), but the bitmap bits remain allocated until a future
  * fsck pass reconciles. Leak-on-failure, not corruption.
  */
+/* STM_ERANGE: no device confirmed and one was shorter than its layout (an
+ * image cut under the open pool takes no uberblock). */
 STM_MUST_USE
 stm_status stm_sync_commit(stm_sync *s);
 

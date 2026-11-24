@@ -237,6 +237,19 @@ static stm_status op_resize(stm_bdev *base, uint64_t new_size)
     return STM_OK;
 }
 
+/* A file can be cut or grown under an open handle, which caps.size_bytes does
+ * not see. A disk answers its open size: one that shrinks refuses a write
+ * past its end instead of growing to take it. */
+static stm_status op_current_size(stm_bdev *base, uint64_t *out)
+{
+    posix_bdev *d = (posix_bdev *)base;
+    struct stat st;
+    if (fstat(d->fd, &st) == -1) return errno_to_status(errno);
+    *out = (st.st_mode & S_IFMT) == S_IFREG ? (uint64_t)st.st_size
+                                            : d->base.caps.size_bytes;
+    return STM_OK;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Async: thread pool.                                                        */
 /* ------------------------------------------------------------------------- */
@@ -490,6 +503,7 @@ static const struct stm_bdev_ops g_posix_ops = {
     .fdatasync         = op_fdatasync,
     .discard           = op_discard,
     .resize            = op_resize,
+    .current_size      = op_current_size,
     .submit_read       = op_submit_read,
     .submit_write      = op_submit_write,
     .submit_fsync      = op_submit_fsync,

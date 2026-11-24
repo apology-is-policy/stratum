@@ -71,17 +71,39 @@ stm_status stm_sb_label_write(stm_bdev *d, uint32_t label_idx,
     return stm_bdev_fsync(d);
 }
 
+/* STM_ERANGE when the device is shorter than its layout, by its file's
+ * length now or by the size its handle has: its labels 2 and 3 are gone,
+ * or lie past every write the handle makes. */
+static stm_status sb_device_short(stm_bdev *d)
+{
+    uint64_t now = 0;
+    stm_status s = stm_bdev_current_bytes(d, &now);
+    if (s != STM_OK) return s;
+    uint64_t layout = stm_bdev_layout_bytes(d);
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    if (now < layout || !caps || caps->size_bytes < layout) return STM_ERANGE;
+    return STM_OK;
+}
+
 /* Write `ub` to slot `slot_idx` of every label (its STM_UB_COPIES copies),
  * then fsync once. Every copy is attempted, so a failed one leaves the
  * others written; STM_OK only when STM_UB_COPIES_REQUIRED copies were
- * written and the fsync succeeded, else the first failure. */
+ * written and the fsync succeeded, else the first failure. A short device
+ * (STM_ERANGE, sb_device_short) takes no copy: the write cannot be made,
+ * and copies in labels 0 and 1 would be read as this generation's vote if
+ * its tail came back. Asked again after the copies, so a cut made while
+ * they were written does not confirm: they reach at most the end of label
+ * 3's last ring slot, STM_UB_SIZE short of the layout. */
 stm_status stm_sb_ub_write_copies(stm_bdev *d, uint32_t slot_idx,
                                   const stm_uberblock *ub)
 {
     if (!ub || slot_idx >= STM_UB_SLOTS_PER_LABEL) return STM_EINVAL;
+    if (stm_bdev_is_read_only(d)) return STM_EROFS;
+    stm_status s = sb_device_short(d);
+    if (s != STM_OK) return s;
 
     uint8_t buf[STM_UB_SIZE];
-    stm_status s = stm_ub_encode(ub, buf, sizeof buf);
+    s = stm_ub_encode(ub, buf, sizeof buf);
     if (s != STM_OK) return s;
 
     stm_status first = STM_OK;
@@ -94,7 +116,8 @@ stm_status stm_sb_ub_write_copies(stm_bdev *d, uint32_t slot_idx,
         else if (first == STM_OK) first = w;
     }
     stm_status f = stm_bdev_fsync(d);
-    if (written >= STM_UB_COPIES_REQUIRED && f == STM_OK) return STM_OK;
+    if (written >= STM_UB_COPIES_REQUIRED && f == STM_OK)
+        return sb_device_short(d);
     return first != STM_OK ? first : f;
 }
 
@@ -381,9 +404,8 @@ static stm_status sb_refuse_layout(stm_bdev *d, uint32_t li, uint32_t si,
  * device that grew has blank space, or one that shrank has data, at its
  * current end. A device smaller than its recorded size refuses; its
  * layout is set first, so a writer that runs anyway (a pool carrying on
- * without the device) writes past the device's end, never over the data
- * at its current end (a file-backed device grows to take that write:
- * OPEN-BUGS (n)). */
+ * without the device) aims past the device's end, never at the data at
+ * its current end; stm_sb_ub_write_copies writes such a device nothing. */
 static stm_status sb_layout(stm_bdev *d, const stm_uberblock *head,
                             uint32_t li, uint32_t si,
                             stm_sb_scan_refusal *why)
