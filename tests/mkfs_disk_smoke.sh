@@ -333,7 +333,18 @@ if [ "$OS" = Darwin ]; then
     else
         no "mkfs and serve of the raw node $RA: rc=$rc: $(tail -1 "$D/r1.log"); serve: $(tail -1 "$D/serve.log")"
     fi
-    if serve "$A"; then
+    # Each leg below starts from a pool of its own made through the raw node, /raw.txt in it, so a
+    # leg whose format went ahead does not decide the next one's.
+    raw_pool() {
+        local w
+        printf '%s\n' "$PASS" | MKFS "$RA" --keyfile "$K" --passphrase-stdin --force > "$D/rp.log" 2>&1 \
+            && serve "$RA" || return 1
+        printf 'raw\n' | FS -s "$S" write /raw.txt > /dev/null 2>&1
+        w=$?
+        stop
+        [ "$w" = 0 ]
+    }
+    if raw_pool && serve "$A"; then
         got=$(FS -s "$S" read /raw.txt 2>/dev/null)
         mkfs_refused "$D/r4.log" "$RA" --keyfile "$D/other.key"
         if [ "$got" = raw ] && [ "$rc" != 0 ] && LC_ALL=C grep -q "is open in a running stratumd" "$D/r4.log" \
@@ -344,12 +355,15 @@ if [ "$OS" = Darwin ]; then
         fi
         stop
     else
-        no "serve $A after its raw node's format: $(tail -1 "$D/serve.log")"
+        no "a pool made through $RA, then served through $A: $(tail -1 "$D/rp.log"); serve: $(tail -1 "$D/serve.log")"
     fi
     # A raw node this user cannot write is claimed for reading alone, and still holds the block
     # node: a daemon on it, read-only, keeps a format and a second daemon off the block node.
-    chmod u-w "$RA"
-    if [ -w "$RA" ]; then
+    if ! raw_pool; then
+        no "a pool made through $RA: $(tail -1 "$D/rp.log"); serve: $(tail -1 "$D/serve.log")"
+    elif ! chmod u-w "$RA"; then
+        no "chmod u-w $RA"
+    elif [ -w "$RA" ]; then
         chmod u+w "$RA"
         skipped "a raw node claimed for reading alone: $RA stays writable to this user with its write bit off (root?)"
     elif serve "$RA" --read-only; then
