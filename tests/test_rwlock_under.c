@@ -223,9 +223,14 @@ STM_TEST(under_the_gate_readers_wait_for_every_writer_counted) {
  * takes the lock and then waits for every reader to read once more before
  * its next take, so no later count-out can rescue a reader a count-out
  * failed to wake: one that does not move within 1 s is lost (and rescued
- * by one more count-out, which finds it waiting). 2 s over the library
- * lock, 2 s over rp. */
+ * by one more count-out, which finds it waiting). Over the library lock and
+ * over rp, at least 2 s and at least LOST_MIN_COUNTOUTS count-outs: a
+ * count-out waits for three readers to be scheduled, which under macOS's
+ * thread sanitizer took 20 ms each (96 in 2 s, none lost). Fewer by
+ * LOST_CAP_NS is a writer that cannot get in. */
 #define LOST_READERS 3
+#define LOST_MIN_COUNTOUTS 100u
+#define LOST_CAP_NS 60000000000u
 
 typedef struct {
     _Alignas(128) atomic_ulong n;
@@ -300,8 +305,10 @@ static void lost_case(bool on_rp)
     unsigned long it = 0, lost = 0, in_lost_state = 0;
     unsigned long snap[LOST_READERS];
     bool hard = false;
-    uint64_t end = rws_now_ns() + 2000000000u;
-    while (started == LOST_READERS && rws_now_ns() < end) {
+    uint64_t t0 = rws_now_ns();
+    uint64_t end = t0 + 2000000000u, cap = t0 + LOST_CAP_NS;
+    while (started == LOST_READERS && rws_now_ns() < cap &&
+           (it < LOST_MIN_COUNTOUTS || rws_now_ns() < end)) {
         stm_rwlock_wrlock(l);
         lost_spin(16);
         stm_rwlock_unlock(l);
@@ -316,17 +323,18 @@ static void lost_case(bool on_rp)
         stm_rwlock_unlock(l);
         if (!lost_all_moved(r, snap)) { hard = true; break; }
     }
+    uint64_t ran_ms = (rws_now_ns() - t0) / 1000000u;
     atomic_store(&r->stop, true);
     uint64_t until = rws_now_ns() + 5000000000u;
     while (atomic_load(&r->exited) < (unsigned)started && rws_now_ns() < until)
         rws_nap();
     bool quiet = atomic_load(&r->exited) == (unsigned)started;
-    printf("    %s: count-outs %lu, readers lost %lu (waiting with no writer "
-           "%lu), stuck after a rescue %d, all done %d\n",
-           on_rp ? "rp" : "library", it, lost, in_lost_state, (int)hard,
-           (int)quiet);
+    printf("    %s: count-outs %lu in %llu ms, readers lost %lu (waiting with no "
+           "writer %lu), stuck after a rescue %d, all done %d\n",
+           on_rp ? "rp" : "library", it, (unsigned long long)ran_ms, lost,
+           in_lost_state, (int)hard, (int)quiet);
     STM_ASSERT_EQ(started, LOST_READERS);
-    STM_ASSERT(it >= 100u);
+    STM_ASSERT(it >= LOST_MIN_COUNTOUTS);
     STM_ASSERT_EQ(lost, 0);
     STM_ASSERT(!hard);
     STM_ASSERT(quiet);
