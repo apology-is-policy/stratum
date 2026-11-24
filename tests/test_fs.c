@@ -95,8 +95,9 @@ STM_TEST(fs_format_and_mount_use_the_keys_and_the_descriptor_given) {
     char moved[300];
     snprintf(moved, sizeof moved, "%s.moved", g_tmp_path);
     unlink(moved);
-    int claim = -1;
-    STM_ASSERT_OK(stm_bdev_claim_image(g_tmp_path, true, &claim));
+    int claim = -1, hold = -1;
+    STM_ASSERT_OK(stm_bdev_claim_image(g_tmp_path, true, &claim, &hold));
+    STM_ASSERT_EQ(hold, -1);
     STM_ASSERT(claim >= 0);
     STM_ASSERT_EQ(rename(g_tmp_path, moved), 0);
 

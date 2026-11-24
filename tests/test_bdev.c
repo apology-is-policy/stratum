@@ -389,8 +389,9 @@ STM_TEST(bdev_claimed_descriptor_is_the_device_wherever_the_name_leads) {
     char moved[300];
     snprintf(moved, sizeof moved, "%s.moved", g_tmp_path);
     unlink(moved);
-    int claim = -1;
-    STM_ASSERT_OK(stm_bdev_claim_image(g_tmp_path, true, &claim));
+    int claim = -1, hold = -1;
+    STM_ASSERT_OK(stm_bdev_claim_image(g_tmp_path, true, &claim, &hold));
+    STM_ASSERT_EQ(hold, -1);
     STM_ASSERT(claim >= 0);
     STM_ASSERT_EQ(rename(g_tmp_path, moved), 0);
     int fd = open(g_tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
@@ -415,8 +416,10 @@ STM_TEST(bdev_claimed_descriptor_is_the_device_wherever_the_name_leads) {
     STM_ASSERT_EQ((uint64_t)was_claimed.st_size, (uint64_t)(1024 * 1024));
     STM_ASSERT_EQ(pread(claim, r, sizeof r, 0), (ssize_t)sizeof r);
     STM_ASSERT_MEM_EQ(w, r, sizeof w);
-    int second = -1;
-    STM_ASSERT_ERR(stm_bdev_claim_image(moved, false, &second), STM_EBUSY);
+    int second = -1, second_hold = -1;
+    STM_ASSERT_ERR(stm_bdev_claim_image(moved, false, &second, &second_hold), STM_EBUSY);
+    STM_ASSERT_EQ(second, -1);
+    STM_ASSERT_EQ(second_hold, -1);
     close(claim);
     unlink(g_tmp_path);
     unlink(moved);

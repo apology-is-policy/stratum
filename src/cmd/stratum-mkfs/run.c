@@ -599,25 +599,32 @@ static bool link_to_no_file(const char *path)
 }
 
 /* 0 with the volume claimed: *claim_fd is the descriptor the claim holds on it, which
- * the format and the mount go through, or -1 where there is none. *disk_bytes is a
+ * the format and the mount go through, or -1 where there is none, and *claim_hold_fd
+ * one more it holds, or -1. *disk_bytes is a
  * disk's size, read through the claim's descriptor (or, where there is none, one
  * opened by name), and 0 for a file; a disk that cannot be what `ask` asks is
  * refused before it is read. */
 static int mkfs_claim(const char *image_path, const char *keyfile_path,
                       bool replaces_key, bool force, bool key_as_is,
                       const struct volume_ask *ask, bool *created, int *claim_fd,
-                      bool *key_there, struct stat *key_seen, uint64_t *disk_bytes)
+                      int *claim_hold_fd, bool *key_there, struct stat *key_seen,
+                      uint64_t *disk_bytes)
 {
     int fd = -1;
     *created = false;
     *claim_fd = -1;
     *disk_bytes = 0;
-    stm_status s = stm_bdev_claim_image(image_path, false, &fd);
+    stm_status s = stm_bdev_claim_image(image_path, false, &fd, claim_hold_fd);
     if (s == STM_ENOENT) {
-        /* Asked now, so that a refusal leaves no empty image behind. */
+        /* Asked now, so that a refusal leaves no empty image behind: a name with
+         * nothing at it can only become a file, of the size asked. */
+        uint64_t bootstrap = ask->bootstrap;
+        if (!ask->size_named
+                && size_volume(ask->bytes, ask->bootstrap_named, &bootstrap, "--size") != 0)
+            return 1;
         if (key_in_the_way(keyfile_path, replaces_key, force, key_as_is, key_there, key_seen))
             return 1;
-        s = stm_bdev_claim_image(image_path, true, &fd);
+        s = stm_bdev_claim_image(image_path, true, &fd, claim_hold_fd);
         *created = s == STM_OK || s == STM_ENOLCK;
         /* The make takes no link, so one that leads to no file is in its way, with or
          * without --force; "File exists" would say nothing of that. */
@@ -639,10 +646,17 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
         fprintf(stderr, "stratum-mkfs: %s is open in a running stratumd\n", image_path);
         return 1;
     }
+    if (s == STM_ESTALE) {
+        fprintf(stderr,
+            "stratum-mkfs: %s led to another device between two opens of it, and nothing "
+            "was claimed\n", image_path);
+        return 1;
+    }
     if (s == STM_ENOLCK && !force) {
         fprintf(stderr,
             "stratum-mkfs: cannot lock %s (%s), so nothing shows whether a daemon has it; "
             "pass --force to format it anyway\n", image_path, strerror(errno));
+        if (fd >= 0) close(fd);
         return 1;
     }
     if (s != STM_OK && s != STM_ENOLCK) {
@@ -1113,6 +1127,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     int  new_key_fd = -1;
     int  old_key_fd = -1;
     int  claim_fd = -1;
+    int  claim_hold_fd = -1;
     int  image_dir_fd = -1;
     const char *image_base = strrchr(image_path, '/');
     image_base = image_base ? image_base + 1 : image_path;
@@ -1127,8 +1142,8 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         .key_named = key_named,
     };
     int refused = mkfs_claim(image_path, keyfile_path, have_pass, force, key_as_is,
-                             &ask, &created, &claim_fd, &key_was_there, &key_seen,
-                             &disk_bytes);
+                             &ask, &created, &claim_fd, &claim_hold_fd, &key_was_there,
+                             &key_seen, &disk_bytes);
     if (created && claim_fd >= 0)
         image_dir_fd = hold_image_dir(image_path, image_base, claim_fd);
     if (refused != 0) {
@@ -1303,8 +1318,8 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     };
 
     /* Phase 1: format. */
-    fprintf(stderr, "formatting %s (%llu bytes)...\n",
-            image_path, (unsigned long long)device_bytes);
+    fprintf(stderr, "formatting %s (%llu bytes, %llu of them the bootstrap pool)...\n",
+            image_path, (unsigned long long)device_bytes, (unsigned long long)bootstrap_bytes);
     stm_status rc = stm_fs_format(image_path, &fopts);
     if (rc != STM_OK) {
         fprintf(stderr, "stratum-mkfs: stm_fs_format failed: status=%d\n", (int)rc);
@@ -1451,6 +1466,8 @@ cleanup:
     }
     if (image_dir_fd >= 0) close(image_dir_fd);
     if (key_dir_fd >= 0) close(key_dir_fd);
+    if (claim_hold_fd >= 0) close(claim_hold_fd);
+    if (claim_fd >= 0) close(claim_fd);
     /* SWISS-4m: wipe + munlock the passphrase buffer regardless of
      * exit path. Stack-allocated, so munlock + memzero is enough —
      * the storage is freed when this stack frame unwinds. */
