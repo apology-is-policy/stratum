@@ -30,7 +30,7 @@ chapter as specs get wider cross-reference tables).
 | `allocator.tla` | 3 | Refcount + deferred-free; unreserve; a send's hold on its blocks. | 24501221 distinct states, depth 29 (3 ranges, 3 owners, MaxGen 3) | `allocator_unreserve_after_write_buggy.cfg`, `allocator_send_sweep_ignores_pins_buggy.cfg`, `allocator_send_sweep_ignores_barrier_buggy.cfg`, `allocator_send_barrier_by_free_gen_buggy.cfg`, `allocator_send_free_before_deindex_buggy.cfg` |
 | `merkle.tla` | 4 | Per-node Merkle chain. | bounded | — |
 | `key_schema.tla` | 7 / TLY-A3 | Per-dataset key state machine + TLY-A3-keyslot mount machine (`wrapper_identity` + mount FSM + `MountResolvesKeyBeforeData`) + TLY-A3-keyslot-wrap UNWRAP-binding: `unwrap_path` tracking + `UnwrapUsesWrapBinding` — a mount that resolves a CORVUS slot sends corvus the same dataset-path binding the slot's WRAP recorded; a mismatch makes corvus reject the envelope → unmountable pool. | bounded | `key_schema_mount_serve_before_resolve_buggy.cfg`, `key_schema_unwrap_wrong_path_buggy.cfg` |
-| `quorum.tla` | 5 | Multi-device commit + mount-claim; the mount reads the ONLINE devices (vote 153) and picks content as the open does. | 2510 distinct states; `quorum_faults.cfg` (one fault) 23068; `quorum_pick.cfg` (four devices, one fault, three commits) 148330 | `quorum_buggy.cfg`, `quorum_mount_buggy.cfg`, `quorum_pick_buggy.cfg` |
+| `quorum.tla` | 5 | Multi-device commit + mount-claim; the mount reads the ONLINE devices (vote 153) and picks content from each device's ring slot of the gen it takes (OPEN-BUGS (ah)). | 43571 distinct states; `quorum_faults.cfg` (one fault) 222859; `quorum_pick.cfg` (four devices, one fault, three commits) @QP@ (each under the dead-slot VIEW and SYMMETRY) | `quorum_buggy.cfg`, `quorum_mount_buggy.cfg`, `quorum_pick_buggy.cfg`, `quorum_ring_buggy.cfg`, `quorum_hidden_buggy.cfg` |
 | `metadata_nonce.tla` | 5 | Per-device paddr-stamping for nonces. | 51939 states | `metadata_nonce_buggy.cfg` |
 | `device_lifecycle.tla` | 5 | Roster state machine (add/remove/fail/rejoin). | large cfg: 10.6M states at depth 21 | `device_lifecycle_buggy.cfg` |
 | `evac.tla` | 5 | Per-block evacuation atomicity. | 13 states, depth 5 | `evac_buggy.cfg`, `evac_remove_no_drain_buggy.cfg` |
@@ -254,8 +254,13 @@ the mount machine composes against the TLY-A3-keyslot-impl mount path
   current auth.
 - `QuorumDurability` — committed state survives arbitrary
   single-device failures within quorum tolerance.
-- `ContentQuorumAtGen` — at `auth_gen`, ≥quorum devices hold
-  byte-identical shared UB bytes (R14 P1).
+- `ContentQuorumAtGen` -- an acknowledged final or claim is held at
+  its gen by a quorum sharing one content (R14 P1). Until OPEN-BUGS (ah)
+  it read: a quorum of the devices at exactly a gen agree on content
+  (`NewestContentQuorum`, kept and not an invariant): false, since a
+  claim the next reservation moved past, or one an open left on fewer
+  than a quorum beside an orphan final, leaves a quorum at the gen with
+  no content quorum among them.
 - `MountGenBumpMulti` — multi-device analog of sync.tla's
   MountGenBump.
 
@@ -270,32 +275,62 @@ and, with `MountCountsUnknown`, refuses while the unknown votes could put
 the authoritative gen above it (`MountHigh`). `MountAtAuthoritative`: a
 mount takes `AuthoritativeGen`. Before, Mount read every device, FAULTED
 ones too, an oracle the implementation cannot read.
-`quorum_faults.cfg` (MaxFaults 1) holds every invariant but
-`ContentQuorumAtGen`, which fails under a fault (OPEN-BUGS (ah): two
-devices at exactly the claim's gen disagree once its quorum member moves
-past it). `quorum_mount_buggy.cfg` (`MountCountsUnknown=FALSE`, the open
+`quorum_faults.cfg` (MaxFaults 1) holds every invariant.
+`quorum_mount_buggy.cfg` (`MountCountsUnknown=FALSE`, the open
 before vote 153) fails `MountKeepsPublished`: a final two devices of three
 acknowledged, one faulted at the next mount, which takes the gen before
 it and writes its claim over the other's copy.
 
-The content pick (Stratum (r) round 1 F2): of the devices read at exactly
-the gen it takes, the mount takes a content a quorum of them holds when a
+The newest-only content pick (Stratum (r) round 1 F2; `NewestPick`, the
+model with `RingRead=FALSE`): of the devices read at exactly the gen it
+takes, the mount takes a content a quorum of them holds when a
 quorum sits there, and when fewer do, the content all of them hold
 (`MinorityMustAgree`), refusing while they disagree. History variables
 record the last acknowledged final or claim; `MountKeepsPublished`: no
 mount takes a gen below it, or at its gen another content.
 `MountAtAuthoritative` is kept and is stricter (a rollback past a
-reservation, which loses nothing, breaks it). `quorum_pick.cfg` (four
-devices, quorum 3, one fault, three commits) holds every invariant but
-`ContentQuorumAtGen`; with two commits no state has a disagreeing
-minority at the mount's gen after an acknowledged final, so the third
-is what tests `MountKeepsPublished` against a published final there;
-`quorum_pick_buggy.cfg` (`MinorityMustAgree=FALSE`,
-the open before the fix) fails `MountKeepsPublished`: an orphan final
-beside the acknowledged claim at the mount's gen, and the mount picks
-the orphan. The model keeps each device's newest uberblock only, so it
-refuses where reading each device's slot for that gen would mount
-(OPEN-BUGS (ah)).
+reservation, which loses nothing, breaks it). `quorum_pick_buggy.cfg`
+(`RingRead=FALSE`, `MinorityMustAgree=FALSE`, the open before (r) round 1
+F2) fails `MountKeepsPublished`: an orphan final beside the acknowledged
+claim at the mount's gen, and the mount picks the orphan.
+
+The ring (OPEN-BUGS (ah)): `dev_ring` keeps each device's uberblock of
+every gen in that gen's slot (`MaxGen < 63`, so the model's ring never
+comes round; the code counts a ring come round as a slot it could not
+read), and a device moved past a gen still holds it there. The claim is
+written device by device (`WriteClaim`) and acknowledged once a quorum
+holds it (`CheckClaimQuorum`), so a crash leaves it on fewer. A content
+names a tree: a final a new one, a claim the tree its open mounted, a
+reservation the last acknowledged one's. With `RingRead`, the mount takes
+a content held in the slot of the gen it mounts such that no other held
+there could have been acknowledged: holders, moved-on devices whose slot
+it could not read (`hid`, any subset, chosen by TLC) and unknown votes
+reaching a quorum (`RingPick`); a content a quorum holds is one, and with
+none possible any held there mounts. `MountNotStuck`: every device online
+and every slot readable, no coordinator in flight, the mount can pick.
+`RingRead=FALSE` is the newest-only open (`NewestPick`, with
+`MinorityMustAgree`). `quorum_pick.cfg` (four devices, quorum 3, one
+fault, three commits) holds every invariant; with two commits the
+newest-only model had no state with a disagreeing minority at the
+mount's gen after an acknowledged final. `quorum_ring_buggy.cfg`
+(`RingRead=FALSE`) fails `MountNotStuck` with no fault: a commit's final
+on one device, the next open's claim on another, a crash, and no open
+can ever mount (15 states); `quorum_hidden_buggy.cfg`
+(`RingCountsHidden=FALSE`) fails `MountKeepsPublished`: the acknowledged
+claim's device moved on, its slot unread, beside an orphan final, and
+the mount takes the orphan (20 states). The code groups by bytes, which
+also record allocator statistics, so its groups can only split the
+model's: the pick's safety holds for any grouping in which a slot holds
+one content and an acknowledged content is one its quorum shares, and
+with every device read and every slot readable no content but a
+quorum's is possible, so the code mounts there too.
+
+The state space: a slot below `AuthoritativeGen` is read by nothing but
+`DevGen`, as the device's newest, unless it is `pub_gen`'s, and stays so
+(cfg `VIEW View` zeroes those; a cfg with `MountCountsUnknown=FALSE`
+mounts below `AuthoritativeGen` and does without it), and nothing tells
+one device from another but its state (`SYMMETRY Symmetry`, devices as
+model values).
 
 Spec-to-code: `src/sync/sync.c::sync_commit, sync_open, write_ub_to_all_devices,
 sync_ub_shared_bytes_match`.
@@ -1953,6 +1988,11 @@ java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
 java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
     -config quorum_pick_buggy.cfg quorum.tla 2>&1 | \
     grep -E "Invariant|Error:" | head -2
+for cfg in quorum_ring_buggy quorum_hidden_buggy; do
+  java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+      -config ${cfg}.cfg quorum.tla 2>&1 | \
+      grep -E "Invariant|Error:" | head -2
+done
 for cfg in namespace_global_bindings_buggy namespace_detach_leaks_buggy \
            namespace_unbind_crosstalk_buggy namespace_lookup_crosstalk_buggy; do
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \

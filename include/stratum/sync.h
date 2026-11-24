@@ -185,15 +185,22 @@ void stm_sync_pool_serial(const stm_sync *s, uint8_t out[16]);
 /*
  * Mount-time open. Scans all labels × commit ring slots, picks the
  * authoritative uberblock (one device: its highest valid gen; more: the
- * quorum-th highest of the devices' best, with content quorum), and:
+ * quorum-th highest of the devices' best, its content read from each
+ * device's ring slot of that gen), and:
  *   - refuses STM_EIO, writing nothing, while a device whose scan refused
  *     could hold a newer commit: such a device is an unknown vote, as
  *     high as any (a device of a multi-device pool can miss writes), and
  *     the open refuses when the (quorum - unknown)-th highest gen the
  *     others read is above the quorum-th (quorum.tla Mount, vote 153);
- *   - refuses STM_EQUORUM when the devices read at exactly that gen
- *     disagree on content: a quorum of them must share one, and when
- *     fewer sit there, all of them (quorum.tla MinorityMustAgree);
+ *   - mounts the one content held at that gen that could have been
+ *     acknowledged: its holders (each device whose newest is that gen,
+ *     and each moved past it whose ring slot of it decodes as it), the
+ *     devices moved past it whose slot settles to nothing or whose ring
+ *     came round, and the unknown votes reaching quorum; refuses
+ *     STM_EIO, writing nothing, when two could have been; with none, the
+ *     content most devices hold, the lowest device index on a tie
+ *     (quorum.tla RingPick, MountNotStuck); refuses STM_EBADVERSION when
+ *     a slot it reads holds a newer build's uberblock;
  *   - writes a claim at authoritative_gen + 1 to every device not REMOVED
  *     or FAULTED, per the MountGenBump invariant (sync.tla). With quorum,
  *     auth_gen becomes the claim's gen and current_gen the claim's + 2.
