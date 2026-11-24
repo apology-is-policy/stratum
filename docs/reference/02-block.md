@@ -75,6 +75,19 @@ every backend refuse it (the Thylacine driver also bounds its own sector
 span). The size is the handle's: from the open, or the last
 `stm_bdev_resize` through it.
 
+A read whose span is not within the same size fails `STM_EIO` in
+`bdev.c`, before the backend, and reads nothing; a read of no bytes
+fits. The device cannot supply bytes past its end, and `STM_EIO` is how
+the replica readers know a replica the device could not read
+(`sync_eio_unreadable` then asks whether the device reads its labels:
+the pool's failure, or the record's, with another replica to try).
+Before the bound the backends answered each their own way: posix a
+short read's `STM_EIO`, or `STM_EINVAL` for an offset past 2^63, or the
+file's bytes where it had grown past the handle's size; the Thylacine
+driver its sector bound's `STM_EINVAL`, which the readers take as the
+device's error, so a read left with no good replica was the pool's
+failure there and the record's on a host.
+
 `stm_bdev_current_bytes` answers the device's size now: a regular
 file's length (cut or grown under the handle, which `caps->size_bytes`
 does not see), else `caps->size_bytes`. `stm_bdev_is_read_only` answers
@@ -108,6 +121,10 @@ copy if you need to retain.
 
 `stm_bdev_submit_write` refuses a span past the device's end at the call,
 as the synchronous write does, and the callback never runs.
+`stm_bdev_submit_read` of a span past the end completes at once: the
+callback runs with `STM_EIO` and no bytes before the call returns
+`STM_OK` (as `stm_bdev_submit_fsync` on a read-only device completes at
+once with `STM_OK`).
 
 ### Fixed buffers (zero-copy)
 
@@ -169,7 +186,8 @@ issued. Used by `test_crash_inject` to synthesize torn-write scenarios.
 
 Reads are faulted by their own countdown and byte ranges
 (`stm_bdev_inject_read_fail_after`, `stm_bdev_inject_read_range`), in a
-build with testing hooks only.
+build with testing hooks only. A read past the device's end fails
+before them and leaves the countdown as it was.
 
 ## Cross-layer integration
 
@@ -211,8 +229,8 @@ by bdev's contract:
 
 | Suite | Coverage |
 |---|---|
-| `test_bdev` (see `tests/test_bdev.c`) | Sync roundtrip on file-backed bdev; caps sanity; resize; discard (no-op on file); read past EOF returns STM_EIO via `posix_pread_full` short-read check; a write past the end refused `STM_EINVAL` (a new file's 0 bytes, straddling, wholly past, wrapping past 2^64), counted as no write, the file and caps unchanged, a write ending at the end accepted, read-only answering `STM_EROFS` first. |
-| `test_bdev_async` (see `tests/test_bdev_async.c`) | Async submit + poll_completions on POSIX backend; fsync ordering; submit queue saturation; a submit past the end refused at the call with no callback, one ending at the end completing, a write of no bytes past the end fitting, sync and async. |
+| `test_bdev` (see `tests/test_bdev.c`) | Sync roundtrip on file-backed bdev; caps sanity; resize; discard (no-op on file); read past EOF returns STM_EIO; a read past the handle's size fails `STM_EIO` before the backend though the file holds bytes there (grown under the handle; wholly past, straddling, wrapping past 2^64), reading nothing, a read ending at the end and one of no bytes past it accepted, an armed read failure not taken; a write past the end refused `STM_EINVAL` (a new file's 0 bytes, straddling, wholly past, wrapping past 2^64), counted as no write, the file and caps unchanged, a write ending at the end accepted, read-only answering `STM_EROFS` first. |
+| `test_bdev_async` (see `tests/test_bdev_async.c`) | Async submit + poll_completions on POSIX backend; fsync ordering; submit queue saturation; a submit past the end refused at the call with no callback, one ending at the end completing, a write of no bytes past the end fitting, sync and async; a read past the handle's size completing at once with `STM_EIO` and no bytes, its callback run before the submit returns, though the file holds bytes there, one ending at the end completing. |
 | `test_crash_inject` (separate module) | Uses `stm_bdev_inject_fail_after` to force write/fsync failures and verify sync's rollback + remount paths converge. ~168 cycles; TSan timeout 180s. |
 
 ## Status
@@ -238,10 +256,12 @@ by bdev's contract:
   file while the bdev is open, `stm_bdev_resize` to the original
   size will re-extend with zeros (scrub's io-fail test exploits this
   to stage read failures).
-- **The write bound is the handle's size.** A file truncated while a
-  handle is open keeps the old size in `caps->size_bytes`, so a write
-  between the new end and the old one still grows it back; one grown
-  by another process is written only up to the size the handle has.
+- **The write and read bounds are the handle's size.** A file truncated
+  while a handle is open keeps the old size in `caps->size_bytes`, so a
+  write between the new end and the old one still grows it back (and a
+  read there gets a short read's `STM_EIO` from posix); one grown by
+  another process is written and read only up to the size the handle
+  has.
 - **io_uring polling requires a user thread**. There is no internal
   thread that drains completions; if the caller stops calling
   `poll_completions` / `wait_completion`, submitted ops accumulate

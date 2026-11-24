@@ -160,6 +160,50 @@ STM_TEST(async_read_error_propagates) {
     unlink(g_path);
 }
 
+/* A read past the handle's size completes at once with STM_EIO and no bytes,
+ * its callback run before the submit returns, though the file holds bytes
+ * there (grown under the handle); one ending at the end completes. */
+STM_TEST(async_read_past_the_end_completes_at_once_with_eio) {
+    make_tmp("rend");
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    stm_bdev *d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_path, &opts, &d));
+    const uint64_t size = 64u * 1024u;
+    STM_ASSERT_OK(stm_bdev_resize(d, size));
+    FILE *f = fopen(g_path, "r+b");
+    STM_ASSERT(f != NULL);
+    if (f) {
+        uint8_t pat[8192];
+        memset(pat, 0x6b, sizeof pat);
+        STM_ASSERT_EQ(fseek(f, (long)size, SEEK_SET), 0);
+        STM_ASSERT_EQ(fwrite(pat, 1, sizeof pat, f), sizeof pat);
+        fclose(f);
+    }
+
+    uint8_t buf[4096], want[4096];
+    memset(buf, 0xee, sizeof buf);
+    memset(want, 0xee, sizeof want);
+    cb_state past = { 0 };
+    stm_status sub = stm_bdev_submit_read(d, size, buf, sizeof buf, on_complete, &past);
+    STM_ASSERT_OK(sub);
+    int at_return = past.hits;
+    while (sub == STM_OK && past.hits == 0) (void)stm_bdev_wait_completion(d, 4);
+    STM_ASSERT_EQ(at_return, 1);
+    STM_ASSERT_ERR(past.status, STM_EIO);
+    STM_ASSERT_EQ(past.bytes, 0u);
+    STM_ASSERT_EQ(memcmp(buf, want, sizeof buf), 0);
+
+    cb_state fits = { 0 };
+    sub = stm_bdev_submit_read(d, size - sizeof buf, buf, sizeof buf, on_complete, &fits);
+    STM_ASSERT_OK(sub);
+    while (sub == STM_OK && fits.hits == 0) (void)stm_bdev_wait_completion(d, 4);
+    STM_ASSERT_OK(fits.status);
+    STM_ASSERT_EQ(fits.bytes, sizeof buf);
+
+    stm_bdev_close(d);
+    unlink(g_path);
+}
+
 /* A submit the device's size does not hold is refused at the call, and its
  * callback never runs. */
 STM_TEST(async_write_past_the_end_is_refused_at_submit) {

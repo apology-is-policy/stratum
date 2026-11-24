@@ -205,10 +205,23 @@ static void io_observe(stm_bdev *d, bool is_write, uint64_t offset,
 }
 #endif
 
+/* Whether [offset, offset + len) lies within the device as its handle knows
+ * it. A file takes a write past its end by growing, which leaves
+ * caps.size_bytes behind it and puts the bytes where no layout of the device
+ * has a place, and gives a read past it whatever the file holds there; a
+ * block device refuses both. Every backend refuses both here, so a read past
+ * the end answers the same status on each. */
+static bool span_fits(const stm_bdev *d, uint64_t offset, size_t len)
+{
+    uint64_t size = d->caps.size_bytes;
+    return len == 0 || ((uint64_t)len <= size && offset <= size - (uint64_t)len);
+}
+
 stm_status stm_bdev_read(stm_bdev *d, uint64_t offset, void *buf, size_t len)
 {
     if (!d || !buf) return STM_EINVAL;
     if (len == 0) return STM_OK;
+    if (!span_fits(d, offset, len)) return STM_EIO;
 #ifdef STRATUM_BUILD_TESTING_HOOKS
     io_observe(d, false, offset, len);
     if (inject_read_should_fail(d)) return STM_EIO;
@@ -247,21 +260,12 @@ static stm_status do_fsync(stm_bdev *d)
     return d->ops->fsync(d);
 }
 
-/* A file takes a write past its end by growing, which leaves caps.size_bytes
- * behind it and puts the bytes where no layout of the device has a place; a
- * block device refuses the same write. Every backend refuses it here. */
-static bool write_span_fits(const stm_bdev *d, uint64_t offset, size_t len)
-{
-    uint64_t size = d->caps.size_bytes;
-    return len == 0 || ((uint64_t)len <= size && offset <= size - (uint64_t)len);
-}
-
 stm_status stm_bdev_write(stm_bdev *d, uint64_t offset, const void *buf, size_t len)
 {
     if (!d || !buf) return STM_EINVAL;
     if (len == 0) return STM_OK;
     if (d->read_only) return STM_EROFS;
-    if (!write_span_fits(d, offset, len)) return STM_EINVAL;
+    if (!span_fits(d, offset, len)) return STM_EINVAL;
 #ifdef STRATUM_BUILD_TESTING_HOOKS
     io_observe(d, true, offset, len);
 #endif
@@ -538,6 +542,12 @@ stm_status stm_bdev_submit_read(stm_bdev *d, uint64_t offset, void *buf,
                                 stm_bdev_completion_cb cb, void *user)
 {
     if (!d || !buf || !cb) return STM_EINVAL;
+    if (!span_fits(d, offset, len)) {
+        stm_op_result r = { .kind = STM_OP_READ, .status = STM_EIO,
+                            .bytes = 0, .user = user };
+        cb(&r);
+        return STM_OK;
+    }
     return d->ops->submit_read(d, offset, buf, len, cb, user);
 }
 
@@ -547,7 +557,7 @@ stm_status stm_bdev_submit_write(stm_bdev *d, uint64_t offset, const void *buf,
 {
     if (!d || !buf || !cb) return STM_EINVAL;
     if (d->read_only) return STM_EROFS;
-    if (!write_span_fits(d, offset, len)) return STM_EINVAL;
+    if (!span_fits(d, offset, len)) return STM_EINVAL;
     return d->ops->submit_write(d, offset, buf, len, cb, user);
 }
 
