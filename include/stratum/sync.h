@@ -194,9 +194,10 @@ void stm_sync_pool_serial(const stm_sync *s, uint8_t out[16]);
  *     others read is above the quorum-th (quorum.tla Mount, vote 153);
  *   - mounts the one content held at that gen that could have been
  *     acknowledged: its holders (each device whose newest is that gen,
- *     and each moved past it whose ring slot of it decodes as it), the
- *     devices moved past it whose slot settles to nothing or whose ring
- *     came round, and the unknown votes reaching quorum; refuses
+ *     and each other whose ring slot of it decodes as it), the
+ *     devices whose slot of it has a copy torn or unreadable and none of
+ *     it, or whose ring came round, and the unknown votes reaching quorum;
+ *     refuses
  *     STM_EIO, writing nothing, when two could have been; with none, the
  *     content most devices hold, the lowest device index on a tie
  *     (quorum.tla RingPick, MountNotStuck); refuses STM_EBADVERSION when

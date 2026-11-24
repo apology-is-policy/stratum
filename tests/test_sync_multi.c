@@ -733,13 +733,13 @@ STM_TEST(sync_multi_mount_detects_alloc_root_gen_tamper) {
 STM_TEST(sync_multi_mount_takes_the_largest_group_when_none_has_quorum) {
     /* Three devices at auth_gen, three contents (two devices' alloc
      * root csums flipped, each another way). Every device was read and
-     * every slot settled, so a content acknowledged there would hold a
-     * quorum of them: none was, and the open takes the largest group,
+     * each holds its own content there, so a content acknowledged there
+     * would hold a quorum of them: none was, and the open takes the largest group,
      * the lowest device index on a tie (OPEN-BUGS (ah), quorum.tla
      * RingPick). Device 0's is the untampered one, and it mounts. The
      * open refused STM_EQUORUM, R14 P1's answer: what R14 P1 needs is
      * that a commit is acknowledged only when a quorum holds one content
-     * (quorum.tla PublishedHasQuorum). */
+     * (quorum.tla ContentQuorumAtGen). */
     make_paths("noq");
     stm_bdev *bds[NDEV] = {0};
     open_bdevs(bds);
@@ -4476,15 +4476,9 @@ typedef struct {
     uint64_t   took;          /* the alloc root the open mounted */
     uint64_t   orphan_root;   /* device x's gen-5 root, the orphan final */
     uint64_t   claim_root;    /* device c's gen-5 root, the claim */
+    uint64_t   writes;        /* device writes the open made */
 } q4_result;
 
-/* A commit's final at 5 reaches device x alone (session A). The next open
- * (B) mounts 4, claims 5 on all four, and commits: its reservation at 6
- * reaches every device but x and c, so its final at 7 is never written.
- * With `orphan`, x's claim write failed and x keeps the orphan final. The
- * open after (C) sees devices at {6, 6, 5, 5}: auth_gen 5, two devices at
- * it, fewer than quorum. `reuse`: B reserves before its commit, taking
- * nodes the orphan's tree holds (B's sweep handed them back). */
 /* Every copy of gen's slot on `d` torn: read back, not one decodes. */
 static void tear_gen(stm_bdev *d, uint64_t gen)
 {
@@ -4496,6 +4490,14 @@ static void tear_gen(stm_bdev *d, uint64_t gen)
     }
 }
 
+/* A commit's final at 5 reaches device x alone (session A). The next open
+ * (B) mounts 4, claims 5 on all four, and commits: its reservation at 6
+ * reaches every device but x and c, so its final at 7 is never written.
+ * With `orphan`, x's claim write failed and x keeps the orphan final. The
+ * open after (C) sees devices at {6, 6, 5, 5}: auth_gen 5, two devices at
+ * it, fewer than quorum. `reuse`: B reserves before its commit, taking
+ * nodes the orphan's tree holds (B's sweep handed them back). `torn`: that many of the devices that
+ * moved past 5 have their slot of 5 torn. */
 static void q4_leg(int x, int c, bool orphan, bool reuse, int torn,
                    const char *tag, q4_result *r)
 {
@@ -4559,8 +4561,20 @@ static void q4_leg(int x, int c, bool orphan, bool reuse, int torn,
     p = q4_pool(b);
     a = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(b[0], &a));
+    uint64_t w0 = 0, w1 = 0;
+    for (int i = 0; i < Q4; i++) {
+        uint64_t w = 0;
+        stm_bdev_io_stats(b[i], &w, NULL, NULL);
+        w0 += w;
+    }
     s = NULL;
     r->open = stm_sync_open(p, a, make_wk(), NULL, NULL, &s);
+    for (int i = 0; i < Q4; i++) {
+        uint64_t w = 0;
+        stm_bdev_io_stats(b[i], &w, NULL, NULL);
+        w1 += w;
+    }
+    r->writes = w1 - w0;
     if (r->open == STM_OK) {
         STM_ASSERT_OK(stm_sync_info_get(s, &si));
         r->took = si.alloc_root_paddr;
@@ -4607,6 +4621,7 @@ STM_TEST(sync_multi_open_reads_the_slots_a_minority_moved_past) {
     STM_ASSERT_EQ(r.took, r.claim_root);
     q4_leg(2, 3, true, true, 2, "torn2", &r);
     STM_ASSERT_ERR(r.open, STM_EIO);
+    STM_ASSERT_EQ(r.writes, 0u);
 }
 
 /* Three devices. Session A commits to 5, and its final at 5 reaches device
@@ -4624,8 +4639,17 @@ typedef enum {
     T3_NOWRAP,      /* m's newest is gen 67, in slot(4) */
     T3_NEWER,       /* m's copy 0 of slot(5) holds a newer build's uberblock,
                      * read back zero twice by the scan */
-    T3_AHEAD        /* m's newest is gen 6, its slot(5) never written: an
+    T3_AHEAD,       /* m's newest is gen 6, its slot(5) never written: an
                      * open's claim at 6 that reached m alone */
+    T3_ZERO0,       /* m's copy 0 of slot(5) reads back zero, the rest
+                     * intact */
+    T3_ZERO1,       /* m's copy 0 of slot(5) reads back zero, copies 1-3
+                     * unreadable: a fault on each copy */
+    T3_ZERO1_AHEAD, /* T3_ZERO1, m moved past 5 by its gen-5 uberblock
+                     * written as 6 */
+    T3_LAG3,        /* m's slots of 4 and 5 never written: newest 3 */
+    T3_ZSCAN        /* every copy of m's slot(5) reads back zero twice (its
+                     * scan settles it blank: newest 4), then reads true */
 } t3_fault;
 
 typedef struct {
@@ -4634,13 +4658,14 @@ typedef struct {
     uint64_t   orphan_root;   /* x's gen-5 root */
     uint64_t   claim_root;    /* the claim's gen-5 root */
     uint64_t   writes;        /* device writes the open made */
+    stm_sb_scan_refusal why;  /* stm_sync_open_ex's */
 } t3_result;
 
 /* Device d's uberblock of gen `from`, written as gen `to`. */
 static void t3_regen(stm_bdev *d, uint64_t from, uint64_t to)
 {
     stm_uberblock u;
-    STM_ASSERT_OK(stm_sb_gen_read(d, from, &u));
+    STM_ASSERT_OK(stm_sb_gen_read(d, from, &u, NULL));
     u.ub_gen = stm_store_le64(to);
     STM_ASSERT_OK(stm_sb_ub_write_copies(d, stm_sb_ring_slot_for_gen(to), &u));
 }
@@ -4699,9 +4724,19 @@ static void t3_leg(int x, unsigned claimed, unsigned moved, bool commit,
     if (f == T3_WRAP) t3_regen(b[m], 6, 68);
     if (f == T3_NOWRAP) t3_regen(b[m], 6, 67);
     if (f == T3_AHEAD) t3_regen(b[m], 4, 6);
+    if (f == T3_ZERO1_AHEAD) t3_regen(b[m], 5, 6);
+    if (f == T3_ZERO0 || f == T3_ZERO1 || f == T3_ZERO1_AHEAD) {
+        uint8_t z[STM_UB_SIZE];
+        memset(z, 0, sizeof z);
+        STM_ASSERT_OK(stm_bdev_write(b[m], gen_copy_off(5, 0), z, sizeof z));
+    }
+    if (f == T3_LAG3) {
+        STM_ASSERT(m != x && !(claimed & (1u << m)));
+        q4_zero_gen(b[m], 4);
+    }
     if (f == T3_NEWER) {
         stm_uberblock u;
-        STM_ASSERT_OK(stm_sb_gen_read(b[m], 5, &u));
+        STM_ASSERT_OK(stm_sb_gen_read(b[m], 5, &u, NULL));
         u.ub_version = stm_store_le32(STM_UB_VERSION + 1u);
         uint8_t buf[STM_UB_SIZE];
         STM_ASSERT_OK(stm_ub_encode(&u, buf, sizeof buf));
@@ -4712,6 +4747,16 @@ static void t3_leg(int x, unsigned claimed, unsigned moved, bool commit,
 
     open_bdevs(b);
     if (f == T3_UNREADABLE) fault_gen_copies(b[m], 5);
+    if (f == T3_ZSCAN)
+        for (uint32_t li = 0; li < STM_UB_COPIES; li++)
+            stm_bdev_inject_read_range_zero(b[m], gen_copy_off(5, li),
+                                            gen_copy_off(5, li) + STM_UB_SIZE,
+                                            2);
+    if (f == T3_ZERO1 || f == T3_ZERO1_AHEAD)
+        for (uint32_t li = 1; li < STM_UB_COPIES; li++)
+            stm_bdev_inject_read_range(b[m], gen_copy_off(5, li),
+                                       gen_copy_off(5, li) + STM_UB_SIZE, -1,
+                                       STM_EIO);
     if (f == T3_NEWER)
         stm_bdev_inject_read_range_zero(b[m], gen_copy_off(5, 0),
                                         gen_copy_off(5, 0) + STM_UB_SIZE, 2);
@@ -4720,7 +4765,7 @@ static void t3_leg(int x, unsigned claimed, unsigned moved, bool commit,
     STM_ASSERT_OK(stm_alloc_open_blank(b[0], &a));
     uint64_t w0 = total_writes(b);
     s = NULL;
-    r->open = stm_sync_open(p, a, make_wk(), NULL, NULL, &s);
+    r->open = stm_sync_open_ex(p, a, make_wk(), NULL, NULL, &r->why, &s);
     r->writes = total_writes(b) - w0;
     if (r->open == STM_OK) {
         stm_sync_info si;
@@ -4744,7 +4789,9 @@ static void t3_leg(int x, unsigned claimed, unsigned moved, bool commit,
  * quorum of holders: the open mounts it (the orphan's tree was swept and
  * reused by the commit). Then the claim's holders made unreadable by
  * device 2's slot torn, or its scan refused (an unknown vote), or its
- * ring come round past slot(5) (newest 68): the orphan and the claim
+ * ring come round past slot(5) (newest 68; no write path puts a device
+ * more than one gen past auth_gen, quorum.tla NewestNearAuth, so this
+ * state is synthetic and the branch defensive): the orphan and the claim
  * could each have been acknowledged, STM_EIO, nothing written. Control
  * for the last: newest 67, in slot(4), mounts the claim. */
 STM_TEST(sync_multi_open_reads_a_claim_a_device_moved_past) {
@@ -4774,8 +4821,11 @@ STM_TEST(sync_multi_open_reads_a_claim_a_device_moved_past) {
  * lowest device index on a tie: x's orphan when x = 0, c's claim when
  * c = 0. quorum_ring_buggy.cfg's shortest trace. And with the third device
  * moved past 5 by an open's claim at 6 that reached it alone, its slot of
- * 5 never written: it confirmed nothing at 5, and the open still takes
- * x's (counted as a slot it could not read, either could have been). */
+ * 5 never written: it confirmed nothing at 5 and counts nothing, and the
+ * open still takes x's (counted hidden, both could have been: STM_EIO).
+ * And with device 0 lagging at 3 (it missed 4 and 5), x = 1: its slot of
+ * 5 blank, it counts nothing, and its own uberblock is no candidate:
+ * device 1's orphan, the lower index of the two at 5, mounts. */
 STM_TEST(sync_multi_open_takes_a_content_when_none_was_acknowledged) {
     t3_result r;
     t3_leg(0, 0x2u, 0x0u, false, 2, T3_NONE, "ahnone0", &r);
@@ -4789,16 +4839,67 @@ STM_TEST(sync_multi_open_takes_a_content_when_none_was_acknowledged) {
     t3_leg(0, 0x2u, 0x0u, false, 2, T3_AHEAD, "ahskip", &r);
     STM_ASSERT_OK(r.open);
     STM_ASSERT_EQ(r.took, r.orphan_root);
+    t3_leg(1, 0x4u, 0x0u, false, 0, T3_LAG3, "ahlag", &r);
+    STM_ASSERT(r.orphan_root != 0 && r.claim_root != 0);
+    STM_ASSERT_OK(r.open);
+    STM_ASSERT_EQ(r.took, r.orphan_root);
+}
+
+/* Review round 1 F1: the claim at 5 acknowledged on devices 1 and 2,
+ * device 0 kept the orphan final. A fault on every copy of one confirmer's
+ * slot of 5 must not drop it: device 1's slot torn, so that its scan reads
+ * 4 (OPEN-BUGS (ai)), or device 2, moved past 5, reading one copy back
+ * zero and the other three unreadable. Counted as nothing, the orphan and
+ * the claim each had one holder, none could have been acknowledged, and
+ * the open mounted the orphan (the lower index) and claimed 6 over it, or
+ * failed STM_ECORRUPT on nodes the claim's commit reused. Counted hidden,
+ * either could have been: STM_EIO, nothing written. Controls: device 1's
+ * slot intact; device 2's copy 0 zero and the other three holding the
+ * claim; device 1's slot read back zero by its scan (newest 4) and true
+ * after, a holder below auth_gen: the claim's quorum, it mounts. */
+STM_TEST(sync_multi_open_counts_a_confirmers_damaged_slot_hidden) {
+    t3_result r;
+    t3_leg(0, 0x6u, 0x0u, false, 1, T3_NONE, "dmgctl", &r);
+    STM_ASSERT(r.orphan_root != 0 && r.claim_root != 0);
+    STM_ASSERT(r.orphan_root != r.claim_root);
+    STM_ASSERT_OK(r.open);
+    STM_ASSERT_EQ(r.took, r.claim_root);
+    t3_leg(0, 0x6u, 0x4u, true, 2, T3_ZERO0, "dmgz0", &r);
+    STM_ASSERT_OK(r.open);
+    STM_ASSERT_EQ(r.took, r.claim_root);
+    t3_leg(0, 0x6u, 0x0u, false, 1, T3_ZSCAN, "dmgzscan", &r);
+    STM_ASSERT_OK(r.open);
+    STM_ASSERT_EQ(r.took, r.claim_root);
+    static const struct { unsigned moved; bool commit; int m; t3_fault f;
+                          const char *tag; } leg[] = {
+        { 0x0u, false, 1, T3_TORN,        "dmglag" },
+        { 0x4u, true,  1, T3_TORN,        "dmglagre" },
+        { 0x4u, true,  2, T3_ZERO1,       "dmgz1" },
+        { 0x0u, false, 2, T3_ZERO1_AHEAD, "dmgz1a" },
+    };
+    for (size_t k = 0; k < sizeof leg / sizeof leg[0]; k++) {
+        t3_leg(0, 0x6u, leg[k].moved, leg[k].commit, leg[k].m, leg[k].f,
+               leg[k].tag, &r);
+        STM_ASSERT_ERR(r.open, STM_EIO);
+        STM_ASSERT_EQ(r.writes, 0u);
+    }
 }
 
 /* A newer build's uberblock in the slot the open reads past the scan (its
  * copy read back zero twice there, so the scan settled it blank) refuses
- * STM_EBADVERSION, as at any slot the scan reads, nothing written. */
+ * STM_EBADVERSION, as at any slot the scan reads, nothing written; `why`
+ * names the copy, its version and the device's newest. */
 STM_TEST(sync_multi_open_refuses_a_newer_build_in_the_slot_it_reads) {
     t3_result r;
     t3_leg(0, 0x6u, 0x4u, true, 2, T3_NEWER, "ahnewer", &r);
     STM_ASSERT_ERR(r.open, STM_EBADVERSION);
     STM_ASSERT_EQ(r.writes, 0u);
+    STM_ASSERT_EQ(r.why.gen, 0u);
+    STM_ASSERT_EQ(r.why.label_idx, 0u);
+    STM_ASSERT_EQ(r.why.slot_idx, 5u);
+    STM_ASSERT_EQ(r.why.byte_offset, gen_copy_off(5, 0));
+    STM_ASSERT_EQ(r.why.best_gen, 6u);
+    STM_ASSERT_EQ(r.why.version, STM_UB_VERSION + 1u);
 }
 
 /* Round 2 F1: device 1's every ring copy reads back zero once, then fails

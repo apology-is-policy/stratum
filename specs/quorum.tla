@@ -51,9 +51,8 @@
 (* (hid; in the code also a ring come round) and the unknown votes        *)
 (* (RingCountsHidden FALSE leaves hid out: buggy). A content a quorum     *)
 (* holds is one, and then no other is. With none, nothing there was       *)
-(* acknowledged and any content held there mounts. A sweep that freed a   *)
-(* held content's nodes ran in an open whose claim at that gen was        *)
-(* acknowledged, and that claim is then a content that could have been.   *)
+(* acknowledged and any content held there mounts (MountIntact checks    *)
+(* that its tree is whole).                                               *)
 (* RingRead FALSE is the open before (ah): of the newest uberblocks at    *)
 (* exactly the gen, a quorum's content, and fewer must all agree          *)
 (* (MinorityMustAgree; FALSE takes any, the implementation before (r)     *)
@@ -74,6 +73,20 @@
 (* shares; with every device read and every slot readable no content is   *)
 (* possible but a quorum's, so the code mounts there too.                 *)
 (*                                                                         *)
+(* Lost trees (damaged, history): an acknowledged claim frees the nodes   *)
+(* of every tree but the one its open mounted (the open's sweep, and the  *)
+(* trees it never saw are free to it), an acknowledged final those of its *)
+(* base (a node a commit frees goes back at a later commit only).         *)
+(* MountIntact: no mount picks a lost tree.                               *)
+(*                                                                         *)
+(* CONSTANT StrictFinal: TRUE = a final is acknowledged when a quorum     *)
+(* holds this attempt's content at the target, as the code counts one     *)
+(* write's confirmations; FALSE = when a quorum reached the target gen,   *)
+(* whatever it holds there (quorum_buggy.cfg). With IdempotentRetry the   *)
+(* two agree. The code's retried final need not repeat the first          *)
+(* attempt's bytes (it rebuilds after a failed final): quorum_retry.cfg   *)
+(* pairs IdempotentRetry FALSE with StrictFinal TRUE.                     *)
+(*                                                                         *)
 (* Invariants proved:                                                       *)
 (*   * TypeOK                — variable domains stable.                    *)
 (*   * QuorumSafety           — phase=Published ⇒ quorum at target_gen.   *)
@@ -93,6 +106,12 @@
 (*                               at its gen only its content.              *)
 (*   * MountNotStuck          -- every device online and every slot        *)
 (*                               readable, the open mounts (OPEN-BUGS (ah)).*)
+(*   * MountIntact            -- no mount picks a tree an acknowledged      *)
+(*                               claim or final freed.                     *)
+(*   * NewestNearAuth         -- no device is more than one gen past the   *)
+(*                               authoritative gen (a ring come round past *)
+(*                               the mount's gen is a rollback's or a      *)
+(*                               fault's).                                 *)
 (***************************************************************************)
 
 EXTENDS Naturals, FiniteSets, TLC
@@ -109,6 +128,8 @@ CONSTANTS
                       \* at the mount's gen must agree; FALSE = buggy impl
     RingRead,         \* BOOLEAN: TRUE = the open reads each device's slot of
                       \* the gen it mounts; FALSE = its newest only (before (ah))
+    StrictFinal,      \* BOOLEAN: TRUE = a final is acknowledged on a quorum
+                      \* holding its content; FALSE = on a quorum at its gen
     RingCountsHidden  \* BOOLEAN: TRUE = a moved-on device whose slot the open
                       \* could not read may have confirmed; FALSE = buggy impl
 
@@ -118,6 +139,7 @@ ASSUME /\ Devices # {}
        /\ MaxFaults  \in Nat
        /\ MaxRetries \in Nat
        /\ IdempotentRetry \in BOOLEAN
+       /\ StrictFinal \in BOOLEAN
        /\ MountCountsUnknown \in BOOLEAN
        /\ MinorityMustAgree \in BOOLEAN
        /\ RingRead \in BOOLEAN
@@ -180,12 +202,14 @@ VARIABLES
                        \* final or claim
     pub_content,       \* 0..MaxContent: its content; mounted, the tree the
                        \* next reservation names
-    mount_lost         \* BOOLEAN: a mount lost it (history; never cleared)
+    mount_lost,        \* BOOLEAN: a mount lost it (history; never cleared)
+    damaged,           \* trees an acknowledged claim or final freed (history)
+    mount_damaged      \* BOOLEAN: a mount picked one (history; never cleared)
 
 vars == <<dev_ring, dev_state, coord_phase, coord_target_gen,
            coord_commit_content, commits_done, retry_count,
            next_content, fault_count, mounted, mount_wrong,
-           pub_gen, pub_content, mount_lost>>
+           pub_gen, pub_content, mount_lost, damaged, mount_damaged>>
 
 (***************************************************************************)
 (* Helpers.                                                                  *)
@@ -256,6 +280,8 @@ Init ==
     /\ pub_gen              = 0
     /\ pub_content          = 0
     /\ mount_lost           = FALSE
+    /\ damaged = {}
+    /\ mount_damaged = FALSE
 
 (***************************************************************************)
 (* The open (stm_sync_open_ex): scan, pick the content to mount, and      *)
@@ -321,10 +347,11 @@ Mount ==
                 /\ mount_lost' = (mount_lost \/ auth < pub_gen
                                   \/ (auth = pub_gen /\ c # pub_content))
                 /\ coord_commit_content' = MountTree(auth, c)
+                /\ mount_damaged' = (mount_damaged \/ (auth > 0 /\ c \in damaged))
            /\ coord_target_gen' = auth + 1
            /\ coord_phase' = "Claiming"
            /\ mount_wrong' = (mount_wrong \/ auth # AuthoritativeGen)
-    /\ UNCHANGED <<dev_ring, dev_state, commits_done, retry_count,
+    /\ UNCHANGED <<damaged, dev_ring, dev_state, commits_done, retry_count,
                     next_content, fault_count, mounted, pub_gen, pub_content>>
 
 \* write_ub_to_all_devices: the claim on one device the open reaches,
@@ -335,7 +362,7 @@ WriteClaim(d) ==
     /\ dev_state[d] = "ONLINE"
     /\ dev_ring[d][coord_target_gen] # coord_commit_content
     /\ dev_ring' = [dev_ring EXCEPT ![d][coord_target_gen] = coord_commit_content]
-    /\ UNCHANGED <<dev_state, coord_phase, coord_target_gen,
+    /\ UNCHANGED <<damaged, mount_damaged, dev_state, coord_phase, coord_target_gen,
                     coord_commit_content, commits_done, retry_count,
                     next_content, fault_count, mounted, mount_wrong,
                     pub_gen, pub_content, mount_lost>>
@@ -351,7 +378,8 @@ CheckClaimQuorum ==
     /\ coord_commit_content' = 0
     /\ pub_gen' = coord_target_gen
     /\ pub_content' = coord_commit_content
-    /\ UNCHANGED <<dev_ring, dev_state, coord_target_gen, commits_done,
+    /\ damaged' = damaged \cup ((1..next_content) \ {coord_commit_content})
+    /\ UNCHANGED <<mount_damaged, dev_ring, dev_state, coord_target_gen, commits_done,
                     retry_count, next_content, fault_count, mount_wrong,
                     mount_lost>>
 
@@ -362,7 +390,7 @@ AbortClaim ==
     /\ coord_phase' = "Idle"
     /\ coord_target_gen' = 0
     /\ coord_commit_content' = 0
-    /\ UNCHANGED <<dev_ring, dev_state, commits_done, retry_count,
+    /\ UNCHANGED <<damaged, mount_damaged, dev_ring, dev_state, commits_done, retry_count,
                     next_content, fault_count, mounted, mount_wrong,
                     pub_gen, pub_content, mount_lost>>
 
@@ -386,7 +414,7 @@ BeginCommit ==
            /\ next_content' = next_content + 1
            /\ coord_commit_content' = next_content + 1
            /\ retry_count' = 0
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, commits_done, fault_count, mounted>>
+    /\ UNCHANGED <<damaged, mount_damaged, mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, commits_done, fault_count, mounted>>
 
 (***************************************************************************)
 (* WriteReservation -- names the tree of the last acknowledged final or   *)
@@ -400,7 +428,7 @@ WriteReservation(d) ==
     /\ dev_state[d] = "ONLINE"
     /\ dev_ring[d][coord_target_gen - 1] # pub_content
     /\ dev_ring' = [dev_ring EXCEPT ![d][coord_target_gen - 1] = pub_content]
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_state, coord_phase, coord_target_gen,
+    /\ UNCHANGED <<damaged, mount_damaged, mount_wrong, pub_gen, pub_content, mount_lost, dev_state, coord_phase, coord_target_gen,
                     coord_commit_content, commits_done, retry_count,
                     next_content, fault_count, mounted>>
 
@@ -408,7 +436,7 @@ CheckReservationQuorum ==
     /\ coord_phase = "Reserving"
     /\ Cardinality(DevicesAtLeastGen(coord_target_gen - 1)) >= QuorumN
     /\ coord_phase' = "Flushing"
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<damaged, mount_damaged, mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, coord_target_gen, coord_commit_content,
                     commits_done, retry_count, next_content, fault_count, mounted>>
 
 AbortReservation ==
@@ -418,13 +446,13 @@ AbortReservation ==
     /\ coord_target_gen' = 0
     /\ coord_commit_content' = 0
     /\ retry_count' = 0
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, commits_done, next_content,
+    /\ UNCHANGED <<damaged, mount_damaged, mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, commits_done, next_content,
                     fault_count, mounted>>
 
 DoFlush ==
     /\ coord_phase = "Flushing"
     /\ coord_phase' = "Finalizing"
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<damaged, mount_damaged, mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, coord_target_gen, coord_commit_content,
                     commits_done, retry_count, next_content, fault_count, mounted>>
 
 (***************************************************************************)
@@ -443,13 +471,25 @@ WriteFinal(d) ==
     /\ dev_state[d] = "ONLINE"
     /\ dev_ring[d][coord_target_gen] # coord_commit_content
     /\ dev_ring' = [dev_ring EXCEPT ![d][coord_target_gen] = coord_commit_content]
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_state, coord_phase, coord_target_gen,
+    /\ UNCHANGED <<damaged, mount_damaged, mount_wrong, pub_gen, pub_content, mount_lost, dev_state, coord_phase, coord_target_gen,
                     coord_commit_content, commits_done, retry_count,
                     next_content, fault_count, mounted>>
 
+\* A final's acknowledgement: StrictFinal counts the devices holding this
+\* attempt's content at the target (the code counts one write's
+\* confirmations), else every device that reached the target gen.
+FinalAcked ==
+    IF StrictFinal
+    THEN Cardinality({ d \in Devices :
+                         dev_ring[d][coord_target_gen] = coord_commit_content })
+             >= QuorumN
+    ELSE Cardinality(DevicesAtLeastGen(coord_target_gen)) >= QuorumN
+
 CheckFinalQuorum ==
     /\ coord_phase = "Finalizing"
-    /\ Cardinality(DevicesAtLeastGen(coord_target_gen)) >= QuorumN
+    /\ FinalAcked
+    \* The base's nodes this commit freed go back at the next commit.
+    /\ damaged' = damaged \cup {pub_content}
     \* All quorum-member devices at target_gen must agree on content.
     \* The actual impl's cross-check at mount enforces this; failure to
     \* agree in TLA space manifests as the ContentAgreement invariant
@@ -458,7 +498,7 @@ CheckFinalQuorum ==
     /\ commits_done' = commits_done + 1
     /\ pub_gen' = coord_target_gen
     /\ pub_content' = coord_commit_content
-    /\ UNCHANGED <<mount_wrong, mount_lost, dev_ring, dev_state, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<mount_damaged, mount_wrong, mount_lost, dev_ring, dev_state, coord_target_gen, coord_commit_content,
                     retry_count, next_content, fault_count, mounted>>
 
 AbortFinal ==
@@ -468,7 +508,7 @@ AbortFinal ==
     /\ coord_target_gen' = 0
     /\ coord_commit_content' = 0
     /\ retry_count' = 0
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, commits_done, next_content,
+    /\ UNCHANGED <<damaged, mount_damaged, mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, commits_done, next_content,
                     fault_count, mounted>>
 
 (***************************************************************************)
@@ -481,7 +521,7 @@ AbortFinal ==
 RetryPhase3 ==
     /\ coord_phase = "Finalizing"
     /\ Cardinality(OnlineDevices) >= QuorumN   \* if below, AbortFinal takes over
-    /\ ~(Cardinality(DevicesAtLeastGen(coord_target_gen)) >= QuorumN)
+    /\ ~FinalAcked
     /\ retry_count < MaxRetries
     /\ retry_count' = retry_count + 1
     /\ coord_phase' = "Reserving"
@@ -490,7 +530,7 @@ RetryPhase3 ==
             /\ next_content' = next_content
        ELSE /\ coord_commit_content' = next_content + 1
             /\ next_content' = next_content + 1
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, coord_target_gen, commits_done,
+    /\ UNCHANGED <<damaged, mount_damaged, mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, coord_target_gen, commits_done,
                     fault_count, mounted>>
 
 Publish ==
@@ -499,7 +539,7 @@ Publish ==
     /\ coord_target_gen' = 0
     /\ coord_commit_content' = 0
     /\ retry_count' = 0
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, commits_done, next_content,
+    /\ UNCHANGED <<damaged, mount_damaged, mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, commits_done, next_content,
                     fault_count, mounted>>
 
 (***************************************************************************)
@@ -511,13 +551,13 @@ DeviceFail(d) ==
     /\ fault_count < MaxFaults
     /\ dev_state' = [dev_state EXCEPT ![d] = "FAULTED"]
     /\ fault_count' = fault_count + 1
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, coord_phase, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<damaged, mount_damaged, mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, coord_phase, coord_target_gen, coord_commit_content,
                     commits_done, retry_count, next_content, mounted>>
 
 DeviceRejoin(d) ==
     /\ dev_state[d] = "FAULTED"
     /\ dev_state' = [dev_state EXCEPT ![d] = "ONLINE"]
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, coord_phase, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<damaged, mount_damaged, mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, coord_phase, coord_target_gen, coord_commit_content,
                     commits_done, retry_count, next_content, fault_count, mounted>>
 
 \* Reconcile a BEHIND ONLINE device: write the session's last acknowledged
@@ -532,7 +572,7 @@ Reconcile(d) ==
     /\ pub_gen > 0
     /\ DevGen(d) < pub_gen
     /\ dev_ring' = [dev_ring EXCEPT ![d][pub_gen] = pub_content]
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_state, coord_phase, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<damaged, mount_damaged, mount_wrong, pub_gen, pub_content, mount_lost, dev_state, coord_phase, coord_target_gen, coord_commit_content,
                     commits_done, retry_count, next_content, fault_count, mounted>>
 
 \* A crash, of a mounted session or of an open mid-claim.
@@ -543,7 +583,7 @@ Crash ==
     /\ coord_commit_content' = 0
     /\ retry_count'          = 0
     /\ mounted'              = FALSE
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, commits_done, next_content, fault_count>>
+    /\ UNCHANGED <<damaged, mount_damaged, mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, commits_done, next_content, fault_count>>
 
 (***************************************************************************)
 (* Next-state.                                                              *)
@@ -596,7 +636,7 @@ View == <<[d \in Devices |-> [g \in 1..MaxGen |->
                                 IF LiveSlot(d, g) THEN dev_ring[d][g] ELSE 0]],
           dev_state, coord_phase, coord_target_gen, coord_commit_content,
           commits_done, retry_count, next_content, fault_count, mounted,
-          mount_wrong, pub_gen, pub_content, mount_lost>>
+          mount_wrong, pub_gen, pub_content, mount_lost, damaged, mount_damaged>>
 
 (***************************************************************************)
 (* Invariants.                                                              *)
@@ -617,6 +657,8 @@ TypeOK ==
     /\ pub_gen \in 0..MaxGen
     /\ pub_content \in 0..MaxContent
     /\ mount_lost \in BOOLEAN
+    /\ mount_damaged \in BOOLEAN
+    /\ damaged \subseteq 1..MaxContent
 
 QuorumSafety ==
     (coord_phase = "Published") =>
@@ -696,6 +738,10 @@ MountAtAuthoritative == ~mount_wrong
 \* final or claim mounted past, or at its gen another content picked.
 MountKeepsPublished == ~mount_lost
 
+\* Review round 1 F4 (OPEN-BUGS (ah)): the fallback mounts a content
+\* nothing acknowledged; its tree must still be whole.
+MountIntact == ~mount_damaged
+
 ContentQuorumAtGen ==
     pub_gen > 0 =>
         Cardinality({ d \in Devices : Slot(d, pub_gen) = pub_content })
@@ -711,6 +757,11 @@ MountNotStuck ==
     => \E c \in HeldAt(VisibleQuorumGen, {}) \cup {0} :
            MountPick(VisibleQuorumGen, {}, c)
 
+\* Every write of a gen comes from a session whose open took the gen below
+\* it or more, and every open takes AuthoritativeGen (vote 153): no device
+\* is more than one gen past it.
+NewestNearAuth == \A d \in Devices : DevGen(d) <= AuthoritativeGen + 1
+
 Invariants ==
     /\ TypeOK
     /\ QuorumSafety
@@ -724,5 +775,7 @@ Invariants ==
     /\ MountAtAuthoritative
     /\ MountKeepsPublished
     /\ MountNotStuck
+    /\ MountIntact
+    /\ NewestNearAuth
 
 =============================================================================

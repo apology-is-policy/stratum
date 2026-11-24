@@ -2406,32 +2406,47 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
      * slot of auth_gen decodes as that generation (stm_sb_gen_read),
      * grouped by shared bytes: every byte of the uberblock but the
      * per-device region (ub_device_uuid, ub_device_id, ub_device_class,
-     * ub_device_role) and ub_csum (sync_ub_shared_bytes_match).
+     * ub_device_role) and ub_csum (sync_ub_shared_bytes_match). A device
+     * below auth_gen whose slot decodes as it (its scan read the copies
+     * back zero) holds it too: a holder that confirmed nothing can only
+     * add a group that could have been, never take one away.
+     *
+     * Hidden: a device whose slot of auth_gen has a copy that does not
+     * settle or settles torn and no copy decoding as auth_gen, wherever its
+     * newest sits: past auth_gen, or below it, where a confirmed auth_gen
+     * torn on every copy leaves its scan (OPEN-BUGS (ai)); and one whose
+     * newest is auth_gen + 63 or more (its ring came round: a rollback's or
+     * a fault's, since a write of a gen needs an open of the gen below it,
+     * and the open mounts auth_gen). A slot each copy of which settles blank
+     * or as another lap never took auth_gen (a confirmed write replaces
+     * every copy, STM_UB_COPIES_REQUIRED) and counts nothing.
      *
      * The canonical group is the one that could have been acknowledged
-     * at auth_gen: its holders, the devices moved past auth_gen whose
-     * slot settled to nothing (unreadable, or torn) or whose ring came
-     * round since (hidden), and the unknown votes, together reaching
-     * quorum. A device that confirmed a content at auth_gen still holds it
-     * there unless hidden or unknown: a later write of auth_gen needs an
-     * open below it, which this pick and vote 153 exclude; and a slot
-     * holds one uberblock (a confirmed write replaces every copy,
-     * STM_UB_COPIES_REQUIRED). A group of quorum holders is such a group,
-     * and then no other is: the rest of the devices are fewer. Two such
-     * groups: the devices not read could decide it, STM_EIO. None:
-     * nothing at auth_gen was acknowledged, and the largest group (the
-     * lowest device index on a tie) is canonical. An open whose sweep
-     * freed a held content's nodes claimed auth_gen, acknowledged on a
-     * quorum, and that claim's group would have been possible.
+     * at auth_gen: its holders, the hidden devices and the unknown votes
+     * together reaching quorum. A device that confirmed a content at
+     * auth_gen still holds it there unless hidden or unknown: a later
+     * write of auth_gen needs an open below it, which this pick and vote
+     * 153 exclude. A group of quorum holders is such a group, and then no
+     * other is: the rest of the devices are fewer. Two such groups: the
+     * devices not read could decide it, STM_EIO. None: nothing at auth_gen
+     * was acknowledged, and the largest group (the lowest device index on
+     * a tie) is canonical. Its trees are intact: an open frees nodes of
+     * trees but the one it mounts only once its claim is acknowledged
+     * (#791 below, and the trees it does not know of are free to it), and a
+     * node a commit frees goes back only at a commit after its final was
+     * acknowledged (stm_alloc_commit, free_gen < committed_gen); a content
+     * that lost nodes so sits beside a claim acknowledged at auth_gen,
+     * which would be possible, or below a gen acknowledged above it
+     * (quorum.tla MountIntact).
      *
-     * With every device read and every slot settled no group reaches 2
-     * but a quorum's, so the open mounts (quorum.tla MountNotStuck).
-     * Dissenters are orphans the next commit's writes leave behind (ARCH
-     * section 5.8). Reading only the devices whose newest was auth_gen,
-     * the open refused while a minority there disagreed, and on a pool of
-     * three devices a claim the next reservation moved past, beside an
-     * orphan final kept by the device that missed the claim, refused every
-     * open (quorum_ring_buggy.cfg). */
+     * With every device read and every slot settled no group is possible
+     * but one a quorum holds, so the open mounts (quorum.tla
+     * MountNotStuck). Dissenters are orphans the next commit's writes leave
+     * behind (ARCH section 5.8). Reading only the devices whose newest was
+     * auth_gen, the open refused while a minority there disagreed, and on
+     * a pool of three devices a claim the next reservation moved past,
+     * beside an orphan final kept by the device that missed the claim,
+     * refused every open (quorum_ring_buggy.cfg). */
     typedef struct { size_t rep; size_t count; } content_group;
     content_group groups[STM_POOL_DEVICES_MAX];
     size_t ngroups = 0;
@@ -2439,14 +2454,15 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
     for (size_t i = 0; i < n; i++) {
         if (!scans[i].valid) continue;
         uint64_t newest = stm_load_le64(scans[i].ub.ub_gen);
-        if (newest < auth_gen) continue;
-        if (newest > auth_gen) {
+        if (newest != auth_gen) {
             stm_uberblock held;
             stm_status gr = STM_EIO;
-            if (newest - auth_gen < STM_UB_SLOTS_PER_LABEL)
+            if (newest < auth_gen ||
+                newest - auth_gen < STM_UB_SLOTS_PER_LABEL)
                 gr = stm_sb_gen_read(stm_pool_device_bdev(p, (uint16_t)i),
-                                     auth_gen, &held);
+                                     auth_gen, &held, why);
             if (gr == STM_EBADVERSION) {
+                if (why) why->best_gen = newest;
                 free(scans);
                 return STM_EBADVERSION;
             }
