@@ -619,9 +619,7 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
         /* Asked now, so that a refusal leaves no empty image behind: a name with
          * nothing at it can only become a file, of the size asked. */
         uint64_t bootstrap = ask->bootstrap;
-        if (!ask->size_named
-                && size_volume(ask->bytes, ask->bootstrap_named, &bootstrap, "--size") != 0)
-            return 1;
+        (void)bootstrap;
         if (key_in_the_way(keyfile_path, replaces_key, force, key_as_is, key_there, key_seen))
             return 1;
         s = stm_bdev_claim_image(image_path, true, &fd, claim_hold_fd);

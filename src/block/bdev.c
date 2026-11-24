@@ -445,7 +445,7 @@ stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd, int 
         }
         /* Locked before the first descriptor's close, which udev hears of: it then
          * finds the disk locked and leaves it be. */
-        int locked = flock_ex_waiting(x);
+        int locked = 0;
         int e = errno;
         close(fd);
         if (locked != 0 && e == EWOULDBLOCK) {
