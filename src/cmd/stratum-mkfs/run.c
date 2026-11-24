@@ -22,12 +22,14 @@
  *   stratum-mkfs IMAGE [--size SIZE] [--keyfile PATH]
  *
  *   --size SIZE     Image size; suffix K/M/G accepted.
- *                   Default: 64M.
+ *                   Default: 64M. A disk is formatted whole: --size,
+ *                   if given, must be its size.
  *   --keyfile PATH  Path to write the PQ-hybrid keyfile (or, with no
  *                   passphrase, use one already there that is the
  *                   user's alone, or any regular file under
  *                   --key-as-is).
- *                   Default: <IMAGE>.key.
+ *                   Default: <IMAGE>.key. A disk has no directory of
+ *                   its own for its key, and needs --keyfile.
  *
  * Exit codes:
  *   0  success
@@ -39,6 +41,7 @@
 #include <stratum/cmds.h>
 #include <stratum/fs.h>
 #include <stratum/keyfile.h>
+#include <stratum/super.h>
 #include <stratum/takename.h>
 #include <stratum/types.h>
 
@@ -90,8 +93,65 @@ static uint64_t default_bootstrap_for(uint64_t device_bytes)
     uint64_t target = device_bytes / 16u;
     if (target < MIN_BOOT) target = MIN_BOOT;
     if (target > MAX_BOOT) target = MAX_BOOT;
-    return target;
+    /* The pool is a whole number of uberblocks; a disk's size is not the
+     * user's to round. */
+    return target - target % STM_UB_SIZE;
 }
+
+/* 0 when a volume of `bytes` holds its bootstrap pool, which is derived from
+ * `bytes` unless the user named one; `what` names the size in a refusal. */
+static int size_volume(uint64_t bytes, bool bootstrap_named, uint64_t *bootstrap,
+                       const char *what)
+{
+    if (bytes < MIN_DEVICE_BYTES) {
+        fprintf(stderr,
+            "stratum-mkfs: %s %llu too small (minimum 16M to fit bootstrap pool)\n",
+            what, (unsigned long long)bytes);
+        return 1;
+    }
+    if (!bootstrap_named) *bootstrap = default_bootstrap_for(bytes);
+    if (*bootstrap >= bytes) {
+        fprintf(stderr, "stratum-mkfs: --bootstrap %llu must be < %s %llu\n",
+                (unsigned long long)*bootstrap, what, (unsigned long long)bytes);
+        return 1;
+    }
+    return 0;
+}
+
+/* What the command line asks of the volume, for a disk to be held to once its size
+ * is known. */
+struct volume_ask {
+    uint64_t bytes;               /* --size, or the default */
+    bool     size_named;
+    uint64_t bootstrap;           /* --bootstrap; 0 = derived */
+    bool     bootstrap_named;
+    bool     key_named;
+};
+
+#if !defined(__thylacine__)
+/* 1, said, when a disk of `disk_bytes` cannot be what the command line asks. */
+static int disk_refused(const char *image_path, uint64_t disk_bytes,
+                        const struct volume_ask *ask)
+{
+    /* A key kept beside a disk would be in /dev, which on Linux is lost at the next boot. */
+    if (!ask->key_named) {
+        fprintf(stderr,
+            "stratum-mkfs: %s is a disk, which has no directory of its own to keep its key "
+            "in: name where the key goes with --keyfile\n", image_path);
+        return 1;
+    }
+    /* A disk cannot be resized, so it is formatted whole. */
+    if (ask->size_named && ask->bytes != disk_bytes) {
+        fprintf(stderr,
+            "stratum-mkfs: %s is a disk of %llu bytes, and a disk is formatted whole: "
+            "leave out --size, or give its size\n",
+            image_path, (unsigned long long)disk_bytes);
+        return 1;
+    }
+    uint64_t bootstrap = ask->bootstrap;
+    return size_volume(disk_bytes, ask->bootstrap_named, &bootstrap, "the disk's size");
+}
+#endif
 
 /* Thylacine has no root: uid 0 is its invalid principal. */
 #if defined(__thylacine__)
@@ -111,7 +171,8 @@ static void usage(void)
 "    stratum serve IMAGE --listen /tmp/stm.sock\n"
 "\n"
 "Options:\n"
-"  --size SIZE      Image size with K/M/G suffix. Default: 64M.\n"
+"  --size SIZE      Image size with K/M/G suffix. Default: 64M. A disk is\n"
+"                   formatted whole: --size, if given, must be its size.\n"
 "  --force          Format over what is already at IMAGE, a file another user\n"
 "                   owns too, and with --passphrase-stdin replace an existing\n"
 "                   keyfile. Whatever they held is gone. Also follows any key\n"
@@ -119,7 +180,8 @@ static void usage(void)
 "                   has and wherever it leads, and uses a keyfile that is not\n"
 "                   the user's alone. A new key is not sent through a link\n"
 "                   that cannot be read: it takes that link's place.\n"
-"                   Never overrides a daemon using IMAGE, and a format\n"
+"                   Never overrides a daemon using IMAGE, never formats a\n"
+"                   disk the system is using (mounted), and a format\n"
 "                   cannot shrink a file: --size must reach it.\n"
 "  --key-as-is      Use the keyfile that is there although another user owns\n"
 "                   it or its mode gives others access; it must still be a\n"
@@ -139,13 +201,15 @@ static void usage(void)
 "                   read and has no other name. Where they lead out of\n"
 "                   PATH's directory, it must be to one that only\n"
 "                   " LINK_OWNERS " can change.\n"
-"                   Default: IMAGE.key.\n"
+"                   Default: IMAGE.key. A disk has no directory of its\n"
+"                   own for its key, and needs --keyfile.\n"
 "  --passphrase-stdin  Read a passphrase line from stdin and use it to\n"
 "                   wrap the keyfile (KFP1 format). The passphrase is\n"
 "                   required at every stratumd open after this. Mutually\n"
 "                   exclusive with the unencrypted-keyfile path.\n"
-"  --bootstrap SIZE Bootstrap pool size. Default: a sixteenth of --size,\n"
-"                   no less than 8M and no more than 256M.\n"
+"  --bootstrap SIZE Bootstrap pool size. Default: a sixteenth of --size, or\n"
+"                   of a disk's own size, no less than 8M and no more than\n"
+"                   256M, rounded down to 4K.\n"
 "  --root-uid N     Owner uid for the dataset root inode (default 0).\n"
 "  --root-gid N     Owner gid for the dataset root inode (default 0).\n"
 "                   N <= 4294967294. Used by Thylacine's host-bake to own\n"
@@ -535,21 +599,32 @@ static bool link_to_no_file(const char *path)
 }
 
 /* 0 with the volume claimed: *claim_fd is the descriptor the claim holds on it, which
- * the format and the mount go through, or -1 where there is none. */
+ * the format and the mount go through, or -1 where there is none, and *claim_hold_fd
+ * one more it holds, or -1. *disk_bytes is a
+ * disk's size, read through the claim's descriptor (or, where there is none, one
+ * opened by name), and 0 for a file; a disk that cannot be what `ask` asks is
+ * refused before it is read. */
 static int mkfs_claim(const char *image_path, const char *keyfile_path,
                       bool replaces_key, bool force, bool key_as_is,
-                      uint64_t device_bytes, bool *created, int *claim_fd,
-                      bool *key_there, struct stat *key_seen)
+                      const struct volume_ask *ask, bool *created, int *claim_fd,
+                      int *claim_hold_fd, bool *key_there, struct stat *key_seen,
+                      uint64_t *disk_bytes)
 {
     int fd = -1;
     *created = false;
     *claim_fd = -1;
-    stm_status s = stm_bdev_claim_image(image_path, false, &fd);
+    *disk_bytes = 0;
+    stm_status s = stm_bdev_claim_image(image_path, false, &fd, claim_hold_fd);
     if (s == STM_ENOENT) {
-        /* Asked now, so that a refusal leaves no empty image behind. */
+        /* Asked now, so that a refusal leaves no empty image behind: a name with
+         * nothing at it can only become a file, of the size asked. */
+        uint64_t bootstrap = ask->bootstrap;
+        if (!ask->size_named
+                && size_volume(ask->bytes, ask->bootstrap_named, &bootstrap, "--size") != 0)
+            return 1;
         if (key_in_the_way(keyfile_path, replaces_key, force, key_as_is, key_there, key_seen))
             return 1;
-        s = stm_bdev_claim_image(image_path, true, &fd);
+        s = stm_bdev_claim_image(image_path, true, &fd, claim_hold_fd);
         *created = s == STM_OK || s == STM_ENOLCK;
         /* The make takes no link, so one that leads to no file is in its way, with or
          * without --force; "File exists" would say nothing of that. */
@@ -561,8 +636,28 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
             return 1;
         }
     }
+    if (s == STM_EBUSY && errno == EBUSY) {
+        fprintf(stderr,
+            "stratum-mkfs: %s is a disk the system is using (mounted?), which --force does "
+            "not format over\n", image_path);
+        return 1;
+    }
     if (s == STM_EBUSY) {
         fprintf(stderr, "stratum-mkfs: %s is open in a running stratumd\n", image_path);
+        return 1;
+    }
+    if (s == STM_ESTALE) {
+        fprintf(stderr,
+            "stratum-mkfs: %s led to another device while it was being claimed, and nothing "
+            "was claimed\n", image_path);
+        return 1;
+    }
+    if (s == STM_ENOLCK && !force && fd >= 0) {
+        fprintf(stderr,
+            "stratum-mkfs: cannot lock %s (%s); it is held open exclusively, which keeps "
+            "the system and this version's daemons off it, not an older daemon; pass --force "
+            "to format it anyway\n", image_path, strerror(errno));
+        close(fd);
         return 1;
     }
     if (s == STM_ENOLCK && !force) {
@@ -607,8 +702,15 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
         }
 #if !defined(__thylacine__)
         /* Nothing ends /dev/zero for the scan, and a format could not size it. */
-        if (!is_file && stm_bdev_device_bytes(look) == 0) {
+        *disk_bytes = is_file ? 0 : stm_bdev_device_bytes(look);
+        if (!is_file && *disk_bytes == 0) {
             fprintf(stderr, "stratum-mkfs: %s is neither a file nor a disk\n", image_path);
+            if (look != fd) close(look);
+            return 1;
+        }
+        /* Asked before the look, which reads all of a disk. */
+        if (*disk_bytes != 0 && disk_refused(image_path, *disk_bytes, ask)) {
+            if (look != fd) close(look);
             return 1;
         }
 #endif
@@ -619,7 +721,7 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
         bool holds = false;
         bool read_ok = force || image_holds_data(look, &holds);
         int e = errno;
-        bool too_big = is_file && (uint64_t)st.st_size > device_bytes;
+        bool too_big = is_file && (uint64_t)st.st_size > ask->bytes;
         if (look != fd) close(look);
         if (!read_ok) {
             fprintf(stderr, "stratum-mkfs: cannot read %s: %s\n", image_path, strerror(e));
@@ -636,7 +738,7 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
                 "stratum-mkfs: %s is %llu bytes and the size asked for is %llu; a format "
                 "cannot shrink a file, so name a size of at least %llu or remove it\n",
                 image_path, (unsigned long long)st.st_size,
-                (unsigned long long)device_bytes, (unsigned long long)st.st_size);
+                (unsigned long long)ask->bytes, (unsigned long long)st.st_size);
             return 1;
         }
     }
@@ -875,6 +977,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
 
     const char *image_path = argv[1];
     uint64_t   device_bytes      = DEFAULT_DEVICE_BYTES;
+    bool       size_named        = false;
     uint64_t   bootstrap_bytes   = 0;   /* 0 = auto from device_bytes */
     const char *keyfile_path     = NULL;
     bool       passphrase_stdin  = false;
@@ -898,6 +1001,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
                 return 1;
             }
             device_bytes = v;
+            size_named = true;
             i++;
         } else if (strcmp(argv[i], "--bootstrap") == 0) {
             if (i + 1 >= argc) { fputs("--bootstrap requires an argument\n", stderr); return 1; }
@@ -962,26 +1066,16 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         }
     }
 
-    if (device_bytes < MIN_DEVICE_BYTES) {
-        fprintf(stderr,
-            "stratum-mkfs: --size %llu too small (minimum 16M to fit bootstrap pool)\n",
-            (unsigned long long)device_bytes);
-        return 1;
-    }
     /* SWISS-4n3: derive bootstrap-pool size from --size when the user
      * didn't specify --bootstrap explicitly. The libfs heuristic
      * (max(64 MiB, dev/1024)) is too generous for tiny test volumes
-     * (would refuse 16-MiB images); ours is default_bootstrap_for's. */
-    if (bootstrap_bytes == 0) {
-        bootstrap_bytes = default_bootstrap_for(device_bytes);
-    }
-    if (bootstrap_bytes >= device_bytes) {
-        fprintf(stderr,
-            "stratum-mkfs: --bootstrap %llu must be < --size %llu\n",
-            (unsigned long long)bootstrap_bytes,
-            (unsigned long long)device_bytes);
+     * (would refuse 16-MiB images); ours is default_bootstrap_for's.
+     * Without --size the size is a disk's or the default, known only once the
+     * volume is claimed, and asked there; the volume is not looked at before. */
+    bool bootstrap_named = bootstrap_bytes != 0;
+    if (size_named &&
+            size_volume(device_bytes, bootstrap_named, &bootstrap_bytes, "--size") != 0)
         return 1;
-    }
 
     if (key_as_is && passphrase_stdin) {
         fputs("stratum-mkfs: --key-as-is uses a key file that is there as it is, and with "
@@ -990,6 +1084,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     }
 
     /* Default keyfile path is <image>.key. */
+    bool key_named = keyfile_path != NULL;
     char default_key_path[1024];
     if (!keyfile_path) {
         int n = snprintf(default_key_path, sizeof default_key_path,
@@ -1039,6 +1134,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     int  new_key_fd = -1;
     int  old_key_fd = -1;
     int  claim_fd = -1;
+    int  claim_hold_fd = -1;
     int  image_dir_fd = -1;
     const char *image_base = strrchr(image_path, '/');
     image_base = image_base ? image_base + 1 : image_path;
@@ -1046,11 +1142,25 @@ int stm_cmd_mkfs_main(int argc, char **argv)
      * about or made through, and never by its name. */
     stm_hybrid_keys wrap;
     memset(&key_seen, 0, sizeof key_seen);
+    uint64_t disk_bytes = 0;
+    struct volume_ask ask = {
+        .bytes = device_bytes, .size_named = size_named,
+        .bootstrap = bootstrap_named ? bootstrap_bytes : 0, .bootstrap_named = bootstrap_named,
+        .key_named = key_named,
+    };
     int refused = mkfs_claim(image_path, keyfile_path, have_pass, force, key_as_is,
-                             device_bytes, &created, &claim_fd, &key_was_there, &key_seen);
+                             &ask, &created, &claim_fd, &claim_hold_fd, &key_was_there,
+                             &key_seen, &disk_bytes);
     if (created && claim_fd >= 0)
         image_dir_fd = hold_image_dir(image_path, image_base, claim_fd);
     if (refused != 0) {
+        exit_code = 1;
+        goto cleanup;
+    }
+    /* The claim refused a disk that cannot be what was asked. */
+    if (disk_bytes != 0) device_bytes = disk_bytes;
+    if (size_volume(device_bytes, bootstrap_named, &bootstrap_bytes,
+                    disk_bytes != 0 ? "the disk's size" : "--size") != 0) {
         exit_code = 1;
         goto cleanup;
     }
@@ -1205,7 +1315,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     }
 
     stm_fs_format_opts fopts = {
-        .device_size_bytes        = device_bytes,
+        .device_size_bytes        = disk_bytes != 0 ? 0 : device_bytes,
         .bootstrap_size_bytes     = bootstrap_bytes,
         .pool_uuid                = { pool_uuid[0],   pool_uuid[1]   },
         .device_uuid              = { device_uuid[0], device_uuid[1] },
@@ -1215,8 +1325,8 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     };
 
     /* Phase 1: format. */
-    fprintf(stderr, "formatting %s (%llu bytes)...\n",
-            image_path, (unsigned long long)device_bytes);
+    fprintf(stderr, "formatting %s (%llu bytes, %llu of them the bootstrap pool)...\n",
+            image_path, (unsigned long long)device_bytes, (unsigned long long)bootstrap_bytes);
     stm_status rc = stm_fs_format(image_path, &fopts);
     if (rc != STM_OK) {
         fprintf(stderr, "stratum-mkfs: stm_fs_format failed: status=%d\n", (int)rc);
@@ -1363,6 +1473,8 @@ cleanup:
     }
     if (image_dir_fd >= 0) close(image_dir_fd);
     if (key_dir_fd >= 0) close(key_dir_fd);
+    if (claim_hold_fd >= 0) close(claim_hold_fd);
+    if (claim_fd >= 0) close(claim_fd);
     /* SWISS-4m: wipe + munlock the passphrase buffer regardless of
      * exit path. Stack-allocated, so munlock + memzero is enough —
      * the storage is freed when this stack frame unwinds. */

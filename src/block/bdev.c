@@ -12,10 +12,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #if !defined(__thylacine__)
 #  include <sys/file.h>
 #  include <sys/ioctl.h>
+#  include <sys/stat.h>
 #  if defined(__APPLE__)
 #    include <sys/disk.h>
 #  elif defined(__linux__)
@@ -345,26 +347,138 @@ uint64_t stm_bdev_device_bytes(int fd)
 }
 #endif
 
-stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd)
+#if defined(__linux__)
+/* systemd-udevd holds a shared flock on a whole disk while it processes an
+ * event (systemd's block device locking contract), which a close after a
+ * write raises: an exclusive lock waits that out, for a while. */
+static int flock_ex_waiting(int fd)
+{
+    for (int i = 0;; i++) {
+        if (flock(fd, LOCK_EX | LOCK_NB) == 0) return 0;
+        if (errno != EWOULDBLOCK || i == 100) return -1;
+        struct timespec ts = { 0, 50L * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+}
+#endif
+
+#if defined(__APPLE__)
+/* The block node of the disk whose raw node `st` is, where it is one. A disk's two
+ * nodes are two vnodes, so two locks: a claim of the raw node holds the block node
+ * locked as well, where every claim of the disk meets. */
+static bool block_twin_name(const struct stat *st, char *twin, size_t n)
+{
+    char name[64];
+    const char *r = devname_r(st->st_rdev, S_IFCHR, name, (int)sizeof name);
+    return r && strncmp(r, "rdisk", 5) == 0 && snprintf(twin, n, "/dev/%s", r + 1) < (int)n;
+}
+#endif
+
+stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd, int *out_hold_fd)
 {
     *out_fd = -1;
+    *out_hold_fd = -1;
 #if !defined(__thylacine__)
     /* Read-write where it can be: over NFS, flock is a byte-range lock, and an
      * exclusive one needs the file open for writing. */
-    int flags = O_CLOEXEC | (create ? O_CREAT | O_EXCL : 0);
+    int flags = O_CLOEXEC | O_NOCTTY | (create ? O_CREAT | O_EXCL : 0);
     int fd = open(path, O_RDWR | flags, 0600);
+    /* A disk the system has mounted: macOS refuses its block node any open. */
+    if (fd < 0 && errno == EBUSY) return STM_EBUSY;
+#if defined(__linux__)
+    bool rw = fd >= 0;
+#endif
     /* Whatever refuses writing (EACCES, EROFS, EPERM on an immutable file, ETXTBSY)
      * still leaves a read-only open, and so the lock. */
     if (fd < 0 && errno != ENOENT && errno != EISDIR && errno != EEXIST)
         fd = open(path, O_RDONLY | flags, 0600);
     if (fd < 0) return errno == ENOENT ? STM_ENOENT : STM_EIO;
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    struct stat st;
+#if defined(__linux__)
+    bool blkdev = false;
+#endif
+    int hold = -1;
+    if (fstat(fd, &st) == 0) {
+#if defined(__APPLE__)
+        /* The raw node of a mounted disk opens read-write (measured: /dev/rdiskNsM
+         * with its slice mounted, read-write or read-only), where its block node,
+         * even for reading, is refused EBUSY. A claim that could open the raw node
+         * for reading alone holds the block node all the same. */
+        char twin[64];
+        if (S_ISCHR(st.st_mode) && block_twin_name(&st, twin, sizeof twin)) {
+            hold = open(twin, O_RDONLY | O_CLOEXEC | O_NOCTTY);
+            if (hold < 0) {
+                int e = errno;
+                close(fd);
+                errno = e;
+                return e == EBUSY ? STM_EBUSY : STM_EIO;
+            }
+            struct stat ts;
+            if (fstat(hold, &ts) != 0 || !S_ISBLK(ts.st_mode) || ts.st_rdev != st.st_rdev) {
+                close(hold);
+                close(fd);
+                return STM_ESTALE;
+            }
+        }
+#elif defined(__linux__)
+        blkdev = S_ISBLK(st.st_mode);
+#endif
+    }
+#if defined(__linux__)
+    /* Linux opens a mounted disk read-write; only an exclusive open is refused
+     * it (EBUSY: mounted, a RAID or LVM member, swap, or another claim), and
+     * the exclusion is held while that descriptor is open. By name, not
+     * through /proc, which may not be mounted. */
+    if (rw && blkdev) {
+        int x = open(path, O_RDWR | O_EXCL | O_NOCTTY | O_CLOEXEC);
+        if (x < 0) {
+            int e = errno;
+            /* Another claim holds the lock as well; the system does not. */
+            if (e == EBUSY && flock_ex_waiting(fd) != 0 && errno == EWOULDBLOCK)
+                e = EWOULDBLOCK;
+            close(fd);
+            errno = e;
+            return e == EBUSY || e == EWOULDBLOCK ? STM_EBUSY : STM_EIO;
+        }
+        struct stat xs;
+        if (fstat(x, &xs) != 0 || !S_ISBLK(xs.st_mode) || xs.st_rdev != st.st_rdev) {
+            close(x);
+            close(fd);
+            return STM_ESTALE;
+        }
+        /* Locked before the first descriptor's close, which udev hears of: it then
+         * finds the disk locked and leaves it be. */
+        int locked = flock_ex_waiting(x);
         int e = errno;
         close(fd);
+        if (locked != 0 && e == EWOULDBLOCK) {
+            close(x);
+            errno = e;
+            return STM_EBUSY;
+        }
+        /* Where it cannot be locked, the exclusive open still keeps the system and
+         * every other claim out. */
+        *out_fd = x;
+        errno = e;
+        return locked == 0 ? STM_OK : STM_ENOLCK;
+    }
+#endif
+#if defined(__linux__)
+    /* A device opened for reading alone takes no exclusive open; its lock waits
+     * udev's out as well. */
+    int got = blkdev ? flock_ex_waiting(fd) : flock(fd, LOCK_EX | LOCK_NB);
+#else
+    int got = flock(fd, LOCK_EX | LOCK_NB);
+#endif
+    if (got != 0 || (hold >= 0 && flock(hold, LOCK_EX | LOCK_NB) != 0)) {
+        int e = errno;
+        close(fd);
+        if (hold >= 0) close(hold);
         errno = e;
         return e == EWOULDBLOCK ? STM_EBUSY : STM_ENOLCK;
     }
     *out_fd = fd;
+    *out_hold_fd = hold;
 #else
     /* Thylacine's pool is a device only its one stratumd opens. */
     (void)path; (void)create;

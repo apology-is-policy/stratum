@@ -161,6 +161,14 @@ jobs:
           STRATUM_TEST_SUDO: 1
         run: bash tests/volume_smoke.sh dist/stratum
 
+      - name: a disk end to end
+        # RAM disks on macOS; loop devices on Linux, made with the runner's sudo. Run
+        # after a failed file-based run too, which says nothing of a disk.
+        if: success() || failure()
+        env:
+          STRATUM_TEST_SUDO: 1
+        run: bash tests/mkfs_disk_smoke.sh dist/stratum
+
       - name: a daemon's stop with clients still connected
         run: python3 tests/stop_with_clients.py dist/stratum
 

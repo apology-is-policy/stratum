@@ -205,16 +205,27 @@ STM_MUST_USE
 stm_status stm_bdev_current_bytes(stm_bdev *d, uint64_t *out);
 
 /*
- * Claim an image for one process. STM_EBUSY: another process holds it.
- * STM_ENOENT: there is no such file and `create` was false; with `create` the
- * file must not exist yet. STM_ENOLCK: the file is there (and with `create`,
- * was made) but this filesystem cannot lock it, so nothing shows who else has
- * it. Any other failure leaves errno set and claims nothing, as does either of
- * those. The kernel drops the claim however the process ends, so nothing stale
- * can lock a volume out. On success *out_fd is the descriptor to close to give
- * it up, or -1 where the platform has no such lock.
+ * Claim an image for one process. STM_EBUSY: another claim holds it (errno
+ * EWOULDBLOCK), or the image is a disk the system is using, mounted (errno
+ * EBUSY): macOS opens no mounted disk's block node, and a claim of a disk's raw
+ * node opens and locks its block node as well (read-only, whichever way the raw
+ * node opened), a disk's two nodes being two locks; a block node that will not
+ * open fails the claim with its errno; on Linux a block device is also opened exclusively (O_EXCL), and an
+ * exclusive holder that never lets the lock go for some seconds is taken for
+ * another claim. On a Linux block device the lock waits that long for udev's
+ * shared lock to go, opened for writing or not. STM_ESTALE: a node the claim
+ * opened was not the device named (on Linux the name, between the claim's two
+ * opens; on macOS the raw node's block twin). STM_ENOENT: there is no such file and `create` was
+ * false; with `create` the file must not exist yet. STM_ENOLCK: the file is there
+ * (and with `create`, was made) but this filesystem cannot lock it, so nothing
+ * shows who else has it; a Linux block device is still held open exclusively,
+ * through *out_fd. Any other failure leaves errno set and claims nothing; so does
+ * STM_ENOENT, and STM_ENOLCK but for that open. The kernel drops the claim however
+ * the process ends, so nothing stale can lock a volume out. *out_fd is the
+ * descriptor the image is used through, or -1 where the platform has no such
+ * lock; *out_hold_fd is one more the claim holds, or -1; closing both gives it up.
  */
-stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd);
+stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd, int *out_hold_fd);
 
 /* The size a disk reports for itself, or 0 where fd is not one. */
 uint64_t stm_bdev_device_bytes(int fd);

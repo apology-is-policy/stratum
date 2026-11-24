@@ -44,7 +44,7 @@ Open options:
 | `queue_depth` | Async queue size. 0 → backend default (512). |
 | `fixed_buffer_bytes` | io_uring only — fixed-buffer region size. |
 | `posix_threads` | Thread-pool size on POSIX async. 0 → CPU count, capped 64. |
-| `claimed_fd` | NULL, or where a descriptor the caller holds on the device is (`stm_bdev_claim_image` gives one): that open file is the device, `path` only names it, nothing is created, and `direct` cannot be asked. A negative one stands for none. |
+| `claimed_fd` | NULL, or where a descriptor the caller holds on the device is (`stm_bdev_claim_image` gives one): that open file is the device, `path` only names it, nothing is created, and `direct` cannot be asked. A negative one stands for none. The claim refuses a disk the system is using (mounted), `STM_EBUSY` with errno `EBUSY`: macOS opens no mounted disk's block node, and a claim of a raw node, whether it opened that node for writing or for reading alone, opens its block twin for reading as well (its device number checked against the raw node's, `STM_ESTALE` where it is another device), which a mounted disk refuses (measured: the raw node of a mounted slice opens read-write), and holds it locked beside its own: a disk's two nodes are two locks, and every claim of the disk meets on the block node's (measured on a RAM disk, each order of the two). The claim gives that second descriptor back as well (`out_hold_fd`), to be kept as long as the claim is. On Linux the claim also opens a block device exclusively (`O_EXCL`, by name, its device number checked against the first open, `STM_ESTALE` where the name led to another device between the two), holding the exclusion while its descriptor is open, and locks it before closing the first open, so udev, hearing of that close, finds it locked and leaves it be. On a Linux block device the lock retries for up to 5 s, as systemd's block-device locking contract asks: udev holds a shared lock on a whole disk while it processes an event, which a close after a write raises. Where it cannot be locked at all, `STM_ENOLCK` comes with the exclusive descriptor, still held. |
 
 `stm_bdev_caps` reports the backend actually selected, logical size,
 physical block size, max single-op size, whether TRIM / SQPOLL / DAX /
@@ -131,6 +131,8 @@ Three source files under `src/block/`:
   simulated via a fixed thread pool that drains an internal queue;
   completion delivery is via per-device lockless queue + condvar.
   Its sizing (`op_current_size`) fstats a regular file.
+  Its fsync on macOS is `F_FULLFSYNC` for a file; a disk answers that
+  ENOTTY, so a disk's is `fsync` then `DKIOCSYNCHRONIZECACHE`.
 - `iouring.c` — Linux io_uring backend. Sync ops issue a single SQE,
   wait in the same thread for its CQE. Async ops submit + return,
   driving completion via user-thread `poll_completions` +

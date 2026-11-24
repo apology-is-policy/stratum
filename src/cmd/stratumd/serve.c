@@ -1501,12 +1501,13 @@ static stm_status stratumd_run_client(const stm_stratumd_opts *opts)
  * control-byte-free; --corvus-session-token-file required (a WRAP
  * needs a token); --read-only refused (provisioning writes);
  * --ctl-listen refused (one-shot, nothing to serve). */
-static stm_status image_must_exist(const char *path);
+static stm_status image_must_exist(const char *path, bool missing_at_claim);
 
 static bool say_scan_refusal(const stm_stratumd_opts *opts, stm_status rc,
                              const stm_sb_scan_refusal *why);
 
-static stm_status stratumd_run_provision(const stm_stratumd_opts *opts, const int *claimed_fd)
+static stm_status stratumd_run_provision(const stm_stratumd_opts *opts, const int *claimed_fd,
+                                         bool missing_at_claim)
 {
     if (!opts->provision_dataset_name || !*opts->provision_dataset_name) {
         fprintf(stderr,
@@ -1589,7 +1590,7 @@ static stm_status stratumd_run_provision(const stm_stratumd_opts *opts, const in
         .scan_refusal              = &refusal,
     };
     stm_fs *fs = NULL;
-    stm_status rc = image_must_exist(opts->fs_path);
+    stm_status rc = image_must_exist(opts->fs_path, missing_at_claim);
     if (rc != STM_OK) return rc;
     rc = stm_fs_mount(opts->fs_path, &mopts, &fs);
     if (rc != STM_OK) {
@@ -1693,34 +1694,54 @@ static stm_status stratumd_run_provision(const stm_stratumd_opts *opts, const in
 
 /*
  * Two daemons on one image each write commits the other knows nothing of, and
- * the pool is lost. A volume is a file, so opening it twice takes only two
- * windows.
+ * the pool is lost. A volume is a file or a disk, so opening it twice takes
+ * only two windows; a disk the system has mounted is another writer.
  */
-static stm_status image_lock(const char *path, int *out_fd)
+static stm_status image_lock(const char *path, int *out_fd, int *out_hold_fd, bool *missing)
 {
-    stm_status s = stm_bdev_claim_image(path, false, out_fd);
+    stm_status s = stm_bdev_claim_image(path, false, out_fd, out_hold_fd);
+    *missing = s == STM_ENOENT;
+    if (s == STM_EBUSY && errno == EBUSY) {
+        fprintf(stderr, "stratumd: a disk the system is using (mounted?): %s\n", path);
+        return s;
+    }
     if (s == STM_EBUSY) {
         fprintf(stderr, "stratumd: already open in another stratumd: %s\n", path);
         return s;
     }
-    if (s != STM_OK && s != STM_ENOENT) { /* a missing image: image_must_exist, once the options pass */
+    if (s == STM_ESTALE) {
+        fprintf(stderr, "stratumd: %s led to another device while it was being claimed\n", path);
+        return s;
+    }
+    /* A filesystem that cannot lock is said and served; any other failure to
+     * claim it is refused, as no lock and no exclusion would be held. A
+     * missing image: image_must_exist, once the options pass. */
+    if (s == STM_ENOLCK && *out_fd >= 0) {
+        fprintf(stderr, "stratumd: warning: cannot lock %s (%s); it is held open "
+                        "exclusively, which keeps the system and this version's daemons "
+                        "out, not an older one\n", path, strerror(errno));
+    } else if (s == STM_ENOLCK) {
         fprintf(stderr, "stratumd: warning: cannot lock %s (%s), so nothing "
                         "stops a second daemon opening it\n", path, strerror(errno));
+    } else if (s != STM_OK && s != STM_ENOENT) {
+        fprintf(stderr, "stratumd: cannot open %s: %s\n", path, strerror(errno));
+        return s;
     }
     return STM_OK;
 }
 
-/* The block layer creates what it is asked to open, and an empty file at a mistyped name helps nobody. */
-static stm_status image_must_exist(const char *path)
+/* The block layer creates what it is asked to open, and an empty file at a mistyped name helps nobody.
+ * One the claim found missing is refused though it is there now: it would be served unclaimed. */
+static stm_status image_must_exist(const char *path, bool missing_at_claim)
 {
 #if !defined(__thylacine__)
     struct stat st;
-    if (stat(path, &st) != 0 && errno == ENOENT) {
+    if (missing_at_claim || (stat(path, &st) != 0 && errno == ENOENT)) {
         fprintf(stderr, "stratumd: no such image: %s\n", path);
         return STM_ENOENT;
     }
 #else
-    (void)path;
+    (void)path; (void)missing_at_claim;
 #endif
     return STM_OK;
 }
@@ -1810,25 +1831,30 @@ static bool say_scan_refusal(const stm_stratumd_opts *opts, stm_status rc,
     return true;
 }
 
-static stm_status stratumd_run_locked(const stm_stratumd_opts *opts, const int *claimed_fd);
+static stm_status stratumd_run_locked(const stm_stratumd_opts *opts, const int *claimed_fd,
+                                      bool missing_at_claim);
 
 stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
 {
     if (!opts || !opts->socket_path)
         return STM_EINVAL;
     int lock_fd = -1;
+    int lock_hold_fd = -1;
+    bool missing = false;
     if (opts->fs_path) {
-        stm_status s = image_lock(opts->fs_path, &lock_fd);
+        stm_status s = image_lock(opts->fs_path, &lock_fd, &lock_hold_fd, &missing);
         if (s != STM_OK) return s;
     }
     /* The mount goes through the descriptor the lock is on: the image served is the
      * one that is locked, wherever its name leads by the time it is mounted. */
-    stm_status rc = stratumd_run_locked(opts, &lock_fd);
+    stm_status rc = stratumd_run_locked(opts, &lock_fd, missing);
     if (lock_fd >= 0) close(lock_fd);
+    if (lock_hold_fd >= 0) close(lock_hold_fd);
     return rc;
 }
 
-static stm_status stratumd_run_locked(const stm_stratumd_opts *opts, const int *claimed_fd)
+static stm_status stratumd_run_locked(const stm_stratumd_opts *opts, const int *claimed_fd,
+                                      bool missing_at_claim)
 {
 
     /* A-3: publish the host-bake owner override before any worker spawns
@@ -1853,7 +1879,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts, const int *
      * mounts, creates the dataset, unmounts; binds no socket and does
      * not block. Branches before the serving mount-opts build below
      * (stratumd_run_provision builds its own). */
-    if (opts->provision_corvus) return stratumd_run_provision(opts, claimed_fd);
+    if (opts->provision_corvus) return stratumd_run_provision(opts, claimed_fd, missing_at_claim);
 
     stm_sb_scan_refusal refusal = {0};
     stm_fs_mount_opts mopts = {
@@ -1874,7 +1900,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts, const int *
     };
 
     stm_fs *fs = NULL;
-    stm_status rc = image_must_exist(opts->fs_path);
+    stm_status rc = image_must_exist(opts->fs_path, missing_at_claim);
     if (rc != STM_OK) return rc;
     rc = stm_fs_mount(opts->fs_path, &mopts, &fs);
     if (rc != STM_OK) {
