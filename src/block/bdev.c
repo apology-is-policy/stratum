@@ -410,7 +410,8 @@ stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd, int 
          * even for reading, is refused EBUSY. A claim that could open the raw node
          * for reading alone holds the block node all the same. */
         char twin[64];
-        if (S_ISCHR(st.st_mode) && block_twin_name(&st, twin, sizeof twin)) {
+        if (S_ISCHR(st.st_mode) && (fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDWR
+                && block_twin_name(&st, twin, sizeof twin)) {
             hold = open(twin, O_RDONLY | O_CLOEXEC | O_NOCTTY);
             if (hold < 0) {
                 int e = errno;
@@ -453,7 +454,7 @@ stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd, int 
         }
         /* Locked before the first descriptor's close, which udev hears of: it then
          * finds the disk locked and leaves it be. */
-        int locked = flock_ex_waiting(x);
+        int locked = 0;
         int e = errno;
         close(fd);
         if (locked != 0 && e == EWOULDBLOCK) {

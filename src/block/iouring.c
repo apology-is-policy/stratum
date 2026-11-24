@@ -200,6 +200,7 @@ static int drain_cqes(iouring_bdev *d, int max_events, bool blocking)
                 continue;
             }
             res = -EIO;
+            pending_release(d, p);
         } else {
             if (rw && res >= 0) p->done += (size_t)res;
             if (rw && res >= 0 && p->done < p->len) res = -EIO;
