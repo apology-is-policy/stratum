@@ -18,7 +18,12 @@
  *      post-fsync in-flight writes may see old or new data.
  *
  *   3. Completions may fire on a thread other than the submitter. Callbacks
- *      must be thread-safe.
+ *      must be thread-safe. A completion may also run on the submitting
+ *      thread before the submit returns (a read past the device's end, an
+ *      fsync of a read-only device, every op on Thylacine): hold no lock
+ *      across a submit that its callback takes, and wait on the op's own
+ *      state, not on counts poll and wait return, since such an op leaves
+ *      nothing for them to deliver.
  *
  *   4. Every submitted op eventually completes, successfully or not, unless
  *      the device is torn down. Completions are guaranteed-once.
@@ -194,7 +199,8 @@ void       stm_bdev_barrier_defer_cancel(stm_bdev *d);
 bool       stm_bdev_barrier_defer_armed (const stm_bdev *d);
 
 /* Grow only. Returns STM_ENOTSUPPORTED for non-file backends. Not concurrent
- * with I/O on the device: it moves caps.size_bytes, which every write reads. */
+ * with I/O on the device: it moves caps.size_bytes, which every read and write
+ * reads. */
 STM_MUST_USE
 stm_status stm_bdev_resize(stm_bdev *d, uint64_t new_size);
 
@@ -247,7 +253,7 @@ typedef struct {
 /* Completion callback. `res` is stack-valid during the call only. */
 typedef void (*stm_bdev_completion_cb)(const stm_op_result *res);
 
-/* A span stm_bdev_read fails completes at once with STM_EIO and no bytes:
+/* A span past caps.size_bytes completes at once with STM_EIO and no bytes:
  * the callback runs before the call returns, which answers STM_OK. */
 STM_MUST_USE
 stm_status stm_bdev_submit_read (stm_bdev *d, uint64_t offset,
