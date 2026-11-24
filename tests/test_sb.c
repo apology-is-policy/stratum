@@ -1889,6 +1889,41 @@ static bool sb_all_zero(stm_bdev *d, uint64_t off, uint64_t len)
  * the tail is read where the device joined and the scan finds 47, by
  * either rule. Laid out first, the tail was read at the new end (blank)
  * and the device answered blank. */
+/* Round 1 F1, the tail half: the head labels hold nothing (blank on disk)
+ * and every tail copy reads back zero once. The tail's copies are read
+ * again after the pass, and the scan finds 47 there, by either rule; read
+ * once, the device answered blank. */
+STM_TEST(sb_mount_scan_settles_the_tail_when_the_head_holds_nothing) {
+    stm_bdev *d = open_test_device("ztail", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    if (!d) return;
+    sb_put_gen(d, 41);
+    sb_put_gen(d, 47);
+    uint8_t z[STM_UB_SIZE];
+    memset(z, 0, sizeof z);
+    for (uint32_t li = 0; li < 2; li++)
+        for (uint32_t si = 0; si < STM_UB_SLOTS_PER_LABEL; si++)
+            STM_ASSERT_OK(stm_bdev_write(d, sb_copy_off(d, si, li), z,
+                                         sizeof z));
+    for (int one = 0; one < 2; one++) {
+        for (uint32_t li = 2; li < STM_LABELS_PER_DEVICE; li++) {
+            uint64_t lo = sb_copy_off(d, 0, li);
+            stm_bdev_inject_read_range_zero(d, lo,
+                lo + (uint64_t)STM_UB_SLOTS_PER_LABEL * STM_UB_SIZE,
+                STM_UB_SLOTS_PER_LABEL);
+        }
+        stm_uberblock found;
+        uint32_t label = 99;
+        STM_ASSERT_OK(stm_sb_mount_scan_ex(d, one == 1, &found, &label, NULL,
+                                           NULL));
+        STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 47u);
+        STM_ASSERT(label >= 2u);
+        stm_bdev_inject_read_range_clear(d);
+    }
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST(sb_mount_scan_settles_the_head_before_it_lays_out_the_tail) {
     stm_bdev *d = open_test_device("zhead", 16 * 1024 * 1024);
     STM_ASSERT(d != NULL);
