@@ -48,7 +48,7 @@
  * exits holding one leaves every later reader at the gate once a writer
  * queues: rw_exit_key is set while the thread holds any, and its
  * destructor runs only then. */
-#define RW_HELD_MAX 64u
+#define RW_HELD_MAX 63u
 
 typedef struct {
     const stm_rwlock *l;
@@ -98,8 +98,10 @@ static void held_check(const stm_rwlock *l, bool wr)
 
 /* Asked before every take, so the take past the limit is never made: a
  * thread sanitizer that tracks each lock a thread holds has a limit of its
- * own (64 in TSan's deadlock detector), and a 65th lock taken would end the
- * run there instead of here. */
+ * own (64 in TSan's deadlock detector), and a lock taken past it would end
+ * the run there instead of here. One under it leaves room for the gate's
+ * mutex, taken while a gated lock is held; mutexes the caller holds are not
+ * counted. */
 static void held_room(void)
 {
     if (rw_nheld == RW_HELD_MAX) {
@@ -111,6 +113,7 @@ static void held_room(void)
 
 static void held_note(const stm_rwlock *l, bool wr)
 {
+    held_room();
     rw_held[rw_nheld].l = l;
     rw_held[rw_nheld].wr = wr;
     if (rw_nheld++ == 0) rw_exit_mark(true);

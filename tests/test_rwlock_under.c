@@ -225,12 +225,13 @@ STM_TEST(under_the_gate_readers_wait_for_every_writer_counted) {
  * failed to wake: one that does not move within 1 s is lost (and rescued
  * by one more count-out, which finds it waiting). Over the library lock and
  * over rp, at least 2 s and at least LOST_MIN_COUNTOUTS count-outs: a
- * count-out waits for three readers to be scheduled, which under macOS's
- * thread sanitizer took 20 ms each (96 in 2 s, none lost). Fewer by
- * LOST_CAP_NS is a writer that cannot get in. */
+ * count-out waits for three readers to be scheduled, about 20 ms each on
+ * CI's macOS runner under the thread sanitizer (96 in 2 s, none lost).
+ * LOST_CAP_NS ends a run of slow count-outs, which then fails the floor,
+ * with both cases inside ctest's 60 s for the binary. */
 #define LOST_READERS 3
 #define LOST_MIN_COUNTOUTS 100u
-#define LOST_CAP_NS 60000000000u
+#define LOST_CAP_NS 20000000000u
 
 typedef struct {
     _Alignas(128) atomic_ulong n;
