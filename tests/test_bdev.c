@@ -8,12 +8,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static char g_tmp_path[256];
@@ -307,6 +309,7 @@ enum { HAMMER_THREADS = 8, HAMMER_OPS = 4000, HAMMER_BYTES = 4096 };
 typedef struct {
     stm_bdev *d;
     unsigned  id;
+    unsigned  ops;
     stm_status err;
     unsigned  wrong;
 } hammer_arg;
@@ -316,7 +319,7 @@ static void *hammer_thread(void *argp)
     hammer_arg *a = argp;
     uint8_t w[HAMMER_BYTES], r[HAMMER_BYTES];
     uint64_t off = (uint64_t)a->id * HAMMER_BYTES;
-    for (unsigned i = 0; i < HAMMER_OPS && a->err == STM_OK; i++) {
+    for (unsigned i = 0; i < a->ops && a->err == STM_OK; i++) {
         memset(w, (int)(a->id * 17u + i), sizeof w);
         a->err = stm_bdev_write(a->d, off, w, sizeof w);
         if (a->err == STM_OK) a->err = stm_bdev_read(a->d, off, r, sizeof r);
@@ -327,17 +330,22 @@ static void *hammer_thread(void *argp)
 }
 
 /* Each thread's own bytes, on the one device a filesystem shares between threads. Run as written
- * over a backend whose completions are taken by whichever thread looks, this crashes or hangs. */
-STM_TEST(bdev_many_threads_share_a_device) {
-    make_tmp("hammer");
+ * over a backend whose completions are taken by whichever thread looks, this crashes or hangs.
+ * `cut` cuts every io_uring entry to 512 bytes, so a thread puts in the rest of another's op. */
+static void hammer(const char *tag, unsigned ops, bool cut)
+{
+    make_tmp(tag);
     stm_bdev_open_opts opts = stm_bdev_open_opts_default();
     stm_bdev *d = NULL;
     STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d));
     STM_ASSERT_OK(stm_bdev_resize(d, 1024 * 1024));
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    bool ur = caps && caps->backend == STM_BDEV_BACKEND_IOURING;
+    if (cut) (void)stm_bdev_iouring_short_for_test(d, 512, UINT_MAX);
     pthread_t th[HAMMER_THREADS];
     hammer_arg arg[HAMMER_THREADS];
     for (unsigned i = 0; i < HAMMER_THREADS; i++) {
-        arg[i] = (hammer_arg){ .d = d, .id = i };
+        arg[i] = (hammer_arg){ .d = d, .id = i, .ops = ops };
         STM_ASSERT_EQ(pthread_create(&th[i], NULL, hammer_thread, &arg[i]), 0);
     }
     for (unsigned i = 0; i < HAMMER_THREADS; i++) {
@@ -345,8 +353,18 @@ STM_TEST(bdev_many_threads_share_a_device) {
         STM_ASSERT_OK(arg[i].err);
         STM_ASSERT_EQ(arg[i].wrong, 0u);
     }
+    /* The control: entries were cut. */
+    if (cut && ur) STM_ASSERT(stm_bdev_iouring_short_for_test(d, 0, 0) < UINT_MAX);
     stm_bdev_close(d);
     unlink(g_tmp_path);
+}
+
+STM_TEST(bdev_many_threads_share_a_device) {
+    hammer("hammer", HAMMER_OPS, false);
+}
+
+STM_TEST(bdev_many_threads_share_a_device_every_entry_cut_short) {
+    hammer("hammer_cut", HAMMER_OPS / 8, true);
 }
 
 /* Opens over io_uring, or says it cannot: a build without it has nothing to test here. */
@@ -422,6 +440,91 @@ STM_TEST(bdev_iouring_an_op_reported_failed_never_runs) {
 static void count_done(const stm_op_result *r)
 {
     atomic_fetch_add((atomic_int *)r->user, 1);
+}
+
+typedef struct {
+    atomic_int hits;
+    stm_status status;
+    size_t     bytes;
+} rest_seen;
+
+static void rest_done(const stm_op_result *r)
+{
+    rest_seen *s = r->user;
+    s->status = r->status;
+    s->bytes = r->bytes;
+    atomic_fetch_add(&s->hits, 1);
+}
+
+/* An async write of `after` at 8192 over `before`, its first entry cut to 512 bytes; then
+ * `kill` ends the ring before anything is reaped, and the op is waited for. It must
+ * complete once, failed, and its rest must never run: the file holds 512 bytes of `after`
+ * and then `before`, and the device answers STM_EIO from then on. */
+static void rest_cannot_go_in(const char *tag, void (*kill)(stm_bdev *d))
+{
+    stm_bdev *d = NULL;
+    if (!open_iouring(tag, 0, &d)) return;
+    STM_ASSERT_OK(stm_bdev_resize(d, 64 * 1024));
+    uint8_t before[4096], after[4096], other[4096];
+    memset(before, 0x11, sizeof before);
+    memset(after, 0x77, sizeof after);
+    memset(other, 0x33, sizeof other);
+    STM_ASSERT_OK(stm_bdev_write(d, 8192, before, sizeof before));
+
+    (void)stm_bdev_iouring_short_for_test(d, 512, 1);
+    rest_seen s = { 0 };
+    atomic_init(&s.hits, 0);
+    STM_ASSERT_OK(stm_bdev_submit_write(d, 8192, after, sizeof after, rest_done, &s));
+    kill(d);
+    for (int ms = 0; atomic_load(&s.hits) == 0 && ms < 5000; ms++) {
+        int n = stm_bdev_wait_completion(d, 4);
+        STM_ASSERT(n >= 0);
+        if (n == 0) {
+            const struct timespec t = { 0, 1000000 };
+            nanosleep(&t, NULL);
+        }
+    }
+    STM_ASSERT_EQ(atomic_load(&s.hits), 1);
+    STM_ASSERT_EQ(s.status, STM_EIO);
+    STM_ASSERT_EQ(s.bytes, (size_t)0);
+    STM_ASSERT_EQ(stm_bdev_poll_completions(d, 4), 0);
+    STM_ASSERT_EQ(atomic_load(&s.hits), 1);
+
+    STM_ASSERT_ERR(stm_bdev_write(d, 16384, other, sizeof other), STM_EIO);
+    STM_ASSERT_ERR(stm_bdev_fsync(d), STM_EIO);
+    stm_bdev_close(d);
+
+    int fd = open(g_tmp_path, O_RDONLY);
+    STM_ASSERT(fd >= 0);
+    uint8_t got[4096];
+    STM_ASSERT_EQ(pread(fd, got, sizeof got, 8192), (ssize_t)sizeof got);
+    STM_ASSERT_EQ(memcmp(got, after, 512), 0);
+    STM_ASSERT_EQ(memcmp(got + 512, before + 512, sizeof got - 512), 0);
+    close(fd);
+    unlink(g_tmp_path);
+}
+
+/* The next submit fails, which is the reaper's of the rest. */
+static void kill_at_the_rest(stm_bdev *d)
+{
+    stm_bdev_iouring_fail_submit_for_test(d, EBADF, 1);
+}
+
+/* A sync write whose entry fails ends the ring before the cut op is reaped. */
+static void kill_before_the_reap(stm_bdev *d)
+{
+    uint8_t b[4096];
+    memset(b, 0x55, sizeof b);
+    stm_bdev_iouring_fail_submit_for_test(d, EBADF, 1);
+    STM_ASSERT_ERR(stm_bdev_write(d, 24576, b, sizeof b), STM_EIO);
+}
+
+STM_TEST(bdev_iouring_an_op_cut_short_whose_rest_is_refused_fails_once) {
+    rest_cannot_go_in("uring_rest_refused", kill_at_the_rest);
+}
+
+STM_TEST(bdev_iouring_an_op_cut_short_on_an_ended_ring_fails_once) {
+    rest_cannot_go_in("uring_rest_dead", kill_before_the_reap);
 }
 
 /* Elsewhere STM_EAGAIN means a lock conflict; a read of a busy device must not answer it. */

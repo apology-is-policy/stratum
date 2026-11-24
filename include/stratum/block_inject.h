@@ -112,9 +112,10 @@ void stm_bdev_iouring_fail_submit_for_test(struct stm_bdev *d, int errnum,
 
 /*
  * io_uring only, a no-op answering 0 elsewhere: the next `count` kernel entries
- * of reads and writes ask for at most `max_bytes` of what is left of their op,
- * as a short transfer leaves it (`max_bytes` 0 disarms). Answers how many
- * entries the arming it replaces had left.
+ * of reads and writes that would ask for more than `max_bytes` of what is left
+ * of their op ask for that much, as a short transfer leaves it (`max_bytes` 0
+ * disarms); an entry that asks no more is not counted. Answers how many entries
+ * the arming it replaces had left.
  */
 unsigned stm_bdev_iouring_short_for_test(struct stm_bdev *d, size_t max_bytes,
                                          unsigned count);

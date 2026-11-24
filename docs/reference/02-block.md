@@ -162,7 +162,7 @@ skipping the per-op copy into kernel memory. Returns
 
 ## Implementation
 
-Three source files under `src/block/`:
+Four source files under `src/block/`:
 
 - `bdev.c` — vtable dispatch. Pointer-based fn table (one per backend);
   every public call indirects through the vtable. Adding a backend is
@@ -176,11 +176,15 @@ Three source files under `src/block/`:
   Its fsync on macOS is `F_FULLFSYNC` for a file; a disk answers that
   ENOTTY, so a disk's is `fsync` then `DKIOCSYNCHRONIZECACHE`.
 - `iouring.c` — Linux io_uring backend. Sync ops issue a single SQE,
-  wait in the same thread for its CQE. Async ops submit + return,
-  driving completion via user-thread `poll_completions` +
-  `wait_completion`; the thread reaping a short transfer's CQE submits
-  its rest, for a sync op as for an async one. Optional SQPOLL + fixed buffers when the kernel
-  supports it.
+  for its first entry, and wait for the op to complete. Async ops submit
+  + return, driving completion via user-thread `poll_completions` +
+  `wait_completion`. The thread reaping a short transfer's CQE, whichever
+  thread's op it is, submits its rest, for a sync op as for an async one;
+  where the rest cannot go in, the op fails `STM_EIO`, once. Fixed buffers
+  where the caller registers them; no SQPOLL.
+- `bdev_thylacine.c` -- the Thylacine backend, built there in place of
+  `posix.c`: an async op runs at its submit, its callback called before
+  the submit returns.
 
 The vtable has one entry per operation — `open`, `close`, `caps`,
 `read`, `write`, `fsync`, `fdatasync`, `discard`, `resize`,
@@ -255,8 +259,8 @@ by bdev's contract:
 
 | Suite | Coverage |
 |---|---|
-| `test_bdev` (see `tests/test_bdev.c`) | Sync roundtrip on file-backed bdev; caps sanity; resize; discard (no-op on file); a read past the end of a file cut under the handle, inside the handle's size, `STM_EIO` from the backend (a partial read that then meets the end, and one wholly past it; one ending at the cut read); a read past the handle's size fails `STM_EIO` before the backend though the file holds bytes there (grown under the handle; wholly past, straddling, wrapping past 2^64), reading nothing and observed by no I/O observer, a read ending at the end and one of no bytes past it accepted, an armed read failure not taken, counted or ranged; a write past the end refused `STM_EINVAL` (a new file's 0 bytes, straddling, wholly past, wrapping past 2^64), counted as no write, the file and caps unchanged, a write ending at the end accepted, read-only answering `STM_EROFS` first. |
-| `test_bdev_async` (see `tests/test_bdev_async.c`) | Async submit + poll_completions on POSIX backend; fsync ordering; submit queue saturation; a submit past the end refused at the call with no callback, one ending at the end completing, a write of no bytes past the end fitting, sync and async; a read past the end of a file cut under the handle reaching the backend (no callback before the submit returns) and failing `STM_EIO` with no bytes on every backend; reads and writes the kernel does 512 bytes at a time (`stm_bdev_iouring_short_for_test`, io_uring) completing once, whole, async and sync, every short entry used; an op the posix backend took completing with no allocation left after its submit (`stm_bdev_posix_alloc_budget_for_test`), and a submit with none left refused `STM_ENOMEM`; a read past the handle's size (wholly past, straddling, wrapping past 2^64) completing at once with `STM_EIO`, no bytes and kind `STM_OP_READ`, its callback run once, before the submit returns, its buffer never written, though the file holds bytes there, one ending at the end completing. |
+| `test_bdev` (see `tests/test_bdev.c`) | Sync roundtrip on file-backed bdev; caps sanity; resize; discard (no-op on file); a read past the end of a file cut under the handle, inside the handle's size, `STM_EIO` from the backend (a partial read that then meets the end, and one wholly past it; one ending at the cut read); a read past the handle's size fails `STM_EIO` before the backend though the file holds bytes there (grown under the handle; wholly past, straddling, wrapping past 2^64), reading nothing and observed by no I/O observer, a read ending at the end and one of no bytes past it accepted, an armed read failure not taken, counted or ranged; a write past the end refused `STM_EINVAL` (a new file's 0 bytes, straddling, wholly past, wrapping past 2^64), counted as no write, the file and caps unchanged, a write ending at the end accepted, read-only answering `STM_EROFS` first; on io_uring, an op cut short whose rest cannot go in (its resubmit refused, or the ring ended before the reap) completing once, `STM_EIO` with no bytes, its rest never run and the device failing from then on; eight threads sharing a device with every entry cut to 512 bytes, so one puts in the rest of another's op. |
+| `test_bdev_async` (see `tests/test_bdev_async.c`) | Async submit + poll_completions on POSIX backend; fsync ordering; submit queue saturation; a submit past the end refused at the call with no callback, one ending at the end completing, a write of no bytes past the end fitting, sync and async; a read past the end of a file cut under the handle reaching the backend (no callback before the submit returns) and failing `STM_EIO` with no bytes on every backend; reads and writes the kernel does 512 bytes at a time (`stm_bdev_iouring_short_for_test`, io_uring) completing once, whole: an async read and write, a sync read and a sync write, every short entry used; an op the posix backend took completing with no allocation left after its submit (`stm_bdev_posix_alloc_budget_for_test`), and a submit with none left refused `STM_ENOMEM`; a read past the handle's size (wholly past, straddling, wrapping past 2^64) completing at once with `STM_EIO`, no bytes and kind `STM_OP_READ`, its callback run once, before the submit returns, its buffer never written, though the file holds bytes there, one ending at the end completing. |
 | `test_crash_inject` (separate module) | Uses `stm_bdev_inject_fail_after` to force write/fsync failures and verify sync's rollback + remount paths converge. ~168 cycles; TSan timeout 180s. |
 
 ## Status

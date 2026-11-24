@@ -585,7 +585,11 @@ unsigned stm_bdev_iouring_short_for_test(stm_bdev *d, size_t max_bytes, unsigned
 
 void stm_bdev_posix_alloc_budget_for_test(stm_bdev *d, int budget)
 {
+#if !defined(__thylacine__)
     if (d && d->caps.backend == STM_BDEV_BACKEND_POSIX) stm_posix_alloc_budget(d, budget);
+#else
+    (void)d; (void)budget;
+#endif
 }
 
 void stm_bdev_io_stats(const stm_bdev *d, uint64_t *writes,

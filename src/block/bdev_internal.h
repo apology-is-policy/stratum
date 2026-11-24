@@ -90,12 +90,12 @@ struct stm_bdev {
 /* A descriptor of the backend's own on the file `fd` has open, or -1 with errno set:
  * EACCES where the device is to be written and `fd` was opened for reading alone. */
 int stm_bdev_dup_claimed(int fd, bool read_only);
+void stm_posix_alloc_budget(stm_bdev *d, int budget);
 #endif
 
 /* Backend constructors. */
 stm_status stm_bdev_open_posix  (const char *path, const stm_bdev_open_opts *opts,
                                  stm_bdev **out);
-void stm_posix_alloc_budget(stm_bdev *d, int budget);
 
 #if STM_HAVE_IOURING
 stm_status stm_bdev_open_iouring(const char *path, const stm_bdev_open_opts *opts,

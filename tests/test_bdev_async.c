@@ -279,12 +279,17 @@ STM_TEST(async_write_past_the_end_is_refused_at_submit) {
     unlink(g_path);
 }
 
+/* Bounded, so an op that never completes fails its caller's hits assertion. */
 static void wait_hits(stm_bdev *d, const cb_state *s)
 {
-    while (s->hits == 0) {
+    for (int ms = 0; s->hits == 0 && ms < 5000; ms++) {
         int n = stm_bdev_wait_completion(d, 4);
         STM_ASSERT(n >= 0);
         if (n < 0) return;
+        if (n == 0) {
+            const struct timespec t = { 0, 1000000 };
+            nanosleep(&t, NULL);
+        }
     }
 }
 
@@ -326,8 +331,17 @@ STM_TEST(async_short_transfers_complete_whole) {
 
     memset(rbuf, 0, sizeof rbuf);
     STM_ASSERT_OK(stm_bdev_read(d, 4096, rbuf, sizeof rbuf));
+    left = stm_bdev_iouring_short_for_test(d, 512, 4);
+    if (ur) STM_ASSERT_EQ(left, 0u);
+    STM_ASSERT_MEM_EQ(wbuf, rbuf, sizeof wbuf);
+
+    /* A sync write cut short, read back whole with nothing cut. */
+    for (size_t i = 0; i < sizeof wbuf; i++) wbuf[i] = (uint8_t)~wbuf[i];
+    STM_ASSERT_OK(stm_bdev_write(d, 32768, wbuf, sizeof wbuf));
     left = stm_bdev_iouring_short_for_test(d, 0, 0);
     if (ur) STM_ASSERT_EQ(left, 0u);
+    memset(rbuf, 0, sizeof rbuf);
+    STM_ASSERT_OK(stm_bdev_read(d, 32768, rbuf, sizeof rbuf));
     STM_ASSERT_MEM_EQ(wbuf, rbuf, sizeof wbuf);
 
     /* Settled, nothing completes a second time. */
