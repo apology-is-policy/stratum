@@ -208,12 +208,14 @@ stm_status stm_bdev_current_bytes(stm_bdev *d, uint64_t *out);
  * Claim an image for one process. STM_EBUSY: another claim holds it (errno
  * EWOULDBLOCK), or the image is a disk the system is using, mounted (errno
  * EBUSY): macOS opens no mounted disk's block node, and a claim of a disk's raw
- * node opens and locks its block node as well, a disk's two nodes being two
- * locks; on Linux a block device is also opened exclusively (O_EXCL), and an
+ * node opens and locks its block node as well (read-only, whichever way the raw
+ * node opened), a disk's two nodes being two locks; a block node that will not
+ * open fails the claim with its errno; on Linux a block device is also opened exclusively (O_EXCL), and an
  * exclusive holder that never lets the lock go for some seconds is taken for
  * another claim. On a Linux block device the lock waits that long for udev's
- * shared lock to go. STM_ESTALE: on Linux, the name led to another device between
- * the claim's two opens of it. STM_ENOENT: there is no such file and `create` was
+ * shared lock to go, opened for writing or not. STM_ESTALE: a node the claim
+ * opened was not the device named (on Linux the name, between the claim's two
+ * opens; on macOS the raw node's block twin). STM_ENOENT: there is no such file and `create` was
  * false; with `create` the file must not exist yet. STM_ENOLCK: the file is there
  * (and with `create`, was made) but this filesystem cannot lock it, so nothing
  * shows who else has it; a Linux block device is still held open exclusively,

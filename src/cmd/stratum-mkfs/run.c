@@ -648,15 +648,22 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
     }
     if (s == STM_ESTALE) {
         fprintf(stderr,
-            "stratum-mkfs: %s led to another device between two opens of it, and nothing "
+            "stratum-mkfs: %s led to another device while it was being claimed, and nothing "
             "was claimed\n", image_path);
+        return 1;
+    }
+    if (s == STM_ENOLCK && !force && fd >= 0) {
+        fprintf(stderr,
+            "stratum-mkfs: cannot lock %s (%s); it is held open exclusively, which keeps "
+            "the system and this version's daemons off it, not an older daemon; pass --force "
+            "to format it anyway\n", image_path, strerror(errno));
+        close(fd);
         return 1;
     }
     if (s == STM_ENOLCK && !force) {
         fprintf(stderr,
             "stratum-mkfs: cannot lock %s (%s), so nothing shows whether a daemon has it; "
             "pass --force to format it anyway\n", image_path, strerror(errno));
-        if (fd >= 0) close(fd);
         return 1;
     }
     if (s != STM_OK && s != STM_ENOLCK) {
