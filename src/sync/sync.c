@@ -1709,12 +1709,16 @@ static stm_status write_ub_to_all_devices(stm_sync *s,
     size_t quorum = sync_quorum_n(s);
     if (confirmed >= quorum) return STM_OK;
 
-    /* R14 P3-5: if every device written was RO and none had a hard
-     * failure, propagate STM_EROFS so the caller can distinguish "can't
-     * write" from "wrote but didn't achieve quorum". Against the devices
+    /* R14 P3-5: fewer than quorum confirmed, no device written failed
+     * other than read-only, and one answered read-only: propagate
+     * STM_EROFS so the caller can distinguish "can't write" from "wrote
+     * but didn't achieve quorum" (the open then mounts read-only; a device
+     * that took the write keeps a copy no quorum makes authoritative,
+     * quorum.tla OrphansNotAuthoritative). Judged against the devices
      * written, not the roster: a REMOVED or FAULTED slot is never
      * written; counted, it would fail every read-only open of a pool
-     * holding one (STM_EQUORUM). */
+     * holding one (STM_EQUORUM). ro_skipped > 0 keeps a shortfall with
+     * no read-only answer (two FAULTED slots of three) STM_EQUORUM. */
     if (confirmed + ro_skipped == attempted && ro_skipped > 0) return STM_EROFS;
 
     /* R14 P3-5: if NO device confirmed and at least one returned a

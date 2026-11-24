@@ -1779,8 +1779,9 @@ static stm_status reopen_from_roster(bool ro, stm_bdev *bds[NDEV],
     for (size_t i = 0; i < NDEV; i++) {
         stm_bdev_open_opts bo = stm_bdev_open_opts_default();
         bo.read_only = ro;
-        STM_ASSERT_OK(stm_bdev_open(g_paths[i], &bo, &bds[i]));
+        bds[i] = NULL;
         as[i] = NULL;
+        STM_ASSERT_OK(stm_bdev_open(g_paths[i], &bo, &bds[i]));
     }
     stm_uberblock ub;
     uint32_t lbl = 0, slot = 0;
@@ -1828,10 +1829,10 @@ static void close_reopened(stm_bdev *bds[NDEV], stm_alloc *as[NDEV],
 }
 
 /* A read-only open of a pool holding a REMOVED slot (`removed`) or a
- * FAULTED one mounts read-only: the claim is refused by every device it
- * is written to, and the slot is not one. Read-write, the same roster
- * opens and claims (the fixture is a pool that opens; read-only is the
- * one variable). */
+ * FAULTED one mounts read-only and reads a block committed before: the
+ * claim is refused by every device it is written to, and the slot is not
+ * one. Read-write, the same roster opens and claims (the fixture is a
+ * pool that opens; read-only is the one variable). */
 static void ro_open_with_a_slot_not_written(bool removed, const char *tag)
 {
     stm_bdev *bds[NDEV] = {0};
@@ -1843,10 +1844,17 @@ static void ro_open_with_a_slot_not_written(bool removed, const char *tag)
         STM_ASSERT_OK(stm_sync_commit(s));
         uint64_t op = 0, np = 0;
         STM_ASSERT_ERR(stm_sync_evacuation_step(s, 2, 0, &op, &np), STM_ENOENT);
-        STM_ASSERT_OK(stm_pool_finish_evacuation(pool, 2));
+        STM_ASSERT_OK(stm_sync_finish_evacuation(s, 2));
     } else {
         STM_ASSERT_OK(stm_pool_fail_device(pool, 1));
     }
+    uint64_t paddrs[2] = { 0 };
+    uint8_t payload[STM_UB_SIZE];
+    for (size_t i = 0; i < sizeof payload; i++) payload[i] = (uint8_t)(i * 7u + 1u);
+    stm_blake3_hash want;
+    stm_blake3(payload, sizeof payload, &want);
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs));
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, 2u, payload, sizeof payload, NULL));
     STM_ASSERT_OK(stm_sync_commit(s));
     stm_sync_info before;
     STM_ASSERT_OK(stm_sync_info_get(s, &before));
@@ -1870,6 +1878,11 @@ static void ro_open_with_a_slot_not_written(bool removed, const char *tag)
         STM_ASSERT_OK(stm_sync_info_get(rs, &ri));
         STM_ASSERT_EQ(ri.auth_gen, before.auth_gen);
         STM_ASSERT_ERR(stm_sync_commit(rs), STM_EROFS);
+        uint8_t back[STM_UB_SIZE];
+        memset(back, 0, sizeof back);
+        STM_ASSERT_OK(stm_sync_mirror_read(rs, paddrs, 2u, back, sizeof back,
+                                           want.bytes));
+        STM_ASSERT_EQ(memcmp(back, payload, sizeof back), 0);
     }
     close_reopened(rb, ra, rp, rs);
 
@@ -1890,6 +1903,26 @@ STM_TEST(sync_multi_a_read_only_open_with_a_removed_slot_mounts) {
 
 STM_TEST(sync_multi_a_read_only_open_with_a_faulted_slot_mounts) {
     ro_open_with_a_slot_not_written(false, "q_ro_flt");
+}
+
+/* A commit that fewer than quorum of the devices it writes confirm, none
+ * of them read-only, fails STM_EQUORUM: two FAULTED slots of three leave
+ * one device written, short of the two the live count's quorum asks. */
+STM_TEST(sync_multi_a_commit_short_of_quorum_with_two_faulted_slots_fails) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "q_two_flt", bds, as, &pool, &s);
+    STM_ASSERT_OK(stm_pool_fail_device(pool, 1));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_info before;
+    STM_ASSERT_OK(stm_sync_info_get(s, &before));
+    STM_ASSERT_OK(stm_pool_fail_device(pool, 2));
+    STM_ASSERT_ERR(stm_sync_commit(s), STM_EQUORUM);
+    stm_sync_info after;
+    STM_ASSERT_OK(stm_sync_info_get(s, &after));
+    STM_ASSERT_EQ(after.auth_gen, before.auth_gen);
+    teardown_mirror_pool(bds, as, pool, s);
 }
 
 /* ========================================================================= */
