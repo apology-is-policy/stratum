@@ -296,12 +296,15 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
  * Commit. Writes Phase 1 reservation UB at auth+1, flushes, writes
  * Phase 3 final UB at auth+2, to every pool device in parallel.
  * Each phase requires quorum (⌊N/2⌋+1) of fsync confirmations; if
- * either phase lacks quorum, the commit aborts with STM_EQUORUM
- * and the in-RAM state is unchanged.
+ * either phase lacks quorum, the commit aborts with STM_EQUORUM.
+ * What a mount would take is unchanged (auth_gen, current_gen, the
+ * roots); the attempt's allocator and engine effects stay in RAM, and
+ * the reservation it wrote or tried is kept for the retry.
  *
- * A retry after a failed final reserves at the same gen and writes the
- * reservation it wrote there again, byte for byte, unless the roster
- * changed in between.
+ * A retry after any failure past the reservation's build (its write,
+ * the barrier, the final) reserves at the same gen and writes the
+ * reservation the last attempt to get that far wrote or tried, byte for
+ * byte, unless a device was added in between.
  *
  * On STM_OK, auth_gen has advanced by 2 (one commit) and the pool's
  * devices hold quorum-confirmed UBs at the reservation and final

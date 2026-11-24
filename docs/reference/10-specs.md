@@ -284,14 +284,17 @@ ones too, an oracle the implementation cannot read.
 retried final need not repeat the first attempt's bytes, and a final is
 acknowledged on a quorum holding its attempt's content, as the code
 counts one write's confirmations). The code rebuilds a failed final: the
-retry repeats the first attempt's bytes when nothing changed between
-the attempts (`quorum.cfg` and `quorum_faults.cfg`, `IdempotentRetry=TRUE`)
-and differs when something did, a write or a sweep (`quorum_retry.cfg`);
-each is checked up to one retry (`MaxRetries=1`). The reservation the
-retry writes is the first attempt's, byte for byte, as `WriteReservation`
-writes `pub_content`; the code rebuilt it before review round 2 F1, and
-still does after a roster change between the attempts (OPEN-BUGS (ak)),
-which the model does not have.
+retry repeats the first attempt's bytes only when it serializes no tree
+at other nodes than the first attempt did (`quorum.cfg` and
+`quorum_faults.cfg`, `IdempotentRetry=TRUE`); a write or a sweep between
+the attempts, or the first commit after an open (which serializes the
+dataset index again), makes it differ (`quorum_retry.cfg`, and with a
+fault `quorum_faults_retry.cfg`); each is checked up to one retry
+(`MaxRetries=1`). The reservation the retry writes is the first
+attempt's, byte for byte, as `WriteReservation` writes `pub_content`; the
+code rebuilt it before review round 2 F1, and still does after a device
+is added between the attempts (OPEN-BUGS (ak)), which the model, having
+no roster, does not have.
 `quorum_buggy.cfg` is the same retry acknowledged on a quorum at the
 gen, whatever it holds (`StrictFinal=FALSE`).
 `quorum_mount_buggy.cfg` (`MountCountsUnknown=FALSE`, the open
@@ -340,8 +343,8 @@ the mount takes the orphan (20 states). The code groups by bytes, which
 also record allocator statistics, so its groups can only split the
 model's: the pick's safety holds for any grouping in which a slot holds
 one content and an acknowledged content is one its quorum shares (the
-code writes a retried reservation's bytes again, short of a roster
-change between the attempts, OPEN-BUGS (ak)), and with every device read
+code writes a retried reservation's bytes again, short of a device
+added between the attempts, OPEN-BUGS (ak)), and with every device read
 and every copy settled blank or valid no content but a quorum's is
 possible, so the code mounts there too. The model has no torn
 slots: the code counts a device whose slot of the gen has a copy torn or

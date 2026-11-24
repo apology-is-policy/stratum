@@ -5047,21 +5047,27 @@ static void rr_obs(void *ctx_, bool is_write, uint64_t off, size_t len)
         }
 }
 
-/* A commit of s whose final, at s's current gen, reaches device 0 alone. */
-static stm_status rr_commit_final_on_d0(stm_sync *s, stm_bdev *b[NDEV])
+/* A commit of s whose writes to one slot fail on the devices in `mask`:
+ * its final's slot (s's current gen), or with `reservation` its
+ * reservation's. */
+static stm_status rr_commit_failing(stm_sync *s, stm_bdev *b[NDEV],
+                                    bool reservation, unsigned mask)
 {
     stm_sync_info si;
     STM_ASSERT_OK(stm_sync_info_get(s, &si));
-    rr_obs_ctx c1 = { si.current_gen, STM_UB_COPIES, b[1] };
-    rr_obs_ctx c2 = { si.current_gen, STM_UB_COPIES, b[2] };
-    stm_bdev_io_observer o1 = { rr_obs, &c1 }, o2 = { rr_obs, &c2 };
-    stm_bdev_set_io_observer_for_test(b[1], &o1);
-    stm_bdev_set_io_observer_for_test(b[2], &o2);
+    const uint64_t g = si.current_gen - (reservation ? 1u : 0u);
+    rr_obs_ctx c[NDEV];
+    stm_bdev_io_observer o[NDEV];
+    for (int i = 0; i < NDEV; i++) {
+        c[i] = (rr_obs_ctx){ g, ((mask >> i) & 1u) ? STM_UB_COPIES : 0, b[i] };
+        o[i] = (stm_bdev_io_observer){ rr_obs, &c[i] };
+        if ((mask >> i) & 1u) stm_bdev_set_io_observer_for_test(b[i], &o[i]);
+    }
     stm_status st = stm_sync_commit(s);
-    stm_bdev_set_io_observer_for_test(b[1], NULL);
-    stm_bdev_set_io_observer_for_test(b[2], NULL);
-    STM_ASSERT_EQ(c1.armed, 0);
-    STM_ASSERT_EQ(c2.armed, 0);
+    for (int i = 0; i < NDEV; i++) {
+        if ((mask >> i) & 1u) stm_bdev_set_io_observer_for_test(b[i], NULL);
+        STM_ASSERT_EQ(c[i].armed, 0);
+    }
     return st;
 }
 
@@ -5089,10 +5095,13 @@ static stm_status rr_open(stm_bdev *b[NDEV], uint64_t *took, uint64_t *writes)
 /* Commits 1 and (2, 3); the commit at (4, 5) has its final reach device 0
  * alone, so the session's current gen stays 5 and its retry reserves at 4
  * again, where all three devices confirmed the first attempt's
- * reservation. `between`: a data reserve before the retry moves the
- * allocator's free count, which the reservation records. `roster`:
- * device 2 is failed before the retry instead. */
-static void rr_leg(const char *tag, bool between, bool roster)
+ * reservation. RR_RESERVE: a data reserve before the retry moves the
+ * allocator's free count, which the reservation records. RR_NOTHING: the
+ * control, nothing between the attempts (the bytes were already the same).
+ * RR_FAIL: the device that failed the final is failed before the retry,
+ * which changes the roster's state bytes and nothing the stash names. */
+enum { RR_RESERVE, RR_NOTHING, RR_FAIL };
+static void rr_leg(const char *tag, int mode)
 {
     make_paths(tag);
     stm_bdev *b[NDEV] = {0};
@@ -5109,7 +5118,7 @@ static void rr_leg(const char *tag, bool between, bool roster)
     STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
     STM_ASSERT_OK(stm_sync_commit(s));                             /* 2, 3 */
     STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
-    STM_ASSERT_ERR(rr_commit_final_on_d0(s, b), STM_EQUORUM);
+    STM_ASSERT_ERR(rr_commit_failing(s, b, false, 6u), STM_EQUORUM);
     stm_sync_info si;
     STM_ASSERT_OK(stm_sync_info_get(s, &si));
     STM_ASSERT_EQ(si.auth_gen, 3u);
@@ -5126,8 +5135,8 @@ static void rr_leg(const char *tag, bool between, bool roster)
     STM_ASSERT_OK(stm_ub_decode(r1[0][0], STM_UB_SIZE, &R1));
     STM_ASSERT_EQ(stm_load_le64(R1.ub_gen), 4u);
 
-    if (between) STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
-    if (roster) STM_ASSERT_OK(stm_pool_fail_device(p, 2));
+    if (mode == RR_RESERVE) STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    if (mode == RR_FAIL) STM_ASSERT_OK(stm_pool_fail_device(p, 2));
     STM_ASSERT_OK(stm_sync_commit(s));                             /* 4, 5 */
     uint8_t r2[NDEV][STM_UB_COPIES][STM_UB_SIZE];
     for (int i = 0; i < NDEV; i++) q4_copy_gen(b[i], 4, true, r2[i]);
@@ -5136,14 +5145,6 @@ static void rr_leg(const char *tag, bool between, bool roster)
     stm_test_info("[%s] free blocks at the reservation: R1 %llu, R2 %llu",
                   tag, (unsigned long long)stm_load_le64(R1.ub_free_blocks),
                   (unsigned long long)stm_load_le64(R2.ub_free_blocks));
-    if (roster) {
-        /* Every device written finds itself in the roster written. */
-        STM_ASSERT_EQ(stm_load_le64(R2.ub_roster_hash),
-                      stm_pool_roster_hash(p));
-        STM_ASSERT(stm_load_le64(R1.ub_roster_hash) !=
-                   stm_pool_roster_hash(p));
-        STM_ASSERT(memcmp(r2[1], r1[1], sizeof r1[1]) != 0);
-    }
     bool same = true;
     for (int i = 0; i < NDEV; i++)
         same = same && memcmp(r2[i], r1[i], sizeof r1[i]) == 0;
@@ -5151,28 +5152,158 @@ static void rr_leg(const char *tag, bool between, bool roster)
     stm_alloc_close(a);
     stm_pool_close(p);
 
-    if (!roster) {
-        /* A power loss in the retry's reservation barrier: device 0's copy
-         * durable (it keeps the first attempt's final at 5), device 1's torn
-         * on every copy, device 2's lost (it keeps the first attempt's). */
-        for (int i = 0; i < NDEV; i++) q4_zero_gen(b[i], 5);
-        q4_copy_gen(b[0], 5, false, f1d0);
-        q4_copy_gen(b[0], 4, false, r2[0]);
-        q4_copy_gen(b[1], 4, false, r1[1]);
-        q4_copy_gen(b[2], 4, false, r1[2]);
-        tear_gen(b[1], 4);
-        close_bdevs(b);
-        open_bdevs(b);
-        uint64_t took = 0, w = 0;
-        stm_status st = rr_open(b, &took, &w);
-        stm_test_info("[%s] retry bytes the same %d; torn-retry open %d, "
-                      "took %llu, writes %llu", tag, (int)same, (int)st,
-                      (unsigned long long)took, (unsigned long long)w);
-        STM_ASSERT_OK(st);
-        STM_ASSERT_EQ(took, stm_load_le64(R1.ub_alloc_root.bp_paddr));
-        STM_ASSERT_EQ(w, (uint64_t)NDEV * STM_UB_COPIES);
-        STM_ASSERT(same);
+    /* A power loss in the retry's reservation barrier: device 0's copy
+     * durable (it keeps the first attempt's final at 5), device 1's torn on
+     * every copy, device 2's lost (it keeps the first attempt's). */
+    for (int i = 0; i < NDEV; i++) q4_zero_gen(b[i], 5);
+    q4_copy_gen(b[0], 5, false, f1d0);
+    q4_copy_gen(b[0], 4, false, r2[0]);
+    q4_copy_gen(b[1], 4, false, r1[1]);
+    q4_copy_gen(b[2], 4, false, r1[2]);
+    tear_gen(b[1], 4);
+    close_bdevs(b);
+    open_bdevs(b);
+    uint64_t took = 0, w = 0;
+    stm_status st = rr_open(b, &took, &w);
+    stm_test_info("[%s] retry bytes the same %d; torn-retry open %d, "
+                  "took %llu, writes %llu", tag, (int)same, (int)st,
+                  (unsigned long long)took, (unsigned long long)w);
+    STM_ASSERT_OK(st);
+    STM_ASSERT_EQ(took, stm_load_le64(R1.ub_alloc_root.bp_paddr));
+    STM_ASSERT_EQ(w, (uint64_t)NDEV * STM_UB_COPIES);
+    STM_ASSERT(same);
+    close_bdevs(b);
+    unlink_paths();
+}
+
+/* The first attempt's reservation write fails on devices 0 and 1 (device
+ * 2 takes it; the cancelled barrier syncs nothing, but the bytes may
+ * stay), a reserve moves the free count, and the retry's barrier loses
+ * power: device 0 keeps the retry's copy, device 1's is torn, device 2
+ * keeps the first attempt's. The retry wrote the bytes it tried. */
+static void rr_res_leg(const char *tag)
+{
+    make_paths(tag);
+    stm_bdev *b[NDEV] = {0};
+    open_bdevs(b);
+    stm_pool *p = make_multi_pool(b);
+    stm_alloc *a = NULL;
+    uint64_t du[2] = { DEV_UUID_LO[0], DEV_UUID_HI };
+    STM_ASSERT_OK(stm_alloc_create(b[0], POOL_UUID, du, TEST_BOOTSTRAP_BYTES,
+                                   &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(p, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 1 */
+    uint64_t dp = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 2, 3 */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_ERR(rr_commit_failing(s, b, true, 3u), STM_EQUORUM);
+    STM_ASSERT_EQ(q4_root(b[0], 4), 0u);
+    STM_ASSERT_EQ(q4_root(b[1], 4), 0u);
+    STM_ASSERT(q4_root(b[2], 4) != 0);
+    uint8_t r1[STM_UB_COPIES][STM_UB_SIZE];
+    q4_copy_gen(b[2], 4, true, r1);
+    stm_uberblock R1;
+    STM_ASSERT_OK(stm_ub_decode(r1[0], STM_UB_SIZE, &R1));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 4, 5 */
+    uint8_t r2[NDEV][STM_UB_COPIES][STM_UB_SIZE];
+    for (int i = 0; i < NDEV; i++) q4_copy_gen(b[i], 4, true, r2[i]);
+    const bool same = memcmp(r2[2], r1, sizeof r1) == 0;
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    for (int i = 0; i < NDEV; i++) q4_zero_gen(b[i], 5);
+    q4_copy_gen(b[1], 4, false, r2[1]);
+    q4_copy_gen(b[2], 4, false, r1);
+    tear_gen(b[1], 4);
+    close_bdevs(b);
+    open_bdevs(b);
+    uint64_t took = 0, w = 0;
+    stm_status st = rr_open(b, &took, &w);
+    stm_test_info("[%s] retry bytes the same %d; torn-retry open %d, "
+                  "took %llu, writes %llu", tag, (int)same, (int)st,
+                  (unsigned long long)took, (unsigned long long)w);
+    STM_ASSERT_OK(st);
+    STM_ASSERT_EQ(took, stm_load_le64(R1.ub_alloc_root.bp_paddr));
+    STM_ASSERT_EQ(w, (uint64_t)NDEV * STM_UB_COPIES);
+    STM_ASSERT(same);
+    close_bdevs(b);
+    unlink_paths();
+}
+
+/* Two devices; the final at 5 fails on device 1, then device 2 is added.
+ * The stashed reservation's roster does not name device 2, so the retry
+ * builds the reservation afresh on three devices; with the retry's final
+ * lost on devices 1 and 2 that reservation is what the pool mounts, and
+ * it opens on the three-device roster (the stash written to device 2
+ * carries a device count of two, and that open refuses). */
+static void rr_add_leg(const char *tag)
+{
+    make_paths(tag);
+    stm_bdev *b[NDEV] = {0};
+    open_bdevs(b);
+    stm_pool_open_opts po;
+    memset(&po, 0, sizeof po);
+    po.pool_uuid[0] = POOL_UUID[0];
+    po.pool_uuid[1] = POOL_UUID[1];
+    po.device_count = 2;
+    for (int i = 0; i < 2; i++) {
+        po.devices[i].uuid[0]    = DEV_UUID_LO[i];
+        po.devices[i].uuid[1]    = DEV_UUID_HI;
+        po.devices[i].size_bytes = TEST_DEVICE_BYTES;
+        po.devices[i].role       = STM_DEV_ROLE_DATA;
+        po.devices[i].class_     = STM_DEV_CLASS_SSD;
+        po.devices[i].state      = STM_DEV_STATE_ONLINE;
+        po.devices[i].bdev       = b[i];
     }
+    stm_pool *p = NULL;
+    STM_ASSERT_OK(stm_pool_open(&po, &p));
+    stm_alloc *a = NULL;
+    uint64_t du[2] = { DEV_UUID_LO[0], DEV_UUID_HI };
+    STM_ASSERT_OK(stm_alloc_create(b[0], POOL_UUID, du, TEST_BOOTSTRAP_BYTES,
+                                   &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(p, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 1 */
+    uint64_t dp = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 2, 3 */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_ERR(rr_commit_failing(s, b, false, 2u), STM_EQUORUM);
+    uint8_t f1d0[STM_UB_COPIES][STM_UB_SIZE];
+    q4_copy_gen(b[0], 5, true, f1d0);
+    stm_pool_device add = {
+        .uuid       = { DEV_UUID_LO[2], DEV_UUID_HI },
+        .size_bytes = TEST_DEVICE_BYTES,
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = b[2],
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &add));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 4, 5 */
+    stm_uberblock R2;
+    STM_ASSERT_OK(stm_sb_label_read(b[0], 0u, 4u, &R2));
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    q4_zero_gen(b[1], 5);
+    q4_zero_gen(b[2], 5);
+    q4_copy_gen(b[0], 5, false, f1d0);
+    close_bdevs(b);
+    open_bdevs(b);
+    uint64_t took = 0, w = 0;
+    stm_status st = rr_open(b, &took, &w);
+    stm_test_info("[%s] reservation's device count %u; open %d, took %llu, "
+                  "writes %llu", tag,
+                  (unsigned)stm_load_le16(R2.ub_device_count), (int)st,
+                  (unsigned long long)took, (unsigned long long)w);
+    STM_ASSERT_OK(st);
+    STM_ASSERT_EQ(stm_load_le16(R2.ub_device_count), 3u);
+    STM_ASSERT_EQ(took, stm_load_le64(R2.ub_alloc_root.bp_paddr));
+    STM_ASSERT_EQ(w, (uint64_t)NDEV * STM_UB_COPIES);
     close_bdevs(b);
     unlink_paths();
 }
@@ -5213,7 +5344,7 @@ static void rr_open_leg(const char *tag)
     STM_ASSERT_OK(stm_sync_info_get(s, &si));
     const uint64_t rg = si.current_gen - 1;
     STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
-    STM_ASSERT_ERR(rr_commit_final_on_d0(s, b), STM_EQUORUM);
+    STM_ASSERT_ERR(rr_commit_failing(s, b, false, 6u), STM_EQUORUM);
     uint8_t r1[NDEV][STM_UB_COPIES][STM_UB_SIZE];
     for (int i = 0; i < NDEV; i++) q4_copy_gen(b[i], rg, true, r1[i]);
     STM_ASSERT_EQ(q4_root(b[1], rg), q4_root(b[0], rg));
@@ -5232,9 +5363,11 @@ static void rr_open_leg(const char *tag)
 }
 
 STM_TEST(sync_multi_commit_retry_writes_its_reservation_again) {
-    rr_leg("rrdirty", true, false);
-    rr_leg("rrsame", false, false);
-    rr_leg("rrroster", false, true);
+    rr_leg("rrdirty", RR_RESERVE);
+    rr_leg("rrsame", RR_NOTHING);
+    rr_leg("rrfail", RR_FAIL);
+    rr_res_leg("rrres");
+    rr_add_leg("rradd");
     rr_open_leg("rropen");
 }
 

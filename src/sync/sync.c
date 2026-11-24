@@ -696,8 +696,10 @@ struct stm_sync {
      * these bytes again rather than a rebuild whose allocator statistics
      * or scrub state moved, so one session never leaves two contents in
      * one slot (sync_open's pick counts a torn copy as possibly holding
-     * the acknowledged one). A roster change in between rebuilds: every
-     * device written must find itself in the roster it is written. */
+     * the acknowledged one). A device added in between rebuilds: the
+     * stashed roster does not name it. A fail, rejoin, evacuation or
+     * removal moves only state bytes (a removed slot persists), so every
+     * device the retry writes is still in the stashed roster. */
     stm_uberblock     res_ub;
     uint64_t          res_ub_gen;
     bool              have_res_ub;
@@ -2438,13 +2440,14 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
      *
      * The canonical group is the one that could have been acknowledged
      * at auth_gen: its holders, the hidden devices and the unknown votes
-     * together reaching quorum. A device that confirmed a content at
-     * auth_gen still holds it there unless hidden or unknown (or a fault
-     * hit every copy): a later write of auth_gen needs an open below it,
-     * which this pick and vote 153 exclude, or the retry of the commit
-     * that wrote it, and stm_sync_commit writes a retried reservation's
-     * bytes again (a roster change between the attempts rebuilds them,
-     * OPEN-BUGS (ak)). A group of quorum holders is such a group, and then
+     * together reaching quorum. A device that confirmed an acknowledged
+     * content at auth_gen still holds it there unless hidden or unknown
+     * (or a fault hit every copy): a later write of auth_gen needs an open
+     * below it, which this pick and vote 153 exclude, or the retry of the
+     * commit that wrote it, and stm_sync_commit writes a retried
+     * reservation's bytes again (a device added between the attempts
+     * rebuilds them, OPEN-BUGS (ak)); an acknowledged final is never
+     * written again. A group of quorum holders is such a group, and then
      * no other is: the rest of the devices are fewer. Two such groups: the
      * hidden devices and the unknown votes could decide it, STM_EIO. None:
      * nothing at auth_gen was acknowledged, and the largest group (the
@@ -3288,8 +3291,8 @@ stm_status stm_sync_commit(stm_sync *s)
                          /*merkle_root=*/       s->merkle_root,
                          &astats_res);
         if (s->have_res_ub && s->res_ub_gen == reservation_gen &&
-            stm_load_le64(s->res_ub.ub_roster_hash) ==
-                stm_load_le64(res_prototype.ub_roster_hash))
+            stm_load_le16(s->res_ub.ub_device_count) ==
+                stm_load_le16(res_prototype.ub_device_count))
             res_prototype = s->res_ub;
     }
 
