@@ -41,6 +41,9 @@ serve() {
         kill -0 "$SP" 2>/dev/null || return 1
         sleep 0.1
     done
+    # A daemon that never listened is not left behind for the next one to hide.
+    kill -KILL "$SP" 2>/dev/null
+    wait "$SP" 2>/dev/null
     return 1
 }
 # A daemon that exits uncleanly has not unmounted, so a remount after it would prove nothing.
