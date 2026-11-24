@@ -44,7 +44,7 @@ Open options:
 | `queue_depth` | Async queue size. 0 → backend default (512). |
 | `fixed_buffer_bytes` | io_uring only — fixed-buffer region size. |
 | `posix_threads` | Thread-pool size on POSIX async. 0 → CPU count, capped 64. |
-| `claimed_fd` | NULL, or where a descriptor the caller holds on the device is (`stm_bdev_claim_image` gives one): that open file is the device, `path` only names it, nothing is created, and `direct` cannot be asked. A negative one stands for none. The claim refuses a disk the system is using (mounted), `STM_EBUSY` with errno `EBUSY`: macOS opens no such disk, and on Linux the claim also opens a disk exclusively (`O_EXCL`), holding the exclusion while its descriptor is open. |
+| `claimed_fd` | NULL, or where a descriptor the caller holds on the device is (`stm_bdev_claim_image` gives one): that open file is the device, `path` only names it, nothing is created, and `direct` cannot be asked. A negative one stands for none. The claim refuses a disk the system is using (mounted), `STM_EBUSY` with errno `EBUSY`: macOS opens no mounted disk's block node, and a raw node is refused when its block twin is (measured: the raw node of a mounted slice opens read-write); on Linux the claim also opens a block device exclusively (`O_EXCL`, by name, its device number checked against the first open), holding the exclusion while its descriptor is open. On a Linux block device the lock retries for up to 5 s, as systemd's block-device locking contract asks: udev holds a shared lock on a whole disk while it processes an event, which a close after a write raises. |
 
 `stm_bdev_caps` reports the backend actually selected, logical size,
 physical block size, max single-op size, whether TRIM / SQPOLL / DAX /

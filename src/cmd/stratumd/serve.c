@@ -1707,9 +1707,15 @@ static stm_status image_lock(const char *path, int *out_fd)
         fprintf(stderr, "stratumd: already open in another stratumd: %s\n", path);
         return s;
     }
-    if (s != STM_OK && s != STM_ENOENT) { /* a missing image: image_must_exist, once the options pass */
+    /* A filesystem that cannot lock is said and served; any other failure to
+     * claim it is refused, as no lock and no exclusion would be held. A
+     * missing image: image_must_exist, once the options pass. */
+    if (s == STM_ENOLCK) {
         fprintf(stderr, "stratumd: warning: cannot lock %s (%s), so nothing "
                         "stops a second daemon opening it\n", path, strerror(errno));
+    } else if (s != STM_OK && s != STM_ENOENT) {
+        fprintf(stderr, "stratumd: cannot open %s: %s\n", path, strerror(errno));
+        return s;
     }
     return STM_OK;
 }

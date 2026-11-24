@@ -2,8 +2,9 @@
 # A disk formatted end to end. A disk cannot be resized, so stratum-mkfs formats it whole: it refuses
 # a --size that is not the disk's before it reads the disk, and writes nothing; it refuses to keep a
 # disk's key in /dev; the pool it makes serves, takes a file and gives it back after a remount; a disk
-# whose size is no multiple of 64 KiB formats too; and a disk the system has mounted is refused,
-# --force or not, by mkfs and by the daemon.
+# whose size is no multiple of 64 KiB formats too; a disk the system has mounted is refused, --force
+# or not, by mkfs and by the daemon (on macOS through its raw node too); and on Linux a claim waits
+# out a moment's shared lock, as udev takes.
 #
 # The disks are made by this run and taken away again: RAM disks on macOS (hdiutil, no root), loop
 # devices on Linux, which need root, or STRATUM_TEST_SUDO=1 and sudo without a password (asked for
@@ -134,6 +135,10 @@ serve() {
         kill -0 "$SP" 2>/dev/null || { SP=; return 1; }
         sleep 0.1
     done
+    # A daemon that never listened is not left behind for the next one to hide.
+    kill -KILL "$SP" 2>/dev/null
+    wait "$SP" 2>/dev/null
+    SP=
     return 1
 }
 # A daemon that exits uncleanly has not unmounted, so a remount after it would prove nothing.
@@ -207,14 +212,34 @@ else
     no "mkfs --size 32M --force over the pool: rc=$rc: $(tail -1 "$D/m3.log"); serve: $(tail -1 "$D/serve.log")"
 fi
 
-# The disk's own size named: formatted (over the pool, so forced).
+# The disk's own size named: formatted anew (over the pool, so forced): /disk.txt is gone.
 printf '%s\n' "$PASS" | MKFS "$A" --size "$BYTES" --keyfile "$K" --passphrase-stdin --force > "$D/m4.log" 2>&1
 rc=$?
-if [ "$rc" = 0 ] && serve "$A"; then
-    ok "a --size that is the disk's formats it"
+if [ "$rc" = 0 ] && LC_ALL=C grep -q "formatting $A ($BYTES bytes)" "$D/m4.log" && serve "$A"; then
+    if FS -s "$S" read /disk.txt > /dev/null 2>&1; then
+        no "after a format of the disk's own size /disk.txt is still there"
+    else
+        ok "a --size that is the disk's formats it anew"
+    fi
     stop
 else
     no "mkfs --size $BYTES --force: rc=$rc: $(tail -1 "$D/m4.log")"
+fi
+
+# udev holds a shared lock on a whole disk while it processes an event, which a close after a
+# write raises; a claim waits that out rather than take udev for a running daemon.
+if [ "$OS" = Linux ]; then
+    flock --shared "$A" sleep 1 &
+    FP=$!
+    sleep 0.2
+    printf '%s\n' "$PASS" | MKFS "$A" --keyfile "$K" --passphrase-stdin --force > "$D/m4b.log" 2>&1
+    rc=$?
+    wait "$FP" 2>/dev/null
+    if [ "$rc" = 0 ] && LC_ALL=C grep -q "formatting $A ($BYTES bytes)" "$D/m4b.log"; then
+        ok "a disk under a moment's shared lock, as udev takes, is formatted once it is let go"
+    else
+        no "mkfs under a moment's shared lock: rc=$rc: $(tail -1 "$D/m4b.log")"
+    fi
 fi
 
 # 300000 sectors: no multiple of 64 KiB, so a sixteenth of it is no whole number of 4 KiB blocks
@@ -250,6 +275,18 @@ if attach $SECTORS_B; then
             ok "a disk the system has mounted is not formatted, --force or not"
         else
             no "mkfs --force of a mounted disk: rc=$rc: $(tail -1 "$D/m6.log")"
+        fi
+        # macOS opens the raw node of a mounted disk read-write (measured); its block twin it refuses.
+        if [ "$OS" = Darwin ]; then
+            R=/dev/r${E#/dev/}
+            printf '%s\n' "$PASS" | MKFS "$R" --keyfile "$K" --passphrase-stdin --force > "$D/m6r.log" 2>&1
+            rc=$?
+            if [ "$rc" != 0 ] && LC_ALL=C grep -q "the system is using" "$D/m6r.log" \
+                    && mount | LC_ALL=C grep -q "^$E "; then
+                ok "the raw node of a disk the system has mounted is not formatted"
+            else
+                no "mkfs --force of the raw node $R of a mounted disk: rc=$rc: $(tail -1 "$D/m6r.log")"
+            fi
         fi
         if serve "$E"; then
             no "the daemon served a disk the system has mounted"
