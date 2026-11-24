@@ -16,6 +16,7 @@
 #if !defined(__thylacine__)
 #  include <sys/file.h>
 #  include <sys/ioctl.h>
+#  include <sys/stat.h>
 #  if defined(__APPLE__)
 #    include <sys/disk.h>
 #  elif defined(__linux__)
@@ -351,13 +352,39 @@ stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd)
 #if !defined(__thylacine__)
     /* Read-write where it can be: over NFS, flock is a byte-range lock, and an
      * exclusive one needs the file open for writing. */
-    int flags = O_CLOEXEC | (create ? O_CREAT | O_EXCL : 0);
+    int flags = O_CLOEXEC | O_NOCTTY | (create ? O_CREAT | O_EXCL : 0);
     int fd = open(path, O_RDWR | flags, 0600);
+    /* A disk the system has mounted: macOS refuses any open of it. */
+    if (fd < 0 && errno == EBUSY) return STM_EBUSY;
+#if defined(__linux__)
+    bool rw = fd >= 0;
+#endif
     /* Whatever refuses writing (EACCES, EROFS, EPERM on an immutable file, ETXTBSY)
      * still leaves a read-only open, and so the lock. */
     if (fd < 0 && errno != ENOENT && errno != EISDIR && errno != EEXIST)
         fd = open(path, O_RDONLY | flags, 0600);
     if (fd < 0) return errno == ENOENT ? STM_ENOENT : STM_EIO;
+#if defined(__linux__)
+    /* Linux opens a mounted disk read-write; only an exclusive open is refused
+     * it (EBUSY), and the exclusion is held while that descriptor is open. */
+    struct stat st;
+    if (rw && fstat(fd, &st) == 0 && S_ISBLK(st.st_mode)) {
+        char self[32];
+        snprintf(self, sizeof self, "/proc/self/fd/%d", fd);
+        int x = open(self, O_RDWR | O_EXCL | O_CLOEXEC);
+        if (x < 0) {
+            int e = errno;
+            /* Held by another claim, which holds the lock as well, or by the system. */
+            if (e == EBUSY && flock(fd, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK)
+                e = EWOULDBLOCK;
+            close(fd);
+            errno = e;
+            return e == EBUSY || e == EWOULDBLOCK ? STM_EBUSY : STM_EIO;
+        }
+        close(fd);
+        fd = x;
+    }
+#endif
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         int e = errno;
         close(fd);
