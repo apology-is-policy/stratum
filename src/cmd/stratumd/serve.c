@@ -1696,9 +1696,9 @@ static stm_status stratumd_run_provision(const stm_stratumd_opts *opts, const in
  * the pool is lost. A volume is a file or a disk, so opening it twice takes
  * only two windows; a disk the system has mounted is another writer.
  */
-static stm_status image_lock(const char *path, int *out_fd)
+static stm_status image_lock(const char *path, int *out_fd, int *out_hold_fd)
 {
-    stm_status s = stm_bdev_claim_image(path, false, out_fd);
+    stm_status s = stm_bdev_claim_image(path, false, out_fd, out_hold_fd);
     if (s == STM_EBUSY && errno == EBUSY) {
         fprintf(stderr, "stratumd: a disk the system is using (mounted?): %s\n", path);
         return s;
@@ -1707,10 +1707,17 @@ static stm_status image_lock(const char *path, int *out_fd)
         fprintf(stderr, "stratumd: already open in another stratumd: %s\n", path);
         return s;
     }
+    if (s == STM_ESTALE) {
+        fprintf(stderr, "stratumd: %s led to another device between two opens of it\n", path);
+        return s;
+    }
     /* A filesystem that cannot lock is said and served; any other failure to
      * claim it is refused, as no lock and no exclusion would be held. A
      * missing image: image_must_exist, once the options pass. */
-    if (s == STM_ENOLCK) {
+    if (s == STM_ENOLCK && *out_fd >= 0) {
+        fprintf(stderr, "stratumd: warning: cannot lock %s (%s); it is held open "
+                        "exclusively, which keeps a second daemon out\n", path, strerror(errno));
+    } else if (s == STM_ENOLCK) {
         fprintf(stderr, "stratumd: warning: cannot lock %s (%s), so nothing "
                         "stops a second daemon opening it\n", path, strerror(errno));
     } else if (s != STM_OK && s != STM_ENOENT) {
@@ -1827,14 +1834,16 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
     if (!opts || !opts->socket_path)
         return STM_EINVAL;
     int lock_fd = -1;
+    int lock_hold_fd = -1;
     if (opts->fs_path) {
-        stm_status s = image_lock(opts->fs_path, &lock_fd);
+        stm_status s = image_lock(opts->fs_path, &lock_fd, &lock_hold_fd);
         if (s != STM_OK) return s;
     }
     /* The mount goes through the descriptor the lock is on: the image served is the
      * one that is locked, wherever its name leads by the time it is mounted. */
     stm_status rc = stratumd_run_locked(opts, &lock_fd);
     if (lock_fd >= 0) close(lock_fd);
+    if (lock_hold_fd >= 0) close(lock_hold_fd);
     return rc;
 }
 
