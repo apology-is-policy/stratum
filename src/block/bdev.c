@@ -228,7 +228,8 @@ stm_status stm_bdev_read(stm_bdev *d, uint64_t offset, void *buf, size_t len)
     if (inject_read_should_fail(d)) return STM_EIO;
     rr_fault f;
     if (inject_read_range(d, offset, len, &f)) {
-        if (f.kind == RR_FROM) return d->ops->read(d, f.at, buf, len);
+        if (f.kind == RR_FROM)
+            return span_fits(d, f.at, len) ? d->ops->read(d, f.at, buf, len) : STM_EIO;
         if (f.answer != STM_OK) return f.answer;
         stm_status s = d->ops->read(d, offset, buf, len);
         if (s == STM_OK) {

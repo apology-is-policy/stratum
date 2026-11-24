@@ -305,7 +305,9 @@ Two residuals (Area F focused audit, P3, both v1.0-acceptable):
   lost); a wait the kernel fails (`arm=irq-wait`) and a used ring moved by
   two (`arm=used-idx`), each re-initing the device and re-submitting; and the
   `slow` and `irq-late` lines capped apart, with a request that never ends
-  named every 300 s past the cap.
+  named every 300 s past the cap; and a read past the device's end failing
+  `STM_EIO` in `bdev.c` with no request sent (the driver's own sector bound
+  answers `STM_EINVAL`).
 - **Thylacine** -- the driver's happy path runs on every boot (the live
   stratumd drives virtio-blk through `do_request` -> `do_request_once`).
   The request-error path (X9) is verified on

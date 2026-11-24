@@ -605,4 +605,24 @@ STM_TEST(bdev_thylacine_a_request_that_never_ends_is_still_named) {
     stm_bdev_close(bd);
 }
 
+/* A read past the device's end fails STM_EIO in bdev.c, as on every backend,
+ * and sends the device no request (the driver's own sector bound answers
+ * STM_EINVAL); one ending at the end reaches the device. */
+STM_TEST(bdev_thylacine_a_read_past_the_end_fails_eio_with_no_request) {
+    stm_bdev *bd = fake_open();
+    if (!bd) return;
+    const stm_bdev_caps *caps = stm_bdev_caps_of(bd);
+    STM_ASSERT(caps != NULL);
+    if (!caps) { stm_bdev_close(bd); return; }
+    const uint64_t size = caps->size_bytes;
+    STM_ASSERT_EQ(size, (uint64_t)0x200000u * 512u);
+    uint32_t before = F.notifies;
+    STM_ASSERT_ERR(stm_bdev_read(bd, size, g_buf, sizeof g_buf), STM_EIO);
+    STM_ASSERT_ERR(stm_bdev_read(bd, size - 2048u, g_buf, sizeof g_buf), STM_EIO);
+    STM_ASSERT_EQ(F.notifies, before);
+    STM_ASSERT_OK(stm_bdev_read(bd, size - sizeof g_buf, g_buf, sizeof g_buf));
+    STM_ASSERT_EQ(F.notifies, before + 1u);
+    stm_bdev_close(bd);
+}
+
 STM_TEST_MAIN("bdev_thylacine")
