@@ -1470,4 +1470,50 @@ STM_TEST(bootstrap_reserve_refused_while_staged_and_oversized) {
     unlink(g_tmp_path);
 }
 
+/* Round 2 F5: a free made before the pass is a pending entry. _end keeps
+ * its node allocated and frees the unmarked orphan beside it; a reserve
+ * pinned at the freed node gets another, and the commit that releases the
+ * entry frees the node without touching that reserve. Swept, the freed
+ * node went to the reserve and the releasing commit cleared it under it.
+ * Control, one variable away: not freed, the same unmarked node is an
+ * orphan, swept, and the pinned reserve takes it. */
+STM_TEST(bootstrap_reconcile_keeps_a_pending_free) {
+    for (int pend = 0; pend < 2; pend++) {
+        make_tmp("recon_pend");
+        stm_bdev *d = open_fresh_device();
+        stm_bootstrap *a = make_fresh_alloc(d);
+        uint64_t live = 0, orphan = 0, gone = 0;
+        STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &live));
+        STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &orphan));
+        STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &gone));
+        STM_ASSERT_OK(stm_bootstrap_commit(a, 1));
+        if (pend)
+            STM_ASSERT_OK(stm_bootstrap_free(a, gone, TEST_NODE_BLOCKS, 2));
+        STM_ASSERT_OK(stm_bootstrap_reconcile_begin(a));
+        STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, live, TEST_NODE_BLOCKS));
+        uint64_t freed = 0;
+        STM_ASSERT_OK(stm_bootstrap_reconcile_end(a, &freed));
+        STM_ASSERT_EQ(freed, pend ? 1u : 2u);
+        stm_bootstrap_stats st;
+        STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+        STM_ASSERT_EQ(st.pending_nodes, pend ? 1u : 0u);
+        STM_ASSERT_EQ(st.allocated_nodes, pend ? 2u : 1u);
+        uint64_t q = 0;
+        STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, gone, &q));
+        STM_ASSERT_EQ(q == gone, pend == 0);
+        STM_ASSERT_OK(stm_bootstrap_commit(a, 3));
+        bool al = false;
+        STM_ASSERT_OK(stm_bootstrap_is_allocated(a, q, &al));
+        STM_ASSERT(al);
+        STM_ASSERT_OK(stm_bootstrap_is_allocated(a, gone, &al));
+        STM_ASSERT_EQ(al, pend == 0);
+        STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+        STM_ASSERT_EQ(st.pending_nodes, 0u);
+        STM_ASSERT_EQ(st.allocated_nodes, 2u);
+        stm_bootstrap_close(a);
+        stm_bdev_close(d);
+        unlink(g_tmp_path);
+    }
+}
+
 STM_TEST_MAIN("bootstrap")

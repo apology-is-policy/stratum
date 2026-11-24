@@ -4581,4 +4581,129 @@ STM_TEST(sync_multi_open_refuses_a_disagreeing_minority_at_auth_gen) {
     STM_ASSERT_ERR(r.open, STM_EQUORUM);
 }
 
+/* Round 2 F1: device 1's every ring copy reads back zero once, then fails
+ * for ever. It settles unreadable, an unknown vote, so the open refuses
+ * STM_EIO (vote 153) and writes nothing, and device 1's acknowledged gen 3
+ * stays. Counted a known vote of nothing, the votes {3, 2} gave auth 2 and
+ * the claim overwrote gen 3. */
+STM_TEST(sync_multi_open_counts_a_device_read_zero_then_unreadable_unknown) {
+    make_paths("zfailopen");
+    quorum_build(true);
+    uint64_t root3 = 0;
+    {
+        stm_bdev *bds[NDEV] = {0};
+        open_bdevs(bds);
+        stm_uberblock u;
+        STM_ASSERT_OK(stm_sb_label_read(bds[1], 0u, 3u, &u));
+        root3 = stm_load_le64(u.ub_alloc_root.bp_paddr);
+        close_bdevs(bds);
+    }
+    STM_ASSERT(root3 != 0);
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    for (uint32_t li = 0; li < STM_UB_COPIES; li++) {
+        uint64_t lo = gen_copy_off(0, li);
+        uint64_t hi = lo + (uint64_t)STM_UB_SLOTS_PER_LABEL * STM_UB_SIZE;
+        stm_bdev_inject_read_range_zero(bds[1], lo, hi, STM_UB_SLOTS_PER_LABEL);
+        stm_bdev_inject_read_range(bds[1], lo, hi, -1, STM_EIO);
+    }
+    stm_pool *pool = make_multi_pool(bds);
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a));
+    uint64_t w0 = total_writes(bds);
+    stm_sync *s = NULL;
+    stm_status op = stm_sync_open(pool, a, make_wk(), NULL, NULL, &s);
+    uint64_t writes = total_writes(bds) - w0;
+    if (op == STM_OK) stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    stm_bdev_inject_read_range_clear(bds[1]);
+    uint64_t after = 0;
+    stm_uberblock u;
+    if (stm_sb_label_read(bds[1], 0u, 3u, &u) == STM_OK &&
+        stm_load_le64(u.ub_gen) == 3u)
+        after = stm_load_le64(u.ub_alloc_root.bp_paddr);
+    close_bdevs(bds);
+    STM_ASSERT_ERR(op, STM_EIO);
+    STM_ASSERT_EQ(writes, 0u);
+    STM_ASSERT_EQ(after, root3);
+    unlink_paths();
+}
+
+/* Round 2 F5: an alloc carried over from an earlier session, not
+ * reopened, holds the frees its last commits left pending when the attach
+ * reconciles it. The sweep keeps their nodes allocated for the commit
+ * that releases them: the attach changes nothing on its bootstrap, the
+ * commits after it keep every node of the tree allocated, and the pool
+ * remounts and commits. Swept, the entries named free nodes that the next
+ * stage cleared again under whatever reserve took them. Control, one
+ * variable away: the alloc reopened blank, whose open never saw those
+ * frees, has them reclaimed. */
+static void attach_carried_over_leg(bool reopen, const char *tag)
+{
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL;
+    stm_sync *s = NULL;
+    g_dev_bytes = UINT64_C(128) * 1024u * 1024u;
+    setup_mirror_pool(2, tag, bds, as, &pool, &s);
+    grow_dev1_tree(as[1], s);
+    stm_bootstrap_stats before, after;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(stm_alloc_bootstrap(as[1]), &before));
+    STM_ASSERT(before.pending_nodes > 0);
+    stm_sync_close(s);
+    stm_alloc_close(as[0]);
+    STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &as[0]));
+    STM_ASSERT_OK(stm_alloc_set_device_id(as[0], 0));
+    for (size_t i = 1; reopen && i < NDEV; i++) {
+        stm_alloc_close(as[i]);
+        STM_ASSERT_OK(stm_alloc_open_blank(bds[i], &as[i]));
+        STM_ASSERT_OK(stm_alloc_set_device_id(as[i], (uint16_t)i));
+    }
+    stm_sync *rs = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool, as[0], make_wk(), NULL, NULL, &rs));
+    STM_ASSERT_OK(stm_sync_attach_alloc(rs, 1u, as[1]));
+    STM_ASSERT_OK(stm_sync_attach_alloc(rs, 2u, as[2]));
+    STM_ASSERT_OK(stm_bootstrap_stats_get(stm_alloc_bootstrap(as[1]), &after));
+    if (reopen) {
+        STM_ASSERT_EQ(after.pending_nodes, 0u);
+        STM_ASSERT(after.allocated_nodes < before.allocated_nodes);
+    } else {
+        STM_ASSERT_EQ(after.pending_nodes, before.pending_nodes);
+        STM_ASSERT_EQ(after.allocated_nodes, before.allocated_nodes);
+    }
+    for (int round = 0; round < 4; round++) {
+        for (int i = 0; i < 300; i++) {
+            uint64_t p = 0;
+            if (stm_alloc_reserve(as[1], 1u, 0, &p) != STM_OK) break;
+        }
+        STM_ASSERT_OK(stm_sync_commit(rs));
+        g_tree_n = 0;
+        g_tree_units = 0;
+        STM_ASSERT_OK(stm_alloc_reconcile_mark(as[1], collect_tree_paddr, NULL));
+        STM_ASSERT(g_tree_n > 0);
+        STM_ASSERT_EQ(tree_nodes_free(as[1]), 0u);
+    }
+    stm_sync_close(rs);
+    close_multi_allocs(as);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+    stm_bdev *rb[NDEV] = {0};
+    stm_alloc *ra[NDEV] = {0};
+    stm_pool *rp = NULL;
+    stm_sync *rs2 = NULL;
+    STM_ASSERT_OK(reopen_from_roster(false, 0, rb, ra, &rp, &rs2));
+    if (rs2) {
+        STM_ASSERT_OK(stm_sync_commit(rs2));
+        close_reopened(rb, ra, rp, rs2);
+    }
+    unlink_paths();
+    g_dev_bytes = TEST_DEVICE_BYTES;
+}
+
+STM_TEST(sync_multi_attach_keeps_a_carried_over_allocs_pending_frees) {
+    attach_carried_over_leg(true, "cofresh");
+    attach_carried_over_leg(false, "cocarry");
+}
+
 STM_TEST_MAIN("sync_multi")

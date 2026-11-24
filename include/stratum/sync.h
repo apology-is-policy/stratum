@@ -551,7 +551,9 @@ uint64_t stm_sync_reconcile_freed_nodes(const stm_sync *s);
  * it holds): orphans are reclaimed, and nodes of the tree a bitmap the
  * alloc's open could not confirm (stm_bootstrap_bitmap_unconfirmed)
  * marks free are taken back. A pass that does not complete fails the
- * attach, with the pass's error, only over such a bitmap.
+ * attach, with the pass's error, only over such a bitmap. An alloc
+ * carried over from an earlier session, not reopened, keeps the frees
+ * its commits left pending allocated until a commit releases them.
  *
  * Returns STM_EEXIST if a slot is already filled for device_id.
  * Returns STM_EINVAL on range / shape violations.

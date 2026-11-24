@@ -1272,8 +1272,11 @@ void stm_bootstrap_commit_defer_cancel(stm_bootstrap *a)
 /* The bootstrap-backed trees to walk (the completeness checklist for the      */
 /* sync-layer driver, a separate chunk): alloc (per device) + alloc_roots +    */
 /* keyschema + repair_log + cas + dataset + snapshot + engine_store. The pass  */
-/* must run at mount BEFORE any free, so pending_head is empty (this format    */
-/* does no pending rebuild on open) and the sweep need not touch it.           */
+/* runs before any reserve: the sweep cannot tell a reserve made since the     */
+/* last commit from an orphan. A free made since is a pending entry, and _end  */
+/* counts its nodes named: the commit that releases the entry clears them,     */
+/* and cleared here first the entry would name free nodes, which the next      */
+/* stage clears again under whatever reserve took them meanwhile.              */
 /* ========================================================================= */
 
 stm_status stm_bootstrap_reconcile_begin(stm_bootstrap *a)
@@ -1337,6 +1340,16 @@ bool stm_bootstrap_reconcile_entry_stale(const stm_bootstrap *a, uint64_t paddr)
 stm_status stm_bootstrap_reconcile_end(stm_bootstrap *a, uint64_t *out_freed_nodes)
 {
     if (!a || !a->reconcile_marked) return STM_EINVAL;
+    for (const pending_entry *e = a->pending_head; e; e = e->next) {
+        uint64_t first = 0;
+        if (!paddr_to_node(a, e->paddr, &first)) {
+            stm_bootstrap_reconcile_abort(a);
+            return STM_ECORRUPT;
+        }
+        uint64_t nnodes = e->nblocks / (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
+        for (uint64_t i = 0; i < nnodes; i++)
+            bit_set(a->reconcile_marked, first + i);
+    }
     uint64_t freed = 0, restored = 0;
     for (uint64_t node = 0; node < a->total_nodes; node++) {
         bool named = bit_is_set(a->reconcile_marked, node) ||

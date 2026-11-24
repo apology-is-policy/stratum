@@ -2424,10 +2424,10 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
      *     MountKeepsPublished): STM_EQUORUM. Ahead-of-auth devices are
      *     orphans that the next commit's writes will overwrite.
      *
-     * Dissenting devices at auth_gen that aren't in the quorum group
-     * are legitimate orphans per ARCH §5.8 — they'll be overwritten
-     * on the next commit's per-device writes. Tolerating minority
-     * disagreement here (instead of failing STM_ECORRUPT like the
+     * Dissenting devices at auth_gen beside a quorum group there are
+     * legitimate orphans (ARCH section 5.8): the next commit's
+     * per-device writes overwrite them. Tolerating that dissent
+     * (instead of failing STM_ECORRUPT like the
      * strict pre-R14 check) lets the impl recover from R14 P1's
      * non-idempotent-retry divergence without operator intervention,
      * and is the spec-compliant behavior per quorum.tla's

@@ -210,6 +210,12 @@ sync-layer driver `sync_reconcile_bootstrap`:
   driver may feed every paddr a tree walk yields.
 - `end` frees every ALLOCATED-but-UNMARKED node (the orphans), reports the
   count, and the freed bits become durable on the next `stm_bootstrap_commit`.
+  A node on the in-RAM pending list counts as marked: the commit past its
+  `free_gen` releases it, and swept first, its entry would name a free node,
+  which that commit clears again under whatever reserve took it (an alloc
+  carried over to a later session's attach holds such entries; Stratum (r)
+  round 2 F5). A reserve made since the last commit cannot be told from an
+  orphan, so the pass runs before any.
 - `abort` drops the marked-bitmap WITHOUT sweeping: the fail-safe when a mark
   pass could not complete (an incomplete mark must never free a live node).
 - `end` also takes back every node a tree names that the bitmap calls free
@@ -529,7 +535,7 @@ carries a dirty flag; a clean-state commit returns the cached
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_bootstrap` | 22 | Bootstrap-pool format (v2), open-roundtrip, node- and 8-node-unit reserve/free/commit, bitmap ping-pong, torn-write recovery (incl. a flip in the last block of the 14-block region), capacity boundaries, the widened bitmap region carrying a >32768-node pool (high-index bit round-trip), and `STM_ENOTSUPPORTED` past `STM_BOOTSTRAP_MAX_NODES`. |
+| `test_bootstrap` | 37 | Bootstrap-pool format (v2), open-roundtrip, node- and 8-node-unit reserve/free/commit, bitmap ping-pong, torn-write recovery (incl. a flip in the last block of the 14-block region), capacity boundaries, the widened bitmap region carrying a >32768-node pool (high-index bit round-trip), and `STM_ENOTSUPPORTED` past `STM_BOOTSTRAP_MAX_NODES`; the mount-time reconcile frees unmarked nodes, keeps marked runs whole, and keeps a pending free's node allocated for the commit that releases it (control: not freed, the node is an orphan and swept). |
 | `test_alloc` | 32 | Tree insertion order, gap-scan reserve, free-then-pending, commit-sweeps-pending, refcount transitions, double-free rejected, full-tree scan, stats, accel is_allocated consistency, device_id stamping, set_device_id-refused-after-reserve, first_allocated + first_allocated_from basic cases, corrupt-tree-entry → STM_ECORRUPT, **first_allocated_from boundary cases** (R20 P3-2 close: NULL args; `min_start_block ≥ 2^48` → STM_EINVAL; empty tree; inclusive lower bound at exact start_block; cursor past end-of-range → next entry; cursor mid-range → next entry by start_block; PENDING-skip; cursor below first entry returns leftmost). |
 | `test_alloc_roots` | 10 | Roots-object set/get/count/iter/commit/load roundtrip; idempotent commit; tamper detection (wrong csum / wrong key / wrong gen). |
 | `test_sync_multi` (indirectly) | — | Exercises `stm_alloc_set_device_id`, multi-alloc attach, roots-object load, mirror reservation across devices. |

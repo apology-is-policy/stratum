@@ -30,7 +30,7 @@ chapter as specs get wider cross-reference tables).
 | `allocator.tla` | 3 | Refcount + deferred-free; unreserve; a send's hold on its blocks. | 24501221 distinct states, depth 29 (3 ranges, 3 owners, MaxGen 3) | `allocator_unreserve_after_write_buggy.cfg`, `allocator_send_sweep_ignores_pins_buggy.cfg`, `allocator_send_sweep_ignores_barrier_buggy.cfg`, `allocator_send_barrier_by_free_gen_buggy.cfg`, `allocator_send_free_before_deindex_buggy.cfg` |
 | `merkle.tla` | 4 | Per-node Merkle chain. | bounded | — |
 | `key_schema.tla` | 7 / TLY-A3 | Per-dataset key state machine + TLY-A3-keyslot mount machine (`wrapper_identity` + mount FSM + `MountResolvesKeyBeforeData`) + TLY-A3-keyslot-wrap UNWRAP-binding: `unwrap_path` tracking + `UnwrapUsesWrapBinding` — a mount that resolves a CORVUS slot sends corvus the same dataset-path binding the slot's WRAP recorded; a mismatch makes corvus reject the envelope → unmountable pool. | bounded | `key_schema_mount_serve_before_resolve_buggy.cfg`, `key_schema_unwrap_wrong_path_buggy.cfg` |
-| `quorum.tla` | 5 | Multi-device commit + mount-claim; the mount reads the ONLINE devices (vote 153) and picks content as the open does. | 2510 distinct states; `quorum_faults.cfg` (one fault) 23068; `quorum_pick.cfg` (four devices, one fault) 35114 | `quorum_buggy.cfg`, `quorum_mount_buggy.cfg`, `quorum_pick_buggy.cfg` |
+| `quorum.tla` | 5 | Multi-device commit + mount-claim; the mount reads the ONLINE devices (vote 153) and picks content as the open does. | 2510 distinct states; `quorum_faults.cfg` (one fault) 23068; `quorum_pick.cfg` (four devices, one fault, three commits) 148330 | `quorum_buggy.cfg`, `quorum_mount_buggy.cfg`, `quorum_pick_buggy.cfg` |
 | `metadata_nonce.tla` | 5 | Per-device paddr-stamping for nonces. | 51939 states | `metadata_nonce_buggy.cfg` |
 | `device_lifecycle.tla` | 5 | Roster state machine (add/remove/fail/rejoin). | large cfg: 10.6M states at depth 21 | `device_lifecycle_buggy.cfg` |
 | `evac.tla` | 5 | Per-block evacuation atomicity. | 13 states, depth 5 | `evac_buggy.cfg`, `evac_remove_no_drain_buggy.cfg` |
@@ -286,8 +286,11 @@ record the last acknowledged final or claim; `MountKeepsPublished`: no
 mount takes a gen below it, or at its gen another content.
 `MountAtAuthoritative` is kept and is stricter (a rollback past a
 reservation, which loses nothing, breaks it). `quorum_pick.cfg` (four
-devices, quorum 3, one fault) holds every invariant but
-`ContentQuorumAtGen`; `quorum_pick_buggy.cfg` (`MinorityMustAgree=FALSE`,
+devices, quorum 3, one fault, three commits) holds every invariant but
+`ContentQuorumAtGen`; with two commits no state has a disagreeing
+minority at the mount's gen after an acknowledged final, so the third
+is what tests `MountKeepsPublished` against a published final there;
+`quorum_pick_buggy.cfg` (`MinorityMustAgree=FALSE`,
 the open before the fix) fails `MountKeepsPublished`: an orphan final
 beside the acknowledged claim at the mount's gen, and the mount picks
 the orphan. The model keeps each device's newest uberblock only, so it
