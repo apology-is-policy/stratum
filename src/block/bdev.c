@@ -572,6 +572,22 @@ void stm_bdev_iouring_fail_submit_for_test(stm_bdev *d, int errnum, unsigned cou
 #endif
 }
 
+unsigned stm_bdev_iouring_short_for_test(stm_bdev *d, size_t max_bytes, unsigned count)
+{
+#if STM_HAVE_IOURING
+    if (d && d->caps.backend == STM_BDEV_BACKEND_IOURING)
+        return stm_iouring_short_entries(d, max_bytes, count);
+#else
+    (void)d; (void)max_bytes; (void)count;
+#endif
+    return 0;
+}
+
+void stm_bdev_posix_alloc_budget_for_test(stm_bdev *d, int budget)
+{
+    if (d && d->caps.backend == STM_BDEV_BACKEND_POSIX) stm_posix_alloc_budget(d, budget);
+}
+
 void stm_bdev_io_stats(const stm_bdev *d, uint64_t *writes,
                        uint64_t *write_bytes, uint64_t *fsyncs)
 {

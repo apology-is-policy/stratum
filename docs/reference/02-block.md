@@ -127,8 +127,20 @@ as the synchronous write does, and the callback never runs.
 callback runs with `STM_EIO` and no bytes before the call returns
 `STM_OK` (as `stm_bdev_submit_fsync` on a read-only device completes at
 once with `STM_OK`). A read inside the size but past a file cut under
-the handle still reaches the backend: posix completes it `STM_EIO`,
-io_uring `STM_OK` with fewer bytes (OPEN-BUGS (w)).
+the handle still reaches the backend, and fails `STM_EIO` with no bytes
+on every backend.
+
+A read or write completes whole or fails: on `STM_OK`, `bytes` is the
+length asked. posix's worker loops `pread`/`pwrite` as the synchronous
+path does; io_uring puts back what is left of a transfer the kernel did
+part of (the op keeps its slot and stays in flight) and fails one that
+moves nothing with bytes left `STM_EIO` (the end of a file cut under the
+handle). Before OPEN-BUGS (w) io_uring completed a short transfer
+`STM_OK` with fewer bytes. Every op a submit takes completes exactly
+once: posix allocates an op's completion with it at the submit, so
+memory that runs out refuses the submit `STM_ENOMEM` (before OPEN-BUGS
+(x) a completion whose allocation failed was dropped, and a waiter for it
+hung).
 
 So a completion may run on the submitting thread before the submit
 returns, and then leaves nothing for `stm_bdev_poll_completions` or
@@ -157,14 +169,17 @@ Three source files under `src/block/`:
   a file-sized change.
 - `posix.c` — POSIX backend. Sync ops use `pread`/`pwrite`. Async is
   simulated via a fixed thread pool that drains an internal queue;
-  completion delivery is via per-device lockless queue + condvar.
+  completion delivery is via per-device lockless queue + condvar. An
+  op's one allocation, made at the submit, carries it through both
+  queues.
   Its sizing (`op_current_size`) fstats a regular file.
   Its fsync on macOS is `F_FULLFSYNC` for a file; a disk answers that
   ENOTTY, so a disk's is `fsync` then `DKIOCSYNCHRONIZECACHE`.
 - `iouring.c` — Linux io_uring backend. Sync ops issue a single SQE,
   wait in the same thread for its CQE. Async ops submit + return,
   driving completion via user-thread `poll_completions` +
-  `wait_completion`. Optional SQPOLL + fixed buffers when the kernel
+  `wait_completion`; the thread reaping a short transfer's CQE submits
+  its rest, for a sync op as for an async one. Optional SQPOLL + fixed buffers when the kernel
   supports it.
 
 The vtable has one entry per operation — `open`, `close`, `caps`,
@@ -241,7 +256,7 @@ by bdev's contract:
 | Suite | Coverage |
 |---|---|
 | `test_bdev` (see `tests/test_bdev.c`) | Sync roundtrip on file-backed bdev; caps sanity; resize; discard (no-op on file); a read past the end of a file cut under the handle, inside the handle's size, `STM_EIO` from the backend (a partial read that then meets the end, and one wholly past it; one ending at the cut read); a read past the handle's size fails `STM_EIO` before the backend though the file holds bytes there (grown under the handle; wholly past, straddling, wrapping past 2^64), reading nothing and observed by no I/O observer, a read ending at the end and one of no bytes past it accepted, an armed read failure not taken, counted or ranged; a write past the end refused `STM_EINVAL` (a new file's 0 bytes, straddling, wholly past, wrapping past 2^64), counted as no write, the file and caps unchanged, a write ending at the end accepted, read-only answering `STM_EROFS` first. |
-| `test_bdev_async` (see `tests/test_bdev_async.c`) | Async submit + poll_completions on POSIX backend; fsync ordering; submit queue saturation; a submit past the end refused at the call with no callback, one ending at the end completing, a write of no bytes past the end fitting, sync and async; a read past the end of a file cut under the handle reaching the backend (no callback before the submit returns) and completing with an error or short bytes; a read past the handle's size (wholly past, straddling, wrapping past 2^64) completing at once with `STM_EIO`, no bytes and kind `STM_OP_READ`, its callback run once, before the submit returns, its buffer never written, though the file holds bytes there, one ending at the end completing. |
+| `test_bdev_async` (see `tests/test_bdev_async.c`) | Async submit + poll_completions on POSIX backend; fsync ordering; submit queue saturation; a submit past the end refused at the call with no callback, one ending at the end completing, a write of no bytes past the end fitting, sync and async; a read past the end of a file cut under the handle reaching the backend (no callback before the submit returns) and failing `STM_EIO` with no bytes on every backend; reads and writes the kernel does 512 bytes at a time (`stm_bdev_iouring_short_for_test`, io_uring) completing once, whole, async and sync, every short entry used; an op the posix backend took completing with no allocation left after its submit (`stm_bdev_posix_alloc_budget_for_test`), and a submit with none left refused `STM_ENOMEM`; a read past the handle's size (wholly past, straddling, wrapping past 2^64) completing at once with `STM_EIO`, no bytes and kind `STM_OP_READ`, its callback run once, before the submit returns, its buffer never written, though the file holds bytes there, one ending at the end completing. |
 | `test_crash_inject` (separate module) | Uses `stm_bdev_inject_fail_after` to force write/fsync failures and verify sync's rollback + remount paths converge. ~168 cycles; TSan timeout 180s. |
 
 ## Status

@@ -37,21 +37,19 @@
 /* Pending op structure.                                                      */
 /* ------------------------------------------------------------------------- */
 
-typedef struct pending_op {
+/* One async op from its submit to the end of its callback: a worker moves it from
+ * the work queue to the completion queue, so nothing is allocated after the submit
+ * and every op taken completes. */
+typedef struct posix_op {
     stm_op_kind             kind;
     uint64_t                offset;
     void                   *buf;         /* for READ: mutable; for WRITE: const cast */
     size_t                  len;
     stm_bdev_completion_cb  cb;
     void                   *user;
-    struct pending_op      *next;
-} pending_op;
-
-typedef struct completion {
     stm_op_result           res;
-    stm_bdev_completion_cb  cb;
-    struct completion      *next;
-} completion;
+    struct posix_op        *next;
+} posix_op;
 
 /* ------------------------------------------------------------------------- */
 /* Backend struct — embeds stm_bdev as first field.                          */
@@ -64,14 +62,14 @@ typedef struct {
     /* Work queue (submissions waiting for a worker). */
     pthread_mutex_t         qlock;
     pthread_cond_t          qcond;
-    pending_op             *q_head;
-    pending_op             *q_tail;
+    posix_op               *q_head;
+    posix_op               *q_tail;
 
     /* Completion queue (ready to dispatch). */
     pthread_mutex_t         clock;
     pthread_cond_t          ccond;
-    completion             *c_head;
-    completion             *c_tail;
+    posix_op               *c_head;
+    posix_op               *c_tail;
     atomic_int              c_count;
 
     /* Worker threads. */
@@ -80,6 +78,10 @@ typedef struct {
     atomic_bool             stop;
 
     bool                    is_disk;       /* not a regular file */
+
+    /* A test's cap on the allocations async ops may still make. */
+    atomic_bool             alloc_capped;
+    atomic_int              alloc_left;
 } posix_bdev;
 
 /* ------------------------------------------------------------------------- */
@@ -270,13 +272,8 @@ static stm_status op_current_size(stm_bdev *base, uint64_t *out)
 /* Async: thread pool.                                                        */
 /* ------------------------------------------------------------------------- */
 
-static void post_completion(posix_bdev *d, stm_op_result res,
-                            stm_bdev_completion_cb cb)
+static void post_completion(posix_bdev *d, posix_op *c)
 {
-    completion *c = malloc(sizeof *c);
-    if (!c) return;                        /* best-effort on OOM */
-    c->res  = res;
-    c->cb   = cb;
     c->next = NULL;
 
     pthread_mutex_lock(&d->clock);
@@ -300,7 +297,7 @@ static void *worker_main(void *arg)
             pthread_mutex_unlock(&d->qlock);
             return NULL;
         }
-        pending_op *op = d->q_head;
+        posix_op *op = d->q_head;
         d->q_head = op->next;
         if (!d->q_head) d->q_tail = NULL;
         pthread_mutex_unlock(&d->qlock);
@@ -323,16 +320,34 @@ static void *worker_main(void *arg)
             break;
         }
 
-        post_completion(d, res, op->cb);
-        free(op);
+        op->res = res;
+        post_completion(d, op);
     }
+}
+
+static posix_op *op_alloc(posix_bdev *d)
+{
+    if (atomic_load(&d->alloc_capped)) {
+        int left = atomic_load(&d->alloc_left);
+        do {
+            if (left <= 0) return NULL;
+        } while (!atomic_compare_exchange_weak(&d->alloc_left, &left, left - 1));
+    }
+    return malloc(sizeof(posix_op));
+}
+
+void stm_posix_alloc_budget(stm_bdev *base, int budget)
+{
+    posix_bdev *d = (posix_bdev *)base;
+    atomic_store(&d->alloc_left, budget < 0 ? 0 : budget);
+    atomic_store(&d->alloc_capped, budget >= 0);
 }
 
 static stm_status enqueue(posix_bdev *d, stm_op_kind kind, uint64_t off,
                           void *buf, size_t len,
                           stm_bdev_completion_cb cb, void *user)
 {
-    pending_op *op = malloc(sizeof *op);
+    posix_op *op = op_alloc(d);
     if (!op) return STM_ENOMEM;
     op->kind   = kind;
     op->offset = off;
@@ -380,8 +395,8 @@ static int op_poll(stm_bdev *base, int max_events)
 
     /* Snap the whole queue under lock, dispatch outside. */
     pthread_mutex_lock(&d->clock);
-    completion *head = d->c_head;
-    completion *tail = d->c_tail;
+    posix_op *head = d->c_head;
+    posix_op *tail = d->c_tail;
     if (!head) {
         pthread_mutex_unlock(&d->clock);
         return 0;
@@ -393,7 +408,7 @@ static int op_poll(stm_bdev *base, int max_events)
     }
 
     /* Count nodes up to max_events. */
-    completion *cut_prev = NULL, *cur = head;
+    posix_op *cut_prev = NULL, *cur = head;
     int n = 0;
     while (cur && n < max_events) {
         cut_prev = cur;
@@ -416,8 +431,8 @@ static int op_poll(stm_bdev *base, int max_events)
     pthread_mutex_unlock(&d->clock);
     (void)tail;
 
-    for (completion *c = head; c; ) {
-        completion *next = c->next;
+    for (posix_op *c = head; c; ) {
+        posix_op *next = c->next;
         c->cb(&c->res);
         free(c);
         c = next;
@@ -485,15 +500,15 @@ static void op_close(stm_bdev *base)
 
     /* Drain any remaining completions without calling user callbacks (the fs
      * is tearing down; callbacks may reference freed state). */
-    completion *c = d->c_head;
+    posix_op *c = d->c_head;
     while (c) {
-        completion *n = c->next;
+        posix_op *n = c->next;
         free(c);
         c = n;
     }
-    pending_op *p = d->q_head;
+    posix_op *p = d->q_head;
     while (p) {
-        pending_op *n = p->next;
+        posix_op *n = p->next;
         free(p);
         p = n;
     }
