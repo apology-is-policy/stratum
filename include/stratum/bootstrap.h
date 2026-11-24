@@ -388,9 +388,10 @@ void       stm_bootstrap_commit_defer_cancel  (stm_bootstrap *a);
  * (per device) + alloc_roots + keyschema + repair_log + cas + dataset-index +
  * snapshot-index (all btree_store / single-node, marked at UNIT_BLOCKS) +
  * every present dataset's current content engine root AND every snapshot's
- * content engine root (btree_engine, marked at NODE_BLOCKS). Run the pass at
- * mount BEFORE any free (so pending_head is empty). Sequence: begin -> mark*
- * -> end.
+ * content engine root (btree_engine, marked at NODE_BLOCKS). Run the pass
+ * before any reserve: the sweep cannot tell one made since the last commit
+ * from an orphan. A free made since is pending, and _end keeps its nodes
+ * allocated for the commit that releases it. Sequence: begin -> mark* -> end.
  *
  * `nblocks` is the reserve span of the node at `paddr` -- a reserve sets
  * nblocks/NODE_BLOCKS consecutive bits and returns the FIRST node's paddr, so

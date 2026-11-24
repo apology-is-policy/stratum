@@ -484,11 +484,14 @@ STM_TEST(sb_mount_scan_fails_closed_on_an_unreadable_successor_slot) {
     sb_put_gen(d, 42);
     stm_uberblock found;
 
-    /* Control: the faults land, elsewhere they cost nothing. */
+    /* Control: the faults land; on one device (its generations
+     * contiguous) a slot past best+2 costs nothing. On a multi-device
+     * pool it refuses (sb_mount_scan_multi_device_refuses_at_any_unreadable_slot). */
     sb_fault_gen(d, 7, -1);
-    STM_ASSERT_OK(stm_sb_mount_scan(d, &found, NULL, NULL));
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, NULL));
     STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
     STM_ASSERT(stm_bdev_inject_read_range_fired(d) >= 1u);
+    STM_ASSERT_ERR(stm_sb_mount_scan(d, &found, NULL, NULL), STM_EIO);
     stm_bdev_inject_read_range_clear(d);
 
     /* best+1 unreadable for good: one read, two re-reads, of each copy.
@@ -512,6 +515,129 @@ STM_TEST(sb_mount_scan_fails_closed_on_an_unreadable_successor_slot) {
     STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(d) - f0, STM_UB_COPIES);
     stm_bdev_inject_read_range_clear(d);
 
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Vote 153: a device of a multi-device pool can miss writes, so its newest
+ * generation can be in any slot. This one confirmed 41, missed 42 to 46
+ * and confirmed 47 (a final whose reservation it missed): with slot(47)
+ * unreadable for good, best is 41 and best+1 and best+2 read blank. The
+ * one-device rule mounts 41; the multi-device rule refuses at slot(47),
+ * naming the first generation past best that slot can hold. */
+STM_TEST(sb_mount_scan_multi_device_refuses_at_any_unreadable_slot) {
+    stm_bdev *d = open_test_device("gapslot", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_gen(d, 41);
+    sb_put_gen(d, 47);
+    stm_uberblock found;
+    stm_sb_scan_refusal why;
+
+    /* Control: every copy readable, 47. */
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, false, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 47u);
+
+    sb_fault_gen(d, 47, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, false, &found, NULL, NULL, &why),
+                   STM_EIO);
+    STM_ASSERT_EQ(why.gen, 47u);
+    STM_ASSERT_EQ(why.slot_idx, 47u);
+    STM_ASSERT_EQ(why.label_idx, 0u);
+    STM_ASSERT_EQ(why.byte_offset, sb_copy_off(d, 47, 0));
+    STM_ASSERT_EQ(why.best_gen, 41u);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 41u);
+    stm_bdev_inject_read_range_clear(d);
+
+    /* Each copy of slot(47) fails once: the re-read finds 47, a gap from
+     * best, and mounts it. */
+    sb_fault_gen(d, 47, 1);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, false, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 47u);
+    stm_bdev_inject_read_range_clear(d);
+
+    /* One copy of slot(47) unreadable for good: the others decode 47. */
+    sb_fault_copy(d, 47, 2, -1);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, false, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 47u);
+    stm_bdev_inject_read_range_clear(d);
+
+    /* A slot never written, unreadable for good: nothing tells it from
+     * one holding a newer commit. 47 + 10 = 57. */
+    sb_fault_gen(d, 57, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, false, &found, NULL, NULL, &why),
+                   STM_EIO);
+    STM_ASSERT_EQ(why.gen, 57u);
+    STM_ASSERT_EQ(why.best_gen, 47u);
+    stm_bdev_inject_read_range_clear(d);
+
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* The strict pass (round 1 F3): a re-read that moves best asks every slot
+ * again, those between the old best and the new among them. 41 and 47
+ * written; every copy of slot(47) fails once, so the pass meets 47 at
+ * k = 6 and moves; slot(50) is unreadable for good. Asked again only from
+ * the new best, it is k = 3 and refuses; a pass that went on from k = 7
+ * would never ask it and mount 47. */
+STM_TEST(sb_mount_scan_a_move_asks_the_slots_behind_it_again) {
+    stm_bdev *d = open_test_device("smove", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_gen(d, 41);
+    sb_put_gen(d, 47);
+    stm_uberblock found;
+    stm_sb_scan_refusal why;
+    /* Control: slot(47) healthy, slot(50) unreadable: refuses too. */
+    sb_fault_gen(d, 50, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, false, &found, NULL, NULL, &why),
+                   STM_EIO);
+    STM_ASSERT_EQ(why.gen, 50u);
+    stm_bdev_inject_read_range_clear(d);
+    sb_fault_gen(d, 47, 1);
+    sb_fault_gen(d, 50, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, false, &found, NULL, NULL, &why),
+                   STM_EIO);
+    STM_ASSERT_EQ(why.gen, 50u);
+    STM_ASSERT_EQ(why.best_gen, 47u);
+    stm_bdev_inject_read_range_clear(d);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Every ring copy of `d` reads back all zero once, with no error. */
+static void sb_zero_ring_once(stm_bdev *d)
+{
+    for (uint32_t li = 0; li < STM_UB_COPIES; li++) {
+        uint64_t lo = sb_copy_off(d, 0, li);
+        stm_bdev_inject_read_range_zero(d, lo,
+            lo + (uint64_t)STM_UB_SLOTS_PER_LABEL * STM_UB_SIZE,
+            STM_UB_SLOTS_PER_LABEL);
+    }
+}
+
+/* Round 1 F1: a read can come back zero with no error. A device whose
+ * every ring copy did so at the scan's one read is not blank (STM_ENOENT,
+ * on a multi-device pool a known vote of nothing): the copies are read
+ * again until they settle, and the newest decodes, by either rule. A
+ * blank device so read still answers STM_ENOENT. */
+STM_TEST(sb_mount_scan_settles_a_ring_read_back_zero_once) {
+    stm_bdev *d = open_test_device("zonce", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    stm_uberblock found;
+    sb_zero_ring_once(d);
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, false, &found, NULL, NULL, NULL),
+                   STM_ENOENT);
+    stm_bdev_inject_read_range_clear(d);
+    sb_put_gen(d, 41);
+    sb_put_gen(d, 47);
+    for (int one = 0; one < 2; one++) {
+        sb_zero_ring_once(d);
+        STM_ASSERT_OK(stm_sb_mount_scan_ex(d, one == 1, &found, NULL, NULL,
+                                           NULL));
+        STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 47u);
+        stm_bdev_inject_read_range_clear(d);
+    }
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -1751,6 +1877,73 @@ static bool sb_all_zero(stm_bdev *d, uint64_t off, uint64_t len)
     return true;
 }
 
+/* Round 1 F1, the tail half: the head labels hold nothing (blank on disk)
+ * and every tail copy reads back zero once. The tail's copies are read
+ * again after the pass, and the scan finds 47 there, by either rule; read
+ * once, the device answered blank. */
+STM_TEST(sb_mount_scan_settles_the_tail_when_the_head_holds_nothing) {
+    stm_bdev *d = open_test_device("ztail", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    if (!d) return;
+    sb_put_gen(d, 41);
+    sb_put_gen(d, 47);
+    uint8_t z[STM_UB_SIZE];
+    memset(z, 0, sizeof z);
+    for (uint32_t li = 0; li < 2; li++)
+        for (uint32_t si = 0; si < STM_UB_SLOTS_PER_LABEL; si++)
+            STM_ASSERT_OK(stm_bdev_write(d, sb_copy_off(d, si, li), z,
+                                         sizeof z));
+    for (int one = 0; one < 2; one++) {
+        for (uint32_t li = 2; li < STM_LABELS_PER_DEVICE; li++) {
+            uint64_t lo = sb_copy_off(d, 0, li);
+            stm_bdev_inject_read_range_zero(d, lo,
+                lo + (uint64_t)STM_UB_SLOTS_PER_LABEL * STM_UB_SIZE,
+                STM_UB_SLOTS_PER_LABEL);
+        }
+        stm_uberblock found;
+        uint32_t label = 99;
+        STM_ASSERT_OK(stm_sb_mount_scan_ex(d, one == 1, &found, &label, NULL,
+                                           NULL));
+        STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 47u);
+        STM_ASSERT(label >= 2u);
+        stm_bdev_inject_read_range_clear(d);
+    }
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Round 1 F1, the head half: on a device that grew, the head labels give
+ * the layout its tail is read by. Every head copy reads back zero once:
+ * they are read again until they settle before the layout is taken, so
+ * the tail is read where the device joined and the scan finds 47, by
+ * either rule. Laid out first, the tail was read at the new end (blank)
+ * and the device answered blank. */
+STM_TEST(sb_mount_scan_settles_the_head_before_it_lays_out_the_tail) {
+    stm_bdev *d = open_test_device("zhead", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    if (!d) return;
+    sb_put_gen(d, 41);
+    sb_put_gen(d, 47);
+    STM_ASSERT_OK(stm_bdev_resize(d, SB_GROWN_BYTES));
+    for (int one = 0; one < 2; one++) {
+        for (uint32_t li = 0; li < 2; li++) {
+            uint64_t lo = sb_copy_off(d, 0, li);
+            stm_bdev_inject_read_range_zero(d, lo,
+                lo + (uint64_t)STM_UB_SLOTS_PER_LABEL * STM_UB_SIZE,
+                STM_UB_SLOTS_PER_LABEL);
+        }
+        stm_bdev_set_layout_bytes(d, 0);
+        stm_uberblock found;
+        STM_ASSERT_OK(stm_sb_mount_scan_ex(d, one == 1, &found, NULL, NULL,
+                                           NULL));
+        STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 47u);
+        STM_ASSERT_EQ(stm_bdev_layout_bytes(d), SB_DEVICE_BYTES);
+        stm_bdev_inject_read_range_clear(d);
+    }
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 /* A device that grew keeps its tail labels where they were: the scan reads
  * them there and mounts 43, where reading them at the new end (blank) let
  * one blank copy settle slot 43 and mount 42 over an acknowledged 43 (F1c
@@ -2059,6 +2252,117 @@ STM_TEST(sb_ub_write_copies_refuses_a_device_shorter_than_its_layout) {
     stm_bdev_close(d);
     STM_ASSERT_EQ(stat(g_tmp_path, &st), 0);
     STM_ASSERT_EQ((uint64_t)st.st_size, SB_SHRUNK_BYTES);
+    unlink(g_tmp_path);
+}
+
+/* Every ring copy: the first `zeros` reads come back zero, then `fails`
+ * reads fail (-1: for ever). */
+static void sb_arm_ring_reads(stm_bdev *d, int64_t zeros, int64_t fails)
+{
+    for (uint32_t li = 0; li < STM_LABELS_PER_DEVICE; li++) {
+        uint64_t lo = sb_copy_off(d, 0, li);
+        uint64_t hi = lo + (uint64_t)STM_UB_SLOTS_PER_LABEL * STM_UB_SIZE;
+        if (zeros) stm_bdev_inject_read_range_zero(d, lo, hi, zeros);
+        if (fails) stm_bdev_inject_read_range(d, lo, hi, fails, STM_EIO);
+    }
+}
+
+/* Round 2 F1: every copy reads back zero once, then fails for ever. The
+ * copies settle unreadable and the scan answers STM_EIO by either rule,
+ * on a device holding 47 and on a blank one; answered blank, a device of a
+ * multi-device pool is a known vote of nothing, past which the open can
+ * mount over the commit it holds. Control, one variable away:
+ * sb_mount_scan_settles_a_ring_read_back_zero_once, whose copies read
+ * whole after the zero. */
+STM_TEST(sb_mount_scan_answers_eio_when_copies_read_zero_then_fail) {
+    for (int blank = 0; blank < 2; blank++) {
+        stm_bdev *d = open_test_device("zfail", 16 * 1024 * 1024);
+        STM_ASSERT(d != NULL);
+        if (!d) return;
+        if (!blank) {
+            sb_put_gen(d, 41);
+            sb_put_gen(d, 47);
+        }
+        for (int one = 0; one < 2; one++) {
+            sb_arm_ring_reads(d, STM_UB_SLOTS_PER_LABEL, -1);
+            stm_uberblock found;
+            STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, one == 1, &found, NULL,
+                                                NULL, NULL), STM_EIO);
+            stm_bdev_inject_read_range_clear(d);
+        }
+        stm_bdev_close(d);
+        unlink(g_tmp_path);
+    }
+}
+
+/* A newer build's uberblock at gen `gen`, in every copy of its slot. */
+static void sb_put_newer_everywhere(stm_bdev *d, uint64_t gen)
+{
+    stm_uberblock ub;
+    fill_example(&ub);
+    ub.ub_gen = stm_store_le64(gen);
+    uint8_t buf[STM_UB_SIZE];
+    STM_ASSERT_OK(stm_ub_encode(&ub, buf, sizeof buf));
+    sb_restamp(buf, STM_UB_VERSION + 1u);
+    for (uint32_t li = 0; li < STM_UB_COPIES; li++)
+        STM_ASSERT_OK(stm_bdev_write(d, sb_copy_off(d, gen, li), buf,
+                                     sizeof buf));
+}
+
+/* Round 2 F1: a newer build's uberblock is all the device holds, and
+ * every copy reads back zero once. Settled, it refuses STM_EBADVERSION
+ * naming the newer version, by either rule: from the head labels, and,
+ * with the head blank on disk, from the tail labels. Read once, the
+ * device answered blank: a fresh device on one device, a known vote of
+ * nothing on a multi-device pool. */
+STM_TEST(sb_mount_scan_refuses_a_newer_build_behind_a_zero_read) {
+    for (int tail = 0; tail < 2; tail++) {
+        stm_bdev *d = open_test_device("znewer", 16 * 1024 * 1024);
+        STM_ASSERT(d != NULL);
+        if (!d) return;
+        sb_put_newer_everywhere(d, 44);
+        if (tail) {
+            uint8_t z[STM_UB_SIZE];
+            memset(z, 0, sizeof z);
+            for (uint32_t li = 0; li < 2; li++)
+                STM_ASSERT_OK(stm_bdev_write(d, sb_copy_off(d, 44, li), z,
+                                             sizeof z));
+        }
+        for (int one = 0; one < 2; one++) {
+            sb_arm_ring_reads(d, STM_UB_SLOTS_PER_LABEL, 0);
+            stm_uberblock found;
+            stm_sb_scan_refusal why;
+            memset(&why, 0, sizeof why);
+            STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, one == 1, &found, NULL,
+                                                NULL, &why), STM_EBADVERSION);
+            STM_ASSERT_EQ(why.version, STM_UB_VERSION + 1u);
+            STM_ASSERT_EQ(why.label_idx < 2u, tail == 0);
+            stm_bdev_inject_read_range_clear(d);
+        }
+        stm_bdev_close(d);
+        unlink(g_tmp_path);
+    }
+}
+
+/* Round 2 F1: every copy fails its first read and reads whole after. The
+ * settle reads each again and the scan finds 47 by either rule, where one
+ * failed read of each answered STM_EIO. */
+STM_TEST(sb_mount_scan_reads_again_a_copy_whose_first_read_failed) {
+    stm_bdev *d = open_test_device("zfailonce", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    if (!d) return;
+    sb_put_gen(d, 41);
+    sb_put_gen(d, 47);
+    for (int one = 0; one < 2; one++) {
+        sb_arm_ring_reads(d, 0, STM_UB_SLOTS_PER_LABEL);
+        stm_uberblock found;
+        memset(&found, 0, sizeof found);
+        STM_ASSERT_OK(stm_sb_mount_scan_ex(d, one == 1, &found, NULL, NULL,
+                                           NULL));
+        STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 47u);
+        stm_bdev_inject_read_range_clear(d);
+    }
+    stm_bdev_close(d);
     unlink(g_tmp_path);
 }
 

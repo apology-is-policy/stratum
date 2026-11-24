@@ -198,6 +198,9 @@ jobs:
           - { tla: fid,                 cfg: fid }
           - { tla: dcache_ebr,          cfg: dcache_ebr }
           - { tla: dek_guard,           cfg: dek_guard }
+          - { tla: quorum,              cfg: quorum }
+          - { tla: quorum,              cfg: quorum_faults }
+          - { tla: quorum,              cfg: quorum_pick }
     steps:
       - uses: actions/checkout@v4
 

@@ -28,6 +28,28 @@
 (*   - FALSE (buggy impl):     retry bumps coord_commit_content;          *)
 (*                               re-writes produce divergent UBs.          *)
 (*                                                                           *)
+(* Mount (2026-11-24, Stratum vote 153): a mount reads the newest          *)
+(* uberblock of the ONLINE devices only. A FAULTED device -- one whose     *)
+(* scan refused (stm_sync_open_ex) -- is an UNKNOWN vote: a device of a    *)
+(* multi-device pool can miss writes, so its generations need not be       *)
+(* contiguous, and nothing bounds what an unreadable slot holds. The       *)
+(* mount takes the highest gen a quorum of the devices it read reaches     *)
+(* (VisibleQuorumGen) and refuses while the unknown votes could put the    *)
+(* authoritative gen above it (MountHigh). The model before read every     *)
+(* device, FAULTED ones included (an oracle the implementation cannot      *)
+(* read), so it could not see an acknowledged commit lost to one           *)
+(* unreadable device. CONSTANT MountCountsUnknown toggles the refusal:     *)
+(* FALSE is the implementation before the fix.                             *)
+(*                                                                         *)
+(* The mount's content pick (round 1 F2): of the devices read at exactly  *)
+(* the gen it mounts, a content a quorum of them holds when a quorum sits *)
+(* there; when fewer do, the content all of them hold, and no mount while *)
+(* they disagree (MinorityMustAgree; FALSE takes any of them, the         *)
+(* implementation before the fix: with four devices or more an orphan     *)
+(* final can sit beside the acknowledged claim at that gen). The model    *)
+(* keeps each device's newest uberblock only, so it refuses where reading *)
+(* each device's slot for that gen would mount (OPEN-BUGS (ah)).          *)
+(*                                                                         *)
 (* Invariants proved:                                                       *)
 (*   * TypeOK                — variable domains stable.                    *)
 (*   * QuorumSafety           — phase=Published ⇒ quorum at target_gen.   *)
@@ -40,6 +62,11 @@
 (*   * MountGenBumpMulti      — post-mount target > any dev_ub[d].gen.    *)
 (*   * ContentAgreementAtGen  — at the same gen, all devices agree on     *)
 (*                               content (R14 P1).                          *)
+(*   * MountAtAuthoritative   -- a mount takes the authoritative gen       *)
+(*                               (vote 153).                               *)
+(*   * MountKeepsPublished    -- a mount never loses an acknowledged       *)
+(*                               commit or claim: not below its gen, and   *)
+(*                               at its gen only its content.              *)
 (***************************************************************************)
 
 EXTENDS Naturals, FiniteSets
@@ -49,7 +76,11 @@ CONSTANTS
     MaxCommits,       \* bound on the number of commit attempts
     MaxFaults,        \* bound on concurrent device faults
     MaxRetries,       \* bound on retries per commit (state-space cap)
-    IdempotentRetry   \* BOOLEAN: TRUE = fixed impl, FALSE = buggy impl
+    IdempotentRetry,  \* BOOLEAN: TRUE = fixed impl, FALSE = buggy impl
+    MountCountsUnknown, \* BOOLEAN: TRUE = a mount refuses while unknown
+                      \* votes could change the gen; FALSE = buggy impl
+    MinorityMustAgree \* BOOLEAN: TRUE = fewer than quorum at the mount's
+                      \* gen must agree on content; FALSE = buggy impl
 
 ASSUME /\ Devices # {}
        /\ Cardinality(Devices) >= 1
@@ -57,6 +88,8 @@ ASSUME /\ Devices # {}
        /\ MaxFaults  \in Nat
        /\ MaxRetries \in Nat
        /\ IdempotentRetry \in BOOLEAN
+       /\ MountCountsUnknown \in BOOLEAN
+       /\ MinorityMustAgree \in BOOLEAN
 
 (***************************************************************************)
 (* Quorum threshold: ⌊N/2⌋+1.                                              *)
@@ -83,7 +116,6 @@ Phase == {"Idle", "Reserving", "Flushing", "Finalizing", "Published"}
 (***************************************************************************)
 
 ClaimContent == 1   \* all claim + reservation UBs use content = 1 (stable).
-MaxContent == 1 + MaxCommits * (MaxRetries + 1)   \* upper bound for state space.
 
 (***************************************************************************)
 (* Each commit may retry up to MaxRetries times (bounded). Each commit    *)
@@ -91,6 +123,12 @@ MaxContent == 1 + MaxCommits * (MaxRetries + 1)   \* upper bound for state space
 (***************************************************************************)
 
 MaxGen == 2 * (MaxCommits + 1)
+
+\* One content per commit attempt, one more per retry that bumps it. An
+\* attempt ends published, aborted (after a fault) or crashed (a mount,
+\* which raises the gen, comes before the next), so attempts number at
+\* most MaxCommits + MaxFaults + MaxGen + 1.
+MaxContent == 1 + (MaxCommits + MaxFaults + MaxGen + 1) * (MaxRetries + 1)
 
 VARIABLES
     dev_ub,            \* [Devices -> [gen |-> 0..MaxGen,
@@ -103,11 +141,18 @@ VARIABLES
     retry_count,       \* 0..MaxRetries (retries within the CURRENT commit)
     next_content,      \* 0..MaxContent — monotonic content-id allocator
     fault_count,       \* 0..MaxFaults
-    mounted            \* BOOLEAN
+    mounted,           \* BOOLEAN
+    mount_wrong,       \* BOOLEAN: a mount took another gen than
+                       \* AuthoritativeGen (history; never cleared)
+    pub_gen,           \* 0..MaxGen: the gen of the last acknowledged
+                       \* final or claim (history)
+    pub_content,       \* 0..MaxContent: its content (history)
+    mount_lost         \* BOOLEAN: a mount lost it (history; never cleared)
 
 vars == <<dev_ub, dev_state, coord_phase, coord_target_gen,
            coord_commit_content, commits_done, retry_count,
-           next_content, fault_count, mounted>>
+           next_content, fault_count, mounted, mount_wrong,
+           pub_gen, pub_content, mount_lost>>
 
 (***************************************************************************)
 (* Helpers.                                                                  *)
@@ -128,6 +173,27 @@ AuthoritativeGen ==
                   \A g2 \in committed : g2 <= g
 
 (***************************************************************************)
+(* What a mount can know (vote 153). It reads the ONLINE devices; each    *)
+(* FAULTED device is an unknown vote, as high as any gen.                  *)
+(***************************************************************************)
+
+VisibleAtLeast(g) == Cardinality({ d \in OnlineDevices : dev_ub[d].gen >= g })
+
+\* The highest gen a quorum of the devices read reaches (0 if none): the
+\* implementation's compute_auth_gen over the scans that succeeded.
+VisibleQuorumGen ==
+    LET ok == { g \in 0..MaxGen : g = 0 \/ VisibleAtLeast(g) >= QuorumN }
+    IN  CHOOSE g \in ok : \A g2 \in ok : g2 <= g
+
+\* The highest gen a quorum could reach if every unknown vote were as high
+\* as any. AuthoritativeGen lies in VisibleQuorumGen..MountHigh.
+MountHigh ==
+    LET ok == { g \in 0..MaxGen :
+                  g = 0 \/ VisibleAtLeast(g)
+                           + Cardinality(Devices \ OnlineDevices) >= QuorumN }
+    IN  CHOOSE g \in ok : \A g2 \in ok : g2 <= g
+
+(***************************************************************************)
 (* Init.                                                                     *)
 (***************************************************************************)
 
@@ -142,6 +208,10 @@ Init ==
     /\ next_content         = ClaimContent  \* content=1 reserved for claim/reservation.
     /\ fault_count          = 0
     /\ mounted              = FALSE
+    /\ mount_wrong          = FALSE
+    /\ pub_gen              = 0
+    /\ pub_content          = 0
+    /\ mount_lost           = FALSE
 
 (***************************************************************************)
 (* Mount — claim UB at auth+1 to every ONLINE device, content=ClaimContent.*)
@@ -151,8 +221,22 @@ Mount ==
     /\ ~mounted
     /\ coord_phase = "Idle"
     /\ Cardinality(OnlineDevices) >= QuorumN
-    /\ LET auth == AuthoritativeGen
+    \* The fix: refuse while an unknown vote could raise the gen.
+    /\ MountCountsUnknown => VisibleQuorumGen = MountHigh
+    /\ LET auth == VisibleQuorumGen
+           at   == DevicesAtGen(auth) \cap OnlineDevices
        IN  /\ auth + 1 <= MaxGen
+           \* The content check (stm_sync_open_ex): with a quorum of the
+           \* devices read sitting at exactly auth, a content a quorum of
+           \* them holds; with fewer, the content all of them hold.
+           /\ \E p \in at :
+                LET picked == dev_ub[p].content
+                    agree  == { e \in at : dev_ub[e].content = picked }
+                IN  /\ IF Cardinality(at) >= QuorumN
+                       THEN Cardinality(agree) >= QuorumN
+                       ELSE MinorityMustAgree => agree = at
+                    /\ mount_lost' = (mount_lost \/ auth < pub_gen
+                                      \/ (auth = pub_gen /\ picked # pub_content))
            /\ coord_target_gen' = auth + 1
            /\ coord_phase' = "Idle"
            \* Claim UB is written to EVERY ONLINE device, overwriting
@@ -167,6 +251,10 @@ Mount ==
                           THEN [gen |-> auth + 1, content |-> ClaimContent]
                           ELSE dev_ub[d]]
            /\ mounted' = TRUE
+           /\ mount_wrong' = (mount_wrong \/ auth # AuthoritativeGen)
+           \* The claim reaches every ONLINE device, a quorum (above).
+           /\ pub_gen' = auth + 1
+           /\ pub_content' = ClaimContent
     /\ UNCHANGED <<dev_state, coord_commit_content, commits_done,
                     retry_count, next_content, fault_count>>
 
@@ -190,7 +278,7 @@ BeginCommit ==
            /\ next_content' = next_content + 1
            /\ coord_commit_content' = next_content + 1
            /\ retry_count' = 0
-    /\ UNCHANGED <<dev_ub, dev_state, commits_done, fault_count, mounted>>
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, commits_done, fault_count, mounted>>
 
 (***************************************************************************)
 (* WriteReservation — stamps ClaimContent (content stable: reservation UB *)
@@ -211,7 +299,7 @@ WriteReservation(d) ==
           /\ dev_ub[d].content # ClaimContent    \* only re-write if would change content
     /\ dev_ub' = [dev_ub EXCEPT ![d] = [gen |-> coord_target_gen - 1,
                                           content |-> ClaimContent]]
-    /\ UNCHANGED <<dev_state, coord_phase, coord_target_gen,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_state, coord_phase, coord_target_gen,
                     coord_commit_content, commits_done, retry_count,
                     next_content, fault_count, mounted>>
 
@@ -219,7 +307,7 @@ CheckReservationQuorum ==
     /\ coord_phase = "Reserving"
     /\ Cardinality(DevicesAtLeastGen(coord_target_gen - 1)) >= QuorumN
     /\ coord_phase' = "Flushing"
-    /\ UNCHANGED <<dev_ub, dev_state, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, coord_target_gen, coord_commit_content,
                     commits_done, retry_count, next_content, fault_count, mounted>>
 
 AbortReservation ==
@@ -229,13 +317,13 @@ AbortReservation ==
     /\ coord_target_gen' = 0
     /\ coord_commit_content' = 0
     /\ retry_count' = 0
-    /\ UNCHANGED <<dev_ub, dev_state, commits_done, next_content,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, commits_done, next_content,
                     fault_count, mounted>>
 
 DoFlush ==
     /\ coord_phase = "Flushing"
     /\ coord_phase' = "Finalizing"
-    /\ UNCHANGED <<dev_ub, dev_state, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, coord_target_gen, coord_commit_content,
                     commits_done, retry_count, next_content, fault_count, mounted>>
 
 (***************************************************************************)
@@ -257,7 +345,7 @@ WriteFinal(d) ==
           /\ dev_ub[d].content # coord_commit_content   \* overwrite if content differs
     /\ dev_ub' = [dev_ub EXCEPT ![d] = [gen |-> coord_target_gen,
                                           content |-> coord_commit_content]]
-    /\ UNCHANGED <<dev_state, coord_phase, coord_target_gen,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_state, coord_phase, coord_target_gen,
                     coord_commit_content, commits_done, retry_count,
                     next_content, fault_count, mounted>>
 
@@ -270,7 +358,9 @@ CheckFinalQuorum ==
     \* violation, which is what we want to catch under the buggy model.
     /\ coord_phase' = "Published"
     /\ commits_done' = commits_done + 1
-    /\ UNCHANGED <<dev_ub, dev_state, coord_target_gen, coord_commit_content,
+    /\ pub_gen' = coord_target_gen
+    /\ pub_content' = coord_commit_content
+    /\ UNCHANGED <<mount_wrong, mount_lost, dev_ub, dev_state, coord_target_gen, coord_commit_content,
                     retry_count, next_content, fault_count, mounted>>
 
 AbortFinal ==
@@ -280,7 +370,7 @@ AbortFinal ==
     /\ coord_target_gen' = 0
     /\ coord_commit_content' = 0
     /\ retry_count' = 0
-    /\ UNCHANGED <<dev_ub, dev_state, commits_done, next_content,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, commits_done, next_content,
                     fault_count, mounted>>
 
 (***************************************************************************)
@@ -302,7 +392,7 @@ RetryPhase3 ==
             /\ next_content' = next_content
        ELSE /\ coord_commit_content' = next_content + 1
             /\ next_content' = next_content + 1
-    /\ UNCHANGED <<dev_ub, dev_state, coord_target_gen, commits_done,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, coord_target_gen, commits_done,
                     fault_count, mounted>>
 
 Publish ==
@@ -311,7 +401,7 @@ Publish ==
     /\ coord_target_gen' = 0
     /\ coord_commit_content' = 0
     /\ retry_count' = 0
-    /\ UNCHANGED <<dev_ub, dev_state, commits_done, next_content,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, commits_done, next_content,
                     fault_count, mounted>>
 
 (***************************************************************************)
@@ -323,13 +413,13 @@ DeviceFail(d) ==
     /\ fault_count < MaxFaults
     /\ dev_state' = [dev_state EXCEPT ![d] = "FAULTED"]
     /\ fault_count' = fault_count + 1
-    /\ UNCHANGED <<dev_ub, coord_phase, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, coord_phase, coord_target_gen, coord_commit_content,
                     commits_done, retry_count, next_content, mounted>>
 
 DeviceRejoin(d) ==
     /\ dev_state[d] = "FAULTED"
     /\ dev_state' = [dev_state EXCEPT ![d] = "ONLINE"]
-    /\ UNCHANGED <<dev_ub, coord_phase, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, coord_phase, coord_target_gen, coord_commit_content,
                     commits_done, retry_count, next_content, fault_count, mounted>>
 
 \* Reconcile a BEHIND ONLINE device by catching its gen up to auth.
@@ -339,17 +429,18 @@ DeviceRejoin(d) ==
 \* reads the authoritative UB from a quorum peer and writes it into
 \* the behind device's ring slot.
 Reconcile(d) ==
+    /\ mounted
     /\ dev_state[d] = "ONLINE"
     /\ coord_phase = "Idle"
     /\ LET auth == AuthoritativeGen
-           peers == DevicesAtGen(auth)
+           peers == DevicesAtGen(auth) \cap OnlineDevices
        IN  /\ dev_ub[d].gen < auth
            /\ peers # {}
            /\ LET peer == CHOOSE e \in peers : TRUE
               IN  dev_ub' = [dev_ub EXCEPT ![d] =
                               [gen |-> auth,
                                content |-> dev_ub[peer].content]]
-    /\ UNCHANGED <<dev_state, coord_phase, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_state, coord_phase, coord_target_gen, coord_commit_content,
                     commits_done, retry_count, next_content, fault_count, mounted>>
 
 Crash ==
@@ -359,7 +450,7 @@ Crash ==
     /\ coord_commit_content' = 0
     /\ retry_count'          = 0
     /\ mounted'              = FALSE
-    /\ UNCHANGED <<dev_ub, dev_state, commits_done, next_content, fault_count>>
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, commits_done, next_content, fault_count>>
 
 (***************************************************************************)
 (* Next-state.                                                              *)
@@ -399,6 +490,10 @@ TypeOK ==
     /\ next_content \in 0..MaxContent
     /\ fault_count \in 0..MaxFaults
     /\ mounted \in BOOLEAN
+    /\ mount_wrong \in BOOLEAN
+    /\ pub_gen \in 0..MaxGen
+    /\ pub_content \in 0..MaxContent
+    /\ mount_lost \in BOOLEAN
 
 QuorumSafety ==
     (coord_phase = "Published") =>
@@ -478,6 +573,16 @@ ContentAgreementAtGen ==
         /\ dev_ub[d].gen = dev_ub[e].gen
         => dev_ub[d].content = dev_ub[e].content
 
+\* Vote 153: what a mount takes is what a quorum holds -- never an older
+\* gen read past an unreadable device that may hold a newer commit.
+MountAtAuthoritative == ~mount_wrong
+
+\* Round 1 F2/F5: what a mount loses. MountAtAuthoritative forbids every
+\* mount below AuthoritativeGen, a rollback past a reservation (which
+\* loses nothing) included; this names the loss itself: an acknowledged
+\* final or claim mounted past, or at its gen another content picked.
+MountKeepsPublished == ~mount_lost
+
 Invariants ==
     /\ TypeOK
     /\ QuorumSafety
@@ -488,5 +593,7 @@ Invariants ==
     /\ QuorumDurability
     /\ MountGenBumpMulti
     /\ ContentQuorumAtGen
+    /\ MountAtAuthoritative
+    /\ MountKeepsPublished
 
 =============================================================================

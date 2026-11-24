@@ -1180,7 +1180,9 @@ stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
  * slot held another version. An uberblock counts only in its
  * generation's ring slot (slot gen % 63, in any label: each generation
  * has a copy in every label); a device whose only uberblocks sit in other
- * slots returns STM_ECORRUPT, not STM_ENOENT.
+ * slots returns STM_ECORRUPT, not STM_ENOENT. Before it answers either,
+ * each copy that read back zero, wrong or not at all is read again until
+ * it settles: STM_ENOENT means every copy settled blank or undecoded.
  *
  * Returns STM_EBADVERSION when a slot it reads holds an uberblock a newer
  * build wrote (stm_ub_is_newer): every commit-ring slot at the first
@@ -1197,7 +1199,11 @@ stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
  * settles when STM_UB_SETTLE_COPIES of its copies hold an older
  * generation or read back blank (a generation this device confirmed is in
  * STM_UB_COPIES_REQUIRED of them). This is the strict rule, for a device
- * whose pool may have others: stm_sb_mount_scan_ex(d, false).
+ * whose pool may have others: stm_sb_mount_scan_ex(d, false). Such a
+ * device can miss writes while quorum holds, so its newest generation
+ * can be in any slot: the strict rule refuses at any slot that does not
+ * settle while a copy stays unreadable (why->gen the first generation
+ * past best that slot can hold).
  *
  * Labels 2 and 3 are read where the device's recorded size puts them. The
  * scan reads labels 0 and 1 first (their offsets do not depend on the
@@ -1248,7 +1254,7 @@ typedef struct stm_sb_scan_refusal {
  * other trees, none with best's, says final; a claim reads as a
  * reservation), and at slot(best+2) only when slot(best+1) did not settle
  * (each copy settled by two reads that came back wrong with no error).
- * Without it, either slot unreadable refuses. `why`, if not NULL, says
+ * Without it, either slot unreadable refuses, and so does any other. `why`, if not NULL, says
  * which copy refused (STM_EIO, or STM_EBADVERSION at another build's
  * uberblock).
  */

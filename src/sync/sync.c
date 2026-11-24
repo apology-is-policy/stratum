@@ -1643,6 +1643,8 @@ static inline size_t sync_quorum_n(const stm_sync *s)
     return stm_pool_live_device_count(s->pool) / 2u + 1u;
 }
 
+static void sync_wedge_locked(stm_sync *s);
+
 /* Write an uberblock carrying `shared` content to every device in the
  * pool at ring slot `slot`, every copy (stm_sb_ub_write_copies: a device
  * confirms only when STM_UB_COPIES_REQUIRED copies are durable). The
@@ -1669,6 +1671,9 @@ static stm_status write_ub_to_all_devices(stm_sync *s,
     size_t ro_skipped = 0;
     size_t attempted = 0;                /* devices written; not REMOVED or FAULTED */
     stm_status last_hard_err = STM_OK;   /* R14 P3-5: for diag propagation */
+    uint16_t primary = 0;                /* the metadata primary */
+    bool primary_short = false;
+    (void)stm_alloc_get_device_id(s->alloc, &primary);
     for (size_t i = 0; i < n; i++) {
         stm_bdev *d = stm_pool_device_bdev(s->pool, (uint16_t)i);
         if (!d) continue;
@@ -1703,7 +1708,20 @@ static stm_status write_ub_to_all_devices(stm_sync *s,
             ro_skipped++;
         } else {
             last_hard_err = sw;
+            if (sw == STM_ERANGE && i == primary) primary_short = true;
         }
+    }
+
+    /* The metadata primary (keyschema, alloc roots, its data area) is
+     * smaller than its layout: every later open refuses it
+     * (stm_alloc_check_layout; its scan answers STM_ERANGE), so no
+     * generation it misses can be mounted, whatever the others confirm.
+     * Fail, and wedge: acknowledging it would promise what no open keeps,
+     * and every later write would do the same. The caller holds s->lock,
+     * or owns s (the open's claim). */
+    if (primary_short) {
+        sync_wedge_locked(s);
+        return STM_ERANGE;
     }
 
     size_t quorum = sync_quorum_n(s);
@@ -2136,10 +2154,11 @@ static bool sync_ub_shared_bytes_match(const stm_uberblock *a,
     return memcmp(&ca, &cb, sizeof ca) == 0;
 }
 
-/* Compute the authoritative gen: highest G such that
- * |{device i : scans[i].valid && scans[i].ub.gen >= G}| >= quorum.
- * Equivalent to: sort valid gens descending, take the (quorum-1)th.
- * Returns 0 if fewer than quorum devices have a valid UB. */
+/* The k-th highest generation among the devices whose scan succeeded, 0
+ * when fewer than k did: the highest G such that
+ * |{device i : scans[i].valid && scans[i].ub.gen >= G}| >= k. With
+ * k = quorum it is the authoritative gen (quorum.tla VisibleQuorumGen).
+ * Equivalent to: sort valid gens descending, take the (k-1)th. */
 static uint64_t compute_auth_gen(const sync_scan *scans, size_t n, size_t quorum)
 {
     /* Collect valid gens, pack into a local array. N <= 64 so stack-ok. */
@@ -2188,10 +2207,9 @@ static uint64_t compute_auth_gen(const sync_scan *scans, size_t n, size_t quorum
 /* index AND every present dataset's content engine + the snapshot index AND   */
 /* every snapshot's captured content engine. All metadata is device-0-backed   */
 /* and the bootstrap is device-0-addressed, so device 0's bootstrap is         */
-/* reconciled and any stray non-device-0 paddr is ignored by reconcile_mark;   */
-/* additional devices' allocator trees (multi-device pools) are left untouched */
-/* -- safe (no sweep on their bootstraps), at the cost of not reclaiming their  */
-/* orphans until the bootstrap layer itself becomes multi-device-aware.       */
+/* reconciled and any stray non-device-0 paddr is ignored by reconcile_mark.   */
+/* An attached device's bootstrap holds its own allocator tree alone, and is   */
+/* reconciled at its attach with that tree marked (sync_reconcile_attached).   */
 struct sync_recon_route { stm_bootstrap *boot; stm_status mark_err; };
 static void sync_recon_mark(void *ctx, uint64_t paddr, uint32_t nblocks) {
     struct sync_recon_route *r = ctx;
@@ -2202,6 +2220,34 @@ static void sync_recon_mark(void *ctx, uint64_t paddr, uint32_t nblocks) {
      * so this is defense-in-depth). A non-bootstrap paddr returns STM_OK. */
     stm_status m = stm_bootstrap_reconcile_mark(r->boot, paddr, nblocks);
     if (m != STM_OK && r->mark_err == STM_OK) r->mark_err = m;
+}
+/* An attached device's tree stamps its device id into each node's paddr
+ * (alloc.c store_reserve); its bootstrap knows the device-0 form only
+ * (store_free hands it the same), and reconcile_mark ignores any other:
+ * marked unconverted, every node of the tree would be swept. */
+struct sync_recon_attached { struct sync_recon_route route; uint16_t device; };
+static void sync_recon_mark_attached(void *ctx, uint64_t paddr, uint32_t nblocks) {
+    struct sync_recon_attached *r = ctx;
+    if (stm_paddr_device(paddr) != r->device) return;
+    sync_recon_mark(&r->route, stm_paddr_make(0, stm_paddr_offset(paddr)),
+                    nblocks);
+}
+/* Reconcile an attached device's bootstrap: its own alloc tree is all it
+ * holds (every other tree is device 0's), so marking that tree is the
+ * complete mark. Aborts without sweeping on any mark error. */
+static stm_status sync_reconcile_attached(stm_alloc *a, uint16_t device) {
+    stm_bootstrap *boot = stm_alloc_bootstrap(a);
+    if (!boot) return STM_EINVAL;
+    stm_status bs = stm_bootstrap_reconcile_begin(boot);
+    if (bs != STM_OK) return bs;
+    struct sync_recon_attached r = { { boot, STM_OK }, device };
+    stm_status rs = stm_alloc_reconcile_mark(a, sync_recon_mark_attached, &r);
+    if (rs != STM_OK || r.route.mark_err != STM_OK) {
+        stm_bootstrap_reconcile_abort(boot);
+        return rs != STM_OK ? rs : r.route.mark_err;
+    }
+    uint64_t freed = 0;
+    return stm_bootstrap_reconcile_end(boot, &freed);
 }
 static stm_status sync_reconcile_bootstrap(stm_sync *s) {
     s->reconcile_freed_nodes = 0;
@@ -2277,8 +2323,13 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
      * an incompatible format version" — fail fast. */
     sync_scan *scans = calloc(n, sizeof *scans);
     if (!scans) return STM_ENOMEM;
-    bool saw_scan_eio = false;  /* a device whose ring could not be read */
-    bool one_device = stm_pool_live_device_count(p) == 1u;
+    size_t unknown = 0;         /* live devices whose scan refused */
+    /* One live device: its refusal is the pool's. Its generations are
+     * contiguous (stm_sb_mount_scan_ex's one_device) only when it has
+     * been the pool's only device: one a remove left alone may have
+     * missed writes while the others were there. */
+    bool one_live = stm_pool_live_device_count(p) == 1u;
+    bool one_device = n == 1u;
     for (size_t i = 0; i < n; i++) {
         stm_bdev *di = stm_pool_device_bdev(p, (uint16_t)i);
         if (!di) continue;
@@ -2287,7 +2338,7 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
          * which is not the pool's (quorum decides) -- except at a newer
          * build's uberblock, which any device names. */
         stm_sb_scan_refusal dwhy;
-        stm_sb_scan_refusal *dw = why && one_device ? why : &dwhy;
+        stm_sb_scan_refusal *dw = why && one_live ? why : &dwhy;
         stm_status sc = stm_sb_mount_scan_ex(di, one_device, &scans[i].ub,
                                              &lbl, &slot, dw);
         if (sc == STM_OK) {
@@ -2296,16 +2347,17 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
             if (why && dw == &dwhy) *why = dwhy;
             free(scans);
             return STM_EBADVERSION;
-        } else if (one_device && (sc == STM_ERANGE ||
-                                  (sc == STM_ECORRUPT && dw->best_gen != 0))) {
+        } else if (one_live && (sc == STM_ERANGE ||
+                                (sc == STM_ECORRUPT && dw->best_gen != 0))) {
             /* The pool's one device is smaller than it was, or one of its
              * uberblocks records another size than its layout. */
             free(scans);
             return sc;
         } else if (sc != STM_ENOENT) {
-            saw_scan_eio = true;
+            unknown++;
         }
-        /* STM_ENOENT / STM_ECORRUPT / STM_EIO: device contributes nothing. */
+        /* STM_ENOENT: a known vote of nothing. Any other refusal: an
+         * unknown vote (below). */
     }
 
     /* Phase 2: determine authoritative gen. */
@@ -2317,8 +2369,24 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
         size_t valid_count = 0;
         for (size_t i = 0; i < n; i++) if (scans[i].valid) valid_count++;
         free(scans);
-        if (valid_count == 0) return saw_scan_eio ? STM_EIO : STM_ENOENT;
+        if (valid_count == 0) return unknown ? STM_EIO : STM_ENOENT;
         return STM_EQUORUM;
+    }
+
+    /* Vote 153 (quorum.tla Mount, MountHigh): a device whose scan
+     * refused is an unknown vote. Of a multi-device pool it may have
+     * missed writes, so nothing bounds what its unreadable slot holds:
+     * as high as any, the unknown votes would make the quorum gen the
+     * (quorum - unknown)-th highest of the scans that succeeded. Refuse
+     * while that is above auth_gen: auth_gen could be a rollback past a
+     * commit those devices and the others above it acknowledged, and the
+     * claim at auth_gen + 1 would overwrite it. valid >= quorum here and
+     * valid + unknown <= live < 2 * quorum, so unknown < quorum. */
+    if (unknown > 0 &&
+        (unknown >= quorum ||
+         compute_auth_gen(scans, n, quorum - unknown) > auth_gen)) {
+        free(scans);
+        return STM_EIO;
     }
 
     /* R9 P0-1: bound durable_gen so the +1 (claim) and +2 (first
@@ -2345,15 +2413,21 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
      *     no single UB can be authoritative).
      *   - If fewer than quorum devs are at exactly auth_gen (the
      *     rest are ahead-of-auth orphans, which is how we recover
-     *     from partial-Phase-3 commits): canonical = any dev at
-     *     auth_gen. No content-quorum check (there are < quorum devs
-     *     to disagree). Ahead-of-auth devices are orphans that the
-     *     next commit's writes will overwrite.
+     *     from partial-Phase-3 commits): canonical = the content all
+     *     of them hold. With four devices or more two of them can
+     *     disagree: an orphan final whose commit failed, and the claim
+     *     a later open made, acknowledged on devices the next commit
+     *     moved past it (their copies at auth_gen sit in ring slots
+     *     this check does not read, OPEN-BUGS (ah)). Taking either by
+     *     device order could mount the orphan, whose nodes that open's
+     *     sweep handed back (quorum.tla MinorityMustAgree,
+     *     MountKeepsPublished): STM_EQUORUM. Ahead-of-auth devices are
+     *     orphans that the next commit's writes will overwrite.
      *
-     * Dissenting devices at auth_gen that aren't in the quorum group
-     * are legitimate orphans per ARCH §5.8 — they'll be overwritten
-     * on the next commit's per-device writes. Tolerating minority
-     * disagreement here (instead of failing STM_ECORRUPT like the
+     * Dissenting devices at auth_gen beside a quorum group there are
+     * legitimate orphans (ARCH section 5.8): the next commit's
+     * per-device writes overwrite them. Tolerating that dissent
+     * (instead of failing STM_ECORRUPT like the
      * strict pre-R14 check) lets the impl recover from R14 P1's
      * non-idempotent-retry divergence without operator intervention,
      * and is the spec-compliant behavior per quorum.tla's
@@ -2396,11 +2470,14 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
             free(scans);
             return STM_EQUORUM;
         }
-    } else {
-        /* < quorum devs at exactly auth_gen — rest are ahead-of-auth
-         * orphans. Canonical = any dev at auth_gen. Orphans get
-         * overwritten by next commit's per-device writes. */
+    } else if (ngroups <= 1) {
+        /* < quorum devs at exactly auth_gen, all agreeing -- the rest
+         * are ahead-of-auth orphans the next commit's per-device writes
+         * overwrite. */
         canonical_idx = any_at_auth;
+    } else {
+        free(scans);
+        return STM_EQUORUM;
     }
     if (canonical_idx == SIZE_MAX) {
         /* Invariant violation: compute_auth_gen returned auth_gen > 0
@@ -4229,6 +4306,21 @@ stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
             stm_status ls = stm_alloc_load_tree_at(alloc, tree_paddr,
                                                      tree_gen,
                                                      tree_csum);
+            /* Reconcile the device's bootstrap before any reserve, as the
+             * open does device 0's: it reclaims nodes a crash or the last
+             * commit's frees left allocated (#791), and restores those a
+             * bitmap the alloc's open could not confirm marks free though
+             * the tree just loaded holds them
+             * (stm_bootstrap_bitmap_unconfirmed), which the next commit's
+             * COW would take. A pass that does not complete refuses the
+             * attach only over such a bitmap. A read-only pool reserves
+             * nothing. */
+            if (ls == STM_OK && !s->read_only) {
+                stm_status rs = sync_reconcile_attached(alloc, device_id);
+                if (rs != STM_OK &&
+                    stm_bootstrap_bitmap_unconfirmed(stm_alloc_bootstrap(alloc)))
+                    ls = rs;
+            }
             if (ls != STM_OK) {
                 s->allocs[device_id] = NULL;
                 s->n_attached--;

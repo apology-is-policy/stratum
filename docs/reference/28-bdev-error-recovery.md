@@ -431,9 +431,8 @@ stderr, at most 32 per request kind over the process.
   the newest commit (overwrite a copy of that slot with zeros; it then reads
   back zero and the mount takes the generation before). An explicit opt-in
   mount could take the newest readable generation; it is enqueued for the
-  operator. A multi-device pool can still roll back a commit
-  acknowledged by exactly a quorum when one of those devices refuses
-  (enqueued).
+  operator. A multi-device pool refuses (STM_EIO) while a device that
+  refuses could hold a newer commit (vote 153; ref 07's mount flow).
 - **The device probe and a host page cache.** Under QEMU with
   `cache=writeback`, or a buffered host backend, the classifying readers'
   device probe can be answered from the host's page cache while reads that
