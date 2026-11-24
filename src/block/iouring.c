@@ -153,7 +153,8 @@ static bool resubmit_rest_locked(iouring_bdev *d, pending *p)
     else
         io_uring_prep_write(sqe, d->fd, p->buf + p->done, entry_len_locked(d, p),
                             p->off + p->done);
-    return submit_locked(d, p, sqe) == STM_OK;
+    (void)submit_locked(d, p, sqe);
+    return true;
 }
 
 /* Dispatch CQEs to their registered callbacks. Returns count delivered.
