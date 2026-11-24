@@ -2207,10 +2207,9 @@ static uint64_t compute_auth_gen(const sync_scan *scans, size_t n, size_t quorum
 /* index AND every present dataset's content engine + the snapshot index AND   */
 /* every snapshot's captured content engine. All metadata is device-0-backed   */
 /* and the bootstrap is device-0-addressed, so device 0's bootstrap is         */
-/* reconciled and any stray non-device-0 paddr is ignored by reconcile_mark;   */
-/* additional devices' allocator trees (multi-device pools) are left untouched */
-/* -- safe (no sweep on their bootstraps), at the cost of not reclaiming their  */
-/* orphans until the bootstrap layer itself becomes multi-device-aware.       */
+/* reconciled and any stray non-device-0 paddr is ignored by reconcile_mark.   */
+/* An attached device's bootstrap holds its own allocator tree alone, and is   */
+/* reconciled at its attach with that tree marked (sync_reconcile_attached).   */
 struct sync_recon_route { stm_bootstrap *boot; stm_status mark_err; };
 static void sync_recon_mark(void *ctx, uint64_t paddr, uint32_t nblocks) {
     struct sync_recon_route *r = ctx;
@@ -2414,10 +2413,16 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
      *     no single UB can be authoritative).
      *   - If fewer than quorum devs are at exactly auth_gen (the
      *     rest are ahead-of-auth orphans, which is how we recover
-     *     from partial-Phase-3 commits): canonical = any dev at
-     *     auth_gen. No content-quorum check (there are < quorum devs
-     *     to disagree). Ahead-of-auth devices are orphans that the
-     *     next commit's writes will overwrite.
+     *     from partial-Phase-3 commits): canonical = the content all
+     *     of them hold. With four devices or more two of them can
+     *     disagree: an orphan final whose commit failed, and the claim
+     *     a later open made, acknowledged on devices the next commit
+     *     moved past it (their copies at auth_gen sit in ring slots
+     *     this check does not read, OPEN-BUGS (ah)). Taking either by
+     *     device order could mount the orphan, whose nodes that open's
+     *     sweep handed back (quorum.tla MinorityMustAgree,
+     *     MountKeepsPublished): STM_EQUORUM. Ahead-of-auth devices are
+     *     orphans that the next commit's writes will overwrite.
      *
      * Dissenting devices at auth_gen that aren't in the quorum group
      * are legitimate orphans per ARCH §5.8 — they'll be overwritten
@@ -2465,11 +2470,14 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
             free(scans);
             return STM_EQUORUM;
         }
-    } else {
-        /* < quorum devs at exactly auth_gen — rest are ahead-of-auth
-         * orphans. Canonical = any dev at auth_gen. Orphans get
-         * overwritten by next commit's per-device writes. */
+    } else if (ngroups <= 1) {
+        /* < quorum devs at exactly auth_gen, all agreeing -- the rest
+         * are ahead-of-auth orphans the next commit's per-device writes
+         * overwrite. */
         canonical_idx = any_at_auth;
+    } else {
+        free(scans);
+        return STM_EQUORUM;
     }
     if (canonical_idx == SIZE_MAX) {
         /* Invariant violation: compute_auth_gen returned auth_gen > 0
@@ -4298,16 +4306,21 @@ stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
             stm_status ls = stm_alloc_load_tree_at(alloc, tree_paddr,
                                                      tree_gen,
                                                      tree_csum);
-            /* A bitmap the alloc's open could not confirm may be a
-             * commit older than the tree just loaded, marking free the
-             * nodes it holds (stm_bootstrap_bitmap_unconfirmed): the next
-             * commit's COW would take them. Reconcile it before any
-             * reserve, as the open does device 0's, and refuse the
-             * attach when the pass does not complete. A read-only pool
-             * reserves nothing. */
-            if (ls == STM_OK && !s->read_only &&
-                stm_bootstrap_bitmap_unconfirmed(stm_alloc_bootstrap(alloc)))
-                ls = sync_reconcile_attached(alloc, device_id);
+            /* Reconcile the device's bootstrap before any reserve, as the
+             * open does device 0's: it reclaims nodes a crash or the last
+             * commit's frees left allocated (#791), and restores those a
+             * bitmap the alloc's open could not confirm marks free though
+             * the tree just loaded holds them
+             * (stm_bootstrap_bitmap_unconfirmed), which the next commit's
+             * COW would take. A pass that does not complete refuses the
+             * attach only over such a bitmap. A read-only pool reserves
+             * nothing. */
+            if (ls == STM_OK && !s->read_only) {
+                stm_status rs = sync_reconcile_attached(alloc, device_id);
+                if (rs != STM_OK &&
+                    stm_bootstrap_bitmap_unconfirmed(stm_alloc_bootstrap(alloc)))
+                    ls = rs;
+            }
             if (ls != STM_OK) {
                 s->allocs[device_id] = NULL;
                 s->n_attached--;

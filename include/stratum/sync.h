@@ -191,6 +191,9 @@ void stm_sync_pool_serial(const stm_sync *s, uint8_t out[16]);
  *     high as any (a device of a multi-device pool can miss writes), and
  *     the open refuses when the (quorum - unknown)-th highest gen the
  *     others read is above the quorum-th (quorum.tla Mount, vote 153);
+ *   - refuses STM_EQUORUM when the devices read at exactly that gen
+ *     disagree on content: a quorum of them must share one, and when
+ *     fewer sit there, all of them (quorum.tla MinorityMustAgree);
  *   - writes a claim at authoritative_gen + 1 to every device not REMOVED
  *     or FAULTED, per the MountGenBump invariant (sync.tla). With quorum,
  *     auth_gen becomes the claim's gen and current_gen the claim's + 2.
@@ -543,11 +546,12 @@ uint64_t stm_sync_reconcile_freed_nodes(const stm_sync *s);
  *   - MUST be called before the first stm_sync_commit that writes
  *     durable state referencing device_id's alloc tree.
  *
- * On a mounted, writable pool whose `alloc` opened on a bitmap it could
- * not confirm (stm_bootstrap_bitmap_unconfirmed), the attach reconciles
- * that bootstrap after loading the device's tree, before any reserve
- * (the tree is all it holds), and fails with the pass's error when the
- * pass does not complete.
+ * On a mounted, writable pool the attach reconciles `alloc`'s bootstrap
+ * after loading the device's tree, before any reserve (the tree is all
+ * it holds): orphans are reclaimed, and nodes of the tree a bitmap the
+ * alloc's open could not confirm (stm_bootstrap_bitmap_unconfirmed)
+ * marks free are taken back. A pass that does not complete fails the
+ * attach, with the pass's error, only over such a bitmap.
  *
  * Returns STM_EEXIST if a slot is already filled for device_id.
  * Returns STM_EINVAL on range / shape violations.

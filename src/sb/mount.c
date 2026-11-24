@@ -449,6 +449,51 @@ static stm_status sb_refuse_version(stm_bdev *d, uint32_t li, uint32_t si,
     return STM_EBADVERSION;
 }
 
+/* Nothing has decoded yet: read again each copy of labels [lo, hi) the
+ * scan's one read left unsettled, until it settles (sb_copy_settle). A
+ * read can come back zero or wrong with no error, and a device whose every
+ * copy did so once would answer as blank: a known vote of nothing, past
+ * which a multi-device pool would mount over a commit the device holds
+ * (stm_sync_open_ex), and a one-device pool would read as fresh. A decode
+ * is best (the highest); true at a newer build's uberblock (its copy and
+ * version in *newer_*), which ends the pass. */
+static bool sb_settle_unread(stm_bdev *d,
+                             uint8_t st[STM_LABELS_PER_DEVICE][STM_UB_SLOTS_PER_LABEL],
+                             uint32_t lo, uint32_t hi, bool *have_any,
+                             uint64_t *best_gen, uint32_t *best_label,
+                             uint32_t *best_slot, stm_uberblock *best_ub,
+                             uint32_t *newer_label, uint32_t *newer_slot,
+                             uint32_t *newer_version)
+{
+    for (uint32_t li = lo; li < hi; li++) {
+        for (uint32_t si = 0; si < STM_UB_SLOTS_PER_LABEL; si++) {
+            sb_slot_state c = (sb_slot_state)st[li][si];
+            if (c != SB_SLOT_READ_ZERO && c != SB_SLOT_READ_WRONG &&
+                c != SB_SLOT_READ_FAILED)
+                continue;
+            stm_uberblock ub;
+            uint32_t v = 0;
+            c = sb_copy_settle(d, &st[li][si], li, si, &ub, &v);
+            if (c == SB_SLOT_NEWER) {
+                *newer_label   = li;
+                *newer_slot    = si;
+                *newer_version = v;
+                return true;
+            }
+            if (c != SB_SLOT_VALID) continue;
+            uint64_t gen = stm_load_le64(ub.ub_gen);
+            if (!*have_any || gen > *best_gen) {
+                *best_gen   = gen;
+                *best_label = li;
+                *best_slot  = si;
+                *best_ub    = ub;
+                *have_any   = true;
+            }
+        }
+    }
+    return false;
+}
+
 stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
                                 stm_uberblock *out_ub,
                                 uint32_t *out_label_idx,
@@ -492,10 +537,20 @@ stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
      *
      * The head labels come first: their newest uberblock gives the layout
      * the tail labels are read by (sb_layout). A newer build's uberblock
-     * there refuses below, its layout not this build's to compute. */
+     * there refuses below, its layout not this build's to compute. When
+     * nothing in them decoded at one read, their copies are read again
+     * until they settle (sb_settle_unread) before the layout is taken, and
+     * the tail's after the pass. */
     for (uint32_t li = 0; li < STM_LABELS_PER_DEVICE; li++) {
         if (li == SB_HEAD_LABELS) {
             if (saw_newer) break;
+            if (!have_any &&
+                sb_settle_unread(d, st, 0, SB_HEAD_LABELS, &have_any,
+                                 &best_gen, &best_label, &best_slot, &best_ub,
+                                 &newer_label, &newer_slot, &newer_version)) {
+                saw_newer = true;
+                break;
+            }
             stm_status ls = sb_layout(d, have_any ? &best_ub : NULL,
                                       best_label, best_slot, why);
             if (ls != STM_OK) return ls;
@@ -544,6 +599,12 @@ stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
         }
     }
 
+    if (!have_any && !saw_newer &&
+        sb_settle_unread(d, st, SB_HEAD_LABELS, STM_LABELS_PER_DEVICE,
+                         &have_any, &best_gen, &best_label, &best_slot,
+                         &best_ub, &newer_label, &newer_slot, &newer_version))
+        saw_newer = true;
+
     /* A newer build wrote this pool: its commits may lie past every
      * generation this build can read, wherever its layout puts them, so
      * mounting what it can read would roll the pool back and the claim
@@ -565,7 +626,11 @@ stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
             return sb_refuse_version(d, older_label, older_slot,
                                      older_version, 0, why);
         if (saw_bad_version) return STM_EBADVERSION;
-        if (any_unread) return STM_EIO;
+        bool unreadable = any_unread;
+        for (uint32_t li = 0; li < STM_LABELS_PER_DEVICE; li++)
+            for (uint32_t si = 0; si < STM_UB_SLOTS_PER_LABEL; si++)
+                if (st[li][si] == (uint8_t)SB_SLOT_UNREADABLE) unreadable = true;
+        if (unreadable) return STM_EIO;
         /* An uberblock out of its slot is still a pool, never a fresh
          * device. */
         return any_misplaced ? STM_ECORRUPT : STM_ENOENT;

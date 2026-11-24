@@ -30,7 +30,7 @@ chapter as specs get wider cross-reference tables).
 | `allocator.tla` | 3 | Refcount + deferred-free; unreserve; a send's hold on its blocks. | 24501221 distinct states, depth 29 (3 ranges, 3 owners, MaxGen 3) | `allocator_unreserve_after_write_buggy.cfg`, `allocator_send_sweep_ignores_pins_buggy.cfg`, `allocator_send_sweep_ignores_barrier_buggy.cfg`, `allocator_send_barrier_by_free_gen_buggy.cfg`, `allocator_send_free_before_deindex_buggy.cfg` |
 | `merkle.tla` | 4 | Per-node Merkle chain. | bounded | — |
 | `key_schema.tla` | 7 / TLY-A3 | Per-dataset key state machine + TLY-A3-keyslot mount machine (`wrapper_identity` + mount FSM + `MountResolvesKeyBeforeData`) + TLY-A3-keyslot-wrap UNWRAP-binding: `unwrap_path` tracking + `UnwrapUsesWrapBinding` — a mount that resolves a CORVUS slot sends corvus the same dataset-path binding the slot's WRAP recorded; a mismatch makes corvus reject the envelope → unmountable pool. | bounded | `key_schema_mount_serve_before_resolve_buggy.cfg`, `key_schema_unwrap_wrong_path_buggy.cfg` |
-| `quorum.tla` | 5 | Multi-device commit + mount-claim; the mount reads the ONLINE devices (vote 153). | 2411 distinct states; `quorum_faults.cfg` (one fault) 21379 | `quorum_buggy.cfg`, `quorum_mount_buggy.cfg` |
+| `quorum.tla` | 5 | Multi-device commit + mount-claim; the mount reads the ONLINE devices (vote 153) and picks content as the open does. | 2510 distinct states; `quorum_faults.cfg` (one fault) 23068; `quorum_pick.cfg` (four devices, one fault) 35114 | `quorum_buggy.cfg`, `quorum_mount_buggy.cfg`, `quorum_pick_buggy.cfg` |
 | `metadata_nonce.tla` | 5 | Per-device paddr-stamping for nonces. | 51939 states | `metadata_nonce_buggy.cfg` |
 | `device_lifecycle.tla` | 5 | Roster state machine (add/remove/fail/rejoin). | large cfg: 10.6M states at depth 21 | `device_lifecycle_buggy.cfg` |
 | `evac.tla` | 5 | Per-block evacuation atomicity. | 13 states, depth 5 | `evac_buggy.cfg`, `evac_remove_no_drain_buggy.cfg` |
@@ -274,8 +274,25 @@ ones too, an oracle the implementation cannot read.
 `ContentQuorumAtGen`, which fails under a fault (OPEN-BUGS (ah): two
 devices at exactly the claim's gen disagree once its quorum member moves
 past it). `quorum_mount_buggy.cfg` (`MountCountsUnknown=FALSE`, the open
-before vote 153) fails `MountAtAuthoritative`: a gen two devices of three
-hold, one faulted at the next mount, which takes the older gen.
+before vote 153) fails `MountKeepsPublished`: a final two devices of three
+acknowledged, one faulted at the next mount, which takes the gen before
+it and writes its claim over the other's copy.
+
+The content pick (Stratum (r) round 1 F2): of the devices read at exactly
+the gen it takes, the mount takes a content a quorum of them holds when a
+quorum sits there, and when fewer do, the content all of them hold
+(`MinorityMustAgree`), refusing while they disagree. History variables
+record the last acknowledged final or claim; `MountKeepsPublished`: no
+mount takes a gen below it, or at its gen another content.
+`MountAtAuthoritative` is kept and is stricter (a rollback past a
+reservation, which loses nothing, breaks it). `quorum_pick.cfg` (four
+devices, quorum 3, one fault) holds every invariant but
+`ContentQuorumAtGen`; `quorum_pick_buggy.cfg` (`MinorityMustAgree=FALSE`,
+the open before the fix) fails `MountKeepsPublished`: an orphan final
+beside the acknowledged claim at the mount's gen, and the mount picks
+the orphan. The model keeps each device's newest uberblock only, so it
+refuses where reading each device's slot for that gen would mount
+(OPEN-BUGS (ah)).
 
 Spec-to-code: `src/sync/sync.c::sync_commit, sync_open, write_ub_to_all_devices,
 sync_ub_shared_bytes_match`.
@@ -1927,6 +1944,11 @@ java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
     grep -E "Invariant|Error:" | head -2
 java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
     -config quorum_mount_buggy.cfg quorum.tla 2>&1 | \
+    grep -E "Invariant|Error:" | head -2
+java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+    -config quorum_pick.cfg quorum.tla 2>&1 | tail -3
+java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+    -config quorum_pick_buggy.cfg quorum.tla 2>&1 | \
     grep -E "Invariant|Error:" | head -2
 for cfg in namespace_global_bindings_buggy namespace_detach_leaks_buggy \
            namespace_unbind_crosstalk_buggy namespace_lookup_crosstalk_buggy; do

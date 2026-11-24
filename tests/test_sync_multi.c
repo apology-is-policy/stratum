@@ -59,6 +59,10 @@ static const uint64_t DEV_UUID_HI = 0xfedcba9876543210ULL;
 
 static char g_paths[NDEV][256];
 
+/* The size open_bdevs, open_multi_allocs and make_multi_pool give each
+ * device; a test that needs more sets it and puts it back. */
+static uint64_t g_dev_bytes = TEST_DEVICE_BYTES;
+
 static void make_paths(const char *tag)
 {
     for (size_t i = 0; i < NDEV; i++) {
@@ -79,7 +83,7 @@ static void open_bdevs(stm_bdev *out[NDEV])
     for (size_t i = 0; i < NDEV; i++) {
         stm_bdev_open_opts bo = stm_bdev_open_opts_default();
         STM_ASSERT_OK(stm_bdev_open(g_paths[i], &bo, &out[i]));
-        STM_ASSERT_OK(stm_bdev_resize(out[i], TEST_DEVICE_BYTES));
+        STM_ASSERT_OK(stm_bdev_resize(out[i], g_dev_bytes));
     }
 }
 
@@ -98,7 +102,7 @@ static stm_pool *make_multi_pool(stm_bdev *bds[NDEV])
     for (size_t i = 0; i < NDEV; i++) {
         opts.devices[i].uuid[0]    = DEV_UUID_LO[i];
         opts.devices[i].uuid[1]    = DEV_UUID_HI;
-        opts.devices[i].size_bytes = TEST_DEVICE_BYTES;
+        opts.devices[i].size_bytes = g_dev_bytes;
         opts.devices[i].role       = STM_DEV_ROLE_DATA;
         opts.devices[i].class_     = STM_DEV_CLASS_SSD;
         opts.devices[i].state      = STM_DEV_STATE_ONLINE;
@@ -1066,7 +1070,7 @@ static void open_multi_allocs(stm_bdev *bds_out[NDEV], stm_alloc *allocs_out[NDE
     for (size_t i = 0; i < NDEV; i++) {
         stm_bdev_open_opts bo = stm_bdev_open_opts_default();
         STM_ASSERT_OK(stm_bdev_open(g_paths[i], &bo, &bds_out[i]));
-        STM_ASSERT_OK(stm_bdev_resize(bds_out[i], TEST_DEVICE_BYTES));
+        STM_ASSERT_OK(stm_bdev_resize(bds_out[i], g_dev_bytes));
 
         uint64_t dev_uuid[2] = { DEV_UUID_LO[i], DEV_UUID_HI };
         STM_ASSERT_OK(stm_alloc_create(bds_out[i], POOL_UUID, dev_uuid,
@@ -3990,13 +3994,20 @@ typedef struct {
     uint64_t   dev1_root;    /* device 1's gen-3 alloc_root afterwards */
 } quorum_mount_result;
 
-/* Open the pool device 0's slot of gen 3 unreadable when `fault0`. */
-static void quorum_mount(bool fault0, quorum_mount_result *r)
+/* Open the pool, device 0's slot of gen 3 unreadable when `fault0`, and
+ * when `zero1` device 1's every ring copy read back zero once. */
+static void quorum_mount(bool fault0, bool zero1, quorum_mount_result *r)
 {
     memset(r, 0, sizeof *r);
     stm_bdev *bds[NDEV] = {0};
     open_bdevs(bds);
     if (fault0) fault_gen_copies(bds[0], 3);
+    for (uint32_t li = 0; zero1 && li < STM_UB_COPIES; li++) {
+        uint64_t lo = gen_copy_off(0, li);
+        stm_bdev_inject_read_range_zero(bds[1], lo,
+            lo + (uint64_t)STM_UB_SLOTS_PER_LABEL * STM_UB_SIZE,
+            STM_UB_SLOTS_PER_LABEL);
+    }
     stm_pool *pool = make_multi_pool(bds);
     stm_alloc *a = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a));
@@ -4012,6 +4023,7 @@ static void quorum_mount(bool fault0, quorum_mount_result *r)
     }
     stm_alloc_close(a);
     stm_pool_close(pool);
+    stm_bdev_inject_read_range_clear(bds[1]);
     stm_uberblock u;
     if (stm_sb_label_read(bds[1], 0u, 3u, &u) == STM_OK &&
         stm_load_le64(u.ub_gen) == 3u)
@@ -4040,19 +4052,19 @@ STM_TEST(sync_multi_open_refuses_while_an_unread_device_could_hold_the_newest) {
         root3 = stm_load_le64(u.ub_alloc_root.bp_paddr);
         close_bdevs(bds);
     }
-    quorum_mount(true, &r);
+    quorum_mount(true, false, &r);
     STM_ASSERT_ERR(r.open, STM_EIO);
     STM_ASSERT_EQ(r.writes, 0u);
     STM_ASSERT(root3 != 0);
     STM_ASSERT_EQ(r.dev1_root, root3);
-    quorum_mount(false, &r);
+    quorum_mount(false, false, &r);
     STM_ASSERT_OK(r.open);
     STM_ASSERT_EQ(r.mounted, 3u);
     unlink_paths();
 
     make_paths("v153b");
     quorum_build(false);
-    quorum_mount(true, &r);
+    quorum_mount(true, false, &r);
     STM_ASSERT_OK(r.open);
     STM_ASSERT_EQ(r.mounted, 3u);
     unlink_paths();
@@ -4127,6 +4139,33 @@ static void primary_cut_leg(size_t cut, const char *tag)
     unlink_paths();
 }
 
+/* Round 1 F1: device 1's every ring copy reads back zero once at the open
+ * (a lost mapping, no error). Its scan reads them again and finds gen 3:
+ * the open mounts gen 3 and leaves device 1's copy of it alone. Taken as
+ * blank (a known vote of nothing), the votes were {3, 2}: the open mounted
+ * gen 2 and wrote its claim over the acknowledged final on every device. */
+STM_TEST(sync_multi_open_settles_a_device_read_back_zero_once) {
+    quorum_mount_result r;
+    make_paths("f1zero");
+    quorum_build(true);
+    uint64_t root3 = 0;
+    {
+        stm_bdev *bds[NDEV] = {0};
+        open_bdevs(bds);
+        stm_uberblock u;
+        STM_ASSERT_OK(stm_sb_label_read(bds[1], 0u, 3u, &u));
+        STM_ASSERT_EQ(stm_load_le64(u.ub_gen), 3u);
+        root3 = stm_load_le64(u.ub_alloc_root.bp_paddr);
+        close_bdevs(bds);
+    }
+    quorum_mount(false, true, &r);
+    STM_ASSERT_OK(r.open);
+    STM_ASSERT_EQ(r.mounted, 3u);
+    STM_ASSERT(root3 != 0);
+    STM_ASSERT_EQ(r.dev1_root, root3);
+    unlink_paths();
+}
+
 STM_TEST(sync_multi_commit_wedges_when_the_metadata_primary_is_cut) {
     primary_cut_leg(0, "r_cut0");
     primary_cut_leg(2, "r_cut2");
@@ -4134,12 +4173,13 @@ STM_TEST(sync_multi_commit_wedges_when_the_metadata_primary_is_cut) {
 
 static uint64_t g_tree_paddrs[1024];
 static size_t   g_tree_n;
+static uint64_t g_tree_units;   /* bootstrap nodes the tree's nodes cover */
 static void collect_tree_paddr(void *ctx, uint64_t paddr, uint32_t nblocks)
 {
     (void)ctx;
-    (void)nblocks;
     if (g_tree_n < sizeof g_tree_paddrs / sizeof g_tree_paddrs[0])
         g_tree_paddrs[g_tree_n++] = paddr;
+    g_tree_units += nblocks / STM_BOOTSTRAP_NODE_BLOCKS;
 }
 
 /* Nodes of the collected tree the bootstrap holds free. */
@@ -4155,6 +4195,28 @@ static size_t tree_nodes_free(stm_alloc *a)
     return n;
 }
 
+/* Device 1's allocator tree, grown past one node (some 5400 entries to a
+ * node: the devices must be larger than TEST_DEVICE_BYTES), then one more
+ * commit. The alloc writes its tree whole at a commit that changes it
+ * (stm_alloc_commit: free_tree, serialize). */
+static void grow_dev1_tree(stm_alloc *a1, stm_sync *s)
+{
+    for (int round = 0; round < 40; round++) {
+        for (int i = 0; i < 400; i++) {
+            uint64_t p = 0;
+            STM_ASSERT_OK(stm_alloc_reserve(a1, 1u, 0, &p));
+        }
+        STM_ASSERT_OK(stm_sync_commit(s));
+        g_tree_n = 0;
+        STM_ASSERT_OK(stm_alloc_reconcile_mark(a1, collect_tree_paddr, NULL));
+        if (g_tree_n >= 3) break;
+    }
+    STM_ASSERT(g_tree_n >= 3);
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a1, 1u, 0, &p));
+    STM_ASSERT_OK(stm_sync_commit(s));
+}
+
 /* Vote 153 (o1c round 2 F3 (b)): device 1's allocator opens on the older
  * of its bootstrap's two bitmaps (the newer fails a read), which holds
  * free nodes of the alloc tree device 1 committed last. The attach
@@ -4166,12 +4228,13 @@ STM_TEST(sync_multi_attach_reconciles_an_unconfirmed_bitmap) {
     stm_bdev *bds[NDEV] = {0};
     stm_alloc *as[NDEV] = {0};
     stm_pool *pool = NULL; stm_sync *s = NULL;
+    /* Round 1 F4: a tree of more than one level, written whole by the
+     * last commit, so the older bitmap holds every node of it free: a
+     * mark that missed a node, the root's children among them, would
+     * leave it free. */
+    g_dev_bytes = UINT64_C(128) * 1024u * 1024u;
     setup_mirror_pool(2, "v153att", bds, as, &pool, &s);
-    for (int i = 0; i < 3; i++) {
-        uint64_t p = 0;
-        STM_ASSERT_OK(stm_alloc_reserve(as[1], 4u, 0, &p));
-        STM_ASSERT_OK(stm_sync_commit(s));
-    }
+    grow_dev1_tree(as[1], s);
     stm_sync_close(s);
     close_multi_allocs(as);
     stm_pool_close(pool);
@@ -4185,7 +4248,7 @@ STM_TEST(sync_multi_attach_reconciles_an_unconfirmed_bitmap) {
     STM_ASSERT(!stm_bootstrap_bitmap_unconfirmed(stm_alloc_bootstrap(ra[1])));
     g_tree_n = 0;
     STM_ASSERT_OK(stm_alloc_reconcile_mark(ra[1], collect_tree_paddr, NULL));
-    STM_ASSERT(g_tree_n > 0);
+    STM_ASSERT(g_tree_n >= 3);
     STM_ASSERT_EQ(tree_nodes_free(ra[1]), 0u);
     stm_bootstrap_stats bst;
     STM_ASSERT_OK(stm_bootstrap_stats_get(stm_alloc_bootstrap(ra[1]), &bst));
@@ -4210,7 +4273,7 @@ STM_TEST(sync_multi_attach_reconciles_an_unconfirmed_bitmap) {
     size_t stale = tree_nodes_free(ra[1]);
     fprintf(stderr, "  info: %zu of the %zu tree nodes free in the older bitmap\n",
             stale, g_tree_n);
-    STM_ASSERT(stale > 0);
+    STM_ASSERT(stale >= 2);
     rs = NULL;
     STM_ASSERT_OK(stm_sync_open(rp, ra[0], make_wk(), NULL, NULL, &rs));
     STM_ASSERT_OK(stm_sync_attach_alloc(rs, 1u, ra[1]));
@@ -4225,6 +4288,69 @@ STM_TEST(sync_multi_attach_reconciles_an_unconfirmed_bitmap) {
     STM_ASSERT_OK(stm_sync_commit(rs));
     close_reopened(rb, ra, rp, rs);
     unlink_paths();
+    g_dev_bytes = TEST_DEVICE_BYTES;
+}
+
+/* Round 1 O3: an attached device's bitmap the alloc's open confirmed still
+ * holds allocated the nodes its last commit freed (a pending free is not
+ * rebuilt on open) and any a crash orphaned (#791). The attach reconciles
+ * it too, as the open does device 0's: after it the bootstrap holds the
+ * tree's nodes and no other, and a commit and a remount load the tree.
+ * The tree has more than one level and the bitmap holds every node of it:
+ * a mark that missed one would sweep it. */
+STM_TEST(sync_multi_attach_reclaims_a_confirmed_bitmaps_orphans) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    g_dev_bytes = UINT64_C(128) * 1024u * 1024u;
+    setup_mirror_pool(2, "o3att", bds, as, &pool, &s);
+    grow_dev1_tree(as[1], s);
+    stm_sync_close(s);
+    close_multi_allocs(as);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+
+    stm_bdev *rb[NDEV] = {0};
+    stm_alloc *ra[NDEV] = {0};
+    for (size_t i = 0; i < NDEV; i++) {
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        STM_ASSERT_OK(stm_bdev_open(g_paths[i], &bo, &rb[i]));
+    }
+    stm_pool *rp = make_multi_pool(rb);
+    for (size_t i = 0; i < NDEV; i++) {
+        STM_ASSERT_OK(stm_alloc_open_blank(rb[i], &ra[i]));
+        STM_ASSERT_OK(stm_alloc_set_device_id(ra[i], (uint16_t)i));
+    }
+    STM_ASSERT(!stm_bootstrap_bitmap_unconfirmed(stm_alloc_bootstrap(ra[1])));
+    stm_bootstrap_stats before, after;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(stm_alloc_bootstrap(ra[1]), &before));
+    stm_sync *rs = NULL;
+    STM_ASSERT_OK(stm_sync_open(rp, ra[0], make_wk(), NULL, NULL, &rs));
+    STM_ASSERT_OK(stm_sync_attach_alloc(rs, 1u, ra[1]));
+    g_tree_n = 0;
+    g_tree_units = 0;
+    STM_ASSERT_OK(stm_alloc_reconcile_mark(ra[1], collect_tree_paddr, NULL));
+    STM_ASSERT_OK(stm_bootstrap_stats_get(stm_alloc_bootstrap(ra[1]), &after));
+    fprintf(stderr, "  info: device 1's bootstrap held %llu nodes, %llu after "
+            "the attach; the tree's %zu cover %llu\n",
+            (unsigned long long)before.allocated_nodes,
+            (unsigned long long)after.allocated_nodes, g_tree_n,
+            (unsigned long long)g_tree_units);
+    STM_ASSERT(g_tree_n >= 3);
+    STM_ASSERT(before.allocated_nodes > g_tree_units);
+    STM_ASSERT_EQ(after.allocated_nodes, g_tree_units);
+    STM_ASSERT_EQ(tree_nodes_free(ra[1]), 0u);
+    STM_ASSERT_OK(stm_sync_attach_alloc(rs, 2u, ra[2]));
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(ra[1], 4u, 0, &p));
+    STM_ASSERT_OK(stm_sync_commit(rs));
+    close_reopened(rb, ra, rp, rs);
+
+    STM_ASSERT_OK(reopen_from_roster(false, 0, rb, ra, &rp, &rs));
+    STM_ASSERT_OK(stm_sync_commit(rs));
+    close_reopened(rb, ra, rp, rs);
+    unlink_paths();
+    g_dev_bytes = TEST_DEVICE_BYTES;
 }
 
 /* Vote 153: a pool whose removes left device 0 its only live device. Its
@@ -4268,6 +4394,191 @@ STM_TEST(sync_multi_a_device_removes_left_alone_keeps_the_strict_scan) {
     STM_ASSERT_OK(reopen_from_roster(false, 0, rb, ra, &rp, &rs));
     close_reopened(rb, ra, rp, rs);
     unlink_paths();
+}
+
+/* ========================================================================= */
+/* Round 1 F2: the content pick, four devices (quorum 3).                     */
+/* ========================================================================= */
+
+#define Q4 4
+static char g_q4_paths[Q4][256];
+
+static void q4_open(stm_bdev *b[Q4])
+{
+    for (int i = 0; i < Q4; i++) {
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        STM_ASSERT_OK(stm_bdev_open(g_q4_paths[i], &bo, &b[i]));
+        STM_ASSERT_OK(stm_bdev_resize(b[i], TEST_DEVICE_BYTES));
+    }
+}
+
+static void q4_close(stm_bdev *b[Q4])
+{
+    for (int i = 0; i < Q4; i++) stm_bdev_close(b[i]);
+}
+
+static stm_pool *q4_pool(stm_bdev *b[Q4])
+{
+    stm_pool_open_opts o;
+    memset(&o, 0, sizeof o);
+    o.pool_uuid[0] = POOL_UUID[0];
+    o.pool_uuid[1] = POOL_UUID[1];
+    o.device_count = Q4;
+    for (int i = 0; i < Q4; i++) {
+        o.devices[i].uuid[0]    = (uint64_t)(i + 1);
+        o.devices[i].uuid[1]    = DEV_UUID_HI;
+        o.devices[i].size_bytes = TEST_DEVICE_BYTES;
+        o.devices[i].role       = STM_DEV_ROLE_DATA;
+        o.devices[i].class_     = STM_DEV_CLASS_SSD;
+        o.devices[i].state      = STM_DEV_STATE_ONLINE;
+        o.devices[i].bdev       = b[i];
+    }
+    stm_pool *p = NULL;
+    STM_ASSERT_OK(stm_pool_open(&o, &p));
+    return p;
+}
+
+static void q4_zero_gen(stm_bdev *d, uint64_t gen)
+{
+    uint8_t z[STM_UB_SIZE];
+    memset(z, 0, sizeof z);
+    for (uint32_t li = 0; li < STM_UB_COPIES; li++)
+        STM_ASSERT_OK(stm_bdev_write(d, gen_copy_off(gen, li), z, sizeof z));
+}
+
+static void q4_copy_gen(stm_bdev *d, uint64_t gen, bool save,
+                        uint8_t buf[STM_UB_COPIES][STM_UB_SIZE])
+{
+    for (uint32_t li = 0; li < STM_UB_COPIES; li++) {
+        if (save)
+            STM_ASSERT_OK(stm_bdev_read(d, gen_copy_off(gen, li), buf[li],
+                                        STM_UB_SIZE));
+        else
+            STM_ASSERT_OK(stm_bdev_write(d, gen_copy_off(gen, li), buf[li],
+                                         STM_UB_SIZE));
+    }
+}
+
+static uint64_t q4_root(stm_bdev *d, uint64_t gen)
+{
+    stm_uberblock u;
+    if (stm_sb_label_read(d, 0u, (uint32_t)(gen % STM_UB_SLOTS_PER_LABEL),
+                          &u) != STM_OK ||
+        stm_load_le64(u.ub_gen) != gen)
+        return 0;
+    return stm_load_le64(u.ub_alloc_root.bp_paddr);
+}
+
+typedef struct {
+    stm_status open;
+    uint64_t   took;          /* the alloc root the open mounted */
+    uint64_t   orphan_root;   /* device x's gen-5 root, the orphan final */
+    uint64_t   claim_root;    /* device c's gen-5 root, the claim */
+} q4_result;
+
+/* A commit's final at 5 reaches device x alone (session A). The next open
+ * (B) mounts 4, claims 5 on all four, and commits: its reservation at 6
+ * reaches every device but x and c, so its final at 7 is never written.
+ * With `orphan`, x's claim write failed and x keeps the orphan final. The
+ * open after (C) sees devices at {6, 6, 5, 5}: auth_gen 5, two devices at
+ * it, fewer than quorum. `reuse`: B reserves before its commit, taking
+ * nodes the orphan's tree holds (B's sweep handed them back). */
+static void q4_leg(int x, int c, bool orphan, bool reuse, const char *tag,
+                   q4_result *r)
+{
+    memset(r, 0, sizeof *r);
+    for (int i = 0; i < Q4; i++) {
+        snprintf(g_q4_paths[i], sizeof g_q4_paths[i],
+                 "/tmp/stm_v2_sync_multi_q4_%s_%d_%d.bin", tag, (int)getpid(),
+                 i);
+        unlink(g_q4_paths[i]);
+    }
+    stm_bdev *b[Q4] = {0};
+    uint8_t saved[STM_UB_COPIES][STM_UB_SIZE];
+    q4_open(b);
+    stm_pool *p = q4_pool(b);
+    stm_alloc *a = NULL;
+    uint64_t du[2] = { 1, DEV_UUID_HI };
+    STM_ASSERT_OK(stm_alloc_create(b[0], POOL_UUID, du, TEST_BOOTSTRAP_BYTES,
+                                   &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(p, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 1 */
+    uint64_t dp = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 2, 3 */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 4, 5 */
+    stm_sync_info si;
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    STM_ASSERT_EQ(si.auth_gen, 5u);
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    q4_copy_gen(b[x], 5, true, saved);
+    for (int i = 0; i < Q4; i++) if (i != x) q4_zero_gen(b[i], 5);
+    r->orphan_root = q4_root(b[x], 5);
+    q4_close(b);
+
+    q4_open(b);
+    p = q4_pool(b);
+    a = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(b[0], &a));
+    s = NULL;
+    STM_ASSERT_OK(stm_sync_open(p, a, make_wk(), NULL, NULL, &s));
+    if (reuse) STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 6, 7 */
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    STM_ASSERT_EQ(si.auth_gen, 7u);
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    r->claim_root = q4_root(b[c], 5);
+    if (orphan) q4_copy_gen(b[x], 5, false, saved);
+    q4_zero_gen(b[x], 6); q4_zero_gen(b[x], 7);
+    q4_zero_gen(b[c], 6); q4_zero_gen(b[c], 7);
+    for (int i = 0; i < Q4; i++) if (i != x && i != c) q4_zero_gen(b[i], 7);
+    q4_close(b);
+
+    q4_open(b);
+    p = q4_pool(b);
+    a = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(b[0], &a));
+    s = NULL;
+    r->open = stm_sync_open(p, a, make_wk(), NULL, NULL, &s);
+    if (r->open == STM_OK) {
+        STM_ASSERT_OK(stm_sync_info_get(s, &si));
+        r->took = si.alloc_root_paddr;
+        stm_sync_close(s);
+    }
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    q4_close(b);
+    for (int i = 0; i < Q4; i++) unlink(g_q4_paths[i]);
+}
+
+/* Two devices at exactly auth_gen, fewer than quorum, disagree: the
+ * orphan final of a commit that failed, and the claim the next open
+ * acknowledged on three devices (two of which then moved past it). The
+ * open refuses STM_EQUORUM, by either device order and with or without
+ * reuse. It took the lower device index's: the orphan when x = 2 (its
+ * tree mounted, or STM_ECORRUPT where the claim's commit reused its
+ * nodes), the claim when c = 2. Control: x's claim write succeeded, the
+ * two at auth_gen agree, and the open mounts the claim. */
+STM_TEST(sync_multi_open_refuses_a_disagreeing_minority_at_auth_gen) {
+    q4_result r;
+    q4_leg(2, 3, false, true, "ctl", &r);
+    STM_ASSERT_OK(r.open);
+    STM_ASSERT(r.claim_root != 0);
+    STM_ASSERT_EQ(r.took, r.claim_root);
+    q4_leg(2, 3, true, true, "xlow", &r);
+    STM_ASSERT(r.orphan_root != 0 && r.claim_root != 0);
+    STM_ASSERT(r.orphan_root != r.claim_root);
+    STM_ASSERT_ERR(r.open, STM_EQUORUM);
+    q4_leg(3, 2, true, true, "clow", &r);
+    STM_ASSERT_ERR(r.open, STM_EQUORUM);
+    q4_leg(2, 3, true, false, "xlow_noreuse", &r);
+    STM_ASSERT_ERR(r.open, STM_EQUORUM);
 }
 
 STM_TEST_MAIN("sync_multi")

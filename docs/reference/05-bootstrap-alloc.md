@@ -219,14 +219,17 @@ sync-layer driver `sync_reconcile_bootstrap`:
   mount fails with the pass's error, since the next reserve would hand out a
   live node (o1c review round 1, F4). This covers device 0's bootstrap. The
   allocators of a multi-device pool's other devices attach after the open
-  (`stm_sync_attach_alloc`); over a bitmap their open could not confirm the
-  attach reconciles that device's bootstrap before any reserve, and refuses
-  when the pass does not complete (vote 153). The device's own alloc tree is
+  (`stm_sync_attach_alloc`); on a writable pool the attach reconciles that
+  device's bootstrap before any reserve, as the open does device 0's: it
+  reclaims the nodes the device's last commit freed and any a crash
+  orphaned, and takes back those a bitmap its open could not confirm
+  marks free (vote 153; Stratum (r) round 1 O3 reclaims on a confirmed
+  one too). A pass that does not complete refuses the attach only over an
+  unconfirmed bitmap. The device's own alloc tree is
   all that bootstrap holds, so marking it is the complete mark; each node's
   paddr carries the device's id and is marked in the bootstrap's device-0
   form (marked as it is, reconcile_mark would pass over it and the sweep
-  free the whole tree). A confirmed bitmap is left as it is: its orphans
-  are not reclaimed.
+  free the whole tree).
 
 **Completeness is the caller's obligation**: a bootstrap-backed tree left
 unwalked has its live nodes swept → corruption. The driver walks alloc +
