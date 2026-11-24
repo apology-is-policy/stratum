@@ -2489,7 +2489,8 @@ STM_TEST(sb_gen_read_tells_a_slot_gen_never_reached_from_one_unread) {
 
 /* A newer build's uberblock in any copy refuses STM_EBADVERSION, beside
  * copies of gen too, and behind a read that came back zero once, `why`
- * naming the copy and its version. Control: that copy holding gen. */
+ * zeroed and naming the first such copy in label order and its version.
+ * Control: that copy holding gen. */
 STM_TEST(sb_gen_read_refuses_a_newer_builds_uberblock) {
     stm_bdev *d = open_test_device("gennew", 16 * 1024 * 1024);
     STM_ASSERT(d != NULL);
@@ -2507,6 +2508,17 @@ STM_TEST(sb_gen_read_refuses_a_newer_builds_uberblock) {
     STM_ASSERT_EQ(why.slot_idx, 46u);
     STM_ASSERT_EQ(why.byte_offset, off);
     STM_ASSERT_EQ(why.best_gen, 0u);
+    STM_ASSERT_EQ(why.version, STM_UB_VERSION + 1u);
+    STM_ASSERT_EQ(why.recorded_bytes, 0u);
+    STM_ASSERT_EQ(why.device_bytes, 0u);
+    uint8_t nb[STM_UB_SIZE];
+    STM_ASSERT_OK(stm_bdev_read(d, off, nb, sizeof nb));
+    sb_restamp(nb, STM_UB_VERSION + 2u);
+    STM_ASSERT_OK(stm_bdev_write(d, sb_copy_off(d, 46, 3), nb, sizeof nb));
+    memset(&why, 0xa5, sizeof why);
+    STM_ASSERT_ERR(stm_sb_gen_read(d, 46, &u, &why), STM_EBADVERSION);
+    STM_ASSERT_EQ(why.label_idx, 46u % 4u);
+    STM_ASSERT_EQ(why.byte_offset, off);
     STM_ASSERT_EQ(why.version, STM_UB_VERSION + 1u);
     uint32_t fired = stm_bdev_inject_read_range_fired(d);
     stm_bdev_inject_read_range_zero(d, off, off + STM_UB_SIZE, 1);

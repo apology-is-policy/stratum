@@ -802,8 +802,10 @@ stm_status stm_sb_gen_read(stm_bdev *d, uint64_t gen, stm_uberblock *out_ub,
             unsettled = true;
         }
     }
-    if (newer)
+    if (newer) {
+        if (why) memset(why, 0, sizeof *why);
         return sb_refuse_version(d, newer_label, si, newer_version, 0, why);
+    }
     if (found) return STM_OK;
     return unsettled ? STM_EIO : STM_ENOENT;
 }

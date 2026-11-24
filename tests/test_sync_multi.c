@@ -5027,4 +5027,215 @@ STM_TEST(sync_multi_attach_keeps_a_carried_over_allocs_pending_frees) {
     attach_carried_over_leg(false, "cocarry");
 }
 
+/* ========================================================================= */
+/* Round 2 F1: a commit retried after its final failed writes its            */
+/* reservation's bytes again.                                                 */
+/* ========================================================================= */
+
+/* Every write to gen's slot on d fails, `armed` copies' worth. */
+typedef struct { uint64_t gen; int armed; stm_bdev *d; } rr_obs_ctx;
+static void rr_obs(void *ctx_, bool is_write, uint64_t off, size_t len)
+{
+    (void)len;
+    rr_obs_ctx *c = ctx_;
+    if (!is_write || c->armed <= 0) return;
+    for (uint32_t li = 0; li < STM_UB_COPIES; li++)
+        if (off == gen_copy_off(c->gen, li)) {
+            stm_bdev_inject_fail_after(c->d, 1);
+            c->armed--;
+            return;
+        }
+}
+
+/* A commit of s whose final, at s's current gen, reaches device 0 alone. */
+static stm_status rr_commit_final_on_d0(stm_sync *s, stm_bdev *b[NDEV])
+{
+    stm_sync_info si;
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    rr_obs_ctx c1 = { si.current_gen, STM_UB_COPIES, b[1] };
+    rr_obs_ctx c2 = { si.current_gen, STM_UB_COPIES, b[2] };
+    stm_bdev_io_observer o1 = { rr_obs, &c1 }, o2 = { rr_obs, &c2 };
+    stm_bdev_set_io_observer_for_test(b[1], &o1);
+    stm_bdev_set_io_observer_for_test(b[2], &o2);
+    stm_status st = stm_sync_commit(s);
+    stm_bdev_set_io_observer_for_test(b[1], NULL);
+    stm_bdev_set_io_observer_for_test(b[2], NULL);
+    STM_ASSERT_EQ(c1.armed, 0);
+    STM_ASSERT_EQ(c2.armed, 0);
+    return st;
+}
+
+static stm_status rr_open(stm_bdev *b[NDEV], uint64_t *took, uint64_t *writes)
+{
+    stm_pool *p = make_multi_pool(b);
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(b[0], &a));
+    uint64_t w0 = total_writes(b);
+    stm_sync *s = NULL;
+    stm_status st = stm_sync_open(p, a, make_wk(), NULL, NULL, &s);
+    *writes = total_writes(b) - w0;
+    *took = 0;
+    if (st == STM_OK) {
+        stm_sync_info si;
+        STM_ASSERT_OK(stm_sync_info_get(s, &si));
+        *took = si.alloc_root_paddr;
+        stm_sync_close(s);
+    }
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    return st;
+}
+
+/* Commits 1 and (2, 3); the commit at (4, 5) has its final reach device 0
+ * alone, so the session's current gen stays 5 and its retry reserves at 4
+ * again, where all three devices confirmed the first attempt's
+ * reservation. `between`: a data reserve before the retry moves the
+ * allocator's free count, which the reservation records. `roster`:
+ * device 2 is failed before the retry instead. */
+static void rr_leg(const char *tag, bool between, bool roster)
+{
+    make_paths(tag);
+    stm_bdev *b[NDEV] = {0};
+    open_bdevs(b);
+    stm_pool *p = make_multi_pool(b);
+    stm_alloc *a = NULL;
+    uint64_t du[2] = { DEV_UUID_LO[0], DEV_UUID_HI };
+    STM_ASSERT_OK(stm_alloc_create(b[0], POOL_UUID, du, TEST_BOOTSTRAP_BYTES,
+                                   &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(p, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 1 */
+    uint64_t dp = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 2, 3 */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_ERR(rr_commit_final_on_d0(s, b), STM_EQUORUM);
+    stm_sync_info si;
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    STM_ASSERT_EQ(si.auth_gen, 3u);
+    STM_ASSERT_EQ(si.current_gen, 5u);
+    STM_ASSERT(q4_root(b[0], 5) != 0);
+    STM_ASSERT_EQ(q4_root(b[1], 5), 0u);
+    STM_ASSERT_EQ(q4_root(b[2], 5), 0u);
+
+    uint8_t r1[NDEV][STM_UB_COPIES][STM_UB_SIZE];
+    uint8_t f1d0[STM_UB_COPIES][STM_UB_SIZE];
+    for (int i = 0; i < NDEV; i++) q4_copy_gen(b[i], 4, true, r1[i]);
+    q4_copy_gen(b[0], 5, true, f1d0);
+    stm_uberblock R1;
+    STM_ASSERT_OK(stm_ub_decode(r1[0][0], STM_UB_SIZE, &R1));
+    STM_ASSERT_EQ(stm_load_le64(R1.ub_gen), 4u);
+
+    if (between) STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    if (roster) STM_ASSERT_OK(stm_pool_fail_device(p, 2));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 4, 5 */
+    uint8_t r2[NDEV][STM_UB_COPIES][STM_UB_SIZE];
+    for (int i = 0; i < NDEV; i++) q4_copy_gen(b[i], 4, true, r2[i]);
+    stm_uberblock R2;
+    STM_ASSERT_OK(stm_ub_decode(r2[0][0], STM_UB_SIZE, &R2));
+    stm_test_info("[%s] free blocks at the reservation: R1 %llu, R2 %llu",
+                  tag, (unsigned long long)stm_load_le64(R1.ub_free_blocks),
+                  (unsigned long long)stm_load_le64(R2.ub_free_blocks));
+    if (roster) {
+        /* Every device written finds itself in the roster written. */
+        STM_ASSERT_EQ(stm_load_le64(R2.ub_roster_hash),
+                      stm_pool_roster_hash(p));
+        STM_ASSERT(stm_load_le64(R1.ub_roster_hash) !=
+                   stm_pool_roster_hash(p));
+        STM_ASSERT(memcmp(r2[1], r1[1], sizeof r1[1]) != 0);
+    }
+    bool same = true;
+    for (int i = 0; i < NDEV; i++)
+        same = same && memcmp(r2[i], r1[i], sizeof r1[i]) == 0;
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
+
+    if (!roster) {
+        /* A power loss in the retry's reservation barrier: device 0's copy
+         * durable (it keeps the first attempt's final at 5), device 1's torn
+         * on every copy, device 2's lost (it keeps the first attempt's). */
+        for (int i = 0; i < NDEV; i++) q4_zero_gen(b[i], 5);
+        q4_copy_gen(b[0], 5, false, f1d0);
+        q4_copy_gen(b[0], 4, false, r2[0]);
+        q4_copy_gen(b[1], 4, false, r1[1]);
+        q4_copy_gen(b[2], 4, false, r1[2]);
+        tear_gen(b[1], 4);
+        close_bdevs(b);
+        open_bdevs(b);
+        uint64_t took = 0, w = 0;
+        stm_status st = rr_open(b, &took, &w);
+        stm_test_info("[%s] retry bytes the same %d; torn-retry open %d, "
+                      "took %llu, writes %llu", tag, (int)same, (int)st,
+                      (unsigned long long)took, (unsigned long long)w);
+        STM_ASSERT_OK(st);
+        STM_ASSERT_EQ(took, stm_load_le64(R1.ub_alloc_root.bp_paddr));
+        STM_ASSERT_EQ(w, (uint64_t)NDEV * STM_UB_COPIES);
+        STM_ASSERT(same);
+    }
+    close_bdevs(b);
+    unlink_paths();
+}
+
+/* The retry at once, nothing between the attempts: the first commit
+ * after an open sweeps the frees the session before it left pending, and
+ * the free count the retry would read has moved by then. */
+static void rr_open_leg(const char *tag)
+{
+    make_paths(tag);
+    stm_bdev *b[NDEV] = {0};
+    open_bdevs(b);
+    stm_pool *p = make_multi_pool(b);
+    stm_alloc *a = NULL;
+    uint64_t du[2] = { DEV_UUID_LO[0], DEV_UUID_HI };
+    STM_ASSERT_OK(stm_alloc_create(b[0], POOL_UUID, du, TEST_BOOTSTRAP_BYTES,
+                                   &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(p, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 1 */
+    uint64_t dp = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 2, 3 */
+    stm_sync_info si;
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    STM_ASSERT_OK(stm_alloc_free(a, dp, si.current_gen));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 4, 5 */
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    close_bdevs(b);
+    open_bdevs(b);
+    p = make_multi_pool(b);
+    a = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(b[0], &a));
+    s = NULL;
+    STM_ASSERT_OK(stm_sync_open(p, a, make_wk(), NULL, NULL, &s)); /* 6 */
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    const uint64_t rg = si.current_gen - 1;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_ERR(rr_commit_final_on_d0(s, b), STM_EQUORUM);
+    uint8_t r1[NDEV][STM_UB_COPIES][STM_UB_SIZE];
+    for (int i = 0; i < NDEV; i++) q4_copy_gen(b[i], rg, true, r1[i]);
+    STM_ASSERT_EQ(q4_root(b[1], rg), q4_root(b[0], rg));
+    STM_ASSERT(q4_root(b[0], rg) != 0);
+    STM_ASSERT_OK(stm_sync_commit(s));
+    for (int i = 0; i < NDEV; i++) {
+        uint8_t r2[STM_UB_COPIES][STM_UB_SIZE];
+        q4_copy_gen(b[i], rg, true, r2);
+        STM_ASSERT(memcmp(r2, r1[i], sizeof r2) == 0);
+    }
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    close_bdevs(b);
+    unlink_paths();
+}
+
+STM_TEST(sync_multi_commit_retry_writes_its_reservation_again) {
+    rr_leg("rrdirty", true, false);
+    rr_leg("rrsame", false, false);
+    rr_leg("rrroster", false, true);
+    rr_open_leg("rropen");
+}
+
 STM_TEST_MAIN("sync_multi")

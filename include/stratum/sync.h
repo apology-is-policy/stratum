@@ -299,6 +299,10 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
  * either phase lacks quorum, the commit aborts with STM_EQUORUM
  * and the in-RAM state is unchanged.
  *
+ * A retry after a failed final reserves at the same gen and writes the
+ * reservation it wrote there again, byte for byte, unless the roster
+ * changed in between.
+ *
  * On STM_OK, auth_gen has advanced by 2 (one commit) and the pool's
  * devices hold quorum-confirmed UBs at the reservation and final
  * gens.

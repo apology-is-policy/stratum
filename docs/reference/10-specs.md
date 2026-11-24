@@ -268,9 +268,9 @@ the mount machine composes against the TLY-A3-keyslot-impl mount path
 - `NewestNearAuth` -- no device is more than one gen past the
   authoritative gen.
 
-Buggy config (`quorum_buggy.cfg`, `IdempotentRetry=FALSE, MaxRetries≥2`):
-reproduces R14 P1 content-divergence at spec level — two retries of a
-commit produce non-identical UBs, and content-quorum fails at mount.
+Buggy config (`quorum_buggy.cfg`, `IdempotentRetry=FALSE, MaxRetries=1`):
+reproduces R14 P1 content-divergence at spec level -- two attempts of a
+commit write non-identical UBs, and content-quorum fails at mount.
 
 Mount (vote 153): it reads the newest uberblock of the ONLINE devices
 only; each FAULTED device is an unknown vote, as high as any. It takes
@@ -281,9 +281,17 @@ mount takes `AuthoritativeGen`. Before, Mount read every device, FAULTED
 ones too, an oracle the implementation cannot read.
 `quorum_faults.cfg` (MaxFaults 1) holds every invariant, and so does
 `quorum_retry.cfg` (`IdempotentRetry=FALSE`, `StrictFinal=TRUE`: a
-retried final need not repeat the first attempt's bytes, as the code
-rebuilds a failed final, and a final is acknowledged on a quorum holding
-its attempt's content, as the code counts one write's confirmations).
+retried final need not repeat the first attempt's bytes, and a final is
+acknowledged on a quorum holding its attempt's content, as the code
+counts one write's confirmations). The code rebuilds a failed final: the
+retry repeats the first attempt's bytes when nothing changed between
+the attempts (`quorum.cfg` and `quorum_faults.cfg`, `IdempotentRetry=TRUE`)
+and differs when something did, a write or a sweep (`quorum_retry.cfg`);
+each is checked up to one retry (`MaxRetries=1`). The reservation the
+retry writes is the first attempt's, byte for byte, as `WriteReservation`
+writes `pub_content`; the code rebuilt it before review round 2 F1, and
+still does after a roster change between the attempts (OPEN-BUGS (ak)),
+which the model does not have.
 `quorum_buggy.cfg` is the same retry acknowledged on a quorum at the
 gen, whatever it holds (`StrictFinal=FALSE`).
 `quorum_mount_buggy.cfg` (`MountCountsUnknown=FALSE`, the open
@@ -331,9 +339,11 @@ claim's device moved on, its slot unread, beside an orphan final, and
 the mount takes the orphan (20 states). The code groups by bytes, which
 also record allocator statistics, so its groups can only split the
 model's: the pick's safety holds for any grouping in which a slot holds
-one content and an acknowledged content is one its quorum shares, and
-with every device read and every slot readable no content but a
-quorum's is possible, so the code mounts there too. The model has no torn
+one content and an acknowledged content is one its quorum shares (the
+code writes a retried reservation's bytes again, short of a roster
+change between the attempts, OPEN-BUGS (ak)), and with every device read
+and every copy settled blank or valid no content but a quorum's is
+possible, so the code mounts there too. The model has no torn
 slots: the code counts a device whose slot of the gen has a copy torn or
 unreadable, and none of the gen, as hidden wherever its newest sits
 (below the gen too, where a confirmed gen torn on every copy leaves its

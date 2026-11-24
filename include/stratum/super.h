@@ -1274,8 +1274,9 @@ stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
  * fault on each of them leaves that after one; unless the ring has come
  * round since, which the caller knows from the device's newest); STM_EIO
  * when none does and a copy does not settle or settles torn; STM_EBADVERSION
- * at a newer build's uberblock, `why`, if not NULL, saying which copy as
- * stm_sb_mount_scan_ex's does (best_gen 0). Read by the layout `d`'s mount
+ * at a newer build's uberblock, `why`, if not NULL, zeroed and then naming
+ * the first such copy in label order as stm_sb_mount_scan_ex's does
+ * (best_gen 0). Read by the layout `d`'s mount
  * scan set.
  */
 STM_MUST_USE
