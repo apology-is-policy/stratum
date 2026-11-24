@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #if !defined(__thylacine__)
 #  include <sys/file.h>
@@ -346,6 +347,40 @@ uint64_t stm_bdev_device_bytes(int fd)
 }
 #endif
 
+#if !defined(__thylacine__)
+/* systemd-udevd holds a shared flock on a whole disk while it processes an
+ * event (systemd's block device locking contract), which a close after a
+ * write raises: an exclusive lock waits that out, for a while. */
+static int flock_ex_waiting(int fd)
+{
+    for (int i = 0;; i++) {
+        if (flock(fd, LOCK_EX | LOCK_NB) == 0) return 0;
+        if (errno != EWOULDBLOCK || i == 100) return -1;
+        struct timespec ts = { 0, 50L * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+}
+#endif
+
+#if defined(__APPLE__)
+/* The raw node of a mounted disk opens read-write (measured: /dev/rdiskNsM
+ * with its slice mounted, read-write or read-only), where its block twin is
+ * refused EBUSY. */
+static bool raw_twin_busy(const struct stat *st)
+{
+    const char *n = devname(st->st_rdev, S_IFCHR);
+    if (!n || strncmp(n, "rdisk", 5) != 0) return false;
+    char twin[64];
+    if (snprintf(twin, sizeof twin, "/dev/%s", n + 1) >= (int)sizeof twin) return false;
+    int t = open(twin, O_RDONLY | O_CLOEXEC | O_NOCTTY);
+    if (t >= 0) {
+        close(t);
+        return false;
+    }
+    return errno == EBUSY;
+}
+#endif
+
 stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd)
 {
     *out_fd = -1;
@@ -354,38 +389,56 @@ stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd)
      * exclusive one needs the file open for writing. */
     int flags = O_CLOEXEC | O_NOCTTY | (create ? O_CREAT | O_EXCL : 0);
     int fd = open(path, O_RDWR | flags, 0600);
-    /* A disk the system has mounted: macOS refuses any open of it. */
+    /* A disk the system has mounted: macOS refuses its block node any open. */
     if (fd < 0 && errno == EBUSY) return STM_EBUSY;
-#if defined(__linux__)
     bool rw = fd >= 0;
-#endif
     /* Whatever refuses writing (EACCES, EROFS, EPERM on an immutable file, ETXTBSY)
      * still leaves a read-only open, and so the lock. */
     if (fd < 0 && errno != ENOENT && errno != EISDIR && errno != EEXIST)
         fd = open(path, O_RDONLY | flags, 0600);
     if (fd < 0) return errno == ENOENT ? STM_ENOENT : STM_EIO;
+    struct stat st;
+    bool blk = false;
+    if (fstat(fd, &st) == 0) {
+#if defined(__APPLE__)
+        if (rw && S_ISCHR(st.st_mode) && raw_twin_busy(&st)) {
+            close(fd);
+            errno = EBUSY;
+            return STM_EBUSY;
+        }
+#elif defined(__linux__)
+        blk = rw && S_ISBLK(st.st_mode);
+#endif
+    }
 #if defined(__linux__)
     /* Linux opens a mounted disk read-write; only an exclusive open is refused
-     * it (EBUSY), and the exclusion is held while that descriptor is open. */
-    struct stat st;
-    if (rw && fstat(fd, &st) == 0 && S_ISBLK(st.st_mode)) {
-        char self[32];
-        snprintf(self, sizeof self, "/proc/self/fd/%d", fd);
-        int x = open(self, O_RDWR | O_EXCL | O_CLOEXEC);
+     * it (EBUSY: mounted, a RAID or LVM member, swap, or another claim), and
+     * the exclusion is held while that descriptor is open. By name, not
+     * through /proc, which may not be mounted. */
+    if (blk) {
+        int x = open(path, O_RDWR | O_EXCL | O_NOCTTY | O_CLOEXEC);
         if (x < 0) {
             int e = errno;
-            /* Held by another claim, which holds the lock as well, or by the system. */
-            if (e == EBUSY && flock(fd, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK)
+            /* Another claim holds the lock as well; the system does not. */
+            if (e == EBUSY && flock_ex_waiting(fd) != 0 && errno == EWOULDBLOCK)
                 e = EWOULDBLOCK;
             close(fd);
             errno = e;
             return e == EBUSY || e == EWOULDBLOCK ? STM_EBUSY : STM_EIO;
         }
+        struct stat xs;
+        if (fstat(x, &xs) != 0 || !S_ISBLK(xs.st_mode) || xs.st_rdev != st.st_rdev) {
+            /* The name led to another device between the two opens. */
+            close(x);
+            close(fd);
+            errno = ESTALE;
+            return STM_EIO;
+        }
         close(fd);
         fd = x;
     }
 #endif
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    if ((blk ? flock_ex_waiting(fd) : flock(fd, LOCK_EX | LOCK_NB)) != 0) {
         int e = errno;
         close(fd);
         errno = e;

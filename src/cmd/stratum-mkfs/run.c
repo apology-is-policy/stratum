@@ -136,6 +136,7 @@ static void say_disk_needs_key(const char *image_path)
         "in: name where the key goes with --keyfile\n", image_path);
 }
 
+#if !defined(__thylacine__)
 /* 1, said, when a disk of `disk_bytes` cannot be what the command line asks. */
 static int disk_refused(const char *image_path, uint64_t disk_bytes,
                         const struct volume_ask *ask)
@@ -155,6 +156,7 @@ static int disk_refused(const char *image_path, uint64_t disk_bytes,
     uint64_t bootstrap = ask->bootstrap;
     return size_volume(disk_bytes, ask->bootstrap_named, &bootstrap, "the disk's size");
 }
+#endif
 
 /* Thylacine has no root: uid 0 is its invalid principal. */
 #if defined(__thylacine__)
@@ -183,7 +185,8 @@ static void usage(void)
 "                   has and wherever it leads, and uses a keyfile that is not\n"
 "                   the user's alone. A new key is not sent through a link\n"
 "                   that cannot be read: it takes that link's place.\n"
-"                   Never overrides a daemon using IMAGE, and a format\n"
+"                   Never overrides a daemon using IMAGE, never formats a\n"
+"                   disk the system is using (mounted), and a format\n"
 "                   cannot shrink a file: --size must reach it.\n"
 "  --key-as-is      Use the keyfile that is there although another user owns\n"
 "                   it or its mode gives others access; it must still be a\n"
@@ -1068,7 +1071,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
 
     /* Default keyfile path is <image>.key. */
     bool key_named = keyfile_path != NULL;
-    if (maybe_disk && !key_named) {
+    if (maybe_disk && S_ISBLK(image_st.st_mode) && !key_named) {
         say_disk_needs_key(image_path);
         return 1;
     }
