@@ -80,8 +80,9 @@ void     stm_bdev_inject_read_range_from(struct stm_bdev *d, uint64_t lo,
                                          uint64_t from);
 
 /*
- * Every read and write of d calls o->fn first, on the calling thread, with
- * what it is about to do; NULL clears it, and *o outlives its arming.
+ * Every read and write of d that d's size holds calls o->fn first, on the
+ * calling thread, with what it is about to do (a span past the end is
+ * refused before it); NULL clears it, and *o outlives its arming.
  * Fires only in a build with testing hooks.
  */
 typedef struct stm_bdev_io_observer {
