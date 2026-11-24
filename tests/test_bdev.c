@@ -127,26 +127,39 @@ STM_TEST(bdev_caps_populated) {
     unlink(g_tmp_path);
 }
 
-/* R0-P1-1 regression: sync read past EOF must return STM_EIO, not silently
- * succeed with partial data. Both backends must agree on this contract. */
+/* R0-P1-1 regression: a sync read past the file's end returns STM_EIO, not
+ * STM_OK with partial data, on both backends. The file is cut under the
+ * handle, so the read is inside the handle's size and reaches the backend:
+ * one that reads part and then meets the end, one wholly past it. */
 STM_TEST(bdev_sync_read_past_eof_is_eio) {
     make_tmp("eof");
     stm_bdev_open_opts opts = stm_bdev_open_opts_default();
     stm_bdev *d = NULL;
     STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d));
-    STM_ASSERT_OK(stm_bdev_resize(d, 4096));
+    STM_ASSERT_OK(stm_bdev_resize(d, 8192));
+    STM_ASSERT_EQ(truncate(g_tmp_path, 6144), 0);
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    STM_ASSERT(caps != NULL);
+    if (caps) STM_ASSERT_EQ(caps->size_bytes, (uint64_t)8192);
 
     uint8_t buf[4096];
-    /* Read crossing the EOF boundary at offset 2048 for 4096 bytes. */
-    STM_ASSERT_ERR(stm_bdev_read(d, 2048, buf, sizeof buf), STM_EIO);
+    STM_ASSERT_ERR(stm_bdev_read(d, 4096, buf, sizeof buf), STM_EIO);
+    STM_ASSERT_ERR(stm_bdev_read(d, 6144, buf, 2048), STM_EIO);
+    STM_ASSERT_OK(stm_bdev_read(d, 2048, buf, sizeof buf));
 
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
 
+static void count_reads(void *ctx, bool is_write, uint64_t offset, size_t len)
+{
+    (void)offset; (void)len;
+    if (!is_write) (*(int *)ctx)++;
+}
+
 /* A read past the handle's size fails STM_EIO before the backend, though the
- * file holds bytes there (grown under the handle), reads nothing, and takes
- * no armed read failure. */
+ * file holds bytes there (grown under the handle), reads nothing, is not
+ * observed, and takes no armed read failure, counted or ranged. */
 STM_TEST(bdev_read_past_the_end_fails_on_the_handles_size) {
     make_tmp("rend");
     stm_bdev_open_opts opts = stm_bdev_open_opts_default();
@@ -167,12 +180,25 @@ STM_TEST(bdev_read_past_the_end_fails_on_the_handles_size) {
     uint8_t r[4096], want[4096];
     memset(want, 0xee, sizeof want);
     memset(r, 0xee, sizeof r);
+    int reads = 0;
+    stm_bdev_io_observer ob = { .fn = count_reads, .ctx = &reads };
+    stm_bdev_set_io_observer_for_test(d, &ob);
     STM_ASSERT_ERR(stm_bdev_read(d, size, r, sizeof r), STM_EIO);
     STM_ASSERT_ERR(stm_bdev_read(d, size - 2048u, r, sizeof r), STM_EIO);
     STM_ASSERT_ERR(stm_bdev_read(d, UINT64_MAX - 100u, r, sizeof r), STM_EIO);
     STM_ASSERT_EQ(memcmp(r, want, sizeof r), 0);
+    STM_ASSERT_EQ(reads, 0);
     STM_ASSERT_OK(stm_bdev_read(d, size - sizeof r, r, sizeof r));
+    STM_ASSERT_EQ(reads, 1);
+    stm_bdev_set_io_observer_for_test(d, NULL);
     STM_ASSERT_OK(stm_bdev_read(d, size + 4096u, r, 0));
+
+    stm_bdev_inject_read_range(d, size - 4096u, size + 8192u, 1, STM_ENODEV);
+    STM_ASSERT_ERR(stm_bdev_read(d, size - 2048u, r, sizeof r), STM_EIO);
+    STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(d), 0u);
+    STM_ASSERT_ERR(stm_bdev_read(d, size - sizeof r, r, sizeof r), STM_ENODEV);
+    STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(d), 1u);
+    stm_bdev_inject_read_range_clear(d);
 
     stm_bdev_inject_read_fail_after(d, 1);
     uint32_t fired = stm_bdev_inject_read_fired_count(d);

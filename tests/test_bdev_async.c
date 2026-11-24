@@ -135,26 +135,30 @@ STM_TEST(async_many_writes_in_flight) {
 }
 
 STM_TEST(async_read_error_propagates) {
-    /* Read past EOF should complete with non-zero status or short bytes. */
+    /* A read past the file's end, inside the handle's size (the file cut
+     * under the handle), reaches the backend and completes with an error or
+     * short bytes: posix a short read's STM_EIO, io_uring STM_OK with fewer
+     * bytes (OPEN-BUGS (w)). */
     make_tmp("eof");
     stm_bdev_open_opts opts = stm_bdev_open_opts_default();
     stm_bdev *d = NULL;
     STM_ASSERT_OK(stm_bdev_open(g_path, &opts, &d));
-    STM_ASSERT_OK(stm_bdev_resize(d, 4096));
+    STM_ASSERT_OK(stm_bdev_resize(d, 8192));
+    STM_ASSERT_EQ(truncate(g_path, 6144), 0);
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    STM_ASSERT(caps != NULL);
+    if (caps) STM_ASSERT_EQ(caps->size_bytes, (uint64_t)8192);
 
     uint8_t buf[4096];
     cb_state s = { 0 };
-    stm_status sub = stm_bdev_submit_read(d, /*offset*/ 1 << 20, buf, sizeof buf,
-                                          on_complete, &s);
+    stm_status sub = stm_bdev_submit_read(d, 4096, buf, sizeof buf, on_complete, &s);
     STM_ASSERT_OK(sub);
+    int at_return = s.hits;
     while (sub == STM_OK && s.hits == 0) {
         int drained = stm_bdev_wait_completion(d, 4);
         (void)drained;
     }
-
-    /* Either short read (bytes = 0 on POSIX hole) or explicit error is ok.
-     * POSIX backend treats short-read as STM_EIO; io_uring may return 0 bytes
-     * for read past EOF. Either is valid. */
+    STM_ASSERT_EQ(at_return, 0);
     STM_ASSERT(s.status != STM_OK || s.bytes < sizeof buf);
 
     stm_bdev_close(d);
@@ -162,8 +166,10 @@ STM_TEST(async_read_error_propagates) {
 }
 
 /* A read past the handle's size completes at once with STM_EIO and no bytes,
- * its callback run before the submit returns, though the file holds bytes
- * there (grown under the handle); one ending at the end completes. */
+ * its callback run once, before the submit returns, though the file holds
+ * bytes there (grown under the handle); its buffer is never written. Wholly
+ * past, straddling the end and wrapping past 2^64. One ending at the end
+ * completes. */
 STM_TEST(async_read_past_the_end_completes_at_once_with_eio) {
     make_tmp("rend");
     stm_bdev_open_opts opts = stm_bdev_open_opts_default();
@@ -180,26 +186,45 @@ STM_TEST(async_read_past_the_end_completes_at_once_with_eio) {
         STM_ASSERT_EQ(fwrite(pat, 1, sizeof pat, f), sizeof pat);
         fclose(f);
     }
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    STM_ASSERT(caps != NULL);
+    if (caps) STM_ASSERT_EQ(caps->size_bytes, size);
 
-    uint8_t buf[4096], want[4096];
-    memset(buf, 0xee, sizeof buf);
+    enum { PAST = 3 };
+    const uint64_t at[PAST] = { size, size - 2048u, UINT64_MAX - 100u };
+    uint8_t pbuf[PAST][4096], want[4096];
+    memset(pbuf, 0xee, sizeof pbuf);
     memset(want, 0xee, sizeof want);
-    cb_state past = { 0 };
-    stm_status sub = stm_bdev_submit_read(d, size, buf, sizeof buf, on_complete, &past);
-    STM_ASSERT_OK(sub);
-    int at_return = past.hits;
-    while (sub == STM_OK && past.hits == 0) (void)stm_bdev_wait_completion(d, 4);
-    STM_ASSERT_EQ(at_return, 1);
-    STM_ASSERT_ERR(past.status, STM_EIO);
-    STM_ASSERT_EQ(past.bytes, 0u);
-    STM_ASSERT_EQ(memcmp(buf, want, sizeof buf), 0);
+    cb_state past[PAST];
+    memset(past, 0, sizeof past);
+    for (int i = 0; i < PAST; i++) {
+        stm_status sub = stm_bdev_submit_read(d, at[i], pbuf[i], sizeof pbuf[i],
+                                              on_complete, &past[i]);
+        STM_ASSERT_OK(sub);
+        STM_ASSERT_EQ(past[i].hits, 1);
+        STM_ASSERT_EQ(past[i].kind, STM_OP_READ);
+        STM_ASSERT_ERR(past[i].status, STM_EIO);
+        STM_ASSERT_EQ(past[i].bytes, 0u);
+    }
 
+    uint8_t buf[4096];
     cb_state fits = { 0 };
-    sub = stm_bdev_submit_read(d, size - sizeof buf, buf, sizeof buf, on_complete, &fits);
+    stm_status sub = stm_bdev_submit_read(d, size - sizeof buf, buf, sizeof buf,
+                                          on_complete, &fits);
     STM_ASSERT_OK(sub);
     while (sub == STM_OK && fits.hits == 0) (void)stm_bdev_wait_completion(d, 4);
     STM_ASSERT_OK(fits.status);
     STM_ASSERT_EQ(fits.bytes, sizeof buf);
+    /* A second completion of a read past the end, had the backend been sent
+     * it as well, would land here, and so would its bytes. */
+    for (int spin = 0; spin < 100; spin++) {
+        (void)stm_bdev_poll_completions(d, 16);
+        usleep(1000);
+    }
+    for (int i = 0; i < PAST; i++) {
+        STM_ASSERT_EQ(past[i].hits, 1);
+        STM_ASSERT_EQ(memcmp(pbuf[i], want, sizeof want), 0);
+    }
 
     stm_bdev_close(d);
     unlink(g_path);
