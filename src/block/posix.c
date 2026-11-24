@@ -642,9 +642,13 @@ stm_status stm_bdev_open_posix(const char *path,
 
     for (uint32_t i = 0; i < n; i++) {
         if (pthread_create(&d->threads[i], NULL, worker_main, d) != 0) {
-            /* Partial failure: signal stop, join what we have, fail. */
+            /* Partial failure: signal stop, join what we have, fail. The broadcast
+             * under qlock, as op_close's: a worker between its look at stop and its
+             * wait would otherwise sleep through it. */
             atomic_store(&d->stop, true);
+            pthread_mutex_lock(&d->qlock);
             pthread_cond_broadcast(&d->qcond);
+            pthread_mutex_unlock(&d->qlock);
             for (uint32_t j = 0; j < i; j++) pthread_join(d->threads[j], NULL);
             free(d->threads);
             free(d->base.path);

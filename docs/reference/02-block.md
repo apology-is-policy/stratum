@@ -169,7 +169,8 @@ Four source files under `src/block/`:
   a file-sized change.
 - `posix.c` — POSIX backend. Sync ops use `pread`/`pwrite`. Async is
   simulated via a fixed thread pool that drains an internal queue;
-  completion delivery is via per-device lockless queue + condvar. An
+  completion delivery is via a per-device queue under a mutex, with a
+  condvar. An
   op's one allocation, made at the submit, carries it through both
   queues.
   Its sizing (`op_current_size`) fstats a regular file.
@@ -180,8 +181,8 @@ Four source files under `src/block/`:
   + return, driving completion via user-thread `poll_completions` +
   `wait_completion`. The thread reaping a short transfer's CQE, whichever
   thread's op it is, submits its rest, for a sync op as for an async one;
-  where the rest cannot go in, the op fails `STM_EIO`, once. Fixed buffers
-  where the caller registers them; no SQPOLL.
+  where the rest cannot go in, the op fails `STM_EIO`, once. Buffers can
+  be registered; no op uses them yet. No SQPOLL.
 - `bdev_thylacine.c` -- the Thylacine backend, built there in place of
   `posix.c`: an async op runs at its submit, its callback called before
   the submit returns.
@@ -267,8 +268,8 @@ by bdev's contract:
 
 - [x] POSIX backend. Sync + thread-pool async. Fault injection on
       write + fsync.
-- [x] io_uring backend. Sync + async, optional SQPOLL, optional
-      fixed buffers. Gated by `STM_ENABLE_IOURING=ON`.
+- [x] io_uring backend. Sync + async; buffers can be registered (no op
+      uses them yet); no SQPOLL. Gated by `STM_ENABLE_IOURING=ON`.
 - [x] Vtable dispatch.
 - [x] `submit_*_fixed` (fixed-buffer async on io_uring): API stub;
       not yet implemented. Returns `STM_ENOTSUPPORTED` on call.
