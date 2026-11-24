@@ -124,7 +124,7 @@ If a chunk's diff doesn't include a reference-doc update, the reviewer should as
 ## Regression testing
 
 - Every audit finding that can be made to fail without the fix should land a regression test. See `tests/test_fs.c::fs_rollback_then_delete_snapshot_no_live_block_freed` and `tests/test_extent.c::extent_nonce_paddr_tamper_rejects` for the pattern.
-- The gate is the ctest suite (`ctest --test-dir build --output-on-failure`), plus, for the manager, `cargo test --release` in `tools/stratum` and `tests/volume_smoke.sh dist/stratum`, run as root or with `STRATUM_TEST_SUDO=1` where sudo asks no password: with neither it skips the checks that need another user, and says so on its last line; with `STRATUM_TEST_SUDO=1` where sudo asks a password it fails.
+- The gate is the ctest suite (`ctest --test-dir build --output-on-failure`), plus, for the manager, `cargo test --release` in `tools/stratum`, `tests/volume_smoke.sh dist/stratum` and `tests/mkfs_disk_smoke.sh dist/stratum`, run as root or with `STRATUM_TEST_SUDO=1` where sudo asks no password: with neither it skips the checks that need another user, and says so on its last line; with `STRATUM_TEST_SUDO=1` where sudo asks a password it fails.
 
 ## Sanitizers (ASan / LeakSan / TSan) — GCP disposable VM ONLY
 

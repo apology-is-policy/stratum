@@ -254,6 +254,10 @@ barrier's strength is the backend's:
 the disk cache — `fsync` alone does not on macOS). So the host test suite +
 `test_durability` exercise true barriers.
 
+A macOS disk node answers `F_FULLFSYNC` (and `F_BARRIERFSYNC`) ENOTTY, so on
+a disk the barrier is `fsync(2)`, which writes out what the system buffers,
+then the `DKIOCSYNCHRONIZECACHE` ioctl, the drive's own cache flush.
+
 ### Thylacine backend (`src/block/bdev_thylacine.c`) — on-device (guest)
 
 The in-guest virtio-blk driver. **Area G made durability self-contained:**

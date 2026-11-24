@@ -205,8 +205,10 @@ STM_MUST_USE
 stm_status stm_bdev_current_bytes(stm_bdev *d, uint64_t *out);
 
 /*
- * Claim an image for one process. STM_EBUSY: another process holds it.
- * STM_ENOENT: there is no such file and `create` was false; with `create` the
+ * Claim an image for one process. STM_EBUSY: another process holds it, errno
+ * EWOULDBLOCK; or the image is a disk the system is using (mounted), errno EBUSY:
+ * macOS opens no such disk, and on Linux a disk is claimed by an exclusive open
+ * as well as the lock. STM_ENOENT: there is no such file and `create` was false; with `create` the
  * file must not exist yet. STM_ENOLCK: the file is there (and with `create`,
  * was made) but this filesystem cannot lock it, so nothing shows who else has
  * it. Any other failure leaves errno set and claims nothing, as does either of
