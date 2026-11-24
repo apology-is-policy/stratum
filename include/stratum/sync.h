@@ -184,9 +184,16 @@ void stm_sync_pool_serial(const stm_sync *s, uint8_t out[16]);
 
 /*
  * Mount-time open. Scans all labels × commit ring slots, picks the
- * authoritative uberblock (highest valid gen), and:
- *   - bumps current_gen to (authoritative_gen + 1) per the
- *     MountGenBump invariant (sync.tla).
+ * authoritative uberblock (one device: its highest valid gen; more: the
+ * quorum-th highest of the devices' best, with content quorum), and:
+ *   - writes a claim at authoritative_gen + 1 to every device not REMOVED
+ *     or FAULTED, per the MountGenBump invariant (sync.tla). With quorum,
+ *     auth_gen becomes the claim's gen and current_gen the claim's + 2.
+ *     When fewer than quorum took it, no device failed other than
+ *     read-only and one answered read-only, the pool opens read-only with
+ *     auth_gen unchanged (every mutating call then answers STM_EROFS).
+ *     Otherwise the open fails STM_EQUORUM (a one-device pool: its
+ *     device's error).
  *   - if the uberblock carries a valid `ub_alloc_root`, calls
  *     stm_alloc_load_tree_at(a, paddr) to rehydrate the tree.
  *
