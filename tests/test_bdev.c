@@ -320,7 +320,10 @@ static void *hammer_thread(void *argp)
     uint8_t w[HAMMER_BYTES], r[HAMMER_BYTES];
     uint64_t off = (uint64_t)a->id * HAMMER_BYTES;
     for (unsigned i = 0; i < a->ops && a->err == STM_OK; i++) {
-        memset(w, (int)(a->id * 17u + i), sizeof w);
+        /* Every 512-byte piece differs from the others, so a rest put in from the wrong place
+         * in the buffer or the file is wrong bytes, not the same ones. */
+        for (unsigned k = 0; k < HAMMER_BYTES; k++)
+            w[k] = (uint8_t)(a->id * 17u + i + k + (k / 512u) * 101u);
         a->err = stm_bdev_write(a->d, off, w, sizeof w);
         if (a->err == STM_OK) a->err = stm_bdev_read(a->d, off, r, sizeof r);
         if (a->err == STM_OK && memcmp(w, r, sizeof w) != 0) a->wrong++;
@@ -476,8 +479,9 @@ static void rest_cannot_go_in(const char *tag, void (*kill)(stm_bdev *d))
     atomic_init(&s.hits, 0);
     STM_ASSERT_OK(stm_bdev_submit_write(d, 8192, after, sizeof after, rest_done, &s));
     kill(d);
+    /* Polled, not waited: an op left in flight fails the count below instead of hanging. */
     for (int ms = 0; atomic_load(&s.hits) == 0 && ms < 5000; ms++) {
-        int n = stm_bdev_wait_completion(d, 4);
+        int n = stm_bdev_poll_completions(d, 4);
         STM_ASSERT(n >= 0);
         if (n == 0) {
             const struct timespec t = { 0, 1000000 };
