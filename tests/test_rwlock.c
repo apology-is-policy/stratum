@@ -66,7 +66,7 @@ static int child_run(void (*fn)(void), char *out, size_t cap)
 }
 
 static stm_rwlock g_l;
-static stm_rwlock g_many[65];
+static stm_rwlock g_many[64];
 
 static void take_rd_rd(void)
 {
@@ -95,7 +95,7 @@ static void unlock_unheld(void) { stm_rwlock_unlock(&g_l); }
 
 static void hold_too_many(void)
 {
-    for (size_t i = 0; i < 65; i++) (void)stm_rwlock_tryrdlock(&g_many[i]);
+    for (size_t i = 0; i < 64; i++) (void)stm_rwlock_tryrdlock(&g_many[i]);
 }
 
 static void *take_and_exit(void *arg)
@@ -165,9 +165,9 @@ static void takes_that_may(void)
     if (stm_rwlock_wrlock(&g_l) != 0) _exit(16);
     if (stm_rwlock_trywrlock(&g_l) == 0) _exit(17);
     if (stm_rwlock_unlock(&g_l) != 0) _exit(18);
-    for (size_t i = 0; i < 64; i++)
+    for (size_t i = 0; i < 63; i++)
         if (stm_rwlock_tryrdlock(&g_many[i]) != 0) _exit(19);
-    for (size_t i = 0; i < 64; i++)
+    for (size_t i = 0; i < 63; i++)
         if (stm_rwlock_unlock(&g_many[i]) != 0) _exit(20);
     pthread_t t;
     if (pthread_create(&t, NULL, take_unlock_and_exit, &g_l) != 0) _exit(21);
@@ -191,7 +191,7 @@ static void expect_abort(void (*fn)(void), const char *msg)
 
 STM_TEST(rwlock_hooks_abort_a_thread_that_takes_a_lock_it_holds) {
     STM_ASSERT_EQ(stm_rwlock_init(&g_l), 0);
-    for (size_t i = 0; i < 65; i++)
+    for (size_t i = 0; i < 64; i++)
         STM_ASSERT_EQ(stm_rwlock_init(&g_many[i]), 0);
     char out[512];
     int st = child_run(takes_that_may, out, sizeof out);
@@ -210,7 +210,7 @@ STM_TEST(rwlock_hooks_abort_a_thread_that_takes_a_lock_it_holds) {
     expect_abort(unlock_unheld,
                  "stm_rwlock: a thread unlocks a lock it does not hold");
     expect_abort(hold_too_many,
-                 "stm_rwlock: a thread holds more than 64 locks");
+                 "stm_rwlock: a thread holds more than 63 locks");
     expect_abort(exit_holding, "stm_rwlock: a thread exits holding a lock");
     expect_abort(destroy_held,
                  "stm_rwlock: a thread destroys a lock it holds");
