@@ -2,7 +2,8 @@
 # A disk formatted end to end. A disk cannot be resized, so stratum-mkfs formats it whole: it refuses
 # a --size that is not the disk's before it reads the disk, and writes nothing; it refuses to keep a
 # disk's key in /dev; the pool it makes serves, takes a file and gives it back after a remount; a disk
-# whose size is no multiple of 64 KiB formats too; a disk the system has mounted is refused, --force
+# whose size is no multiple of 64 KiB formats too, and with a --bootstrap and no --size is held to its
+# own size, not to the size a file would be made at; a disk the system has mounted is refused, --force
 # or not, by mkfs and by the daemon (on macOS through its raw node too); and on Linux a claim waits
 # out a moment's shared lock, as udev takes.
 #
@@ -255,6 +256,17 @@ if attach $SECTORS_B; then
         stop
     else
         no "mkfs of a $BYTES_B-byte disk: rc=$rc: $(tail -1 "$D/m5.log"); serve: $(tail -1 "$D/serve.log")"
+    fi
+
+    # 68 MiB of bootstrap is more than the 64 MiB a file is made at with no --size, and less than
+    # this disk, which is the size it is held to.
+    printf '%s\n' "$PASS" | MKFS "$E" --bootstrap 68M --keyfile "$K" --passphrase-stdin --force \
+        > "$D/m5b.log" 2>&1
+    rc=$?
+    if [ "$rc" = 0 ] && LC_ALL=C grep -q "formatting $E ($BYTES_B bytes)" "$D/m5b.log"; then
+        ok "a disk with --bootstrap 68M and no --size is held to its own size"
+    else
+        no "mkfs --bootstrap 68M of a $BYTES_B-byte disk: rc=$rc: $(tail -1 "$D/m5b.log")"
     fi
 
     # Mounted by the system: refused by mkfs, --force or not, and by the daemon; unmounted, the
