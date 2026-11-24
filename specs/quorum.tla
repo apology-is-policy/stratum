@@ -41,14 +41,38 @@
 (* unreadable device. CONSTANT MountCountsUnknown toggles the refusal:     *)
 (* FALSE is the implementation before the fix.                             *)
 (*                                                                         *)
-(* The mount's content pick (round 1 F2): of the devices read at exactly  *)
-(* the gen it mounts, a content a quorum of them holds when a quorum sits *)
-(* there; when fewer do, the content all of them hold, and no mount while *)
-(* they disagree (MinorityMustAgree; FALSE takes any of them, the         *)
-(* implementation before the fix: with four devices or more an orphan     *)
-(* final can sit beside the acknowledged claim at that gen). The model    *)
-(* keeps each device's newest uberblock only, so it refuses where reading *)
-(* each device's slot for that gen would mount (OPEN-BUGS (ah)).          *)
+(* The ring (2026-11-24, OPEN-BUGS (ah)): a device keeps one uberblock   *)
+(* per generation, in that generation's ring slot (dev_ring; MaxGen < 63, *)
+(* so the model's ring never comes round), and one moved past a gen still *)
+(* holds that gen's uberblock. The open picks the content it mounts from  *)
+(* the slots of the gen it mounts (RingRead TRUE): the one content held   *)
+(* there that could have been acknowledged there, counting with its       *)
+(* holders the devices moved past the gen whose slot it could not read    *)
+(* (hid; in the code also a ring come round) and the unknown votes        *)
+(* (RingCountsHidden FALSE leaves hid out: buggy). A content a quorum     *)
+(* holds is one, and then no other is. With none, nothing there was       *)
+(* acknowledged and any content held there mounts. A sweep that freed a   *)
+(* held content's nodes ran in an open whose claim at that gen was        *)
+(* acknowledged, and that claim is then a content that could have been.   *)
+(* RingRead FALSE is the open before (ah): of the newest uberblocks at    *)
+(* exactly the gen, a quorum's content, and fewer must all agree          *)
+(* (MinorityMustAgree; FALSE takes any, the implementation before (r)     *)
+(* round 1 F2). It refuses where a slot holds the answer, and with three  *)
+(* devices every open can refuse while every device is online             *)
+(* (quorum_ring_buggy.cfg fails MountNotStuck).                           *)
+(*                                                                         *)
+(* The claim is written device by device (WriteClaim) and acknowledged    *)
+(* once a quorum holds it (CheckClaimQuorum): a crash or a fault in       *)
+(* between leaves it on fewer, beside whatever the others hold there.     *)
+(*                                                                         *)
+(* A content names a tree: a final a new one, a claim the tree the open   *)
+(* mounted, a reservation the tree of the last acknowledged final or      *)
+(* claim. The code groups uberblocks by their bytes, which also record    *)
+(* the allocator's statistics when written, so its groups can only split  *)
+(* the model's. The pick's safety holds for any grouping in which a slot  *)
+(* holds one content and an acknowledged content is one its quorum        *)
+(* shares; with every device read and every slot readable no content is   *)
+(* possible but a quorum's, so the code mounts there too.                 *)
 (*                                                                         *)
 (* Invariants proved:                                                       *)
 (*   * TypeOK                — variable domains stable.                    *)
@@ -59,17 +83,19 @@
 (*                                devices never become authoritative.      *)
 (*   * LiveCoordTargetValid   — in-flight target_gen ≥ auth.               *)
 (*   * QuorumDurability       — committed commits stay authoritative.      *)
-(*   * MountGenBumpMulti      — post-mount target > any dev_ub[d].gen.    *)
-(*   * ContentAgreementAtGen  — at the same gen, all devices agree on     *)
-(*                               content (R14 P1).                          *)
+(*   * MountGenBumpMulti      -- post-mount target >= every DevGen(d).     *)
+(*   * ContentQuorumAtGen     -- an acknowledged final or claim is held at *)
+(*                               its gen by a quorum, one content (R14 P1).*)
 (*   * MountAtAuthoritative   -- a mount takes the authoritative gen       *)
 (*                               (vote 153).                               *)
 (*   * MountKeepsPublished    -- a mount never loses an acknowledged       *)
 (*                               commit or claim: not below its gen, and   *)
 (*                               at its gen only its content.              *)
+(*   * MountNotStuck          -- every device online and every slot        *)
+(*                               readable, the open mounts (OPEN-BUGS (ah)).*)
 (***************************************************************************)
 
-EXTENDS Naturals, FiniteSets
+EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS
     Devices,          \* finite set of device ids, e.g. {1, 2, 3}
@@ -79,8 +105,12 @@ CONSTANTS
     IdempotentRetry,  \* BOOLEAN: TRUE = fixed impl, FALSE = buggy impl
     MountCountsUnknown, \* BOOLEAN: TRUE = a mount refuses while unknown
                       \* votes could change the gen; FALSE = buggy impl
-    MinorityMustAgree \* BOOLEAN: TRUE = fewer than quorum at the mount's
-                      \* gen must agree on content; FALSE = buggy impl
+    MinorityMustAgree, \* BOOLEAN (RingRead FALSE): TRUE = fewer than quorum
+                      \* at the mount's gen must agree; FALSE = buggy impl
+    RingRead,         \* BOOLEAN: TRUE = the open reads each device's slot of
+                      \* the gen it mounts; FALSE = its newest only (before (ah))
+    RingCountsHidden  \* BOOLEAN: TRUE = a moved-on device whose slot the open
+                      \* could not read may have confirmed; FALSE = buggy impl
 
 ASSUME /\ Devices # {}
        /\ Cardinality(Devices) >= 1
@@ -90,6 +120,8 @@ ASSUME /\ Devices # {}
        /\ IdempotentRetry \in BOOLEAN
        /\ MountCountsUnknown \in BOOLEAN
        /\ MinorityMustAgree \in BOOLEAN
+       /\ RingRead \in BOOLEAN
+       /\ RingCountsHidden \in BOOLEAN
 
 (***************************************************************************)
 (* Quorum threshold: ⌊N/2⌋+1.                                              *)
@@ -104,18 +136,17 @@ QuorumN == (Cardinality(Devices) \div 2) + 1
 
 DevState == {"ONLINE", "FAULTED"}
 
-Phase == {"Idle", "Reserving", "Flushing", "Finalizing", "Published"}
+Phase == {"Idle", "Claiming", "Reserving", "Flushing", "Finalizing", "Published"}
 
 (***************************************************************************)
-(* Content space. Each commit attempt gets a distinct content tag; the     *)
-(* claim UB (post-mount) and reservation UBs share "ClaimContent" (= 1)   *)
-(* because their bytes are derived deterministically from the previous    *)
-(* auth UB's bytes with only ub_gen bumped. Final UBs use a commit-       *)
-(* specific content that varies per commit (and per retry, in the buggy   *)
-(* model).                                                                  *)
+(* Content space. A content names a tree. Each commit attempt gets a     *)
+(* distinct one for its final (one per retry too, in the buggy model); a *)
+(* claim names the tree its open mounted, a reservation the tree of the  *)
+(* last acknowledged final or claim (their bytes are that uberblock's    *)
+(* with ub_gen bumped). 0 is an empty slot.                               *)
 (***************************************************************************)
 
-ClaimContent == 1   \* all claim + reservation UBs use content = 1 (stable).
+FormatContent == 1  \* the tree a fresh pool starts with
 
 (***************************************************************************)
 (* Each commit may retry up to MaxRetries times (bounded). Each commit    *)
@@ -131,12 +162,13 @@ MaxGen == 2 * (MaxCommits + 1)
 MaxContent == 1 + (MaxCommits + MaxFaults + MaxGen + 1) * (MaxRetries + 1)
 
 VARIABLES
-    dev_ub,            \* [Devices -> [gen |-> 0..MaxGen,
-                       \*              content |-> 0..MaxContent]]
+    dev_ring,          \* [Devices -> [1..MaxGen -> 0..MaxContent]]: each
+                       \* ring slot's content (0: none)
     dev_state,         \* [Devices -> DevState]
     coord_phase,       \* Phase
     coord_target_gen,  \* 0..MaxGen
-    coord_commit_content, \* 0..MaxContent (content tag for current commit's final UB)
+    coord_commit_content, \* 0..MaxContent: the current commit's final, or
+                          \* the claim's (Claiming)
     commits_done,      \* 0..MaxCommits
     retry_count,       \* 0..MaxRetries (retries within the CURRENT commit)
     next_content,      \* 0..MaxContent — monotonic content-id allocator
@@ -145,11 +177,12 @@ VARIABLES
     mount_wrong,       \* BOOLEAN: a mount took another gen than
                        \* AuthoritativeGen (history; never cleared)
     pub_gen,           \* 0..MaxGen: the gen of the last acknowledged
-                       \* final or claim (history)
-    pub_content,       \* 0..MaxContent: its content (history)
+                       \* final or claim
+    pub_content,       \* 0..MaxContent: its content; mounted, the tree the
+                       \* next reservation names
     mount_lost         \* BOOLEAN: a mount lost it (history; never cleared)
 
-vars == <<dev_ub, dev_state, coord_phase, coord_target_gen,
+vars == <<dev_ring, dev_state, coord_phase, coord_target_gen,
            coord_commit_content, commits_done, retry_count,
            next_content, fault_count, mounted, mount_wrong,
            pub_gen, pub_content, mount_lost>>
@@ -160,8 +193,19 @@ vars == <<dev_ub, dev_state, coord_phase, coord_target_gen,
 
 OnlineDevices == { d \in Devices : dev_state[d] = "ONLINE" }
 
-DevicesAtGen(g) == { d \in Devices : dev_ub[d].gen = g }
-DevicesAtLeastGen(g) == { d \in Devices : dev_ub[d].gen >= g }
+\* A device's newest uberblock: the highest gen its ring holds.
+DevGen(d) ==
+    LET held == { g \in 1..MaxGen : dev_ring[d][g] # 0 }
+    IN  IF held = {} THEN 0 ELSE CHOOSE g \in held : \A g2 \in held : g2 <= g
+
+DevContent(d) == IF DevGen(d) = 0 THEN 0 ELSE dev_ring[d][DevGen(d)]
+
+\* What device d's slot of gen g holds (0: none -- blank, or in the code a
+\* lap of the ring before or after).
+Slot(d, g) == IF g = 0 THEN 0 ELSE dev_ring[d][g]
+
+DevicesAtGen(g) == { d \in Devices : DevGen(d) = g }
+DevicesAtLeastGen(g) == { d \in Devices : DevGen(d) >= g }
 
 GenCommitted(g) ==
     g > 0 /\ Cardinality(DevicesAtLeastGen(g)) >= QuorumN
@@ -177,7 +221,7 @@ AuthoritativeGen ==
 (* FAULTED device is an unknown vote, as high as any gen.                  *)
 (***************************************************************************)
 
-VisibleAtLeast(g) == Cardinality({ d \in OnlineDevices : dev_ub[d].gen >= g })
+VisibleAtLeast(g) == Cardinality({ d \in OnlineDevices : DevGen(d) >= g })
 
 \* The highest gen a quorum of the devices read reaches (0 if none): the
 \* implementation's compute_auth_gen over the scans that succeeded.
@@ -198,14 +242,14 @@ MountHigh ==
 (***************************************************************************)
 
 Init ==
-    /\ dev_ub               = [d \in Devices |-> [gen |-> 0, content |-> 0]]
+    /\ dev_ring             = [d \in Devices |-> [g \in 1..MaxGen |-> 0]]
     /\ dev_state            = [d \in Devices |-> "ONLINE"]
     /\ coord_phase          = "Idle"
     /\ coord_target_gen     = 0
     /\ coord_commit_content = 0
     /\ commits_done         = 0
     /\ retry_count          = 0
-    /\ next_content         = ClaimContent  \* content=1 reserved for claim/reservation.
+    /\ next_content         = FormatContent
     /\ fault_count          = 0
     /\ mounted              = FALSE
     /\ mount_wrong          = FALSE
@@ -214,8 +258,54 @@ Init ==
     /\ mount_lost           = FALSE
 
 (***************************************************************************)
-(* Mount — claim UB at auth+1 to every ONLINE device, content=ClaimContent.*)
+(* The open (stm_sync_open_ex): scan, pick the content to mount, and      *)
+(* write the claim at auth+1, naming the tree it mounts.                  *)
 (***************************************************************************)
+
+\* The devices read that moved past gen a: the only ones whose slot of a
+\* is not their newest.
+MovedOn(a) == { d \in OnlineDevices : DevGen(d) > a }
+
+\* The devices read whose slot of gen a holds a's uberblock, hid aside
+\* (moved-on devices whose slot the open could not read).
+Holders(a, hid) == { d \in OnlineDevices \ hid : Slot(d, a) # 0 }
+HoldersOf(a, hid, c) == { d \in Holders(a, hid) : Slot(d, a) = c }
+HeldAt(a, hid) == { Slot(d, a) : d \in Holders(a, hid) }
+
+\* How many devices could have confirmed content c at gen a: its holders,
+\* the moved-on devices whose slot the open could not read, and the
+\* unknown votes. A device that took c at a still holds it there: a later
+\* write at a needs an open below a, which MountKeepsPublished excludes.
+Possible(a, hid, c) ==
+    Cardinality(HoldersOf(a, hid, c))
+    + (IF RingCountsHidden THEN Cardinality(hid) ELSE 0)
+    + Cardinality(Devices \ OnlineDevices)
+
+\* The ring read: a content held at a, and no other held there could have
+\* been acknowledged. A content a quorum holds is one (any other's holders,
+\* hid and unknown votes are the rest of the devices, fewer than a
+\* quorum); with none possible, nothing at a was, and any held there is.
+RingPick(a, hid, c) ==
+    /\ c \in HeldAt(a, hid)
+    /\ \A c2 \in HeldAt(a, hid) \ {c} : Possible(a, hid, c2) < QuorumN
+
+\* Before (ah): the newest uberblocks at exactly gen a; a quorum of them
+\* must agree, fewer all.
+NewestPick(a, c) ==
+    LET at    == DevicesAtGen(a) \cap OnlineDevices
+        agree == { e \in at : DevContent(e) = c }
+    IN  /\ agree # {}
+        /\ IF Cardinality(at) >= QuorumN
+           THEN Cardinality(agree) >= QuorumN
+           ELSE MinorityMustAgree => agree = at
+
+\* Gen 0 is a fresh pool: nothing to pick.
+MountPick(a, hid, c) ==
+    IF a = 0 THEN c = 0
+    ELSE IF RingRead THEN RingPick(a, hid, c)
+    ELSE hid = {} /\ NewestPick(a, c)
+
+MountTree(a, c) == IF a = 0 THEN FormatContent ELSE c
 
 Mount ==
     /\ ~mounted
@@ -224,39 +314,57 @@ Mount ==
     \* The fix: refuse while an unknown vote could raise the gen.
     /\ MountCountsUnknown => VisibleQuorumGen = MountHigh
     /\ LET auth == VisibleQuorumGen
-           at   == DevicesAtGen(auth) \cap OnlineDevices
        IN  /\ auth + 1 <= MaxGen
-           \* The content check (stm_sync_open_ex): with a quorum of the
-           \* devices read sitting at exactly auth, a content a quorum of
-           \* them holds; with fewer, the content all of them hold.
-           /\ \E p \in at :
-                LET picked == dev_ub[p].content
-                    agree  == { e \in at : dev_ub[e].content = picked }
-                IN  /\ IF Cardinality(at) >= QuorumN
-                       THEN Cardinality(agree) >= QuorumN
-                       ELSE MinorityMustAgree => agree = at
-                    /\ mount_lost' = (mount_lost \/ auth < pub_gen
-                                      \/ (auth = pub_gen /\ picked # pub_content))
+           /\ \E hid \in SUBSET MovedOn(auth),
+                 c \in HeldAt(auth, {}) \cup {0} :
+                /\ MountPick(auth, hid, c)
+                /\ mount_lost' = (mount_lost \/ auth < pub_gen
+                                  \/ (auth = pub_gen /\ c # pub_content))
+                /\ coord_commit_content' = MountTree(auth, c)
            /\ coord_target_gen' = auth + 1
-           /\ coord_phase' = "Idle"
-           \* Claim UB is written to EVERY ONLINE device, overwriting
-           \* any prior content at the claim gen. The impl's
-           \* write_ub_to_all_devices writes to each device
-           \* unconditionally; an orphan final UB at gen=auth+1 from a
-           \* partially-completed pre-crash commit gets overwritten
-           \* by the claim on devices that are online. This cleans up
-           \* orphans at the claim gen slot (same (label, slot)).
-           /\ dev_ub' = [d \in Devices |->
-                          IF dev_state[d] = "ONLINE"
-                          THEN [gen |-> auth + 1, content |-> ClaimContent]
-                          ELSE dev_ub[d]]
-           /\ mounted' = TRUE
+           /\ coord_phase' = "Claiming"
            /\ mount_wrong' = (mount_wrong \/ auth # AuthoritativeGen)
-           \* The claim reaches every ONLINE device, a quorum (above).
-           /\ pub_gen' = auth + 1
-           /\ pub_content' = ClaimContent
-    /\ UNCHANGED <<dev_state, coord_commit_content, commits_done,
-                    retry_count, next_content, fault_count>>
+    /\ UNCHANGED <<dev_ring, dev_state, commits_done, retry_count,
+                    next_content, fault_count, mounted, pub_gen, pub_content>>
+
+\* write_ub_to_all_devices: the claim on one device the open reaches,
+\* over whatever that device's slot of the claim gen held (an orphan final
+\* of a commit that failed, a claim an earlier open left).
+WriteClaim(d) ==
+    /\ coord_phase = "Claiming"
+    /\ dev_state[d] = "ONLINE"
+    /\ dev_ring[d][coord_target_gen] # coord_commit_content
+    /\ dev_ring' = [dev_ring EXCEPT ![d][coord_target_gen] = coord_commit_content]
+    /\ UNCHANGED <<dev_state, coord_phase, coord_target_gen,
+                    coord_commit_content, commits_done, retry_count,
+                    next_content, fault_count, mounted, mount_wrong,
+                    pub_gen, pub_content, mount_lost>>
+
+\* A quorum holds the claim: the open returns, the claim acknowledged.
+CheckClaimQuorum ==
+    /\ coord_phase = "Claiming"
+    /\ Cardinality({ d \in Devices :
+                       dev_ring[d][coord_target_gen] = coord_commit_content })
+           >= QuorumN
+    /\ mounted' = TRUE
+    /\ coord_phase' = "Idle"
+    /\ coord_commit_content' = 0
+    /\ pub_gen' = coord_target_gen
+    /\ pub_content' = coord_commit_content
+    /\ UNCHANGED <<dev_ring, dev_state, coord_target_gen, commits_done,
+                    retry_count, next_content, fault_count, mount_wrong,
+                    mount_lost>>
+
+\* Too few devices online to take it: the open fails, nothing mounted.
+AbortClaim ==
+    /\ coord_phase = "Claiming"
+    /\ Cardinality(OnlineDevices) < QuorumN
+    /\ coord_phase' = "Idle"
+    /\ coord_target_gen' = 0
+    /\ coord_commit_content' = 0
+    /\ UNCHANGED <<dev_ring, dev_state, commits_done, retry_count,
+                    next_content, fault_count, mounted, mount_wrong,
+                    pub_gen, pub_content, mount_lost>>
 
 (***************************************************************************)
 (* BeginCommit — coordinator picks target = auth+2, fresh content.         *)
@@ -278,27 +386,20 @@ BeginCommit ==
            /\ next_content' = next_content + 1
            /\ coord_commit_content' = next_content + 1
            /\ retry_count' = 0
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, commits_done, fault_count, mounted>>
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, commits_done, fault_count, mounted>>
 
 (***************************************************************************)
-(* WriteReservation — stamps ClaimContent (content stable: reservation UB *)
-(* carries PREVIOUS auth's roots = claim content).                          *)
-(*                                                                           *)
-(* Guard removed from original spec: the impl's write_ub_to_all_devices   *)
-(* writes to every device unconditionally, overwriting any prior gen-or-  *)
-(* content. Model reflects this by permitting writes on devices already at*)
-(* reservation_gen (idempotent with same content).                          *)
+(* WriteReservation -- names the tree of the last acknowledged final or   *)
+(* claim (build_uberblock from the session's mirrors, gen bumped).        *)
+(* write_ub_to_all_devices writes every device it reaches, whatever that  *)
+(* device's slot held.                                                     *)
 (***************************************************************************)
 
 WriteReservation(d) ==
     /\ coord_phase = "Reserving"
     /\ dev_state[d] = "ONLINE"
-    /\ dev_ub[d].gen <= coord_target_gen - 1
-    /\ \/ dev_ub[d].gen < coord_target_gen - 1
-       \/ /\ dev_ub[d].gen = coord_target_gen - 1
-          /\ dev_ub[d].content # ClaimContent    \* only re-write if would change content
-    /\ dev_ub' = [dev_ub EXCEPT ![d] = [gen |-> coord_target_gen - 1,
-                                          content |-> ClaimContent]]
+    /\ dev_ring[d][coord_target_gen - 1] # pub_content
+    /\ dev_ring' = [dev_ring EXCEPT ![d][coord_target_gen - 1] = pub_content]
     /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_state, coord_phase, coord_target_gen,
                     coord_commit_content, commits_done, retry_count,
                     next_content, fault_count, mounted>>
@@ -307,7 +408,7 @@ CheckReservationQuorum ==
     /\ coord_phase = "Reserving"
     /\ Cardinality(DevicesAtLeastGen(coord_target_gen - 1)) >= QuorumN
     /\ coord_phase' = "Flushing"
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, coord_target_gen, coord_commit_content,
                     commits_done, retry_count, next_content, fault_count, mounted>>
 
 AbortReservation ==
@@ -317,13 +418,13 @@ AbortReservation ==
     /\ coord_target_gen' = 0
     /\ coord_commit_content' = 0
     /\ retry_count' = 0
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, commits_done, next_content,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, commits_done, next_content,
                     fault_count, mounted>>
 
 DoFlush ==
     /\ coord_phase = "Flushing"
     /\ coord_phase' = "Finalizing"
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, coord_target_gen, coord_commit_content,
                     commits_done, retry_count, next_content, fault_count, mounted>>
 
 (***************************************************************************)
@@ -340,11 +441,8 @@ DoFlush ==
 WriteFinal(d) ==
     /\ coord_phase = "Finalizing"
     /\ dev_state[d] = "ONLINE"
-    /\ \/ dev_ub[d].gen < coord_target_gen
-       \/ /\ dev_ub[d].gen = coord_target_gen
-          /\ dev_ub[d].content # coord_commit_content   \* overwrite if content differs
-    /\ dev_ub' = [dev_ub EXCEPT ![d] = [gen |-> coord_target_gen,
-                                          content |-> coord_commit_content]]
+    /\ dev_ring[d][coord_target_gen] # coord_commit_content
+    /\ dev_ring' = [dev_ring EXCEPT ![d][coord_target_gen] = coord_commit_content]
     /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_state, coord_phase, coord_target_gen,
                     coord_commit_content, commits_done, retry_count,
                     next_content, fault_count, mounted>>
@@ -360,7 +458,7 @@ CheckFinalQuorum ==
     /\ commits_done' = commits_done + 1
     /\ pub_gen' = coord_target_gen
     /\ pub_content' = coord_commit_content
-    /\ UNCHANGED <<mount_wrong, mount_lost, dev_ub, dev_state, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<mount_wrong, mount_lost, dev_ring, dev_state, coord_target_gen, coord_commit_content,
                     retry_count, next_content, fault_count, mounted>>
 
 AbortFinal ==
@@ -370,7 +468,7 @@ AbortFinal ==
     /\ coord_target_gen' = 0
     /\ coord_commit_content' = 0
     /\ retry_count' = 0
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, commits_done, next_content,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, commits_done, next_content,
                     fault_count, mounted>>
 
 (***************************************************************************)
@@ -392,7 +490,7 @@ RetryPhase3 ==
             /\ next_content' = next_content
        ELSE /\ coord_commit_content' = next_content + 1
             /\ next_content' = next_content + 1
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, coord_target_gen, commits_done,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, coord_target_gen, commits_done,
                     fault_count, mounted>>
 
 Publish ==
@@ -401,7 +499,7 @@ Publish ==
     /\ coord_target_gen' = 0
     /\ coord_commit_content' = 0
     /\ retry_count' = 0
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, commits_done, next_content,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, commits_done, next_content,
                     fault_count, mounted>>
 
 (***************************************************************************)
@@ -413,44 +511,39 @@ DeviceFail(d) ==
     /\ fault_count < MaxFaults
     /\ dev_state' = [dev_state EXCEPT ![d] = "FAULTED"]
     /\ fault_count' = fault_count + 1
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, coord_phase, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, coord_phase, coord_target_gen, coord_commit_content,
                     commits_done, retry_count, next_content, mounted>>
 
 DeviceRejoin(d) ==
     /\ dev_state[d] = "FAULTED"
     /\ dev_state' = [dev_state EXCEPT ![d] = "ONLINE"]
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, coord_phase, coord_target_gen, coord_commit_content,
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, coord_phase, coord_target_gen, coord_commit_content,
                     commits_done, retry_count, next_content, fault_count, mounted>>
 
-\* Reconcile a BEHIND ONLINE device by catching its gen up to auth.
-\* Content is copied from a quorum member at exactly auth_gen (under
-\* ContentAgreementAtGen, any such member's content is canonical).
-\* This models ARCH §5.8's replay-missed-commits step: the reconciler
-\* reads the authoritative UB from a quorum peer and writes it into
-\* the behind device's ring slot.
+\* Reconcile a BEHIND ONLINE device: write the session's last acknowledged
+\* uberblock into its slot (ARCH section 5.8's replay-missed-commits step).
+\* The implementation has none yet (only write_ub_to_all_devices writes an
+\* uberblock); the one it builds must copy that canonical uberblock, since
+\* a device's uberblock at auth_gen may be an orphan's.
 Reconcile(d) ==
     /\ mounted
     /\ dev_state[d] = "ONLINE"
     /\ coord_phase = "Idle"
-    /\ LET auth == AuthoritativeGen
-           peers == DevicesAtGen(auth) \cap OnlineDevices
-       IN  /\ dev_ub[d].gen < auth
-           /\ peers # {}
-           /\ LET peer == CHOOSE e \in peers : TRUE
-              IN  dev_ub' = [dev_ub EXCEPT ![d] =
-                              [gen |-> auth,
-                               content |-> dev_ub[peer].content]]
+    /\ pub_gen > 0
+    /\ DevGen(d) < pub_gen
+    /\ dev_ring' = [dev_ring EXCEPT ![d][pub_gen] = pub_content]
     /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_state, coord_phase, coord_target_gen, coord_commit_content,
                     commits_done, retry_count, next_content, fault_count, mounted>>
 
+\* A crash, of a mounted session or of an open mid-claim.
 Crash ==
-    /\ mounted
+    /\ mounted \/ coord_phase = "Claiming"
     /\ coord_phase'          = "Idle"
     /\ coord_target_gen'     = 0
     /\ coord_commit_content' = 0
     /\ retry_count'          = 0
     /\ mounted'              = FALSE
-    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ub, dev_state, commits_done, next_content, fault_count>>
+    /\ UNCHANGED <<mount_wrong, pub_gen, pub_content, mount_lost, dev_ring, dev_state, commits_done, next_content, fault_count>>
 
 (***************************************************************************)
 (* Next-state.                                                              *)
@@ -458,6 +551,9 @@ Crash ==
 
 Next ==
     \/ Mount
+    \/ \E d \in Devices : WriteClaim(d)
+    \/ CheckClaimQuorum
+    \/ AbortClaim
     \/ BeginCommit
     \/ \E d \in Devices : WriteReservation(d)
     \/ CheckReservationQuorum
@@ -476,11 +572,38 @@ Next ==
 Spec == Init /\ [][Next]_vars
 
 (***************************************************************************)
+(* The state space without what no step can read (cfg VIEW View). A ring  *)
+(* slot below AuthoritativeGen is read by nothing but DevGen, and only as  *)
+(* the device's newest, unless it is pub_gen's: the mount reads the slot  *)
+(* of VisibleQuorumGen, which MountCountsUnknown makes AuthoritativeGen   *)
+(* (MountHigh >= AuthoritativeGen >= VisibleQuorumGen), and every write   *)
+(* and its guard is at the claim gen, the reservation's or the final's,   *)
+(* none below AuthoritativeGen, or at pub_gen (Reconcile). Neither        *)
+(* AuthoritativeGen nor a newest falls, and pub_gen moves only to a gen   *)
+(* being written, so a slot read by nothing stays so. Two states that      *)
+(* differ only there have the same futures and the same invariants. A cfg *)
+(* with MountCountsUnknown = FALSE mounts below AuthoritativeGen and must *)
+(* not use the view.                                                       *)
+(***************************************************************************)
+
+LiveSlot(d, g) == g >= AuthoritativeGen \/ g = pub_gen \/ g = DevGen(d)
+
+\* Nothing in the spec tells one device from another but its state (cfg
+\* SYMMETRY Symmetry, Devices a set of model values).
+Symmetry == Permutations(Devices)
+
+View == <<[d \in Devices |-> [g \in 1..MaxGen |->
+                                IF LiveSlot(d, g) THEN dev_ring[d][g] ELSE 0]],
+          dev_state, coord_phase, coord_target_gen, coord_commit_content,
+          commits_done, retry_count, next_content, fault_count, mounted,
+          mount_wrong, pub_gen, pub_content, mount_lost>>
+
+(***************************************************************************)
 (* Invariants.                                                              *)
 (***************************************************************************)
 
 TypeOK ==
-    /\ dev_ub \in [Devices -> [gen: 0..MaxGen, content: 0..MaxContent]]
+    /\ dev_ring \in [Devices -> [1..MaxGen -> 0..MaxContent]]
     /\ dev_state \in [Devices -> DevState]
     /\ coord_phase \in Phase
     /\ coord_target_gen \in 0..MaxGen
@@ -502,17 +625,17 @@ QuorumSafety ==
 AuthoritativeMono ==
     /\ commits_done = 0 \/ AuthoritativeGen >= 2
     /\ \A d \in Devices :
-          dev_ub[d].gen > 0 =>
+          DevGen(d) > 0 =>
              AuthoritativeGen >= 2 \/ commits_done = 0
-                              \/ dev_ub[d].gen < 2
+                              \/ DevGen(d) < 2
 
 CommitAtomic ==
     AuthoritativeGen >= 2 * commits_done
 
 OrphansNotAuthoritative ==
     \A d \in Devices :
-        dev_ub[d].gen > AuthoritativeGen =>
-            Cardinality(DevicesAtLeastGen(dev_ub[d].gen)) < QuorumN
+        DevGen(d) > AuthoritativeGen =>
+            Cardinality(DevicesAtLeastGen(DevGen(d))) < QuorumN
 
 LiveCoordTargetValid ==
     (mounted /\ coord_phase # "Idle") =>
@@ -522,43 +645,33 @@ QuorumDurability == AuthoritativeGen >= 2 * commits_done
 
 MountGenBumpMulti ==
     mounted => \A d \in Devices :
-                   dev_ub[d].gen <= coord_target_gen \/ coord_phase = "Idle"
+                   DevGen(d) <= coord_target_gen \/ coord_phase = "Idle"
 
 (***************************************************************************)
 (* R14 P1: ContentQuorumAtGen.                                             *)
-(*                                                                           *)
-(* At any gen G where a quorum of devices report UBs (at G or higher),    *)
-(* at LEAST a quorum of the devices-at-exactly-G must agree on content.   *)
-(* Devices at G with a different content are "orphans" whose state will   *)
-(* be overwritten by a future commit or reconciliation (ARCH §5.8).       *)
-(*                                                                           *)
-(* This is the property the impl's mount-time agreement check must        *)
-(* enforce: find the content shared by ≥quorum devices at auth_gen,      *)
-(* pick that as canonical, and ignore dissenters as orphans. A stricter  *)
-(* "all devices at G must agree" (ContentAgreementAtGen below) is NOT a  *)
-(* safety invariant — it can be violated legitimately by device-fault    *)
-(* scenarios where a FAULTED device retains an orphan UB from an earlier *)
-(* partial commit while subsequent mount-claims overwrite the online    *)
-(* quorum members.                                                         *)
-(*                                                                           *)
-(* Under IdempotentRetry=FALSE (buggy impl), even ContentQuorumAtGen can *)
-(* be violated if MaxRetries >= 2 — three retries can produce three      *)
-(* distinct contents at the same gen, leaving no quorum group at that    *)
-(* gen. Under IdempotentRetry=TRUE (fixed impl), retries preserve content *)
-(* so WriteFinal only ever stamps one content value per gen; content-    *)
-(* quorum always holds.                                                   *)
+(*                                                                         *)
+(* An acknowledged final or claim is held at its gen by a quorum sharing  *)
+(* its content: what a retry that writes the same bytes keeps (the buggy  *)
+(* retry acknowledges a quorum at the gen holding divergent contents).    *)
+(* Until OPEN-BUGS (ah) it read: where a quorum of devices sit at exactly *)
+(* a gen, a quorum of them agree on content (NewestContentQuorum below),  *)
+(* what the open's newest-only check needed. That does not hold: a claim  *)
+(* the next reservation moved past, or a claim left on fewer than a       *)
+(* quorum beside an orphan final, leaves a quorum at the gen with no      *)
+(* content quorum among them. What the open needs is the ring read        *)
+(* (Mount, MountKeepsPublished, MountNotStuck).                            *)
 (***************************************************************************)
 
 \* Set of distinct contents observed on devices at exactly gen g.
-ContentsAtGen(g) == { dev_ub[d].content : d \in DevicesAtGen(g) }
+ContentsAtGen(g) == { DevContent(d) : d \in DevicesAtGen(g) }
 
 \* Does gen g have content-quorum — some content c held by >= quorum
 \* of the devices at exactly g?
 ContentQuorumAt(g) ==
     \E c \in ContentsAtGen(g) :
-        Cardinality({ d \in DevicesAtGen(g) : dev_ub[d].content = c }) >= QuorumN
+        Cardinality({ d \in DevicesAtGen(g) : DevContent(d) = c }) >= QuorumN
 
-ContentQuorumAtGen ==
+NewestContentQuorum ==
     \A g \in 1..MaxGen :
         Cardinality(DevicesAtGen(g)) >= QuorumN => ContentQuorumAt(g)
 
@@ -569,9 +682,9 @@ ContentQuorumAtGen ==
 \* a new claim at the same gen.
 ContentAgreementAtGen ==
     \A d, e \in Devices :
-        /\ dev_ub[d].gen > 0
-        /\ dev_ub[d].gen = dev_ub[e].gen
-        => dev_ub[d].content = dev_ub[e].content
+        /\ DevGen(d) > 0
+        /\ DevGen(d) = DevGen(e)
+        => DevContent(d) = DevContent(e)
 
 \* Vote 153: what a mount takes is what a quorum holds -- never an older
 \* gen read past an unreadable device that may hold a newer commit.
@@ -582,6 +695,21 @@ MountAtAuthoritative == ~mount_wrong
 \* loses nothing) included; this names the loss itself: an acknowledged
 \* final or claim mounted past, or at its gen another content picked.
 MountKeepsPublished == ~mount_lost
+
+ContentQuorumAtGen ==
+    pub_gen > 0 =>
+        Cardinality({ d \in Devices : Slot(d, pub_gen) = pub_content })
+            >= QuorumN
+
+\* OPEN-BUGS (ah): every device online, every slot readable, no
+\* coordinator in flight -- the open mounts.
+MountNotStuck ==
+    (/\ ~mounted
+     /\ coord_phase = "Idle"
+     /\ OnlineDevices = Devices
+     /\ VisibleQuorumGen + 1 <= MaxGen)
+    => \E c \in HeldAt(VisibleQuorumGen, {}) \cup {0} :
+           MountPick(VisibleQuorumGen, {}, c)
 
 Invariants ==
     /\ TypeOK
@@ -595,5 +723,6 @@ Invariants ==
     /\ ContentQuorumAtGen
     /\ MountAtAuthoritative
     /\ MountKeepsPublished
+    /\ MountNotStuck
 
 =============================================================================
