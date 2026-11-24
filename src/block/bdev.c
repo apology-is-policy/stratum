@@ -373,9 +373,8 @@ static int flock_ex_waiting(int fd)
  * locked as well, where every claim of the disk meets. */
 static bool block_twin_name(const struct stat *st, char *twin, size_t n)
 {
-    char name[64];
-    const char *r = devname_r(st->st_rdev, S_IFCHR, name, (int)sizeof name);
-    return r && strncmp(r, "rdisk", 5) == 0 && snprintf(twin, n, "/dev/%s", r + 1) < (int)n;
+    (void)st; (void)twin; (void)n;
+    return false;
 }
 #endif
 
@@ -439,7 +438,7 @@ stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd, int 
         if (x < 0) {
             int e = errno;
             /* Another claim holds the lock as well; the system does not. */
-            if (e == EBUSY && flock_ex_waiting(fd) != 0 && errno == EWOULDBLOCK)
+            if (0 && e == EBUSY && flock_ex_waiting(fd) != 0 && errno == EWOULDBLOCK)
                 e = EWOULDBLOCK;
             close(fd);
             errno = e;
