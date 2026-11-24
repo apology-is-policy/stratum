@@ -152,6 +152,9 @@ void stm_bdev_set_layout_bytes(stm_bdev *d, uint64_t bytes);
 /* Synchronous ops                                                            */
 /* ========================================================================= */
 
+/* A read whose span is not within caps.size_bytes fails STM_EIO and reads
+ * nothing, on every backend: the device cannot supply bytes past its end
+ * (a device cut below what its records name). A read of no bytes fits. */
 STM_MUST_USE
 stm_status stm_bdev_read (stm_bdev *d, uint64_t offset, void       *buf, size_t len);
 
@@ -244,6 +247,8 @@ typedef struct {
 /* Completion callback. `res` is stack-valid during the call only. */
 typedef void (*stm_bdev_completion_cb)(const stm_op_result *res);
 
+/* A span stm_bdev_read fails completes at once with STM_EIO and no bytes:
+ * the callback runs before the call returns, which answers STM_OK. */
 STM_MUST_USE
 stm_status stm_bdev_submit_read (stm_bdev *d, uint64_t offset,
                                  void *buf, size_t len,
