@@ -186,6 +186,11 @@ void stm_sync_pool_serial(const stm_sync *s, uint8_t out[16]);
  * Mount-time open. Scans all labels × commit ring slots, picks the
  * authoritative uberblock (one device: its highest valid gen; more: the
  * quorum-th highest of the devices' best, with content quorum), and:
+ *   - refuses STM_EIO, writing nothing, while a device whose scan refused
+ *     could hold a newer commit: such a device is an unknown vote, as
+ *     high as any (a device of a multi-device pool can miss writes), and
+ *     the open refuses when the (quorum - unknown)-th highest gen the
+ *     others read is above the quorum-th (quorum.tla Mount, vote 153);
  *   - writes a claim at authoritative_gen + 1 to every device not REMOVED
  *     or FAULTED, per the MountGenBump invariant (sync.tla). With quorum,
  *     auth_gen becomes the claim's gen and current_gen the claim's + 2.
@@ -264,7 +269,8 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
  * refused on (see stm_sb_mount_scan_ex): on a pool with one live device
  * an unreadable one (STM_EIO, why->gen), on any pool one holding a newer
  * build's uberblock (STM_EBADVERSION, why->version). Zeroed at entry; gen
- * and version stay 0 otherwise.
+ * and version stay 0 otherwise. A multi-device pool's STM_EIO for an
+ * unknown vote leaves gen 0: the refusal is the pool's, not one copy's.
  */
 struct stm_sb_scan_refusal;
 STM_MUST_USE
@@ -299,7 +305,10 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
  * fsck pass reconciles. Leak-on-failure, not corruption.
  */
 /* STM_ERANGE: no device confirmed and one was shorter than its layout (an
- * image cut under the open pool takes no uberblock). */
+ * image cut under the open pool takes no uberblock); or the metadata
+ * primary was, whatever the others confirmed: every later open refuses
+ * its layout, so a generation it misses can never be mounted. The handle
+ * then wedges (every later call answers STM_EWEDGED). */
 STM_MUST_USE
 stm_status stm_sync_commit(stm_sync *s);
 
@@ -533,6 +542,12 @@ uint64_t stm_sync_reconcile_freed_nodes(const stm_sync *s);
  *     device_id.
  *   - MUST be called before the first stm_sync_commit that writes
  *     durable state referencing device_id's alloc tree.
+ *
+ * On a mounted, writable pool whose `alloc` opened on a bitmap it could
+ * not confirm (stm_bootstrap_bitmap_unconfirmed), the attach reconciles
+ * that bootstrap after loading the device's tree, before any reserve
+ * (the tree is all it holds), and fails with the pass's error when the
+ * pass does not complete.
  *
  * Returns STM_EEXIST if a slot is already filled for device_id.
  * Returns STM_EINVAL on range / shape violations.

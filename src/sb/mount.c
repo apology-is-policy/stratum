@@ -592,7 +592,8 @@ stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
      * at best+2 only when best+1 was not settled (its copies neither held
      * an older generation of their own slot nor read back zero). A device
      * of a multi-device pool can miss a generation's write while quorum
-     * holds, so there either slot unreadable refuses. */
+     * holds, so there either slot unreadable refuses, and so does any
+     * other (below). */
     for (;;) {
         stm_uberblock cand;
         bool later = false;
@@ -641,6 +642,41 @@ stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
         if (s2 == SB_SLOT_UNREADABLE)
             return sb_refuse(d, g2, at, best_gen, why);
         break;
+    }
+
+    /* A device of a multi-device pool can miss writes while quorum holds
+     * (FAULTED, or a write that failed), so its generations need not be
+     * contiguous: the newest it confirmed can be in any slot, best+1 and
+     * best+2 only the nearest. Every other slot must settle or decode no
+     * newer than best; one that stays unreadable could hold a newer
+     * commit, and mounting best would roll the pool back past it, so the
+     * device refuses (an unknown vote, stm_sync_open_ex). A re-read that
+     * finds a newer generation moves best and every slot is asked again
+     * (a copy settled once stays settled). */
+    if (!one_device) {
+        for (uint32_t k = 1; k < STM_UB_SLOTS_PER_LABEL; k++) {
+            uint64_t g = best_gen + k;
+            if (g < best_gen) break;
+            stm_uberblock cand;
+            bool later = false;
+            uint32_t version = 0;
+            uint32_t at = 0;
+            sb_slot_state sk = sb_successor(d, st, g, best_gen, &cand, &later,
+                                            &version, &at);
+            if (sk == SB_SLOT_NEWER)
+                return sb_refuse_version(d, at, stm_sb_ring_slot_for_gen(g),
+                                         version, best_gen, why);
+            if (later) {
+                best_gen   = stm_load_le64(cand.ub_gen);
+                best_label = at;
+                best_slot  = stm_sb_ring_slot_for_gen(g);
+                best_ub    = cand;
+                k = 0;
+                continue;
+            }
+            if (sk == SB_SLOT_UNREADABLE)
+                return sb_refuse(d, g, at, best_gen, why);
+        }
     }
 
     /* Every uberblock of the device records the same size (a device keeps

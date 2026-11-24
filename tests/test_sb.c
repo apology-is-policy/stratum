@@ -484,11 +484,14 @@ STM_TEST(sb_mount_scan_fails_closed_on_an_unreadable_successor_slot) {
     sb_put_gen(d, 42);
     stm_uberblock found;
 
-    /* Control: the faults land, elsewhere they cost nothing. */
+    /* Control: the faults land; on one device (its generations
+     * contiguous) a slot past best+2 costs nothing. On a multi-device
+     * pool it refuses (sb_mount_scan_multi_device_refuses_at_any_unreadable_slot). */
     sb_fault_gen(d, 7, -1);
-    STM_ASSERT_OK(stm_sb_mount_scan(d, &found, NULL, NULL));
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, NULL));
     STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
     STM_ASSERT(stm_bdev_inject_read_range_fired(d) >= 1u);
+    STM_ASSERT_ERR(stm_sb_mount_scan(d, &found, NULL, NULL), STM_EIO);
     stm_bdev_inject_read_range_clear(d);
 
     /* best+1 unreadable for good: one read, two re-reads, of each copy.
@@ -510,6 +513,62 @@ STM_TEST(sb_mount_scan_fails_closed_on_an_unreadable_successor_slot) {
     STM_ASSERT_OK(stm_sb_mount_scan(d, &found, NULL, NULL));
     STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
     STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(d) - f0, STM_UB_COPIES);
+    stm_bdev_inject_read_range_clear(d);
+
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Vote 153: a device of a multi-device pool can miss writes, so its newest
+ * generation can be in any slot. This one confirmed 41, missed 42 to 46
+ * and confirmed 47 (a final whose reservation it missed): with slot(47)
+ * unreadable for good, best is 41 and best+1 and best+2 read blank. The
+ * one-device rule mounts 41; the multi-device rule refuses at slot(47),
+ * naming the first generation past best that slot can hold. */
+STM_TEST(sb_mount_scan_multi_device_refuses_at_any_unreadable_slot) {
+    stm_bdev *d = open_test_device("gapslot", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    sb_put_gen(d, 41);
+    sb_put_gen(d, 47);
+    stm_uberblock found;
+    stm_sb_scan_refusal why;
+
+    /* Control: every copy readable, 47. */
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, false, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 47u);
+
+    sb_fault_gen(d, 47, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, false, &found, NULL, NULL, &why),
+                   STM_EIO);
+    STM_ASSERT_EQ(why.gen, 47u);
+    STM_ASSERT_EQ(why.slot_idx, 47u);
+    STM_ASSERT_EQ(why.label_idx, 0u);
+    STM_ASSERT_EQ(why.byte_offset, sb_copy_off(d, 47, 0));
+    STM_ASSERT_EQ(why.best_gen, 41u);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 41u);
+    stm_bdev_inject_read_range_clear(d);
+
+    /* Each copy of slot(47) fails once: the re-read finds 47, a gap from
+     * best, and mounts it. */
+    sb_fault_gen(d, 47, 1);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, false, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 47u);
+    stm_bdev_inject_read_range_clear(d);
+
+    /* One copy of slot(47) unreadable for good: the others decode 47. */
+    sb_fault_copy(d, 47, 2, -1);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, false, &found, NULL, NULL, &why));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 47u);
+    stm_bdev_inject_read_range_clear(d);
+
+    /* A slot never written, unreadable for good: nothing tells it from
+     * one holding a newer commit. 47 + 10 = 57. */
+    sb_fault_gen(d, 57, -1);
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, false, &found, NULL, NULL, &why),
+                   STM_EIO);
+    STM_ASSERT_EQ(why.gen, 57u);
+    STM_ASSERT_EQ(why.best_gen, 47u);
     stm_bdev_inject_read_range_clear(d);
 
     stm_bdev_close(d);

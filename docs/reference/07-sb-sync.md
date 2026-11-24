@@ -236,8 +236,11 @@ primary allocator as `stm_sync_open` does. It refuses:
   (they never reach the layout's end, so a cut during them shows). Not
   even labels 0 and 1 take a copy: the device never counts toward a
   commit's quorum, and no copy becomes a vote if its tail comes back. A
-  one-device pool's commit then fails `STM_ERANGE`. `stm_bdev_write` refuses any write past a device's end
-  (`STM_EINVAL`); a file-backed device keeps the size it was cut to. On a one-device pool `stm_sync_open` returns
+  one-device pool's commit then fails `STM_ERANGE`, and so does a
+  multi-device pool's when that device is the metadata primary, whatever
+  the others confirm (OPEN-BUGS (r)): every later open refuses its layout,
+  so no generation it misses can be mounted. The handle then wedges. `stm_bdev_write` refuses any write past a device's end
+  (`STM_EINVAL`); a file-backed device keeps the size it was cut to. On a pool with one live device `stm_sync_open` returns
   the scan's STM_ERANGE, and the STM_ECORRUPT below, as they are.
 - `STM_ECORRUPT` when the uberblock it would mount, or the newest head copy,
   records no valid size or another size than the layout labels 2 and 3
@@ -324,12 +327,18 @@ again: it counts as blank only after two reads came back all zero, as torn
 after two reads came back wrong otherwise (one of them may be zero), and as
 unreadable when three reads brought neither two such reads nor a decode (a
 failed read counts toward unreadable). Each blank successor copy costs one
-more 4 KiB read: four a mount on one device whose ring has not come round,
-eight under the strict rule (best+1 and best+2). A device of a multi-device
-pool can miss a generation's write while quorum holds, so there either slot
-unsettled refuses; a refusing device is then no vote for the older
-generation it read (a stale vote could make a false quorum). An unreadable
-copy anywhere else costs nothing. A refusal says which copy
+more 4 KiB read: four a mount on one device whose ring has not come round.
+A device of a multi-device pool can miss writes while quorum holds (a
+FAULTED slot, a failed write), so its generations need not be contiguous
+and the newest it confirmed can be in any slot: under the strict rule
+every slot must settle, and any that stays unsettled with a copy
+unreadable refuses (`why->gen` the first generation past best that slot
+can hold); a re-read that finds a newer generation moves best and every
+slot is asked again. That costs one more read per blank copy of every
+slot: up to 248 (about 1 MiB) on a device whose ring has not come round.
+A refusing device is then an unknown vote (the mount flow, step 2), never
+a vote for the older generation it read (a stale vote could make a false
+quorum). On one device an unreadable copy past best+2 costs nothing. A refusal says which copy
 (`stm_sb_scan_refusal`: the generation, label, slot, byte offset and the
 best generation read;
 `stm_fs_mount_opts.scan_refusal`, filled by the mount's first scan or by
@@ -503,18 +512,25 @@ first record went answers `STM_EWEDGED` and the sync wedges.
 
 ```
 1. For each device in pool: stm_sb_mount_scan_ex -> (highest valid ub_gen,
-   ub); one_device when the pool has one live device. A device whose scan
-   answers STM_EIO contributes nothing; if no device gave a uberblock and one
-   answered STM_EIO, the open answers STM_EIO, not STM_ENOENT (an unreadable
-   pool is not a fresh one); a one-device pool whose device is smaller than
-   recorded answers STM_ERANGE. The no-rollback rule above holds for one
-   device: in a multi-device pool a device that refuses drops out of the
-   quorum like a dead one, and a commit acknowledged by exactly a quorum,
-   one of whose devices refuses, can be rolled back (enqueued).
+   ub); one_device when the pool has had one device only (a roster of one
+   slot: a device a remove left alone may have missed writes while the
+   others were there). A device whose scan refuses (STM_EIO; on a pool
+   with more than one live device STM_ERANGE and STM_ECORRUPT too) is an
+   unknown vote; one that finds no uberblock (STM_ENOENT) votes nothing.
+   If no device gave a uberblock and one refused, the open answers
+   STM_EIO, not STM_ENOENT (an unreadable pool is not a fresh one); a pool
+   with one live device answers its STM_ERANGE or STM_ECORRUPT as it is.
 2. Compute authoritative gen:
      sort valid gens desc
      auth = gens[quorum - 1]        // kth largest, where k = floor(N/2)+1
    Quorum < k: return STM_EQUORUM.
+   Unknown votes (vote 153; quorum.tla Mount, MountHigh): each could be
+   as high as any, so the gen a quorum may hold is at most
+     ceiling = gens[quorum - unknown - 1]
+   ceiling > auth: return STM_EIO, writing nothing. auth could roll back
+   a commit those devices and the others above it acknowledged, and the
+   claim at auth + 1 would overwrite it. So the no-rollback rule above
+   holds for any pool.
 3. Content-quorum check (R14 P1):
      Group visible UBs at auth_gen by byte-equal shared fields.
      Largest group must be ≥ quorum, else ContentQuorumAtGen violated.
@@ -672,9 +688,9 @@ atomically so add / attach / commit / detach composes in one step.
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_sb` | 51 | Encode / decode roundtrip; csum tamper rejected; magic tamper -> STM_ENOENT; version tamper -> STM_EBADVERSION; zero-gen rejected; label offsets; label_read / label_write; mount_scan picks highest valid; the bytes every version keeps (magic, version, the csum's domain, read without `stm_ub_csum`; an uberblock of those fields alone is a newer build's); a newer build's uberblock refuses the mount and the refusal names its slot (best+1, one of the kept fields alone, two in other slots naming the first, re-reads at best+1 and best+2, the one-device read of best-1; a torn one and an older one do not); every generation in all four labels: the write puts every copy and fails when one fails, a generation is found by any copy, one copy settles a slot, the first of differing copies is taken (in the first pass and when re-reads find them), a later copy beats a blank one before it, a refusal names the first unreadable copy, the one-device final call needs no copy of best-1 with best's trees, an older build's pool is named; the layout (v35): a grown device's tail labels are read where it joined (an acknowledged generation found there, a later write lands there, the new end stays blank; control: not grown), a device smaller than recorded refuses naming both sizes (a newer build's head copy refuses first), with no head copy the tail is read at the current size, and an uberblock recording another size, or none, refuses (a roster counting more than its 64 slots too); a handle laid out at a size no layout can have still reads its head labels.; a device shorter than its layout (cut under the handle, cut before the open, grown back under a handle opened short, cut while its copies are written) takes no copy, read-only answers STM_EROFS. |
+| `test_sb` | 52 | Encode / decode roundtrip; csum tamper rejected; magic tamper -> STM_ENOENT; version tamper -> STM_EBADVERSION; zero-gen rejected; label offsets; label_read / label_write; mount_scan picks highest valid; the bytes every version keeps (magic, version, the csum's domain, read without `stm_ub_csum`; an uberblock of those fields alone is a newer build's); a newer build's uberblock refuses the mount and the refusal names its slot (best+1, one of the kept fields alone, two in other slots naming the first, re-reads at best+1 and best+2, the one-device read of best-1; a torn one and an older one do not); every generation in all four labels: the write puts every copy and fails when one fails, a generation is found by any copy, one copy settles a slot, the first of differing copies is taken (in the first pass and when re-reads find them), a later copy beats a blank one before it, a refusal names the first unreadable copy, the one-device final call needs no copy of best-1 with best's trees, an older build's pool is named; the layout (v35): a grown device's tail labels are read where it joined (an acknowledged generation found there, a later write lands there, the new end stays blank; control: not grown), a device smaller than recorded refuses naming both sizes (a newer build's head copy refuses first), with no head copy the tail is read at the current size, and an uberblock recording another size, or none, refuses (a roster counting more than its 64 slots too); a handle laid out at a size no layout can have still reads its head labels.; a device shorter than its layout (cut under the handle, cut before the open, grown back under a handle opened short, cut while its copies are written) takes no copy, read-only answers STM_EROFS; vote 153: on a multi-device pool any slot unsettled with a copy unreadable refuses, naming the first generation past best it can hold (a device that missed gens: one device mounts best past it; a copy failing once is re-read and moves best across the gap; one copy unreadable costs nothing). |
 | `test_sync` | 50 | Single-device commit + remount; MountGenBump; alloc-root tree encoded under correct key; version boundary refusals; every ring write lands in all four labels, a mount finds the newest generation by any copy, and no one unreadable label hides a commit; an allocator opened before the scan on a device that grew is refused, writing nothing (control: not grown); a device smaller than its recorded size refuses the open (STM_ERANGE), writing nothing; a pool made on a device larger than its roster records is laid out at the recorded size (its uberblock copies at the recorded tail, its data area below them), and an allocator made before stm_pool_open is refused; a one-device layout refusal keeps its status (STM_ECORRUPT) and names its copy.; a one-device pool's image cut under the open pool fails the next commit STM_ERANGE and is not regrown. |
-| `test_sync_multi` | 60 | 3-device quorum roundtrip; 1-of-3 device loss tolerated; sub-quorum refused (STM_EQUORUM); orphan-ahead-of-quorum ignored; content-quorum tested; alloc-roots indirection; v5/v6/v7 version refusals (the v5 test exercises one prior version; the decode accepts only `STM_UB_VERSION_MIN_COMPAT`..`STM_UB_VERSION`, and a newer build's uberblock refuses the pool); mirror(2) + mirror(3) roundtrips + tampered-replica fallback; reserve refuses NONE profile; attach_alloc arg validation; RO pool refuses write ops; wedge refusal; keyschema idempotent commit produces byte-identical UBs; replace_device_online resume from step-3 commit failure; same-uuid-different-alloc refused; slot-0 spoofing refused; multi-retry converges; **commit succeeds with one FAULTED device** (R21 P1); replace-claim blocks concurrent mutators on the claimed slot via sync-wrapper bypass-closed (R23 P3-4).; a replace whose rollback cannot remove the new slot wedges and answers the wedge; a newer build's uberblock on one device refuses the open and names its slot; attach refuses an allocator whose data area runs past its device's layout, and one on a device smaller than its layout; a dissenting device's own recorded size does not place the pool's writes on it; a device truncated below its recorded size gets no uberblock, keeps that size through the pool's open and commit, and never counts toward a commit's quorum; a read-only open of a pool holding a REMOVED slot, or a FAULTED one, mounts read-only and reads a block committed before (control: read-write, the same roster opens and claims); a commit that two FAULTED slots of three leave short of quorum fails STM_EQUORUM. |
+| `test_sync_multi` | 64 | 3-device quorum roundtrip; 1-of-3 device loss tolerated; sub-quorum refused (STM_EQUORUM); orphan-ahead-of-quorum ignored; content-quorum tested; alloc-roots indirection; v5/v6/v7 version refusals (the v5 test exercises one prior version; the decode accepts only `STM_UB_VERSION_MIN_COMPAT`..`STM_UB_VERSION`, and a newer build's uberblock refuses the pool); mirror(2) + mirror(3) roundtrips + tampered-replica fallback; reserve refuses NONE profile; attach_alloc arg validation; RO pool refuses write ops; wedge refusal; keyschema idempotent commit produces byte-identical UBs; replace_device_online resume from step-3 commit failure; same-uuid-different-alloc refused; slot-0 spoofing refused; multi-retry converges; **commit succeeds with one FAULTED device** (R21 P1); replace-claim blocks concurrent mutators on the claimed slot via sync-wrapper bypass-closed (R23 P3-4).; a replace whose rollback cannot remove the new slot wedges and answers the wedge; a newer build's uberblock on one device refuses the open and names its slot; attach refuses an allocator whose data area runs past its device's layout, and one on a device smaller than its layout; a dissenting device's own recorded size does not place the pool's writes on it; a device truncated below its recorded size gets no uberblock, keeps that size through the pool's open and commit, and never counts toward a commit's quorum; a read-only open of a pool holding a REMOVED slot, or a FAULTED one, mounts read-only and reads a block committed before (control: read-write, the same roster opens and claims); a commit that two FAULTED slots of three leave short of quorum fails STM_EQUORUM; vote 153: a commit acknowledged by two devices of three, one of them unreadable at the next open, refuses STM_EIO and writes nothing (control: healthy, it mounts; with the third device holding it too, the unknown vote cannot change the gen and it mounts), an attach over a bitmap open could not confirm reconciles it before any reserve (every node of the device's tree held after; a commit and a remount after), and a device removes left alone keeps the strict scan (a slot unreadable past best+2 refuses); (r): the metadata primary cut under the open pool fails the commit STM_ERANGE and wedges (control: another device cut, the commit is acknowledged and the next open mounts it). |
 
 ## Status
 
