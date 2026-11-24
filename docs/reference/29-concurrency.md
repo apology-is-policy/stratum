@@ -428,9 +428,13 @@ in-flight tags — is real but not yet demonstrated by this workload.
   over a lock that prefers readers, so the gate's preference is what it
   sees on every host: the same stream starving a writer on that lock bare
   is its control; a new reader waits for a waiting writer, and for every
-  writer counted; no reader is lost at a count-out (a 2 s stress over
-  each lock); and a reader woken for another lock on its stripe waits
-  again. `test_rwlock_fs.c` lets a commit in under a stream of writes
+  writer counted; no reader is lost at a count-out (a stress over each
+  lock of at least 2 s and at least 100 count-outs, capped at 60 s: a
+  count-out waits for three readers to be scheduled, 20 ms each under
+  macOS's thread sanitizer); and a reader woken for another lock on its
+  stripe waits again. The hooks refuse a 65th lock before taking it, so
+  a sanitizer that tracks each lock a thread holds (TSan's deadlock
+  detector stops at 64) never sees it taken. `test_rwlock_fs.c` lets a commit in under a stream of writes
   holding `fs->global` shared; the ctest entries `test_corvus_mount_rp_*`
   run the ENOSPC reclaim's witnesses in the test mode.
 
