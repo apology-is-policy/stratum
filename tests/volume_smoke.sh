@@ -224,20 +224,26 @@ fi
 "$B" mkfs "$D/raw.stm" --size 64M < /dev/null > "$D/raw.log" 2>&1 || no "a volume with no passphrase: $(tail -1 "$D/raw.log")"
 # A bootstrap the size asked cannot hold is a usage error, asked before anything is made: no image,
 # no key, and in a directory mkfs cannot write, that is still what is refused. One size larger, the
-# same bootstrap formats.
-mkdir "$D/ro" && chmod 555 "$D/ro"
+# same bootstrap formats. Root writes a directory of mode 555 all the same, so as root that leg is
+# not run (a note says so).
+BOOT_NO="--bootstrap 71303168 must be < --size 67108864"
 "$B" mkfs "$D/boot.stm" --bootstrap 68M < /dev/null > "$D/boot.log" 2>&1
 rc=$?
-"$B" mkfs "$D/ro/boot.stm" --bootstrap 68M < /dev/null > "$D/boot-ro.log" 2>&1
-rc_ro=$?
-chmod 755 "$D/ro"
-BOOT_NO="--bootstrap 71303168 must be < --size 67108864"
+rc_ro=
+if [ "$(id -u)" = 0 ]; then
+    echo "note: as root a directory of mode 555 can be written: the bootstrap check in one mkfs cannot write is not made"
+else
+    mkdir "$D/ro" && chmod 555 "$D/ro"
+    "$B" mkfs "$D/ro/boot.stm" --bootstrap 68M < /dev/null > "$D/boot-ro.log" 2>&1
+    rc_ro=$?
+    chmod 755 "$D/ro"
+fi
 if [ "$rc" = 1 ] && LC_ALL=C grep -qF -- "$BOOT_NO" "$D/boot.log" && [ ! -e "$D/boot.stm" ] && [ ! -e "$D/boot.stm.key" ] \
-        && [ "$rc_ro" = 1 ] && LC_ALL=C grep -qF -- "$BOOT_NO" "$D/boot-ro.log" \
+        && { [ -z "$rc_ro" ] || { [ "$rc_ro" = 1 ] && LC_ALL=C grep -qF -- "$BOOT_NO" "$D/boot-ro.log"; }; } \
         && "$B" mkfs "$D/boot.stm" --bootstrap 68M --size 128M < /dev/null > "$D/boot2.log" 2>&1 && [ -s "$D/boot.stm" ]; then
     ok "a bootstrap the default size cannot hold is refused before anything is made"
 else
-    no "--bootstrap 68M with no --size: rc=$rc: $(tail -1 "$D/boot.log"); image $([ -e "$D/boot.stm" ] && echo left || echo none), key $([ -e "$D/boot.stm.key" ] && echo left || echo none); in a directory it cannot write: rc=$rc_ro: $(tail -1 "$D/boot-ro.log"); with --size 128M: $(tail -1 "$D/boot2.log")"
+    no "--bootstrap 68M with no --size: rc=$rc: $(tail -1 "$D/boot.log"); image $([ -e "$D/boot.stm" ] && echo left || echo none), key $([ -e "$D/boot.stm.key" ] && echo left || echo none); in a directory it cannot write: rc=$rc_ro: $(tail -1 "$D/boot-ro.log" 2>/dev/null); with --size 128M: $(tail -1 "$D/boot2.log")"
 fi
 chmod 644 "$D/raw.stm.key"
 if "$B" mkfs "$D/shared.stm" --size 64M --keyfile "$D/raw.stm.key" < /dev/null > "$D/shared.log" 2>&1; then
