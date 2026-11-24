@@ -767,3 +767,36 @@ stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
     return stm_sb_mount_scan_ex(d, false, out_ub, out_label_idx,
                                 out_slot_idx, NULL);
 }
+
+/* Every copy is read, so a newer build's uberblock in any of them refuses
+ * as the scan would; of differing copies of gen the first in label order
+ * is taken, as the scan takes them. */
+stm_status stm_sb_gen_read(stm_bdev *d, uint64_t gen, stm_uberblock *out_ub)
+{
+    if (!d || !out_ub) return STM_EINVAL;
+    uint32_t si = stm_sb_ring_slot_for_gen(gen);
+    bool found = false;
+    bool settled = false;
+    bool newer = false;
+    for (uint32_t li = 0; li < STM_UB_COPIES; li++) {
+        stm_uberblock ub;
+        uint32_t v = 0;
+        sb_slot_state c = sb_slot_read(d, li, si, &ub, NULL, &v);
+        if (c == SB_SLOT_READ_ZERO || c == SB_SLOT_READ_WRONG ||
+            c == SB_SLOT_READ_FAILED) {
+            uint8_t st = (uint8_t)c;
+            c = sb_copy_settle(d, &st, li, si, &ub, &v);
+        }
+        if (c == SB_SLOT_NEWER) {
+            newer = true;
+        } else if (c == SB_SLOT_VALID && stm_load_le64(ub.ub_gen) == gen) {
+            if (!found) *out_ub = ub;
+            found = true;
+        } else if (c == SB_SLOT_VALID || c == SB_SLOT_BLANK) {
+            settled = true;
+        }
+    }
+    if (newer) return STM_EBADVERSION;
+    if (found) return STM_OK;
+    return settled ? STM_ENOENT : STM_EIO;
+}

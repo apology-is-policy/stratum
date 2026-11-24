@@ -2366,4 +2366,126 @@ STM_TEST(sb_mount_scan_reads_again_a_copy_whose_first_read_failed) {
     unlink(g_tmp_path);
 }
 
+/* stm_sb_gen_read: gen's uberblock from any copy of its slot, each read
+ * again until it settles; of differing copies the first in label order,
+ * as the scan takes them. */
+STM_TEST(sb_gen_read_takes_gens_uberblock_from_any_copy) {
+    stm_bdev *d = open_test_device("genok", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    if (!d) return;
+    sb_put_gen_m(d, 41, 1);
+    sb_put_gen_m(d, 42, 2);
+    stm_uberblock u;
+    STM_ASSERT_OK(stm_sb_gen_read(d, 42, &u));
+    STM_ASSERT_EQ(stm_load_le64(u.ub_gen), 42u);
+    STM_ASSERT_EQ(u.ub_merkle_root[0], 2u);
+    for (uint32_t only = 0; only < STM_UB_COPIES; only++) {
+        for (uint32_t li = 0; li < STM_UB_COPIES; li++)
+            if (li != only) sb_fault_copy(d, 42, li, -1);
+        memset(&u, 0, sizeof u);
+        STM_ASSERT_OK(stm_sb_gen_read(d, 42, &u));
+        STM_ASSERT_EQ(stm_load_le64(u.ub_gen), 42u);
+        stm_bdev_inject_read_range_clear(d);
+    }
+    /* Every copy's first read back zero, or failed: read again. */
+    for (int fail = 0; fail < 2; fail++) {
+        uint32_t fired = stm_bdev_inject_read_range_fired(d);
+        for (uint32_t li = 0; li < STM_UB_COPIES; li++) {
+            uint64_t off = sb_copy_off(d, 42, li);
+            if (fail)
+                stm_bdev_inject_read_range(d, off, off + STM_UB_SIZE, 1,
+                                           STM_EIO);
+            else
+                stm_bdev_inject_read_range_zero(d, off, off + STM_UB_SIZE, 1);
+        }
+        memset(&u, 0, sizeof u);
+        STM_ASSERT_OK(stm_sb_gen_read(d, 42, &u));
+        STM_ASSERT_EQ(stm_load_le64(u.ub_gen), 42u);
+        STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(d) - fired,
+                      STM_UB_COPIES);
+        stm_bdev_inject_read_range_clear(d);
+    }
+    for (uint32_t odd = 0; odd < STM_UB_COPIES; odd++) {
+        sb_put_gen_m(d, 42, 2);
+        stm_uberblock other;
+        fill_example(&other);
+        other.ub_gen = stm_store_le64(42);
+        memset(other.ub_merkle_root, 7, sizeof other.ub_merkle_root);
+        STM_ASSERT_OK(stm_sb_label_write(d, odd, 42u, &other));
+        STM_ASSERT_OK(stm_sb_gen_read(d, 42, &u));
+        STM_ASSERT_EQ(u.ub_merkle_root[0], odd == 0 ? 7u : 2u);
+    }
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A slot that settles to nothing of gen's answers STM_ENOENT: blank, or
+ * holding another lap's generation, or one copy blank and the rest
+ * unreadable (a confirmed write replaces every copy). No copy settling
+ * answers STM_EIO: unreadable, torn, or read back zero once and then
+ * failing. Controls: gen itself, and one copy readable. */
+STM_TEST(sb_gen_read_tells_a_slot_gen_never_reached_from_one_unread) {
+    stm_bdev *d = open_test_device("genno", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    if (!d) return;
+    sb_put_gen_m(d, 41, 1);
+    sb_put_gen_m(d, 42, 2);
+    stm_uberblock u;
+    STM_ASSERT_OK(stm_sb_gen_read(d, 41, &u));
+    STM_ASSERT_ERR(stm_sb_gen_read(d, 43, &u), STM_ENOENT);
+    STM_ASSERT_ERR(stm_sb_gen_read(d, 41u + 63u, &u), STM_ENOENT);
+    STM_ASSERT_ERR(stm_sb_gen_read(d, 42u + 63u, &u), STM_ENOENT);
+    uint8_t z[STM_UB_SIZE];
+    memset(z, 0, sizeof z);
+    STM_ASSERT_OK(stm_bdev_write(d, sb_copy_off(d, 41, 2), z, sizeof z));
+    for (uint32_t li = 0; li < STM_UB_COPIES; li++)
+        if (li != 2) sb_fault_copy(d, 41, li, -1);
+    STM_ASSERT_ERR(stm_sb_gen_read(d, 41, &u), STM_ENOENT);
+    stm_bdev_inject_read_range_clear(d);
+    sb_fault_gen(d, 42, -1);
+    STM_ASSERT_ERR(stm_sb_gen_read(d, 42, &u), STM_EIO);
+    stm_bdev_inject_read_range_clear(d);
+    for (uint32_t li = 1; li < STM_UB_COPIES; li++)
+        sb_fault_copy(d, 42, li, -1);
+    STM_ASSERT_OK(stm_sb_gen_read(d, 42, &u));
+    stm_bdev_inject_read_range_clear(d);
+    for (uint32_t li = 0; li < STM_UB_COPIES; li++) {
+        uint64_t off = sb_copy_off(d, 42, li);
+        stm_bdev_inject_read_range_zero(d, off, off + STM_UB_SIZE, 1);
+        stm_bdev_inject_read_range(d, off, off + STM_UB_SIZE, -1, STM_EIO);
+    }
+    STM_ASSERT_ERR(stm_sb_gen_read(d, 42, &u), STM_EIO);
+    stm_bdev_inject_read_range_clear(d);
+    sb_rot_gen(d, 44);
+    STM_ASSERT_ERR(stm_sb_gen_read(d, 44, &u), STM_EIO);
+    sb_put_gen_m(d, 44, 4);
+    STM_ASSERT_OK(stm_sb_gen_read(d, 44, &u));
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A newer build's uberblock in any copy refuses STM_EBADVERSION, beside
+ * copies of gen too, and behind a read that came back zero once. Control:
+ * that copy holding gen. */
+STM_TEST(sb_gen_read_refuses_a_newer_builds_uberblock) {
+    stm_bdev *d = open_test_device("gennew", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    if (!d) return;
+    sb_put_gen_m(d, 46, 6);
+    stm_uberblock u;
+    STM_ASSERT_OK(stm_sb_gen_read(d, 46, &u));
+    sb_put_version(d, 46, 46, STM_UB_VERSION + 1u, true);
+    STM_ASSERT_ERR(stm_sb_gen_read(d, 46, &u), STM_EBADVERSION);
+    uint64_t off = sb_gen_off(d, 46);
+    uint32_t fired = stm_bdev_inject_read_range_fired(d);
+    stm_bdev_inject_read_range_zero(d, off, off + STM_UB_SIZE, 1);
+    STM_ASSERT_ERR(stm_sb_gen_read(d, 46, &u), STM_EBADVERSION);
+    STM_ASSERT_EQ(stm_bdev_inject_read_range_fired(d) - fired, 1u);
+    stm_bdev_inject_read_range_clear(d);
+    sb_put_gen_m(d, 46, 6);
+    STM_ASSERT_OK(stm_sb_gen_read(d, 46, &u));
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("sb")

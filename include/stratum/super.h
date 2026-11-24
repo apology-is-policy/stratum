@@ -1265,6 +1265,19 @@ stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
                                 uint32_t *out_slot_idx,
                                 stm_sb_scan_refusal *why);
 
+/*
+ * The uberblock of generation `gen` on `d`, from gen's ring slot, each copy
+ * read until it settles: STM_OK with `*out_ub`, the first copy in label
+ * order that decodes as gen; STM_ENOENT when none does and a copy settles
+ * blank or as another generation of that slot (gen's write never reached
+ * this device, a confirmed write replacing every copy, unless the ring has
+ * come round since: the caller knows the device's newest); STM_EIO when no
+ * copy settles; STM_EBADVERSION at a newer build's uberblock. Read by the
+ * layout `d`'s mount scan set.
+ */
+STM_MUST_USE
+stm_status stm_sb_gen_read(stm_bdev *d, uint64_t gen, stm_uberblock *out_ub);
+
 #ifdef __cplusplus
 }
 #endif
