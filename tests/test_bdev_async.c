@@ -144,9 +144,10 @@ STM_TEST(async_read_error_propagates) {
 
     uint8_t buf[4096];
     cb_state s = { 0 };
-    STM_ASSERT_OK(stm_bdev_submit_read(d, /*offset*/ 1 << 20, buf, sizeof buf,
-                                       on_complete, &s));
-    while (s.hits == 0) {
+    stm_status sub = stm_bdev_submit_read(d, /*offset*/ 1 << 20, buf, sizeof buf,
+                                          on_complete, &s);
+    STM_ASSERT_OK(sub);
+    while (sub == STM_OK && s.hits == 0) {
         int drained = stm_bdev_wait_completion(d, 4);
         (void)drained;
     }
