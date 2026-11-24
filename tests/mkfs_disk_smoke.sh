@@ -3,9 +3,11 @@
 # a --size that is not the disk's before it reads the disk, and writes nothing; it refuses to keep a
 # disk's key in /dev; the pool it makes serves, takes a file and gives it back after a remount; a disk
 # whose size is no multiple of 64 KiB formats too, and with a --bootstrap and no --size is held to its
-# own size, not to the size a file would be made at; a disk the system has mounted is refused, --force
-# or not, by mkfs and by the daemon (on macOS through its raw node too); and on Linux a claim waits
-# out a moment's shared lock, as udev takes.
+# own size, not to the size a file would be made at; a disk a daemon serves is refused a format and a
+# second daemon, and on macOS through either of its two nodes, the raw one formatting and serving too;
+# a disk the system has mounted is refused, --force or not, by mkfs and by the daemon (on macOS through
+# its raw node too); and on Linux a claim waits out a moment's shared lock, as udev takes, and refuses
+# one held for good once it has waited some seconds.
 #
 # The disks are made by this run and taken away again: RAM disks on macOS (hdiutil, no root), loop
 # devices on Linux, which need root, or STRATUM_TEST_SUDO=1 and sudo without a password (asked for
@@ -151,6 +153,29 @@ stop() {
     rm -f "$S"
     [ "$rc" = 0 ] || no "the daemon exited $rc on TERM"
 }
+# A second daemon on $1 beside the one serving, which has to stop by itself, refused as another
+# daemon's: its log is $D/$2.log. One still running after 20 s is killed, and is a finding.
+second_serve() {
+    rm -f "$D/s2.sock"
+    printf '%s\n' "$PASS" | SERVE "$1" --listen "$D/s2.sock" --keyfile "$K" --passphrase-stdin \
+        > "$D/$2.log" 2>&1 &
+    local p=$! rc
+    for _ in $(seq 1 200); do
+        kill -0 "$p" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$p" 2>/dev/null; then
+        kill -KILL "$p" 2>/dev/null
+        wait "$p" 2>/dev/null
+        echo "still running after 20 s" >> "$D/$2.log"
+        return 1
+    fi
+    wait "$p"
+    rc=$?
+    [ "$rc" != 0 ] && LC_ALL=C grep -q "already open in another stratumd" "$D/$2.log"
+}
+# Milliseconds, where date can say them (GNU date: Linux).
+ms() { echo $(( $(date +%s%N) / 1000000 )); }
 
 # No key beside a disk: it would be in /dev, on Linux kept in memory and gone at the next boot.
 H0=$(disk_hash "$A")
@@ -177,7 +202,7 @@ fi
 # The disk whole, and the pool it makes serves, keeps a file and gives it back after a remount.
 printf '%s\n' "$PASS" | MKFS "$A" --keyfile "$K" --passphrase-stdin > "$D/m2.log" 2>&1
 rc=$?
-if [ "$rc" = 0 ] && LC_ALL=C grep -q "formatting $A ($BYTES bytes)" "$D/m2.log"; then
+if [ "$rc" = 0 ] && LC_ALL=C grep -q "formatting $A ($BYTES bytes," "$D/m2.log"; then
     ok "a disk is formatted whole"
 else
     no "mkfs of the whole disk: rc=$rc: $(tail -1 "$D/m2.log")"
@@ -216,8 +241,12 @@ fi
 # The disk's own size named: formatted anew (over the pool, so forced): /disk.txt is gone.
 printf '%s\n' "$PASS" | MKFS "$A" --size "$BYTES" --keyfile "$K" --passphrase-stdin --force > "$D/m4.log" 2>&1
 rc=$?
-if [ "$rc" = 0 ] && LC_ALL=C grep -q "formatting $A ($BYTES bytes)" "$D/m4.log" && serve "$A"; then
-    if FS -s "$S" read /disk.txt > /dev/null 2>&1; then
+if [ "$rc" = 0 ] && LC_ALL=C grep -q "formatting $A ($BYTES bytes," "$D/m4.log" && serve "$A"; then
+    printf 'fresh\n' | FS -s "$S" write /fresh.txt > /dev/null 2>&1
+    got=$(FS -s "$S" read /fresh.txt 2>/dev/null)
+    if [ "$got" != fresh ]; then
+        no "after a format of the disk's own size the pool does not keep a file: /fresh.txt reads [$got]"
+    elif FS -s "$S" read /disk.txt > /dev/null 2>&1; then
         no "after a format of the disk's own size /disk.txt is still there"
     else
         ok "a --size that is the disk's formats it anew"
@@ -227,19 +256,105 @@ else
     no "mkfs --size $BYTES --force: rc=$rc: $(tail -1 "$D/m4.log")"
 fi
 
+# A disk a daemon serves is claimed: a format, forced or not, and a second daemon are refused, and
+# the pool it serves keeps its file. On Linux the claim waits some seconds for a lock it could take
+# for udev's before it calls the holder another claim.
+if serve "$A"; then
+    printf 'claimed\n' | FS -s "$S" write /claimed.txt > /dev/null 2>&1 || no "writing /claimed.txt"
+    t0=0
+    [ "$OS" = Linux ] && t0=$(ms)
+    printf '%s\n' "$PASS" | MKFS "$A" --keyfile "$D/other.key" --passphrase-stdin --force > "$D/c1.log" 2>&1
+    rc=$?
+    el=0
+    [ "$OS" = Linux ] && el=$(( $(ms) - t0 ))
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q "is open in a running stratumd" "$D/c1.log" \
+            && { [ "$OS" != Linux ] || [ "$el" -ge 4500 ]; }; then
+        ok "a disk a daemon serves is not formatted, --force or not"
+    else
+        no "mkfs --force of a disk a daemon serves: rc=$rc after $el ms: $(tail -1 "$D/c1.log")"
+    fi
+    got=
+    second_serve "$A" c2 && got=$(FS -s "$S" read /claimed.txt 2>/dev/null)
+    if [ "$got" = claimed ]; then
+        ok "a second daemon on a disk one serves is refused, and the pool keeps its file"
+    else
+        no "a second daemon on a disk one serves: $(tail -1 "$D/c2.log"); /claimed.txt reads [$got]"
+    fi
+    stop
+else
+    no "serve the disk to claim it: $(tail -1 "$D/serve.log")"
+fi
+
+# macOS: a disk's raw node and block node are two nodes and one disk, so a daemon on either keeps a
+# format and a second daemon off the other. The raw node formats whole and serves.
+if [ "$OS" = Darwin ]; then
+    RA=/dev/r${A#/dev/}
+    printf '%s\n' "$PASS" | MKFS "$RA" --keyfile "$K" --passphrase-stdin --force > "$D/r1.log" 2>&1
+    rc=$?
+    if [ "$rc" = 0 ] && LC_ALL=C grep -q "formatting $RA ($BYTES bytes," "$D/r1.log" && serve "$RA"; then
+        printf 'raw\n' | FS -s "$S" write /raw.txt > /dev/null 2>&1
+        got=$(FS -s "$S" read /raw.txt 2>/dev/null)
+        [ "$got" = raw ] && ok "a disk's raw node is formatted whole and serves" \
+            || no "through the raw node /raw.txt reads [$got]"
+        printf '%s\n' "$PASS" | MKFS "$A" --keyfile "$D/other.key" --passphrase-stdin --force > "$D/r2.log" 2>&1
+        rc=$?
+        if [ "$rc" != 0 ] && LC_ALL=C grep -q "is open in a running stratumd" "$D/r2.log" \
+                && second_serve "$A" r3; then
+            ok "a daemon on the raw node keeps a format and a second daemon off the block node"
+        else
+            no "with $RA served, mkfs --force $A: rc=$rc: $(tail -1 "$D/r2.log"); a second daemon on $A: $(tail -1 "$D/r3.log")"
+        fi
+        stop
+    else
+        no "mkfs and serve of the raw node $RA: rc=$rc: $(tail -1 "$D/r1.log"); serve: $(tail -1 "$D/serve.log")"
+    fi
+    if serve "$A"; then
+        got=$(FS -s "$S" read /raw.txt 2>/dev/null)
+        printf '%s\n' "$PASS" | MKFS "$RA" --keyfile "$D/other.key" --passphrase-stdin --force > "$D/r4.log" 2>&1
+        rc=$?
+        if [ "$got" = raw ] && [ "$rc" != 0 ] && LC_ALL=C grep -q "is open in a running stratumd" "$D/r4.log" \
+                && second_serve "$RA" r5; then
+            ok "a daemon on the block node keeps a format and a second daemon off the raw node"
+        else
+            no "with $A served (/raw.txt [$got]), mkfs --force $RA: rc=$rc: $(tail -1 "$D/r4.log"); a second daemon on $RA: $(tail -1 "$D/r5.log")"
+        fi
+        stop
+    else
+        no "serve $A after its raw node's format: $(tail -1 "$D/serve.log")"
+    fi
+fi
+
 # udev holds a shared lock on a whole disk while it processes an event, which a close after a
-# write raises; a claim waits that out rather than take udev for a running daemon.
+# write raises; a claim waits that out rather than take udev for a running daemon, and a lock held
+# for good it calls another claim's once it has waited some seconds.
 if [ "$OS" = Linux ]; then
-    flock --shared "$A" sleep 1 &
+    rm -f "$D/held"
+    flock --shared "$A" sh -c ': > "$1"; sleep 1' sh "$D/held" &
     FP=$!
-    sleep 0.2
+    for _ in $(seq 1 50); do [ -e "$D/held" ] && break; sleep 0.1; done
     printf '%s\n' "$PASS" | MKFS "$A" --keyfile "$K" --passphrase-stdin --force > "$D/m4b.log" 2>&1
     rc=$?
     wait "$FP" 2>/dev/null
-    if [ "$rc" = 0 ] && LC_ALL=C grep -q "formatting $A ($BYTES bytes)" "$D/m4b.log"; then
+    if [ -e "$D/held" ] && [ "$rc" = 0 ] && LC_ALL=C grep -q "formatting $A ($BYTES bytes," "$D/m4b.log"; then
         ok "a disk under a moment's shared lock, as udev takes, is formatted once it is let go"
     else
-        no "mkfs under a moment's shared lock: rc=$rc: $(tail -1 "$D/m4b.log")"
+        no "mkfs under a moment's shared lock (held: $([ -e "$D/held" ] && echo yes || echo never)): rc=$rc: $(tail -1 "$D/m4b.log")"
+    fi
+    # The same lock held past the wait: refused after it, before the holder lets go.
+    rm -f "$D/held"
+    flock --shared "$A" sh -c ': > "$1"; sleep 9' sh "$D/held" &
+    FP=$!
+    for _ in $(seq 1 50); do [ -e "$D/held" ] && break; sleep 0.1; done
+    t0=$(ms)
+    printf '%s\n' "$PASS" | MKFS "$A" --keyfile "$K" --passphrase-stdin --force > "$D/m4c.log" 2>&1
+    rc=$?
+    el=$(( $(ms) - t0 ))
+    wait "$FP" 2>/dev/null
+    if [ -e "$D/held" ] && [ "$rc" != 0 ] && LC_ALL=C grep -q "is open in a running stratumd" "$D/m4c.log" \
+            && [ "$el" -ge 4500 ] && [ "$el" -lt 8500 ]; then
+        ok "a disk under a shared lock held for good is refused once the claim has waited"
+    else
+        no "mkfs under a shared lock held for good: rc=$rc after $el ms: $(tail -1 "$D/m4c.log")"
     fi
 fi
 
@@ -251,7 +366,7 @@ if attach $SECTORS_B; then
     E=$DEV
     printf '%s\n' "$PASS" | MKFS "$E" --keyfile "$K" --passphrase-stdin --force > "$D/m5.log" 2>&1
     rc=$?
-    if [ "$rc" = 0 ] && LC_ALL=C grep -q "formatting $E ($BYTES_B bytes)" "$D/m5.log" && serve "$E"; then
+    if [ "$rc" = 0 ] && LC_ALL=C grep -q "formatting $E ($BYTES_B bytes," "$D/m5.log" && serve "$E"; then
         ok "a disk of $BYTES_B bytes is formatted whole"
         stop
     else
@@ -263,7 +378,8 @@ if attach $SECTORS_B; then
     printf '%s\n' "$PASS" | MKFS "$E" --bootstrap 68M --keyfile "$K" --passphrase-stdin --force \
         > "$D/m5b.log" 2>&1
     rc=$?
-    if [ "$rc" = 0 ] && LC_ALL=C grep -q "formatting $E ($BYTES_B bytes)" "$D/m5b.log"; then
+    if [ "$rc" = 0 ] \
+            && LC_ALL=C grep -q "formatting $E ($BYTES_B bytes, 71303168 of them the bootstrap pool)" "$D/m5b.log"; then
         ok "a disk with --bootstrap 68M and no --size is held to its own size"
     else
         no "mkfs --bootstrap 68M of a $BYTES_B-byte disk: rc=$rc: $(tail -1 "$D/m5b.log")"
