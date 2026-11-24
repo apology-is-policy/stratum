@@ -93,6 +93,26 @@ static uint64_t default_bootstrap_for(uint64_t device_bytes)
     return target;
 }
 
+/* 0 when a volume of `bytes` holds its bootstrap pool, which is derived from
+ * `bytes` unless the user named one; `what` names the size in a refusal. */
+static int size_volume(uint64_t bytes, bool bootstrap_named, uint64_t *bootstrap,
+                       const char *what)
+{
+    if (bytes < MIN_DEVICE_BYTES) {
+        fprintf(stderr,
+            "stratum-mkfs: %s %llu too small (minimum 16M to fit bootstrap pool)\n",
+            what, (unsigned long long)bytes);
+        return 1;
+    }
+    if (!bootstrap_named) *bootstrap = default_bootstrap_for(bytes);
+    if (*bootstrap >= bytes) {
+        fprintf(stderr, "stratum-mkfs: --bootstrap %llu must be < %s %llu\n",
+                (unsigned long long)*bootstrap, what, (unsigned long long)bytes);
+        return 1;
+    }
+    return 0;
+}
+
 /* Thylacine has no root: uid 0 is its invalid principal. */
 #if defined(__thylacine__)
 #define LINK_OWNERS "the user"
@@ -111,7 +131,8 @@ static void usage(void)
 "    stratum serve IMAGE --listen /tmp/stm.sock\n"
 "\n"
 "Options:\n"
-"  --size SIZE      Image size with K/M/G suffix. Default: 64M.\n"
+"  --size SIZE      Image size with K/M/G suffix. Default: 64M. A disk is\n"
+"                   formatted whole: --size, if given, must be its size.\n"
 "  --force          Format over what is already at IMAGE, a file another user\n"
 "                   owns too, and with --passphrase-stdin replace an existing\n"
 "                   keyfile. Whatever they held is gone. Also follows any key\n"
@@ -535,15 +556,17 @@ static bool link_to_no_file(const char *path)
 }
 
 /* 0 with the volume claimed: *claim_fd is the descriptor the claim holds on it, which
- * the format and the mount go through, or -1 where there is none. */
+ * the format and the mount go through, or -1 where there is none. *disk_bytes is a
+ * disk's size, read through that descriptor, and 0 for a file. */
 static int mkfs_claim(const char *image_path, const char *keyfile_path,
                       bool replaces_key, bool force, bool key_as_is,
                       uint64_t device_bytes, bool *created, int *claim_fd,
-                      bool *key_there, struct stat *key_seen)
+                      bool *key_there, struct stat *key_seen, uint64_t *disk_bytes)
 {
     int fd = -1;
     *created = false;
     *claim_fd = -1;
+    *disk_bytes = 0;
     stm_status s = stm_bdev_claim_image(image_path, false, &fd);
     if (s == STM_ENOENT) {
         /* Asked now, so that a refusal leaves no empty image behind. */
@@ -607,8 +630,10 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
         }
 #if !defined(__thylacine__)
         /* Nothing ends /dev/zero for the scan, and a format could not size it. */
-        if (!is_file && stm_bdev_device_bytes(look) == 0) {
+        *disk_bytes = is_file ? 0 : stm_bdev_device_bytes(look);
+        if (!is_file && *disk_bytes == 0) {
             fprintf(stderr, "stratum-mkfs: %s is neither a file nor a disk\n", image_path);
+            if (look != fd) close(look);
             return 1;
         }
 #endif
@@ -875,6 +900,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
 
     const char *image_path = argv[1];
     uint64_t   device_bytes      = DEFAULT_DEVICE_BYTES;
+    bool       size_named        = false;
     uint64_t   bootstrap_bytes   = 0;   /* 0 = auto from device_bytes */
     const char *keyfile_path     = NULL;
     bool       passphrase_stdin  = false;
@@ -898,6 +924,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
                 return 1;
             }
             device_bytes = v;
+            size_named = true;
             i++;
         } else if (strcmp(argv[i], "--bootstrap") == 0) {
             if (i + 1 >= argc) { fputs("--bootstrap requires an argument\n", stderr); return 1; }
@@ -962,26 +989,18 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         }
     }
 
-    if (device_bytes < MIN_DEVICE_BYTES) {
-        fprintf(stderr,
-            "stratum-mkfs: --size %llu too small (minimum 16M to fit bootstrap pool)\n",
-            (unsigned long long)device_bytes);
-        return 1;
-    }
     /* SWISS-4n3: derive bootstrap-pool size from --size when the user
      * didn't specify --bootstrap explicitly. The libfs heuristic
      * (max(64 MiB, dev/1024)) is too generous for tiny test volumes
-     * (would refuse 16-MiB images); ours is default_bootstrap_for's. */
-    if (bootstrap_bytes == 0) {
-        bootstrap_bytes = default_bootstrap_for(device_bytes);
-    }
-    if (bootstrap_bytes >= device_bytes) {
-        fprintf(stderr,
-            "stratum-mkfs: --bootstrap %llu must be < --size %llu\n",
-            (unsigned long long)bootstrap_bytes,
-            (unsigned long long)device_bytes);
+     * (would refuse 16-MiB images); ours is default_bootstrap_for's.
+     * A disk's size is known only once it is claimed: asked there. */
+    bool bootstrap_named = bootstrap_bytes != 0;
+    struct stat image_st;
+    bool maybe_disk = stat(image_path, &image_st) == 0 &&
+                      (S_ISBLK(image_st.st_mode) || S_ISCHR(image_st.st_mode));
+    if (!maybe_disk &&
+            size_volume(device_bytes, bootstrap_named, &bootstrap_bytes, "--size") != 0)
         return 1;
-    }
 
     if (key_as_is && passphrase_stdin) {
         fputs("stratum-mkfs: --key-as-is uses a key file that is there as it is, and with "
@@ -1046,11 +1065,28 @@ int stm_cmd_mkfs_main(int argc, char **argv)
      * about or made through, and never by its name. */
     stm_hybrid_keys wrap;
     memset(&key_seen, 0, sizeof key_seen);
+    uint64_t disk_bytes = 0;
     int refused = mkfs_claim(image_path, keyfile_path, have_pass, force, key_as_is,
-                             device_bytes, &created, &claim_fd, &key_was_there, &key_seen);
+                             device_bytes, &created, &claim_fd, &key_was_there, &key_seen,
+                             &disk_bytes);
     if (created && claim_fd >= 0)
         image_dir_fd = hold_image_dir(image_path, image_base, claim_fd);
     if (refused != 0) {
+        exit_code = 1;
+        goto cleanup;
+    }
+    /* A disk cannot be resized, so it is formatted whole. */
+    if (disk_bytes != 0 && size_named && device_bytes != disk_bytes) {
+        fprintf(stderr,
+            "stratum-mkfs: %s is a disk of %llu bytes, and a disk is formatted whole: "
+            "leave out --size, or give its size\n",
+            image_path, (unsigned long long)disk_bytes);
+        exit_code = 1;
+        goto cleanup;
+    }
+    if (disk_bytes != 0) device_bytes = disk_bytes;
+    if (size_volume(device_bytes, bootstrap_named, &bootstrap_bytes,
+                    disk_bytes != 0 ? "the disk's size" : "--size") != 0) {
         exit_code = 1;
         goto cleanup;
     }
@@ -1205,7 +1241,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     }
 
     stm_fs_format_opts fopts = {
-        .device_size_bytes        = device_bytes,
+        .device_size_bytes        = disk_bytes != 0 ? 0 : device_bytes,
         .bootstrap_size_bytes     = bootstrap_bytes,
         .pool_uuid                = { pool_uuid[0],   pool_uuid[1]   },
         .device_uuid              = { device_uuid[0], device_uuid[1] },
