@@ -623,7 +623,7 @@ Every device in the pool has:
 - A **role** (`DATA`, `LOG`, `CACHE`, `SPARE`) — see §4.9 and §4.10.
 - A **class** (`SSD`, `HDD`, `PMEM`, `ZNS`) for placement hints.
 - An **availability state** (`ONLINE`, `OFFLINE`, `DEGRADED`, `FAULTED`, `REMOVED`).
-- A **size** in bytes (at pool-join time; devices don't dynamically resize).
+- A **size** in bytes (at pool-join time; devices don't dynamically resize). **As built** (v35, operator vote 161): the size the device's roster entry records places its labels 2 and 3 (section 5.3.1) and ends its data area; a device that has grown keeps that layout and leaves the new space unused. A device smaller than its recorded size has lost its tail labels: on a one-device pool the mount refuses (`STM_ERANGE`, read-only too); on a multi-device pool that device drops out of the vote, the pool mounts on the rest, and its writes to that device go past the device's end (a file-backed device grows to take them, OPEN-BUGS (n)). Giving the pool a device's new space would be an explicit operation; none is built.
 - An **order in the roster** (stable; survives add/remove).
 
 The roster is persisted in the per-device uberblocks (§5) so any subset of devices can recover the full roster.
@@ -958,6 +958,8 @@ Why four labels? Localized damage (controller scribble, cable-induced torn write
 
 Mount reads **all four labels** on every device; picks the best. "Best" = highest valid gen with quorum across the roster.
 
+**As built** (v35, operator vote 161): `end` is the size the device's roster entry recorded when it joined the pool (`stm_ub_device_bytes`), not the size it has now, so a device that grows or shrinks underneath the pool does not move labels 2 and 3 onto blank space or onto data. Mount reads labels 0 and 1 first, whose offsets do not depend on the size, and lays labels 2 and 3 out at the size their newest uberblock records (`stm_sb_mount_scan_ex` sets `stm_bdev_layout_bytes`, which every label offset, the device probe and the allocator's data area use). A v34 build put them at the current end.
+
 #### 5.3.2 Label contents
 
 Each 256 KiB label contains:
@@ -1062,15 +1064,16 @@ Key design choices:
 
 #### 5.4.1 What every version keeps
 
-Every pool-format version, this one's successors included, keeps these where an older build reads them (binding; operator decision 2026-11-23):
+Every pool-format version, this one's successors included, keeps these where an older build reads them (binding; operator decision 2026-11-23, the labels 0 and 1 line operator vote 162 of 2026-11-24):
 
 - `ub_magic` holds `STM_UB_MAGIC` (`0x324d555441525453`, "STRATUM2") at byte 0;
 - `ub_version` is a le32 at byte 8;
 - `ub_csum`, bytes [4064, 4096), is the unkeyed BLAKE3-256 of bytes [0, 4064) as stored;
-- an uberblock is 4 KiB, written into commit-ring slots: slot k (0..62) of label L lies at byte `label_offset[L] + k x 4096`, the label offsets being 0, 262144, size - 524288 and size - 262144 (section 5.3.1; slot 63 of each label is the mirror, section 5.3.2);
+- an uberblock is 4 KiB, written into commit-ring slots: slot k (0..62) of label L lies at byte `label_offset[L] + k x 4096`, the label offsets being 0, 262144, size - 524288 and size - 262144 (section 5.3.1; slot 63 of each label is the mirror, section 5.3.2). Since v35 the size is the device's recorded size, so on a device whose size changed labels 2 and 3 are not where a v34 build looks; labels 0 and 1 do not depend on the size, and every version writes each generation's uberblock there (next line), so an older build finds every newer uberblock in them;
+- every generation's uberblock is written to its ring slot in labels 0 and 1;
 - each version's number is greater than every earlier version's.
 
-So a build that reads an uberblock a newer one wrote tells it from a torn or foreign slot (`stm_ub_is_newer`: the magic, a version above its own, a csum that verifies) and refuses the pool, rather than mount an older generation under the newer commits and overwrite one of them with its claim (`stm_sb_mount_scan_ex`). A version may change anything else in the block, and which ring slots a generation's copies go to.
+So a build that reads an uberblock a newer one wrote tells it from a torn or foreign slot (`stm_ub_is_newer`: the magic, a version above its own, a csum that verifies) and refuses the pool, rather than mount an older generation under the newer commits and overwrite one of them with its claim (`stm_sb_mount_scan_ex`). A version may change anything else in the block, which ring slot a generation's copies go to, and whether labels 2 and 3 hold them.
 
 ### 5.5 Quorum semantics
 
@@ -1106,7 +1109,7 @@ On mount, Stratum reads every device's labels and collects valid uberblocks (csu
 - The highest gen with quorum is the "authoritative gen."
 - Any device at a lower gen is `BEHIND`.
 - Any device at a higher gen than the authoritative gen had a partial commit — its state is discarded and it reconciles to the authoritative gen.
-- **As built**, per device (`stm_sb_mount_scan_ex`): a generation counts at its ring slot in any label; among differing copies of one generation the first in label order is taken. A device's best is not taken while the slot of best+1 or best+2, where the only newer commit could be, is unsettled and a copy stays unreadable (STM_EIO; on a one-device pool, best+1 only when best may be a reservation): the slot settles when one copy holds an older generation or reads back blank (a generation the device confirmed is in all four). Any copy holding a newer build's uberblock refuses the pool (section 5.4.1).
+- **As built**, per device (`stm_sb_mount_scan_ex`): a generation counts at its ring slot in any label; among differing copies of one generation the first in label order is taken. A device's best is not taken while the slot of best+1 or best+2, where the only newer commit could be, is unsettled and a copy stays unreadable (STM_EIO; on a one-device pool, best+1 only when best may be a reservation): the slot settles when one copy holds an older generation or reads back blank (a generation the device confirmed is in all four). Any copy holding a newer build's uberblock refuses the pool (section 5.4.1). Labels 0 and 1 are read first: labels 2 and 3 are read at the size their newest uberblock records for the device (section 5.3.1); a device smaller than that refuses (`STM_ERANGE`), and an uberblock that records another size than the layout it was read by refuses (`STM_ECORRUPT`).
 
 #### 5.5.4 Quorum under roster changes
 

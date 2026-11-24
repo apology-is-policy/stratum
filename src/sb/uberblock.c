@@ -126,6 +126,23 @@ bool stm_ub_is_older(const void *buf, size_t buf_len)
     return version != 0u && version < STM_UB_VERSION_MIN_COMPAT;
 }
 
+stm_status stm_ub_device_bytes(const stm_uberblock *ub, uint64_t *out_bytes)
+{
+    if (!ub || !out_bytes) return STM_EINVAL;
+    uint16_t count = stm_load_le16(ub->ub_device_count);
+    uint16_t id = stm_load_le16(ub->ub_device_id);
+    if (count > sizeof ub->ub_roster / STM_UB_ROSTER_SLOT_BYTES || id >= count)
+        return STM_ECORRUPT;
+    le64 sz;
+    memcpy(sz.v, ub->ub_roster + (size_t)id * STM_UB_ROSTER_SLOT_BYTES +
+                     STM_UB_ROSTER_SIZE_OFF, sizeof sz.v);
+    uint64_t bytes = stm_load_le64(sz);
+    uint64_t lo[STM_LABELS_PER_DEVICE];
+    if (stm_label_offsets(bytes, lo) != STM_OK) return STM_ECORRUPT;
+    *out_bytes = bytes;
+    return STM_OK;
+}
+
 /* ========================================================================= */
 /* Key-schema header packing (P4-4a, ARCH §7.7.3).                            */
 /* ========================================================================= */

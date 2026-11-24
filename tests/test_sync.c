@@ -95,10 +95,9 @@ static const stm_hybrid_keys *make_wk(void)
 /* P5-1: wrap a single bdev in a stm_pool with fixed test UUIDs +
  * DATA/SSD/ONLINE. Every test uses this same 1-device pool shape,
  * mirroring the N=1 degenerate path. */
-static stm_pool *make_test_pool(stm_bdev *d)
+/* A one-device pool on `d`, its roster recording `bytes`. */
+static stm_pool *make_test_pool_sized(stm_bdev *d, uint64_t bytes)
 {
-    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
-    STM_ASSERT(caps != NULL);
     stm_pool_open_opts opts;
     memset(&opts, 0, sizeof opts);
     opts.pool_uuid[0] = POOL_UUID[0];
@@ -106,7 +105,7 @@ static stm_pool *make_test_pool(stm_bdev *d)
     opts.device_count = 1;
     opts.devices[0].uuid[0]    = DEVICE_UUID[0];
     opts.devices[0].uuid[1]    = DEVICE_UUID[1];
-    opts.devices[0].size_bytes = caps->size_bytes;
+    opts.devices[0].size_bytes = bytes;
     opts.devices[0].role       = STM_DEV_ROLE_DATA;
     opts.devices[0].class_     = STM_DEV_CLASS_SSD;
     opts.devices[0].state      = STM_DEV_STATE_ONLINE;
@@ -114,6 +113,13 @@ static stm_pool *make_test_pool(stm_bdev *d)
     stm_pool *p = NULL;
     STM_ASSERT_OK(stm_pool_open(&opts, &p));
     return p;
+}
+
+static stm_pool *make_test_pool(stm_bdev *d)
+{
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    STM_ASSERT(caps != NULL);
+    return make_test_pool_sized(d, caps ? caps->size_bytes : 0);
 }
 
 /* Create a fresh pool: stm_alloc_create + stm_pool_open + stm_sync_create. */
@@ -193,6 +199,189 @@ STM_TEST(sync_first_commit_writes_uberblock) {
     STM_ASSERT(info.alloc_root_paddr != 0);
 
     teardown(a, s, pool);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* An allocator opened before the scan, on a device that grew since the
+ * pool was made, spans the device's current size, over its tail labels
+ * (vote 161): stm_sync_open refuses it (STM_EINVAL), writing nothing, and
+ * takes one opened after a scan laid the device out. Control: the same
+ * open on the device not grown. */
+STM_TEST(sync_open_refuses_an_allocator_over_the_tail_labels) {
+    for (int grown = 0; grown < 2; grown++) {
+        make_tmp("growalloc");
+        stm_bdev *d = open_fresh_device();
+        stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+        make_fresh_pool(d, &a, &s, &pool);
+        uint64_t p = 0;
+        STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p));
+        STM_ASSERT_OK(stm_sync_commit(s));
+        teardown(a, s, pool);
+        stm_bdev_close(d);
+
+        d = open_fresh_device();
+        if (grown) STM_ASSERT_OK(stm_bdev_resize(d, 2u * TEST_DEVICE_BYTES));
+        stm_alloc *a2 = NULL;
+        STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+        stm_pool *pool2 = make_test_pool_sized(d, TEST_DEVICE_BYTES);
+        stm_sync *s2 = NULL;
+        uint64_t writes = 0, after = 0;
+        stm_bdev_io_stats(d, &writes, NULL, NULL);
+        stm_status rc = stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2);
+        printf("  %s: open %d\n", grown ? "grown" : "same size", (int)rc);
+        if (grown) {
+            STM_ASSERT_ERR(rc, STM_EINVAL);
+            stm_bdev_io_stats(d, &after, NULL, NULL);
+            STM_ASSERT_EQ(after, writes);
+        } else {
+            STM_ASSERT_OK(rc);
+            stm_sync_close(s2);
+        }
+        stm_pool_close(pool2);
+        stm_alloc_close(a2);
+
+        STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+        pool2 = make_test_pool_sized(d, TEST_DEVICE_BYTES);
+        STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
+        teardown(a2, s2, pool2);
+        stm_bdev_close(d);
+        unlink(g_tmp_path);
+    }
+}
+
+/* A pool made on a device larger than its roster records (vote 161) is
+ * laid out at the recorded size from stm_pool_open: its commit's
+ * uberblock copies land at the recorded tail, none at the device's end,
+ * and its allocator's data area stops below the recorded tail labels; an
+ * allocator made before stm_pool_open is refused. */
+STM_TEST(sync_create_lays_the_device_out_at_its_roster_size) {
+    make_tmp("rostersize");
+    stm_bdev *d = open_fresh_device();
+    STM_ASSERT_OK(stm_bdev_resize(d, 2u * TEST_DEVICE_BYTES));
+    stm_alloc *a0 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(d, POOL_UUID, DEVICE_UUID,
+                                     TEST_BOOTSTRAP_BYTES, &a0));
+    stm_pool *pool = make_test_pool_sized(d, TEST_DEVICE_BYTES);
+    STM_ASSERT_EQ(stm_bdev_layout_bytes(d), TEST_DEVICE_BYTES);
+    /* An allocator made before stm_pool_open spans the size the handle
+     * had: stm_sync_create refuses it, writing nothing. */
+    uint64_t w0 = 0, w1 = 0;
+    stm_bdev_io_stats(d, &w0, NULL, NULL);
+    stm_sync *s0 = NULL;
+    STM_ASSERT_ERR(stm_sync_create(pool, a0, make_wk(), NULL, &s0), STM_EINVAL);
+    stm_bdev_io_stats(d, &w1, NULL, NULL);
+    STM_ASSERT_EQ(w1, w0);
+    stm_alloc_close(a0);
+    stm_alloc *a = NULL; stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_alloc_create(d, POOL_UUID, DEVICE_UUID,
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_alloc_stats st;
+    STM_ASSERT_OK(stm_alloc_stats_get(a, &st));
+    STM_ASSERT_EQ(st.data_last_block,
+                  (TEST_DEVICE_BYTES - 2u * (uint64_t)STM_LABEL_SIZE) / STM_UB_SIZE - 1u);
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s, &info));
+    uint32_t cs = stm_sb_ring_slot_for_gen(info.auth_gen);
+    uint64_t lo[STM_LABELS_PER_DEVICE], off = 0;
+    uint8_t buf[STM_UB_SIZE];
+    stm_uberblock got;
+    STM_ASSERT_OK(stm_label_offsets(TEST_DEVICE_BYTES, lo));
+    STM_ASSERT_OK(stm_ub_slot_offset(lo[3], cs, &off));
+    STM_ASSERT_OK(stm_bdev_read(d, off, buf, sizeof buf));
+    STM_ASSERT_OK(stm_ub_decode(buf, sizeof buf, &got));
+    STM_ASSERT_EQ(stm_load_le64(got.ub_gen), info.auth_gen);
+    STM_ASSERT_OK(stm_label_offsets(2u * TEST_DEVICE_BYTES, lo));
+    STM_ASSERT_OK(stm_ub_slot_offset(lo[3], cs, &off));
+    STM_ASSERT_OK(stm_bdev_read(d, off, buf, sizeof buf));
+    STM_ASSERT_ERR(stm_ub_decode(buf, sizeof buf, &got), STM_ENOENT);
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* The pool's one device, smaller than its roster records (vote 161):
+ * stm_sync_open refuses it as the scan does (STM_ERANGE, not the EIO of a
+ * device whose ring could not be read), writing nothing. */
+STM_TEST(sync_open_refuses_a_device_smaller_than_its_recorded_size) {
+    make_tmp("shrunk");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+
+    /* The backends only grow a device; shrink the file under no handle. */
+    const uint64_t shrunk = TEST_DEVICE_BYTES - UINT64_C(1024) * 1024u;
+    STM_ASSERT_EQ(truncate(g_tmp_path, (off_t)shrunk), 0);
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &bo, &d));
+    if (!d) return;
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    STM_ASSERT(caps != NULL);
+    if (caps) STM_ASSERT_EQ(caps->size_bytes, shrunk);
+    stm_pool *pool2 = make_test_pool_sized(d, TEST_DEVICE_BYTES);
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    uint64_t writes = 0, after = 0;
+    stm_bdev_io_stats(d, &writes, NULL, NULL);
+    stm_sync *s2 = NULL;
+    STM_ASSERT_ERR(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2),
+                   STM_ERANGE);
+    stm_bdev_io_stats(d, &after, NULL, NULL);
+    STM_ASSERT_EQ(after, writes);
+    stm_alloc_close(a2);
+    stm_pool_close(pool2);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* One of the one device's uberblocks records another size than its layout
+ * (vote 161): stm_sync_open refuses with the scan's status, STM_ECORRUPT,
+ * naming the copy, not as a ring it could not read (STM_EIO). */
+STM_TEST(sync_open_keeps_a_layout_refusal) {
+    make_tmp("layoutrefusal");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+
+    d = open_fresh_device();
+    stm_uberblock ub;
+    uint32_t lbl = 0, slot = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
+    uint64_t gen = stm_load_le64(ub.ub_gen);
+    uint32_t next = stm_sb_ring_slot_for_gen(gen + 1u);
+    ub.ub_gen = stm_store_le64(gen + 1u);
+    le64 sz = stm_store_le64(TEST_DEVICE_BYTES + UINT64_C(4) * 1024u * 1024u);
+    memcpy(ub.ub_roster + STM_UB_ROSTER_SIZE_OFF, sz.v, sizeof sz.v);
+    STM_ASSERT_OK(stm_sb_label_write(d, 2u, next, &ub));
+    STM_ASSERT_OK(stm_sb_label_write(d, 3u, next, &ub));
+    stm_pool *pool2 = make_test_pool(d);
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_sb_scan_refusal why;
+    memset(&why, 0, sizeof why);
+    stm_sync *s2 = NULL;
+    STM_ASSERT_ERR(stm_sync_open_ex(pool2, a2, make_wk(), NULL, NULL, &why, &s2),
+                   STM_ECORRUPT);
+    STM_ASSERT_EQ(why.best_gen, gen + 1u);
+    STM_ASSERT_EQ(why.label_idx, 2u);
+    STM_ASSERT_EQ(why.slot_idx, next);
+    stm_alloc_close(a2);
+    stm_pool_close(pool2);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }

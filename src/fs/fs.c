@@ -1333,9 +1333,11 @@ stm_status stm_fs_format(const char *path, stm_fs_format_opts *opts)
     }
 
     /* Wipe label regions before anything else writes to them. See
-     * format_wipe_labels doc. Uses the bdev's actual size (post-resize). */
+     * format_wipe_labels doc. Uses the bdev's actual size (post-resize),
+     * which the roster records below and the layout follows. */
     const stm_bdev_caps *caps = stm_bdev_caps_of(d);
     if (!caps) { stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return STM_EIO; }
+    stm_bdev_set_layout_bytes(d, caps->size_bytes);
     s = format_wipe_labels(d, caps->size_bytes);
     if (s != STM_OK) { stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
 

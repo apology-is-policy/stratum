@@ -1129,6 +1129,113 @@ STM_TEST(p9_socket_stratumd_names_another_builds_pool) {
     STM_ASSERT_EQ(rmdir(dir), 0);
 }
 
+/* The newest uberblock of the pool at g_tmp_path (its slot in *slot). */
+static stm_uberblock pool_newest_ub(uint32_t *slot)
+{
+    stm_uberblock ub;
+    memset(&ub, 0, sizeof ub);
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    stm_bdev *d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &bo, &d));
+    if (!d) return ub;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, NULL, slot));
+    stm_bdev_close(d);
+    return ub;
+}
+
+/* stratumd names a device smaller than its pool recorded (both sizes, and
+ * the head copy recording them), and an uberblock whose recorded size does
+ * not fit where its labels were read (a copy of the next generation in
+ * labels 2 and 3 recording 4 MiB more). Control: every copy of the newest
+ * uberblock moved out of its slot refuses with the second's status
+ * (STM_ECORRUPT) and without its line. */
+STM_TEST(p9_socket_stratumd_names_a_pool_its_device_does_not_fit) {
+    char dir[] = "/tmp/stm_socktest_fit_XXXXXX";
+    STM_ASSERT_TRUE(mkdtemp(dir) != NULL);
+    char fs_path[64];
+    snprintf(fs_path, sizeof fs_path, "%s/fs.sock", dir);
+    static char err[65536];
+    static const char *const what[] = { "shrunk", "tail size", "misplaced" };
+    const uint64_t shrunk = TEST_DEVICE_BYTES - UINT64_C(1024) * 1024u;
+    for (int leg = 0; leg < 3; leg++) {
+        make_tmp(leg == 0 ? "9p_sock_shrunk" : leg == 1 ? "9p_sock_tailsz"
+                                                       : "9p_sock_misplaced");
+        stm_fs_format_opts fopts = default_format_opts();
+        STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+        uint32_t slot = 0;
+        stm_uberblock ub = pool_newest_ub(&slot);
+        uint64_t gen = stm_load_le64(ub.ub_gen);
+        uint64_t lo[STM_LABELS_PER_DEVICE];
+        STM_ASSERT_OK(stm_label_offsets(TEST_DEVICE_BYTES, lo));
+        char line[256];
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        stm_bdev *d = NULL;
+        STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &bo, &d));
+        if (!d) return;
+        if (leg == 0) {
+            /* The backends only grow a device; shrink the file under no
+             * handle. */
+            stm_bdev_close(d);
+            STM_ASSERT_EQ(truncate(g_tmp_path, (off_t)shrunk), 0);
+            d = NULL;
+            STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &bo, &d));
+            if (!d) return;
+            const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+            STM_ASSERT_TRUE(caps != NULL && caps->size_bytes == shrunk);
+            snprintf(line, sizeof line,
+                     "is %llu bytes, smaller than the %llu bytes the pool recorded "
+                     "for it (uberblock in label 0 slot %u)",
+                     (unsigned long long)shrunk,
+                     (unsigned long long)TEST_DEVICE_BYTES, slot);
+        } else if (leg == 1) {
+            uint32_t next = (uint32_t)((gen + 1u) % STM_UB_SLOTS_PER_LABEL);
+            ub.ub_gen = stm_store_le64(gen + 1u);
+            le64 sz = stm_store_le64(TEST_DEVICE_BYTES + UINT64_C(4) * 1024u * 1024u);
+            memcpy(ub.ub_roster + STM_UB_ROSTER_SIZE_OFF, sz.v, sizeof sz.v);
+            STM_ASSERT_OK(stm_sb_label_write(d, 2u, next, &ub));
+            STM_ASSERT_OK(stm_sb_label_write(d, 3u, next, &ub));
+            snprintf(line, sizeof line,
+                     "the uberblock of generation %llu in label 2 slot %u (byte "
+                     "offset %llu) records no size, or another size, for this device",
+                     (unsigned long long)(gen + 1u), next,
+                     (unsigned long long)(lo[2] + (uint64_t)next * STM_UB_SIZE));
+        } else {
+            uint8_t buf[STM_UB_SIZE], zero[STM_UB_SIZE];
+            memset(zero, 0, sizeof zero);
+            uint32_t away = (slot + 5u) % STM_UB_SLOTS_PER_LABEL;
+            for (uint32_t li = 0; li < STM_LABELS_PER_DEVICE; li++) {
+                STM_ASSERT_OK(stm_bdev_read(d, lo[li] + (uint64_t)slot * STM_UB_SIZE,
+                                            buf, sizeof buf));
+                STM_ASSERT_OK(stm_bdev_write(d, lo[li] + (uint64_t)away * STM_UB_SIZE,
+                                             buf, sizeof buf));
+                STM_ASSERT_OK(stm_bdev_write(d, lo[li] + (uint64_t)slot * STM_UB_SIZE,
+                                             zero, sizeof zero));
+            }
+            snprintf(line, sizeof line, "records no size, or another size");
+        }
+        stm_bdev_close(d);
+        atomic_bool stop;
+        atomic_init(&stop, false);
+        failing_run r;
+        memset(&r.opts, 0, sizeof r.opts);
+        r.opts.fs_path     = g_tmp_path;
+        r.opts.keyfile_path = g_key_path;
+        r.opts.socket_path = fs_path;
+        r.opts.stop_flag   = &stop;
+        stm_status rc = STM_OK;
+        stratumd_stderr_of(&r, what[leg], &rc, err, sizeof err);
+        printf("  %s: rc %d, stderr: %s", what[leg], (int)rc, err);
+        STM_ASSERT_EQ((int)rc, (int)(leg == 0 ? STM_ERANGE : STM_ECORRUPT));
+        STM_ASSERT_EQ(strstr(err, line) != NULL, leg != 2);
+        if (leg == 2)
+            STM_ASSERT_TRUE(strstr(err, "smaller than the") == NULL);
+        unlink(g_tmp_path);
+    }
+    struct stat st;
+    STM_ASSERT_TRUE(lstat(fs_path, &st) != 0 && errno == ENOENT);
+    STM_ASSERT_EQ(rmdir(dir), 0);
+}
+
 /* A socket left at the name the listener binds under first is a killed
  * process's, and is cleared; a file there is somebody's, and is left. */
 STM_TEST(p9_socket_listen_clears_only_a_socket_from_its_staged_name) {

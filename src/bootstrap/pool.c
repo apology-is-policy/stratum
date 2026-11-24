@@ -344,15 +344,15 @@ static stm_status compute_bootstrap_size(stm_bdev *d,
                                           uint64_t requested_bytes,
                                           uint64_t *out_size_bytes)
 {
-    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
-    if (!caps) return STM_EINVAL;
+    if (!d) return STM_EINVAL;
+    uint64_t layout = stm_bdev_layout_bytes(d);
 
     /* Head labels (2 × 256K) + margin (512K) = 1 MiB before pool.
      * Tail labels (2 × 256K) = 512K after pool. */
     const uint64_t overhead = STM_BOOTSTRAP_OFFSET +
                               (uint64_t)STM_LABEL_SIZE * 2u;
-    if (caps->size_bytes <= overhead) return STM_ENOSPC;
-    uint64_t max_bootstrap = caps->size_bytes - overhead;
+    if (layout <= overhead) return STM_ENOSPC;
+    uint64_t max_bootstrap = layout - overhead;
 
     uint64_t size = requested_bytes;
     bool     size_explicit = (requested_bytes != 0);
@@ -360,7 +360,7 @@ static stm_status compute_bootstrap_size(stm_bdev *d,
         /* Default formula from ARCH §6.5.1: max(MIN, device / DIVISOR).
          * Explicit callers (tests, dev scenarios) can bypass the MIN
          * floor below by passing a specific size. */
-        uint64_t div_size = caps->size_bytes / STM_BOOTSTRAP_SIZE_DIVISOR;
+        uint64_t div_size = layout / STM_BOOTSTRAP_SIZE_DIVISOR;
         size = STM_BOOTSTRAP_MIN_SIZE_BYTES > div_size ?
                     STM_BOOTSTRAP_MIN_SIZE_BYTES : div_size;
     }

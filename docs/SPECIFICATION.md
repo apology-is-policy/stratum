@@ -105,7 +105,10 @@ in the code, not measurements.
 +---------+---------+--------+----------------+-------------------------+---------+---------+
 ```
 
-The minimum device is 8 MiB. The block size is fixed at 4 KiB.
+The minimum device is 8 MiB. The block size is fixed at 4 KiB. Labels 2 and 3, and the end of the data
+area, sit at the size the device had when it joined the pool, which its roster entry records (since
+v35). A device that grows keeps that layout and leaves the new space unused. One smaller than its
+recorded size refuses the mount of a one-device pool; a multi-device pool mounts without it.
 
 ### 3.2 Uberblocks
 
@@ -119,7 +122,8 @@ with magic `STRATUM2` and a BLAKE3-256 self-checksum.
   holding an older generation, or reading back blank, proves the device never confirmed the slot's
   generation. One unreadable copy does not hide a generation. A label region that refuses writes leaves
   the device unmountable read-write (read-only mounts still work).
-- Mount scans every slot and takes the highest valid generation per device. Across devices, the
+- Mount scans every slot and takes the highest valid generation per device, reading labels 0 and 1
+  first: labels 2 and 3 are read where the size the newest of them records puts them. Across devices, the
   authoritative generation is the quorum-th highest, with quorum `floor(live / 2) + 1` and a check that
   a quorum of devices at that generation hold identical content.
 - A read-write mount writes a claim uberblock at `auth + 1`, so generations used by orphaned writes

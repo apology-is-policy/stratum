@@ -26,6 +26,18 @@ Device layout (ARCH §5.3.1, §6.5):
   4 KiB blocks with length + refcount. Hosts extents + btree leaves
   that a filesystem actually cares about.
 
+`end` is the device's layout size (`stm_bdev_layout_bytes`): the size its
+roster entry recorded when it joined the pool, which `stm_pool_open` sets
+from the roster it is given and the mount's scan reads from labels 0 and 1
+(since v35, operator vote 161). A device that grew keeps its data area; the
+new space stays unused. `stm_alloc_check_layout` answers whether an
+allocator's data area is the one its device's layout gives, and
+`stm_sync_create`, `stm_sync_open` and `stm_sync_attach_alloc` refuse one
+that is not:
+`STM_EINVAL` when it was opened before the layout was set on a device that
+grew (it would span the tail labels), `STM_ERANGE` when the device is
+smaller than its layout.
+
 Each region is independent — bootstrap is a bitmap, data is a
 Bε-tree. The split exists because the allocator tree's nodes need a
 place to live BEFORE the allocator tree can track them (chicken-

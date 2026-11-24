@@ -137,6 +137,17 @@ void stm_bdev_close(stm_bdev *d);
 
 const stm_bdev_caps *stm_bdev_caps_of(const stm_bdev *d);
 
+/* The device size the pool's layout uses: labels 2 and 3 end at it and the
+ * data area stops below them (ARCHITECTURE 5.3.1). It is the size the
+ * device's roster entry recorded when it joined the pool, which a device
+ * that has grown since exceeds. Set by stm_fs_format (the device's size),
+ * stm_pool_open and stm_pool_add_device (the size the roster records),
+ * the mount's scan (from labels 0 and 1, stm_sb_mount_scan_ex) and
+ * stm_sync_open (from the canonical roster). Until set, or once set to 0,
+ * the device's current size. */
+uint64_t stm_bdev_layout_bytes(const stm_bdev *d);
+void stm_bdev_set_layout_bytes(stm_bdev *d, uint64_t bytes);
+
 /* ========================================================================= */
 /* Synchronous ops                                                            */
 /* ========================================================================= */

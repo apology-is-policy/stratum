@@ -25,6 +25,9 @@ Per-device regions (ARCH §5.3.1):
   ^         ^         ^            ^                ^           ^         ^
   0         256K      512K         1 MiB            bpool_end   end-512K  end-256K
 
+  end = the size the device's roster entry recorded when it joined the
+  pool (since v35), not its current size.
+
 Each label (256 KiB) is 63 uberblock slots + 1 mirror slot:
 
   Slot 0:  ub_gen % slots_per_label == 0 landing pad
@@ -66,7 +69,7 @@ one copy, 252 generations; a v34 build reads no earlier pool.
 | Offset | Size | Field | Meaning |
 |---|---|---|---|
 | 0 | 8 | `ub_magic` | `0x324d555441525453` (ASCII "STRATUM2"); every version keeps it here (ARCH section 5.4.1). |
-| 8 | 4 | `ub_version` | `STM_UB_VERSION = 34`; `STM_UB_VERSION_MIN_COMPAT = 34`: this build reads its own version only (pools of earlier versions are re-created). Every version keeps it here. |
+| 8 | 4 | `ub_version` | `STM_UB_VERSION = 35`; `STM_UB_VERSION_MIN_COMPAT = 35`: this build reads its own version only (pools of earlier versions are re-created). Every version keeps it here. |
 | 12–20 | 12 | feature flags | `compat` / `ro_compat` / `incompat` (ARCH §5.2). |
 | 24 | 16 | `ub_pool_uuid` | Pool identity. |
 | 40 | 16 | `ub_device_uuid` | This device's identity. |
@@ -155,8 +158,13 @@ newer or an older build's uberblock from a torn one (below).
 ### Label scanning
 
 ```c
-// Compute the byte offsets of the 4 label regions given device size.
+// Compute the byte offsets of the 4 label regions given the device's layout
+// size (stm_bdev_layout_bytes: its recorded size once a scan has read it).
 stm_status stm_label_offsets(uint64_t dev_size, uint64_t out_offsets[STM_LABELS_PER_DEVICE]);
+
+// The size ub's roster records for ub's own device; STM_ECORRUPT when it
+// has no slot for it or the size cannot hold the labels.
+stm_status stm_ub_device_bytes(const stm_uberblock *ub, uint64_t *out_bytes);
 
 // Read a single uberblock from (label, slot). Fast-path for targeted reads.
 stm_status stm_sb_label_read(stm_bdev *d, uint32_t label, uint32_t slot, stm_uberblock *out);
@@ -198,6 +206,40 @@ mounting what it reads would roll the pool back and the claim would
 overwrite one of them. The rule is stricter than ZFS's, which judges only
 the best uberblock's version: any slot, any generation, read-only mounts
 too.
+
+Labels 2 and 3 end at the size the device's roster entry recorded when it
+joined the pool (v35, operator vote 161; ARCH sections 4.3.1, 5.3.1). The
+scan reads labels 0 and 1 first, whose offsets do not depend on the size,
+takes the size their newest uberblock records for the device
+(`stm_ub_device_bytes`) and sets the device's layout to it
+(`stm_bdev_set_layout_bytes`) before reading labels 2 and 3; every label
+offset, the device probe (`sync_device_answers`) and the allocator's data
+area use that layout. With no head copy decoding, the layout stays as the
+handle had it: the size the caller's roster records once `stm_pool_open`
+has run (it lays each live device out at its roster size, and
+`stm_pool_add_device` at the size it records for the new device), the
+current size on a fresh handle (the fs mount's peek scan). A head
+label's offset needs no layout, so labels 0 and 1 are read whatever the
+handle's layout is; `stm_pool_open` refuses (STM_EINVAL) a live device
+whose recorded size cannot hold a layout, and `stm_sync_create` checks the
+primary allocator as `stm_sync_open` does. It refuses:
+
+- `STM_ERANGE` when the recorded size exceeds the device's (`why` names
+  both sizes and the head copy): the device's labels 2 and 3 and the end of
+  its data area are gone. The layout is set first, so a writer that runs
+  anyway (a multi-device pool mounted without the device) writes past the
+  device's end, never over its data; a file-backed device grows to take
+  that write (OPEN-BUGS (n)). On a one-device pool `stm_sync_open` returns
+  the scan's STM_ERANGE, and the STM_ECORRUPT below, as they are.
+- `STM_ECORRUPT` when the uberblock it would mount, or the newest head copy,
+  records no valid size or another size than the layout labels 2 and 3
+  were read by (`why` names the copy and its generation): every uberblock
+  of a device records the same size.
+
+A device that grew keeps its layout and leaves the new space unused; a v34
+build read labels 2 and 3 at the new end, where one blank copy settled a
+successor slot and rolled the mount back past an acknowledged generation
+once the head copies of it were unreadable (F1c review X1).
 
 Its limits. A newer uberblock goes unseen only when every read of every
 copy of it fails: each generation has four copies (since v34), so one
@@ -456,7 +498,8 @@ first record went answers `STM_EWEDGED` and the sync wedges.
    ub); one_device when the pool has one live device. A device whose scan
    answers STM_EIO contributes nothing; if no device gave a uberblock and one
    answered STM_EIO, the open answers STM_EIO, not STM_ENOENT (an unreadable
-   pool is not a fresh one). The no-rollback rule above holds for one
+   pool is not a fresh one); a one-device pool whose device is smaller than
+   recorded answers STM_ERANGE. The no-rollback rule above holds for one
    device: in a multi-device pool a device that refuses drops out of the
    quorum like a dead one, and a commit acknowledged by exactly a quorum,
    one of whose devices refuses, can be rolled back (enqueued).
@@ -473,7 +516,15 @@ first record went answers `STM_EWEDGED` and the sync wedges.
      ub_pool_uuid == pool.uuid
      ub_device_uuid == pool.devices[ub.device_id].uuid
      ub_roster_hash == BLAKE3(pool.roster_bytes)
-   Any mismatch → STM_EROSTER.
+   Any mismatch -> STM_ECORRUPT.
+   Then every live device is laid out at the size the canonical roster
+   records: a dissenting device's own copy, or a scan that read no head
+   copy, does not place the pool's writes. The primary allocator's data
+   area must be the one its own device's layout gives (stm_alloc_check_layout):
+   STM_EINVAL when it was opened before the layout was set on a device
+   that grew (it would put data on the tail labels), STM_ERANGE when the
+   device is smaller than its layout (stm_sync_attach_alloc checks the
+   same).
 5. MountGenBump + claim:
      claim_gen = auth + 1
      For each online device: write a claim UB at claim_gen (quorum required).
@@ -606,9 +657,9 @@ atomically so add / attach / commit / detach composes in one step.
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_sb` | 47 | Encode / decode roundtrip; csum tamper rejected; magic tamper -> STM_ENOENT; version tamper -> STM_EBADVERSION; zero-gen rejected; label offsets; label_read / label_write; mount_scan picks highest valid; the bytes every version keeps (magic, version, the csum's domain, read without `stm_ub_csum`; an uberblock of those fields alone is a newer build's); a newer build's uberblock refuses the mount and the refusal names its slot (best+1, one of the kept fields alone, two in other slots naming the first, re-reads at best+1 and best+2, the one-device read of best-1; a torn one and an older one do not); every generation in all four labels: the write puts every copy and fails when one fails, a generation is found by any copy, one copy settles a slot, the first of differing copies is taken (in the first pass and when re-reads find them), a later copy beats a blank one before it, a refusal names the first unreadable copy, the one-device final call needs no copy of best-1 with best's trees, an older build's pool is named. |
-| `test_sync` | 45 | Single-device commit + remount; MountGenBump; alloc-root tree encoded under correct key; version boundary refusals; every ring write lands in all four labels, a mount finds the newest generation by any copy, and no one unreadable label hides a commit. |
-| `test_sync_multi` | 55 | 3-device quorum roundtrip; 1-of-3 device loss tolerated; sub-quorum refused (STM_EQUORUM); orphan-ahead-of-quorum ignored; content-quorum tested; alloc-roots indirection; v5/v6/v7 version refusals (the v5 test exercises one prior version; the decode accepts only `STM_UB_VERSION_MIN_COMPAT`..`STM_UB_VERSION`, and a newer build's uberblock refuses the pool); mirror(2) + mirror(3) roundtrips + tampered-replica fallback; reserve refuses NONE profile; attach_alloc arg validation; RO pool refuses write ops; wedge refusal; keyschema idempotent commit produces byte-identical UBs; replace_device_online resume from step-3 commit failure; same-uuid-different-alloc refused; slot-0 spoofing refused; multi-retry converges; **commit succeeds with one FAULTED device** (R21 P1); replace-claim blocks concurrent mutators on the claimed slot via sync-wrapper bypass-closed (R23 P3-4).; a replace whose rollback cannot remove the new slot wedges and answers the wedge; a newer build's uberblock on one device refuses the open and names its slot. |
+| `test_sb` | 50 | Encode / decode roundtrip; csum tamper rejected; magic tamper -> STM_ENOENT; version tamper -> STM_EBADVERSION; zero-gen rejected; label offsets; label_read / label_write; mount_scan picks highest valid; the bytes every version keeps (magic, version, the csum's domain, read without `stm_ub_csum`; an uberblock of those fields alone is a newer build's); a newer build's uberblock refuses the mount and the refusal names its slot (best+1, one of the kept fields alone, two in other slots naming the first, re-reads at best+1 and best+2, the one-device read of best-1; a torn one and an older one do not); every generation in all four labels: the write puts every copy and fails when one fails, a generation is found by any copy, one copy settles a slot, the first of differing copies is taken (in the first pass and when re-reads find them), a later copy beats a blank one before it, a refusal names the first unreadable copy, the one-device final call needs no copy of best-1 with best's trees, an older build's pool is named; the layout (v35): a grown device's tail labels are read where it joined (an acknowledged generation found there, a later write lands there, the new end stays blank; control: not grown), a device smaller than recorded refuses naming both sizes (a newer build's head copy refuses first), with no head copy the tail is read at the current size, and an uberblock recording another size, or none, refuses (a roster counting more than its 64 slots too); a handle laid out at a size no layout can have still reads its head labels. |
+| `test_sync` | 49 | Single-device commit + remount; MountGenBump; alloc-root tree encoded under correct key; version boundary refusals; every ring write lands in all four labels, a mount finds the newest generation by any copy, and no one unreadable label hides a commit; an allocator opened before the scan on a device that grew is refused, writing nothing (control: not grown); a device smaller than its recorded size refuses the open (STM_ERANGE), writing nothing; a pool made on a device larger than its roster records is laid out at the recorded size (its uberblock copies at the recorded tail, its data area below them), and an allocator made before stm_pool_open is refused; a one-device layout refusal keeps its status (STM_ECORRUPT) and names its copy. |
+| `test_sync_multi` | 56 | 3-device quorum roundtrip; 1-of-3 device loss tolerated; sub-quorum refused (STM_EQUORUM); orphan-ahead-of-quorum ignored; content-quorum tested; alloc-roots indirection; v5/v6/v7 version refusals (the v5 test exercises one prior version; the decode accepts only `STM_UB_VERSION_MIN_COMPAT`..`STM_UB_VERSION`, and a newer build's uberblock refuses the pool); mirror(2) + mirror(3) roundtrips + tampered-replica fallback; reserve refuses NONE profile; attach_alloc arg validation; RO pool refuses write ops; wedge refusal; keyschema idempotent commit produces byte-identical UBs; replace_device_online resume from step-3 commit failure; same-uuid-different-alloc refused; slot-0 spoofing refused; multi-retry converges; **commit succeeds with one FAULTED device** (R21 P1); replace-claim blocks concurrent mutators on the claimed slot via sync-wrapper bypass-closed (R23 P3-4).; a replace whose rollback cannot remove the new slot wedges and answers the wedge; a newer build's uberblock on one device refuses the open and names its slot; attach refuses an allocator whose data area runs past its device's layout, and one on a device smaller than its layout; a dissenting device's own recorded size does not place the pool's writes on it. |
 
 ## Status
 

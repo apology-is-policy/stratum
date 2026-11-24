@@ -211,7 +211,8 @@ Btrfs pinned-extents + delayed-refs + `flush_space`→`COMMIT_TRANS`; ZFS
 - **Layout:** `STM_LABELS_PER_DEVICE = 4` labels x `STM_UB_SLOTS_PER_LABEL = 63`
   commit-ring slots; each generation's uberblock goes to its slot in **all four
   labels** (since v34), so a device holds 63 generations, four copies each. Labels 0/1 sit at
-  the device head (offsets 0 / 256 KiB); labels 2/3 at the tail — localized so
+  the device head (offsets 0 / 256 KiB); labels 2/3 at the tail of the size the
+  device's roster entry records (since v35; a device that grew keeps them) -- localized so
   a controller scribble / firmware rewrite / cable-induced torn write cannot
   destroy all copies.
 - **Ring rotation:** `slot = gen % 63`. A commit never overwrites the

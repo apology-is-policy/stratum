@@ -399,11 +399,11 @@ STM_TEST(dirent_arg_validation) {
 /* test_fs.                                                            */
 /* ------------------------------------------------------------------ */
 
-STM_TEST(dirent_ub_version_is_v34) {
-    /* F1c bumped STM_UB_VERSION 33 -> 34 (each uberblock in all four
-     * labels). The dirent layer's on-disk format is unchanged since v25
-     * but rides the latest version constant. */
-    STM_ASSERT_EQ(STM_UB_VERSION, 34u);
+STM_TEST(dirent_ub_version_is_v35) {
+    /* STM_UB_VERSION 34 -> 35: labels 2 and 3 end at the device's
+     * recorded size. The dirent layer's on-disk format is unchanged since
+     * v25 but rides the latest version constant. */
+    STM_ASSERT_EQ(STM_UB_VERSION, 35u);
 }
 
 /* R73 P2-1: stm_dirent_drop_for_dir bulk-removes every record keyed

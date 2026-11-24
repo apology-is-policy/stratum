@@ -16,8 +16,16 @@
 
 #include <string.h>
 
-/* Compute the byte offset of (label_idx, slot_idx) on a device whose
- * size is captured via stm_bdev_caps_of. */
+/* Labels 0 and 1 lie at the head of the device, at offsets its size does
+ * not change; labels 2 and 3 end at its layout (label.c). */
+static const uint32_t SB_HEAD_LABELS = 2u;
+_Static_assert(STM_LABELS_PER_DEVICE == 4u,
+               "the scan learns the layout from the head labels before the tail");
+
+/* Compute the byte offset of (label_idx, slot_idx) in the device's
+ * layout (stm_bdev_layout_bytes: the size its roster entry recorded, not
+ * the size it has now). A head label's offset needs no layout, so a
+ * handle laid out at a size no layout can have still reads its head. */
 static stm_status compute_offset(stm_bdev *d, uint32_t label_idx,
                                    uint32_t slot_idx,
                                    uint64_t *out_byte_offset)
@@ -25,12 +33,14 @@ static stm_status compute_offset(stm_bdev *d, uint32_t label_idx,
     if (!d) return STM_EINVAL;
     if (label_idx >= STM_LABELS_PER_DEVICE) return STM_EINVAL;
 
-    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
-    if (!caps) return STM_EINVAL;
-
     uint64_t label_offsets[STM_LABELS_PER_DEVICE];
-    stm_status s = stm_label_offsets(caps->size_bytes, label_offsets);
-    if (s != STM_OK) return s;
+    if (label_idx < SB_HEAD_LABELS) {
+        label_offsets[label_idx] = (uint64_t)label_idx * STM_LABEL_SIZE;
+    } else {
+        stm_status s = stm_label_offsets(stm_bdev_layout_bytes(d),
+                                         label_offsets);
+        if (s != STM_OK) return s;
+    }
 
     return stm_ub_slot_offset(label_offsets[label_idx], slot_idx,
                                 out_byte_offset);
@@ -280,7 +290,7 @@ static sb_slot_state sb_successor(stm_bdev *d,
  * which is older (sync.c). The writers of the one version the decode
  * accepts stamp it so: a writer that changes the stamp, or a version
  * range that admits another writer, changes this proof. */
-_Static_assert(STM_UB_VERSION == 34u && STM_UB_VERSION_MIN_COMPAT == 34u,
+_Static_assert(STM_UB_VERSION == 35u && STM_UB_VERSION_MIN_COMPAT == 35u,
                "re-check that only a final has ub_repair_log_root_gen == ub_gen");
 
 /* The scan's pick among differing copies of one generation (the first
@@ -350,6 +360,55 @@ static stm_status sb_refuse(stm_bdev *d, uint64_t gen, uint32_t li,
     return STM_EIO;
 }
 
+/* The uberblock at copy (li, si) records no valid size for its device, or
+ * another size than the layout labels 2 and 3 were read by. */
+static stm_status sb_refuse_layout(stm_bdev *d, uint32_t li, uint32_t si,
+                                   uint64_t gen, stm_sb_scan_refusal *why)
+{
+    if (why) {
+        why->label_idx = li;
+        why->slot_idx  = si;
+        why->best_gen  = gen;
+        if (compute_offset(d, li, si, &why->byte_offset) != STM_OK)
+            why->byte_offset = 0;
+    }
+    return STM_ECORRUPT;
+}
+
+/* Lay the device out at the size the newest uberblock of its head labels
+ * records for it (`head`, at copy (li, si); NULL when none decoded, and
+ * the layout stays as it was), before labels 2 and 3 are read: where a
+ * device that grew has blank space, or one that shrank has data, at its
+ * current end. A device smaller than its recorded size refuses; its
+ * layout is set first, so a writer that runs anyway (a pool carrying on
+ * without the device) writes past the device's end, never over the data
+ * at its current end (a file-backed device grows to take that write:
+ * OPEN-BUGS (n)). */
+static stm_status sb_layout(stm_bdev *d, const stm_uberblock *head,
+                            uint32_t li, uint32_t si,
+                            stm_sb_scan_refusal *why)
+{
+    if (!head) return STM_OK;
+    uint64_t gen = stm_load_le64(head->ub_gen);
+    uint64_t recorded = 0;
+    if (stm_ub_device_bytes(head, &recorded) != STM_OK)
+        return sb_refuse_layout(d, li, si, gen, why);
+    stm_bdev_set_layout_bytes(d, recorded);
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    if (!caps) return STM_EINVAL;
+    if (recorded <= caps->size_bytes) return STM_OK;
+    if (why) {
+        why->label_idx      = li;
+        why->slot_idx       = si;
+        why->best_gen       = gen;
+        why->recorded_bytes = recorded;
+        why->device_bytes   = caps->size_bytes;
+        if (compute_offset(d, li, si, &why->byte_offset) != STM_OK)
+            why->byte_offset = 0;
+    }
+    return STM_ERANGE;
+}
+
 /* Copy (li, si) holds an uberblock of `version`, which this build does
  * not read. */
 static stm_status sb_refuse_version(stm_bdev *d, uint32_t li, uint32_t si,
@@ -407,8 +466,18 @@ stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
      * tree; the first in label order is taken. On a multi-device pool the
      * device was outvoted instead and its pick is only its vote: the
      * content-quorum check (sync.c) treats a dissenting device as an
-     * orphan. */
+     * orphan.
+     *
+     * The head labels come first: their newest uberblock gives the layout
+     * the tail labels are read by (sb_layout). A newer build's uberblock
+     * there refuses below, its layout not this build's to compute. */
     for (uint32_t li = 0; li < STM_LABELS_PER_DEVICE; li++) {
+        if (li == SB_HEAD_LABELS) {
+            if (saw_newer) break;
+            stm_status ls = sb_layout(d, have_any ? &best_ub : NULL,
+                                      best_label, best_slot, why);
+            if (ls != STM_OK) return ls;
+        }
         for (uint32_t si = 0; si < STM_UB_SLOTS_PER_LABEL; si++) {
             stm_uberblock candidate;
             stm_status s = STM_OK;
@@ -551,6 +620,16 @@ stm_status stm_sb_mount_scan_ex(stm_bdev *d, bool one_device,
             return sb_refuse(d, g2, at, best_gen, why);
         break;
     }
+
+    /* Every uberblock of the device records the same size (a device keeps
+     * the size it joined with), so one that records another came from
+     * somewhere else: residue of a pool laid out at another size, or data
+     * at a tail read by a layout the head labels did not give. Residue
+     * recording the layout's own size is not told apart here. */
+    uint64_t recorded = 0;
+    if (stm_ub_device_bytes(&best_ub, &recorded) != STM_OK ||
+        recorded != stm_bdev_layout_bytes(d))
+        return sb_refuse_layout(d, best_label, best_slot, best_gen, why);
 
     *out_ub = best_ub;
     if (out_label_idx) *out_label_idx = best_label;

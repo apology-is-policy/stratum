@@ -534,12 +534,22 @@ extern "C" {
  * operator decision 2026-11-05), so a v33 pool answers STM_EBADVERSION and
  * a v34 pool holds no older uberblocks (format zeroes the labels).
  *
+ * v34->v35: labels 2 and 3, and the data area below them, end at the size
+ * the device's roster entry recorded when it joined the pool, not at its
+ * current size (ARCHITECTURE sections 4.3.1, 5.3.1): a device that grew
+ * keeps its layout and leaves the new space unused, and one smaller than
+ * its recorded size refuses (STM_ERANGE): the mount, on a one-device
+ * pool; its vote, on a multi-device one. A v34 build put them
+ * at the current size, so a v34 pool on a device that grew may hold data
+ * where v35 reads labels 2 and 3. Fields unchanged; no upgrade path, as
+ * at v34.
+ *
  * See `docs/phase-9.7-design.md` section 3.1 / section 3.3 + section 4 + section 5 for the
  * staging. */
-#define STM_UB_VERSION        34u
+#define STM_UB_VERSION        35u
 
 /* The oldest version this build reads: this one alone. */
-#define STM_UB_VERSION_MIN_COMPAT  34u
+#define STM_UB_VERSION_MIN_COMPAT  35u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */
@@ -1055,7 +1065,8 @@ void stm_ub_csum(const void *buf, size_t buf_len, uint8_t out[32]);
  * this one's successors included, keeps STM_UB_MAGIC at byte 0,
  * ub_version (le32) at byte 8 and ub_csum, the unkeyed BLAKE3-256 of
  * bytes [0, 4064) as stored, in bytes [4064, 4096), in 4 KiB commit-ring
- * slots (ARCHITECTURE section 5.4.1), so a build tells a newer one's
+ * slots, each generation in labels 0 and 1 (ARCHITECTURE section 5.4.1),
+ * so a build tells a newer one's
  * uberblock from a torn or foreign slot and refuses the pool
  * (stm_sb_mount_scan_ex) rather than mount an older generation under the
  * newer commits.
@@ -1067,13 +1078,29 @@ bool stm_ub_is_newer(const void *buf, size_t buf_len);
  * fields stm_ub_is_newer reads). The scan names it when nothing decodes. */
 bool stm_ub_is_older(const void *buf, size_t buf_len);
 
+/* The ub_roster slot layout the sb layer reads (pool.h has the whole):
+ * slot ub_device_id, STM_UB_ROSTER_SLOT_BYTES long, holds this device's
+ * size, le64, at STM_UB_ROSTER_SIZE_OFF. */
+#define STM_UB_ROSTER_SLOT_BYTES  32u
+#define STM_UB_ROSTER_SIZE_OFF    16u
+
+/* The size `ub`'s roster records for `ub`'s own device (its slot
+ * ub_device_id): the size the device had when it joined the pool, which
+ * places labels 2 and 3 and ends the data area. STM_ECORRUPT when
+ * ub_device_id is not below ub_device_count, ub_device_count exceeds the
+ * roster, or the size cannot hold the labels (stm_label_offsets). */
+STM_MUST_USE
+stm_status stm_ub_device_bytes(const stm_uberblock *ub, uint64_t *out_bytes);
+
 /* ========================================================================= */
 /* Label placement.                                                           */
 /* ========================================================================= */
 
 /*
  * Populate `offsets[STM_LABELS_PER_DEVICE]` with the byte offsets of
- * each label on a device of `device_bytes` total size.
+ * each label on a device whose layout is `device_bytes` long: the size
+ * its roster entry records (stm_bdev_layout_bytes), which a device that
+ * grew since it joined exceeds.
  *
  *   offsets[0] = 0
  *   offsets[1] = STM_LABEL_SIZE
@@ -1171,6 +1198,20 @@ stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
  * generation or read back blank (a generation this device confirmed is in
  * STM_UB_COPIES_REQUIRED of them). This is the strict rule, for a device
  * whose pool may have others: stm_sb_mount_scan_ex(d, false).
+ *
+ * Labels 2 and 3 are read where the device's recorded size puts them. The
+ * scan reads labels 0 and 1 first (their offsets do not depend on the
+ * size), takes the size the newest uberblock there records for this
+ * device (stm_ub_device_bytes) and sets the device's layout to it
+ * (stm_bdev_set_layout_bytes) before it reads labels 2 and 3; when none
+ * decodes there the layout stays as it was, the current size on a fresh
+ * handle. Returns STM_ERANGE when that size exceeds the device's: the
+ * device is smaller than when it joined the pool, so its labels 2 and 3
+ * and the end of its data area are gone. Returns STM_ECORRUPT when the
+ * newest head copy records no valid size, or when the uberblock it would
+ * mount records none or another size than the layout it read labels 2
+ * and 3 by. A head label's offset needs no layout, so labels 0 and 1 are
+ * read whatever the handle's layout is.
  */
 STM_MUST_USE
 stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
@@ -1184,8 +1225,10 @@ stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
  * the copy holds an uberblock of that version, which this build does not
  * read (STM_EBADVERSION; gen is 0): a newer build's, above STM_UB_VERSION,
  * or, when nothing decoded, an older build's, below
- * STM_UB_VERSION_MIN_COMPAT. Both are 0 when the scan refused for another
- * reason. */
+ * STM_UB_VERSION_MIN_COMPAT. recorded_bytes != 0: the device is
+ * device_bytes long, less than the recorded_bytes the copy in label_idx
+ * slot_idx records for it (STM_ERANGE). All three are 0 when the scan
+ * refused for another reason. */
 typedef struct stm_sb_scan_refusal {
     uint64_t gen;
     uint32_t label_idx;
@@ -1193,6 +1236,8 @@ typedef struct stm_sb_scan_refusal {
     uint64_t byte_offset;
     uint64_t best_gen;
     uint32_t version;
+    uint64_t recorded_bytes;
+    uint64_t device_bytes;
 } stm_sb_scan_refusal;
 
 /*

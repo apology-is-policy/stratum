@@ -14,9 +14,23 @@
 #include <stratum/block_inject.h>
 #include <stratum/hash.h>
 
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+
+/* The size of every device these tests open (open_test_device), which
+ * fill_example's roster records for device 0. */
+#define SB_DEVICE_BYTES (UINT64_C(16) * 1024u * 1024u)
+
+/* Device 0's roster entry records `bytes` (its uuid, then its size). */
+static void sb_record_bytes(stm_uberblock *ub, uint64_t bytes)
+{
+    le64 u = ub->ub_device_uuid[0];
+    le64 sz = stm_store_le64(bytes);
+    memcpy(ub->ub_roster, u.v, sizeof u.v);
+    memcpy(ub->ub_roster + STM_UB_ROSTER_SIZE_OFF, sz.v, sizeof sz.v);
+}
 
 static void fill_example(stm_uberblock *ub)
 {
@@ -40,8 +54,9 @@ static void fill_example(stm_uberblock *ub)
     ub->ub_redundancy_kind = STM_RED_MIRROR;
     ub->ub_device_class  = STM_DEV_CLASS_SSD;
     ub->ub_device_role   = STM_DEV_ROLE_DATA;
-    /* merkle, key_schema, roster: left zero — Phase 3 tests don't
-     * populate them. Round-trip still verifies structure. */
+    sb_record_bytes(ub, SB_DEVICE_BYTES);
+    /* merkle, key_schema: left zero -- Phase 3 tests don't populate
+     * them. Round-trip still verifies structure. */
 }
 
 STM_TEST(sb_uberblock_sizes) {
@@ -1705,6 +1720,269 @@ STM_TEST(sb_mount_scan_a_later_copy_beats_a_blank_one_before_it) {
         STM_ASSERT_EQ(label, 1u);
         stm_bdev_inject_read_range_clear(d);
     }
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Vote 161: labels 2 and 3 end at the size the device's roster entry
+ * recorded when it joined (16 MiB here), whatever its size now. */
+static const uint64_t SB_GROWN_BYTES  = UINT64_C(32) * 1024u * 1024u;
+static const uint64_t SB_SHRUNK_BYTES = UINT64_C(12) * 1024u * 1024u;
+
+/* Gen 41 a final, 42 its reservation, 43 the reservation's final, and the
+ * head labels' copies of 43 unreadable: the mount needs a tail copy of 43. */
+static void sb_put_41_to_43_head_of_43_unreadable(stm_bdev *d)
+{
+    sb_put_ub(d, 41, 1, 41, STM_UB_VERSION);
+    sb_put_ub(d, 42, 1, 41, STM_UB_VERSION);
+    sb_put_ub(d, 43, 2, 43, STM_UB_VERSION);
+}
+
+/* Every byte of [off, off + len) reads back zero. */
+static bool sb_all_zero(stm_bdev *d, uint64_t off, uint64_t len)
+{
+    uint8_t buf[STM_UB_SIZE];
+    for (uint64_t at = off; at < off + len; at += sizeof buf) {
+        if (stm_bdev_read(d, at, buf, sizeof buf) != STM_OK) return false;
+        for (size_t i = 0; i < sizeof buf; i++)
+            if (buf[i]) return false;
+    }
+    return true;
+}
+
+/* A device that grew keeps its tail labels where they were: the scan reads
+ * them there and mounts 43, where reading them at the new end (blank) let
+ * one blank copy settle slot 43 and mount 42 over an acknowledged 43 (F1c
+ * review X1). Control, one variable away: the same pool, not grown. A
+ * write after the scan lands at the recorded tail, and the new end stays
+ * blank. */
+STM_TEST(sb_mount_scan_a_grown_device_reads_its_tail_labels_where_it_joined) {
+    for (int grown = 0; grown < 2; grown++) {
+        stm_bdev *d = open_test_device("grown", 16 * 1024 * 1024);
+        STM_ASSERT(d != NULL);
+        if (!d) return;
+        sb_put_41_to_43_head_of_43_unreadable(d);
+        uint64_t lo[STM_LABELS_PER_DEVICE];
+        STM_ASSERT_OK(stm_label_offsets(SB_DEVICE_BYTES, lo));
+        if (grown) STM_ASSERT_OK(stm_bdev_resize(d, SB_GROWN_BYTES));
+        sb_fault_copy(d, 43, 0, -1);
+        sb_fault_copy(d, 43, 1, -1);
+        for (int strict = 0; strict < 2; strict++) {
+            stm_uberblock found;
+            uint32_t label = 99;
+            stm_bdev_set_layout_bytes(d, 0);
+            stm_status s = stm_sb_mount_scan_ex(d, !strict, &found, &label,
+                                                NULL, NULL);
+            printf("  %s, %s: scan %d, gen %llu, layout %llu\n",
+                   grown ? "grown" : "same size",
+                   strict ? "strict" : "one device", (int)s,
+                   (unsigned long long)stm_load_le64(found.ub_gen),
+                   (unsigned long long)stm_bdev_layout_bytes(d));
+            STM_ASSERT_OK(s);
+            STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 43u);
+            STM_ASSERT_EQ(label, 2u);
+            STM_ASSERT_EQ(stm_bdev_layout_bytes(d), SB_DEVICE_BYTES);
+        }
+        stm_bdev_inject_read_range_clear(d);
+        sb_put_ub(d, 44, 2, 43, STM_UB_VERSION);
+        for (uint32_t li = 2; li < STM_LABELS_PER_DEVICE; li++) {
+            uint8_t buf[STM_UB_SIZE];
+            stm_uberblock back;
+            STM_ASSERT_OK(stm_bdev_read(d, lo[li] + 44u * STM_UB_SIZE, buf,
+                                        sizeof buf));
+            STM_ASSERT_OK(stm_ub_decode(buf, sizeof buf, &back));
+            STM_ASSERT_EQ(stm_load_le64(back.ub_gen), 44u);
+        }
+        if (grown) {
+            uint64_t now[STM_LABELS_PER_DEVICE];
+            STM_ASSERT_OK(stm_label_offsets(SB_GROWN_BYTES, now));
+            STM_ASSERT(sb_all_zero(d, now[2], 2u * (uint64_t)STM_LABEL_SIZE));
+        }
+        stm_bdev_close(d);
+        unlink(g_tmp_path);
+    }
+}
+
+/* A device smaller than its recorded size has lost its tail labels and
+ * the end of its data area: both rules refuse, STM_ERANGE, naming the
+ * sizes and the head copy that records them, with the layout at the
+ * recorded size. A newer build's uberblock in a head label refuses as
+ * that first: its layout is not this build's to judge. */
+STM_TEST(sb_mount_scan_refuses_a_device_smaller_than_its_recorded_size) {
+    stm_bdev *d = open_test_device("shrunk", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    if (!d) return;
+    sb_put_gen(d, 41);
+    sb_put_gen(d, 42);
+    sb_put_gen(d, 43);
+    /* The backends only grow a device; shrink the file under no handle. */
+    stm_bdev_close(d);
+    STM_ASSERT_EQ(truncate(g_tmp_path, (off_t)SB_SHRUNK_BYTES), 0);
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &bo, &d));
+    if (!d) return;
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    STM_ASSERT(caps != NULL);
+    if (caps) STM_ASSERT_EQ(caps->size_bytes, SB_SHRUNK_BYTES);
+    for (int strict = 0; strict < 2; strict++) {
+        stm_uberblock found;
+        stm_sb_scan_refusal why;
+        memset(&why, 0xa5, sizeof why);
+        stm_bdev_set_layout_bytes(d, 0);
+        stm_status s = stm_sb_mount_scan_ex(d, !strict, &found, NULL, NULL,
+                                            &why);
+        printf("  %s: scan %d, recorded %llu, device %llu\n",
+               strict ? "strict" : "one device", (int)s,
+               (unsigned long long)why.recorded_bytes,
+               (unsigned long long)why.device_bytes);
+        STM_ASSERT_EQ(s, STM_ERANGE);
+        STM_ASSERT_EQ(why.recorded_bytes, SB_DEVICE_BYTES);
+        STM_ASSERT_EQ(why.device_bytes, SB_SHRUNK_BYTES);
+        STM_ASSERT_EQ(why.label_idx, 0u);
+        STM_ASSERT_EQ(why.slot_idx, 43u);
+        STM_ASSERT_EQ(why.byte_offset, 43u * (uint64_t)STM_UB_SIZE);
+        STM_ASSERT_EQ(why.best_gen, 43u);
+        STM_ASSERT_EQ(why.gen, 0u);
+        STM_ASSERT_EQ(why.version, 0u);
+        STM_ASSERT_EQ(stm_bdev_layout_bytes(d), SB_DEVICE_BYTES);
+    }
+    sb_put_version(d, 44, 44, STM_UB_VERSION + 1u, true);
+    stm_uberblock found;
+    stm_sb_scan_refusal why;
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why),
+                   STM_EBADVERSION);
+    STM_ASSERT_EQ(why.version, STM_UB_VERSION + 1u);
+    STM_ASSERT_EQ(why.recorded_bytes, 0u);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* With no head copy decoding, the tail is read at the layout the handle
+ * already has, the current size on a fresh one: an unchanged device mounts
+ * 43 from its tail; a grown one finds its new end blank and refuses
+ * (STM_EIO: the head labels could not be read). An uberblock must record
+ * the layout it was read by: a tail copy of 43 recording 20 MiB under head
+ * copies recording 16 refuses (STM_ECORRUPT, naming it), and so does a
+ * head copy whose roster has no slot for its device. */
+STM_TEST(sb_mount_scan_checks_the_layout_an_uberblock_records) {
+    for (int grown = 0; grown < 2; grown++) {
+        stm_bdev *d = open_test_device("nohead", 16 * 1024 * 1024);
+        STM_ASSERT(d != NULL);
+        if (!d) return;
+        sb_put_gen(d, 41);
+        sb_put_gen(d, 42);
+        sb_put_gen(d, 43);
+        if (grown) STM_ASSERT_OK(stm_bdev_resize(d, SB_GROWN_BYTES));
+        stm_bdev_inject_read_range(d, 0, 2u * (uint64_t)STM_LABEL_SIZE, -1,
+                                   STM_EIO);
+        for (int strict = 0; strict < 2; strict++) {
+            stm_uberblock found;
+            memset(&found, 0, sizeof found);
+            stm_status s = stm_sb_mount_scan_ex(d, !strict, &found, NULL,
+                                                NULL, NULL);
+            printf("  no head, %s, %s: scan %d, gen %llu\n",
+                   grown ? "grown" : "same size",
+                   strict ? "strict" : "one device", (int)s,
+                   (unsigned long long)stm_load_le64(found.ub_gen));
+            if (grown) {
+                STM_ASSERT_EQ(s, STM_EIO);
+            } else {
+                STM_ASSERT_OK(s);
+                STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 43u);
+            }
+        }
+        stm_bdev_close(d);
+        unlink(g_tmp_path);
+    }
+
+    stm_bdev *d = open_test_device("tailsize", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    if (!d) return;
+    sb_put_gen(d, 41);
+    sb_put_gen(d, 42);
+    stm_uberblock ub;
+    fill_example(&ub);
+    ub.ub_gen = stm_store_le64(43);
+    sb_record_bytes(&ub, UINT64_C(20) * 1024u * 1024u);
+    STM_ASSERT_OK(stm_sb_label_write(d, 2u, 43u, &ub));
+    STM_ASSERT_OK(stm_sb_label_write(d, 3u, 43u, &ub));
+    uint64_t lo[STM_LABELS_PER_DEVICE];
+    STM_ASSERT_OK(stm_label_offsets(SB_DEVICE_BYTES, lo));
+    for (int strict = 0; strict < 2; strict++) {
+        stm_uberblock found;
+        stm_sb_scan_refusal why;
+        memset(&why, 0xa5, sizeof why);
+        stm_bdev_set_layout_bytes(d, 0);
+        STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, !strict, &found, NULL, NULL,
+                                            &why), STM_ECORRUPT);
+        STM_ASSERT_EQ(why.best_gen, 43u);
+        STM_ASSERT_EQ(why.label_idx, 2u);
+        STM_ASSERT_EQ(why.slot_idx, 43u);
+        STM_ASSERT_EQ(why.byte_offset, lo[2] + 43u * (uint64_t)STM_UB_SIZE);
+        STM_ASSERT_EQ(why.recorded_bytes, 0u);
+    }
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+
+    d = open_test_device("noslot", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    if (!d) return;
+    sb_put_gen(d, 41);
+    fill_example(&ub);
+    ub.ub_gen = stm_store_le64(42);
+    ub.ub_device_id = stm_store_le16(1);
+    STM_ASSERT_OK(stm_sb_ub_write_copies(d, 42u, &ub));
+    stm_uberblock found;
+    stm_sb_scan_refusal why;
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why),
+                   STM_ECORRUPT);
+    STM_ASSERT_EQ(why.best_gen, 42u);
+    STM_ASSERT_EQ(why.label_idx, 0u);
+    STM_ASSERT_EQ(why.slot_idx, 42u);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+
+    /* The roster has 64 slots: a head copy counting 65 devices refuses,
+     * though its device's slot (64), past the roster, holds a valid size. */
+    _Static_assert(offsetof(stm_uberblock, ub_roster) + sizeof ub.ub_roster +
+                       STM_UB_ROSTER_SIZE_OFF + 8u <= offsetof(stm_uberblock, ub_csum),
+                   "slot 64's size lies inside the uberblock, before its csum");
+    d = open_test_device("overcount", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    if (!d) return;
+    sb_put_gen(d, 41);
+    fill_example(&ub);
+    ub.ub_gen = stm_store_le64(42);
+    ub.ub_device_count = stm_store_le16(65);
+    ub.ub_device_id = stm_store_le16(64);
+    le64 sz = stm_store_le64(SB_DEVICE_BYTES);
+    memcpy((uint8_t *)&ub + offsetof(stm_uberblock, ub_roster) +
+               64u * STM_UB_ROSTER_SLOT_BYTES + STM_UB_ROSTER_SIZE_OFF,
+           sz.v, sizeof sz.v);
+    STM_ASSERT_OK(stm_sb_ub_write_copies(d, 42u, &ub));
+    memset(&why, 0xa5, sizeof why);
+    STM_ASSERT_ERR(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, &why),
+                   STM_ECORRUPT);
+    STM_ASSERT_EQ(why.best_gen, 42u);
+    STM_ASSERT_EQ(why.label_idx, 0u);
+    STM_ASSERT_EQ(why.slot_idx, 42u);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+
+    /* A handle laid out at a size no layout can have still reads its head
+     * labels, and the scan lays it out at the size they record. */
+    d = open_test_device("badlayout", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+    if (!d) return;
+    sb_put_gen(d, 41);
+    sb_put_gen(d, 42);
+    sb_put_gen(d, 43);
+    stm_bdev_set_layout_bytes(d, UINT64_C(1024) * 1024u);
+    memset(&found, 0, sizeof found);
+    STM_ASSERT_OK(stm_sb_mount_scan_ex(d, true, &found, NULL, NULL, NULL));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 43u);
+    STM_ASSERT_EQ(stm_bdev_layout_bytes(d), SB_DEVICE_BYTES);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }

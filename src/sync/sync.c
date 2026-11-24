@@ -1825,6 +1825,14 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
         rp = *profile;
     }
 
+    /* stm_pool_open laid each device out at its roster size; an
+     * allocator made before that spans the size the handle had. */
+    uint16_t primary = 0;
+    stm_status lay = stm_alloc_get_device_id(a, &primary);
+    if (lay == STM_OK)
+        lay = stm_alloc_check_layout(a, stm_pool_device_bdev(p, primary));
+    if (lay != STM_OK) return lay;
+
     /* R9 P1-1: the rest of this function calls stm_random_bytes /
      * stm_aead_* transitively via stm_alloc_set_crypt_ctx; libsodium
      * must be initialized. Idempotent. */
@@ -2270,15 +2278,21 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
          * which is not the pool's (quorum decides) -- except at a newer
          * build's uberblock, which any device names. */
         stm_sb_scan_refusal dwhy;
-        stm_sb_scan_refusal *dw = !why ? NULL : one_device ? why : &dwhy;
+        stm_sb_scan_refusal *dw = why && one_device ? why : &dwhy;
         stm_status sc = stm_sb_mount_scan_ex(di, one_device, &scans[i].ub,
                                              &lbl, &slot, dw);
         if (sc == STM_OK) {
             scans[i].valid = true;
         } else if (sc == STM_EBADVERSION) {
-            if (dw == &dwhy) *why = dwhy;
+            if (why && dw == &dwhy) *why = dwhy;
             free(scans);
             return STM_EBADVERSION;
+        } else if (one_device && (sc == STM_ERANGE ||
+                                  (sc == STM_ECORRUPT && dw->best_gen != 0))) {
+            /* The pool's one device is smaller than it was, or one of its
+             * uberblocks records another size than its layout. */
+            free(scans);
+            return sc;
         } else if (sc != STM_ENOENT) {
             saw_scan_eio = true;
         }
@@ -2422,6 +2436,22 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
         if (canon_dev->uuid[0] != canon_uuid[0] ||
             canon_dev->uuid[1] != canon_uuid[1]) return STM_ECORRUPT;
     }
+
+    /* Each device's scan laid it out at the size its own uberblock
+     * records; the pool writes at the size the canonical roster (checked
+     * above) records, which a dissenting or unread device's own copy
+     * does not set. An allocator opened before the scans, on a device
+     * that grew, would put data on the tail labels. */
+    for (size_t i = 0; i < n; i++) {
+        stm_bdev *di = stm_pool_device_bdev(p, (uint16_t)i);
+        const stm_pool_device *dv = stm_pool_device_info(p, (uint16_t)i);
+        if (di && dv) stm_bdev_set_layout_bytes(di, dv->size_bytes);
+    }
+    uint16_t primary = 0;
+    stm_status lay = stm_alloc_get_device_id(a, &primary);
+    if (lay == STM_OK)
+        lay = stm_alloc_check_layout(a, stm_pool_device_bdev(p, primary));
+    if (lay != STM_OK) return lay;
 
     uint64_t alloc_root_gen = stm_load_le64(ub.ub_alloc_root_gen);
 
@@ -4136,6 +4166,13 @@ stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
             pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
             return STM_EEXIST;
         }
+    }
+    /* Its data area must stop below the device's tail labels. */
+    stm_status lay = stm_alloc_check_layout(alloc, di_check->bdev);
+    if (lay != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        stm_pool_unlock_shared(s->pool);
+        return lay;
     }
 
     s->allocs[device_id] = alloc;
@@ -7583,9 +7620,8 @@ static stm_status sync_replicas_failed(bool *rec_bad, stm_status dev_err,
  * record's failure (ZFS's vdev_probe asks the same after a failed I/O). */
 static bool sync_device_answers(stm_bdev *bd)
 {
-    const stm_bdev_caps *caps = stm_bdev_caps_of(bd);
     uint64_t lo[STM_LABELS_PER_DEVICE];
-    if (!caps || stm_label_offsets(caps->size_bytes, lo) != STM_OK)
+    if (!bd || stm_label_offsets(stm_bdev_layout_bytes(bd), lo) != STM_OK)
         return false;
     uint8_t probe[STM_UB_SIZE];
     for (uint32_t l = 0; l < STM_LABELS_PER_DEVICE; l++) {

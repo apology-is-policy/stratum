@@ -183,8 +183,9 @@ v34, the current one alone).
 | 31 -> 32 | 9.7-impl-3: the snapshot record's fixed prefix grows 52 -> 92 bytes (`root_gen` + `root_csum[32]`), the snapshot's captured btree_engine root triple. **No uberblock field change**; v31 pools refused. |
 | 32 -> 33 | 9.8-BE-format: internal btree-engine nodes may carry a persisted Be message region. Additive: a v33 build mounted v32 pools and upgraded them on mount (`STM_UB_VERSION_MIN_COMPAT = 32`, the first ranged gate). |
 | 33 -> 34 | F1c (operator vote 151): each generation's uberblock goes to commit-ring slot gen % 63 of ALL FOUR labels (v33: label gen % 4, one copy), and a device confirms the write only when all four copies were written and flushed (`07-sb-sync.md`). **No uberblock field change**; the placement is the break. No upgrade path (operator decision 2026-11-05: on-disk breaks are free until the format freezes): `STM_UB_VERSION_MIN_COMPAT = 34`, so v33 pools are refused (STM_EBADVERSION, and stratumd says an older build wrote the pool) and re-created. |
+| 34 -> 35 | OPEN-BUGS (m) (operator vote 161): labels 2 and 3, and the data area below them, end at the size the device's roster entry recorded when it joined the pool, not at its current size (`07-sb-sync.md`, ARCH sections 4.3.1, 5.3.1). A device that grew keeps its layout and leaves the new space unused; one smaller than recorded refuses (STM_ERANGE): the mount of a one-device pool, its vote in a multi-device one. **No uberblock field change**; the placement is the break (a v34 build used grown space, so a v34 pool on a grown device may hold data where v35 reads labels 2 and 3). No upgrade path: `STM_UB_VERSION_MIN_COMPAT = 35`, v34 pools refused and re-created. |
 
-Current: `STM_UB_VERSION == 34`, `STM_UB_VERSION_MIN_COMPAT == 34` (see `include/stratum/super.h`).
+Current: `STM_UB_VERSION == 35`, `STM_UB_VERSION_MIN_COMPAT == 35` (see `include/stratum/super.h`).
 
 ### Merkle-rooted integrity
 

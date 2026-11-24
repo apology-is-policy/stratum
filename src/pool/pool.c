@@ -39,6 +39,10 @@
 #define OFF_CLASS       25u
 #define OFF_STATE       26u
 /* 27..31 reserved (zero). */
+_Static_assert(STM_POOL_ROSTER_SLOT_SIZE == STM_UB_ROSTER_SLOT_BYTES &&
+               OFF_SIZE_BYTES == STM_UB_ROSTER_SIZE_OFF,
+               "the scan reads a device's recorded size where the roster puts it "
+               "(stm_ub_device_bytes)");
 
 struct stm_pool {
     uint64_t        pool_uuid[2];
@@ -248,6 +252,10 @@ stm_status stm_pool_open(const stm_pool_open_opts *opts, stm_pool **out)
              * alloc tree is still live — data-half of remove_device
              * (P5-4b-ii) drains it range-by-range. */
             if (!d->bdev) return STM_EINVAL;
+            /* Its labels and data area are laid out at this size. */
+            uint64_t lo[STM_LABELS_PER_DEVICE];
+            if (stm_label_offsets(d->size_bytes, lo) != STM_OK)
+                return STM_EINVAL;
         }
         if (uuid_is_zero(d->uuid)) return STM_EINVAL;
         if (!role_in_range(d->role))   return STM_EINVAL;
@@ -276,6 +284,11 @@ stm_status stm_pool_open(const stm_pool_open_opts *opts, stm_pool **out)
     p->read_only    = opts->read_only;
     for (size_t i = 0; i < opts->device_count; i++) {
         p->devices[i] = opts->devices[i];
+        /* Labels 2 and 3 and the data area end at the size the roster
+         * records, not the size the device has now (vote 161). */
+        if (p->devices[i].bdev)
+            stm_bdev_set_layout_bytes(p->devices[i].bdev,
+                                      p->devices[i].size_bytes);
     }
     p->roster_hash    = hash_of_devs(p->devices, p->device_count);
     p->replace_claim  = STM_POOL_REPLACE_CLAIM_NONE;
@@ -561,6 +574,9 @@ stm_status stm_pool_add_device_locked(stm_pool *p,
     stm_pool_device slot = *new_device;
     slot.size_bytes = caps->size_bytes;
     slot.state      = STM_DEV_STATE_ONLINE;
+    /* Its labels and data area are laid out at the size recorded here,
+     * whatever an earlier scan of this handle set. */
+    stm_bdev_set_layout_bytes(slot.bdev, slot.size_bytes);
 
     /* Append + rehash. Matches the TLA model's AddDevice action. */
     p->devices[p->device_count] = slot;

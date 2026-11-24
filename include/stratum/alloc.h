@@ -242,6 +242,15 @@ stm_status stm_alloc_set_device_id(stm_alloc *a, uint16_t device_id);
 STM_MUST_USE
 stm_status stm_alloc_get_device_id(const stm_alloc *a, uint16_t *out_device_id);
 
+/* Whether the allocator's data area is the one `dev`'s layout gives now
+ * (stm_bdev_layout_bytes; `dev` the pool's handle on the allocator's
+ * device, NULL for the allocator's own): STM_EINVAL when it was opened
+ * before the layout was set on a device that has grown, and would place
+ * data where the device's tail labels are; STM_ERANGE when the device is
+ * smaller than its layout. */
+STM_MUST_USE
+stm_status stm_alloc_check_layout(const stm_alloc *a, const stm_bdev *dev);
+
 /*
  * Borrow the allocator's bootstrap handle. Used by higher layers
  * (stm_sync / stm_keyschema) that need to reserve node-sized paddrs

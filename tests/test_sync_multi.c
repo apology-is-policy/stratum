@@ -514,6 +514,77 @@ STM_TEST(sync_multi_mount_tolerates_minority_content_divergence) {
     unlink_paths();
 }
 
+/* A device whose own uberblock records another size for it than the
+ * pool's roster does is laid out there by its own scan; the pool writes
+ * it at the size the canonical roster records (vote 161), so the claim
+ * lands at the recorded tail, and nothing at the tail the dissenting
+ * copy names, which lies in the device's data area. */
+STM_TEST(sync_multi_a_dissenting_copys_size_does_not_place_the_pools_writes) {
+    make_paths("dissize");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool *pool = make_multi_pool(bds);
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+
+    const uint64_t forged = TEST_DEVICE_BYTES - UINT64_C(1024) * 1024u;
+    {
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        stm_bdev *d = NULL;
+        STM_ASSERT_OK(stm_bdev_open(g_paths[2], &bo, &d));
+        stm_uberblock ub;
+        uint32_t lbl, slot;
+        STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
+        (void)lbl;
+        le64 sz = stm_store_le64(forged);
+        memcpy(ub.ub_roster + 2u * STM_UB_ROSTER_SLOT_BYTES +
+                   STM_UB_ROSTER_SIZE_OFF, sz.v, sizeof sz.v);
+        STM_ASSERT_OK(stm_sb_ub_write_copies(d, slot, &ub));
+        stm_bdev_set_layout_bytes(d, 0);
+        STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
+        STM_ASSERT_EQ(stm_bdev_layout_bytes(d), forged);
+        stm_bdev_close(d);
+    }
+
+    open_bdevs(bds);
+    pool = make_multi_pool(bds);
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, NULL, &s2));
+    STM_ASSERT_EQ(stm_bdev_layout_bytes(bds[2]), TEST_DEVICE_BYTES);
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s2, &info));
+    uint32_t cs = stm_sb_ring_slot_for_gen(info.auth_gen);
+    uint64_t lo[STM_LABELS_PER_DEVICE], off = 0;
+    uint8_t buf[STM_UB_SIZE];
+    stm_uberblock got;
+    STM_ASSERT_OK(stm_label_offsets(TEST_DEVICE_BYTES, lo));
+    STM_ASSERT_OK(stm_ub_slot_offset(lo[2], cs, &off));
+    STM_ASSERT_OK(stm_bdev_read(bds[2], off, buf, sizeof buf));
+    STM_ASSERT_OK(stm_ub_decode(buf, sizeof buf, &got));
+    STM_ASSERT_EQ(stm_load_le64(got.ub_gen), info.auth_gen);
+    STM_ASSERT_OK(stm_label_offsets(forged, lo));
+    STM_ASSERT_OK(stm_ub_slot_offset(lo[2], cs, &off));
+    STM_ASSERT_OK(stm_bdev_read(bds[2], off, buf, sizeof buf));
+    STM_ASSERT_ERR(stm_ub_decode(buf, sizeof buf, &got), STM_ENOENT);
+
+    stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
 STM_TEST(sync_multi_mount_detects_alloc_root_gen_tamper) {
     /* R14 P2 regression: ub_alloc_root_gen is a SHARED field (same
      * across all devices' UBs for a given commit). The byte-level
@@ -1190,8 +1261,9 @@ STM_TEST(sync_multi_reserve_mirror_refuses_none_profile) {
     teardown_mirror_pool(bds, as, pool, s);
 }
 
-/* attach_alloc refuses device_id == 0 (primary already attached) and
- * a second attach for the same device_id. */
+/* attach_alloc refuses device_id == 0 (primary already attached), an
+ * allocator whose data area runs past its device's layout, and a second
+ * attach for the same device_id. */
 STM_TEST(sync_multi_attach_alloc_arg_validation) {
     make_paths("attach_val");
     stm_bdev *bds[NDEV] = {0};
@@ -1208,6 +1280,20 @@ STM_TEST(sync_multi_attach_alloc_arg_validation) {
 
     /* mismatched device_id on alloc (as[2] has id=2; try to attach at 1). */
     STM_ASSERT_ERR(stm_sync_attach_alloc(s, 1, as[2]), STM_EINVAL);
+
+    /* An allocator spanning past its device's tail labels: the device
+     * laid out 1 MiB shorter than the allocator was opened at, as a scan
+     * of a device that grew leaves it (vote 161). */
+    const stm_bdev_caps *caps1 = stm_bdev_caps_of(bds[1]);
+    STM_ASSERT(caps1 != NULL);
+    if (caps1)
+        stm_bdev_set_layout_bytes(bds[1], caps1->size_bytes - UINT64_C(1024) * 1024u);
+    STM_ASSERT_ERR(stm_sync_attach_alloc(s, 1, as[1]), STM_EINVAL);
+    /* A device smaller than its layout, as a scan of one that shrank
+     * leaves it: STM_ERANGE, not the geometry mismatch. */
+    stm_bdev_set_layout_bytes(bds[1], TEST_DEVICE_BYTES + UINT64_C(1024) * 1024u);
+    STM_ASSERT_ERR(stm_sync_attach_alloc(s, 1, as[1]), STM_ERANGE);
+    stm_bdev_set_layout_bytes(bds[1], 0);
 
     /* Normal: attach as[1] at device_id=1. */
     STM_ASSERT_OK(stm_sync_attach_alloc(s, 1, as[1]));

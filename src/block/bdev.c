@@ -107,6 +107,19 @@ const stm_bdev_caps *stm_bdev_caps_of(const stm_bdev *d)
     return d ? &d->caps : NULL;
 }
 
+uint64_t stm_bdev_layout_bytes(const stm_bdev *d)
+{
+    if (!d) return 0;
+    uint64_t set = atomic_load_explicit(&((stm_bdev *)d)->layout_bytes,
+                                        memory_order_relaxed);
+    return set ? set : d->caps.size_bytes;
+}
+
+void stm_bdev_set_layout_bytes(stm_bdev *d, uint64_t bytes)
+{
+    if (d) atomic_store_explicit(&d->layout_bytes, bytes, memory_order_relaxed);
+}
+
 /* The kinds of faulted read stm_bdev_inject_read_range* arm. */
 enum { RR_ANSWER = 0, RR_ZERO, RR_FROM };
 

@@ -1758,9 +1758,10 @@ static void say_why_mount_failed(const stm_stratumd_opts *opts, stm_status rc)
 }
 
 /* A mount that stops rather than roll back past a commit it cannot read, or
- * past a newer build's, or that finds only an older build's pool, says where
- * that uberblock is, so the slot can be found and dealt with. Returns whether
- * it said anything. */
+ * past a newer build's, or that finds only an older build's pool, or a
+ * device smaller than the pool recorded, or an uberblock whose recorded
+ * size does not fit where it was read, says where that uberblock is, so the
+ * slot can be found and dealt with. Returns whether it said anything. */
 static bool say_scan_refusal(const stm_stratumd_opts *opts, stm_status rc,
                              const stm_sb_scan_refusal *why)
 {
@@ -1781,6 +1782,22 @@ static bool say_scan_refusal(const stm_stratumd_opts *opts, stm_status rc,
                 opts->fs_path, why->version, why->label_idx, why->slot_idx,
                 (unsigned long long)why->byte_offset, (unsigned)STM_UB_VERSION_MIN_COMPAT,
                 (unsigned)STM_UB_VERSION);
+        return true;
+    }
+    if (rc == STM_ERANGE && why->recorded_bytes != 0) {
+        fprintf(stderr, "stratumd: %s is %llu bytes, smaller than the %llu bytes the pool "
+                        "recorded for it (uberblock in label %u slot %u): the end of the pool "
+                        "is gone, and the mount stops; restore the device's size\n",
+                opts->fs_path, (unsigned long long)why->device_bytes,
+                (unsigned long long)why->recorded_bytes, why->label_idx, why->slot_idx);
+        return true;
+    }
+    if (rc == STM_ECORRUPT && why->best_gen != 0) {
+        fprintf(stderr, "stratumd: %s: the uberblock of generation %llu in label %u slot %u "
+                        "(byte offset %llu) records no size, or another size, for this device "
+                        "than the one its labels were read at; the mount stops\n",
+                opts->fs_path, (unsigned long long)why->best_gen, why->label_idx,
+                why->slot_idx, (unsigned long long)why->byte_offset);
         return true;
     }
     if (rc != STM_EIO || why->gen == 0) return false;

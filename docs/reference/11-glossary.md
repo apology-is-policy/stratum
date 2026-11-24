@@ -50,6 +50,7 @@ documents them in depth.
 |---|---|---|
 | **auth_gen** | Most-recent committed final gen with quorum. 0 on fresh pool. Commits advance by 2; mount-claim by 1. | [07-sb-sync](07-sb-sync.md) |
 | **commit ring** | The circular 63-slot UB rotation, each generation in all 4 labels (v34). `slot = gen % 63`. | [07-sb-sync](07-sb-sync.md) |
+| **layout size** | The device size the pool's layout uses: labels 2 and 3 end at it and the data area stops below them. The size the device's roster entry recorded when it joined the pool, read at mount from labels 0 and 1 (v35, `stm_bdev_layout_bytes`). | [07-sb-sync](07-sb-sync.md) |
 | **content-quorum** | Byte-level agreement of shared UB fields across ≥quorum devices at `auth_gen`. Violating pools are rejected at mount (R14). | [07-sb-sync](07-sb-sync.md), [10-specs](10-specs.md) |
 | **EvacuationAtomic** | Spec invariant (evac.tla): every block has ≥`MirrorN` replicas on non-REMOVED devices at every reachable state. | [10-specs](10-specs.md) |
 | **gen** | Generation counter — monotonic per commit. 1 for fresh pool's first commit; `auth + 2` for subsequent commits. | [07-sb-sync](07-sb-sync.md) |

@@ -672,11 +672,11 @@ STM_TEST(xattr_op_without_attach_refused) {
 /* Compile-time invariants.                                            */
 /* ------------------------------------------------------------------ */
 
-STM_TEST(xattr_ub_version_is_v34) {
-    /* F1c bumped STM_UB_VERSION 33 -> 34 (each uberblock in all four
-     * labels). The xattr layer's on-disk value format is unchanged since
-     * v26 but rides the latest version constant. */
-    STM_ASSERT_EQ((unsigned)STM_UB_VERSION, (unsigned)34u);
+STM_TEST(xattr_ub_version_is_v35) {
+    /* STM_UB_VERSION 34 -> 35: labels 2 and 3 end at the device's
+     * recorded size. The xattr layer's on-disk value format is unchanged
+     * since v26 but rides the latest version constant. */
+    STM_ASSERT_EQ((unsigned)STM_UB_VERSION, (unsigned)35u);
 }
 
 /* ------------------------------------------------------------------ */

@@ -491,8 +491,8 @@ STM_TEST(pool_fs_roundtrip_populates_roster) {
      * restated here so a future version bump that forgets to
      * update this test fails loudly. */
     STM_ASSERT_EQ(stm_load_le32(ub.ub_version), STM_UB_VERSION);
-    STM_ASSERT_EQ(STM_UB_VERSION, 34u);  /* every uberblock in all four labels, v33 -> v34 */
-    STM_ASSERT_EQ(STM_UB_VERSION_MIN_COMPAT, 34u);  /* no upgrade path */
+    STM_ASSERT_EQ(STM_UB_VERSION, 35u);  /* labels 2 and 3 at the recorded size, v34 -> v35 */
+    STM_ASSERT_EQ(STM_UB_VERSION_MIN_COMPAT, 35u);  /* no upgrade path */
 
     /* Roster fields are populated. */
     STM_ASSERT_EQ(stm_load_le16(ub.ub_device_count), 1u);
@@ -667,7 +667,7 @@ static void mutate_device_id_out_of_range(stm_uberblock *ub) {
     ub->ub_device_id = stm_store_le16(5);
 }
 
-/* v34 has no upgrade path (the previous version's pools are re-created):
+/* v35 has no upgrade path (the previous version's pools are re-created):
  * a pool of the previous version refuses as one, STM_EBADVERSION, not
  * STM_ENOENT. */
 STM_TEST(pool_mount_refuses_a_pool_of_the_previous_version) {
@@ -1034,6 +1034,193 @@ STM_TEST(pool_add_device_appends_and_advances_roster_hash) {
     stm_bdev_close(d);
     stm_bdev_close(d2);
     unlink(g_tmp_path);
+}
+
+/* A device joins at its size, and its handle is laid out at it, whatever
+ * an earlier scan of the handle set (vote 161). */
+/* A live device's recorded size is the one its labels and data area are
+ * laid out at (vote 161): below what a layout needs, stm_pool_open
+ * refuses it. Control: the device's own size. */
+STM_TEST(pool_open_rejects_a_size_no_layout_fits) {
+    make_tmp("open_small");
+    stm_bdev *d = open_fresh_device();
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = POOL_UUID[0];
+    opts.pool_uuid[1] = POOL_UUID[1];
+    opts.device_count = 1;
+    opts.devices[0].uuid[0]    = DEVICE_UUID[0];
+    opts.devices[0].uuid[1]    = DEVICE_UUID[1];
+    opts.devices[0].size_bytes = UINT64_C(1024) * 1024u;
+    opts.devices[0].role       = STM_DEV_ROLE_DATA;
+    opts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    opts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    opts.devices[0].bdev       = d;
+    stm_pool *p = NULL;
+    STM_ASSERT_ERR(stm_pool_open(&opts, &p), STM_EINVAL);
+    STM_ASSERT(p == NULL);
+    opts.devices[0].size_bytes = TEST_DEVICE_BYTES;
+    STM_ASSERT_OK(stm_pool_open(&opts, &p));
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(pool_add_device_lays_it_out_at_its_size) {
+    make_tmp("add_device_layout");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+    stm_bdev *d2 = open_companion_device("add_device_layout");
+    STM_ASSERT(d2 != NULL);
+    stm_bdev_set_layout_bytes(d2, UINT64_C(20) * 1024u * 1024u);
+    stm_pool_device add = {
+        .uuid       = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .size_bytes = UINT64_C(20) * 1024u * 1024u,
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &add));
+    const stm_pool_device *info = stm_pool_device_info(p, 1);
+    STM_ASSERT(info != NULL);
+    if (info) STM_ASSERT_EQ(info->size_bytes, TEST_DEVICE_BYTES);
+    STM_ASSERT_EQ(stm_bdev_layout_bytes(d2), TEST_DEVICE_BYTES);
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+/* The image at g_tmp_path resized to `bytes` under no open handle: the
+ * backends only grow a device, so a shrink is the file's. */
+static void resize_image(uint64_t bytes)
+{
+    STM_ASSERT_EQ(truncate(g_tmp_path, (off_t)bytes), 0);
+    stm_bdev_open_opts bopts = stm_bdev_open_opts_default();
+    stm_bdev *d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &bopts, &d));
+    if (!d) return;
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    STM_ASSERT(caps != NULL);
+    if (caps) STM_ASSERT_EQ(caps->size_bytes, bytes);
+    stm_bdev_close(d);
+}
+
+/* Mount, reserve and commit; the data area's size before the commit. */
+static uint64_t mount_commit_unmount(const char *kf)
+{
+    stm_fs_mount_opts mopts;
+    memset(&mopts, 0, sizeof mopts);
+    mopts.keyfile_path = kf;
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return 0;
+    stm_fs_stats st;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_fs_reserve(fs, 4u, 0, &p));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    return st.data_total_blocks;
+}
+
+/* Vote 161, end to end. A pool on a device that grew mounts and commits
+ * at the size it was formatted at: the data area keeps its size, the
+ * newest commit's tail copies sit at the formatted end, the new end stays
+ * blank, and the device shrunk back to that size mounts again. Shrunk
+ * below it, the mount refuses, read-only too (STM_ERANGE, naming both
+ * sizes). */
+STM_TEST(pool_a_grown_device_keeps_its_layout_and_a_shrunk_one_refuses) {
+    make_tmp("grow_shrink");
+    char kf[256];
+    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_grow_kf_%d.bin", (int)getpid());
+    unlink(kf);
+    make_keyfile(kf);
+    stm_fs_format_opts fopts;
+    memset(&fopts, 0, sizeof fopts);
+    fopts.device_size_bytes = TEST_DEVICE_BYTES;
+    fopts.bootstrap_size_bytes = TEST_BOOTSTRAP_BYTES;
+    fopts.pool_uuid[0]   = POOL_UUID[0];
+    fopts.pool_uuid[1]   = POOL_UUID[1];
+    fopts.device_uuid[0] = DEVICE_UUID[0];
+    fopts.device_uuid[1] = DEVICE_UUID[1];
+    fopts.keyfile_path   = kf;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    uint64_t total = mount_commit_unmount(kf);
+    STM_ASSERT(total > 0);
+    resize_image(2u * TEST_DEVICE_BYTES);
+    STM_ASSERT_EQ(mount_commit_unmount(kf), total);
+    {
+        stm_fs_mount_opts mopts;
+        memset(&mopts, 0, sizeof mopts);
+        mopts.keyfile_path = kf;
+        mopts.read_only = true;
+        stm_fs *fs = NULL;
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        if (fs) {
+            stm_fs_stats st;
+            STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+            STM_ASSERT_EQ(st.data_total_blocks, total);
+            STM_ASSERT_OK(stm_fs_unmount(fs));
+        }
+    }
+
+    stm_bdev_open_opts bopts = stm_bdev_open_opts_default();
+    stm_bdev *d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &bopts, &d));
+    if (!d) return;
+    stm_uberblock ub;
+    uint32_t slot = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, NULL, &slot));
+    STM_ASSERT_EQ(stm_bdev_layout_bytes(d), TEST_DEVICE_BYTES);
+    uint64_t lo[STM_LABELS_PER_DEVICE];
+    STM_ASSERT_OK(stm_label_offsets(TEST_DEVICE_BYTES, lo));
+    for (uint32_t li = 2; li < STM_LABELS_PER_DEVICE; li++) {
+        uint8_t buf[STM_UB_SIZE];
+        stm_uberblock copy;
+        STM_ASSERT_OK(stm_bdev_read(d, lo[li] + (uint64_t)slot * STM_UB_SIZE,
+                                    buf, sizeof buf));
+        STM_ASSERT_OK(stm_ub_decode(buf, sizeof buf, &copy));
+        STM_ASSERT_EQ(stm_load_le64(copy.ub_gen), stm_load_le64(ub.ub_gen));
+    }
+    uint64_t now[STM_LABELS_PER_DEVICE];
+    STM_ASSERT_OK(stm_label_offsets(2u * TEST_DEVICE_BYTES, now));
+    bool blank = true;
+    for (uint64_t at = now[2]; at < now[2] + 2u * STM_LABEL_SIZE && blank;
+         at += STM_UB_SIZE) {
+        uint8_t buf[STM_UB_SIZE];
+        STM_ASSERT_OK(stm_bdev_read(d, at, buf, sizeof buf));
+        for (size_t i = 0; i < sizeof buf; i++)
+            if (buf[i]) blank = false;
+    }
+    STM_ASSERT(blank);
+    stm_bdev_close(d);
+
+    resize_image(TEST_DEVICE_BYTES);
+    STM_ASSERT_EQ(mount_commit_unmount(kf), total);
+
+    resize_image(TEST_DEVICE_BYTES - UINT64_C(1024) * 1024u);
+    for (int ro = 0; ro < 2; ro++) {
+        stm_fs_mount_opts mopts;
+        memset(&mopts, 0, sizeof mopts);
+        mopts.keyfile_path = kf;
+        mopts.read_only = ro != 0;
+        stm_sb_scan_refusal why;
+        mopts.scan_refusal = &why;
+        stm_fs *fs = NULL;
+        STM_ASSERT_ERR(stm_fs_mount(g_tmp_path, &mopts, &fs), STM_ERANGE);
+        STM_ASSERT(fs == NULL);
+        STM_ASSERT_EQ(why.recorded_bytes, TEST_DEVICE_BYTES);
+        STM_ASSERT_EQ(why.device_bytes,
+                      TEST_DEVICE_BYTES - UINT64_C(1024) * 1024u);
+    }
+    unlink(g_tmp_path);
+    unlink(kf);
 }
 
 STM_TEST(pool_add_device_rejects_duplicate_uuid) {

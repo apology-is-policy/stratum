@@ -39,6 +39,8 @@ struct stm_bdev {
     stm_bdev_caps              caps;
     char                      *path;        /* strdup'd */
     bool                       read_only;
+    /* stm_bdev_layout_bytes; 0 until set. */
+    atomic_uint_fast64_t       layout_bytes;
 
     /* CF-4 B barrier-defer window (block.h). Zero-init = disarmed —
      * every backend calloc's its struct. Single-armer contract: mutated

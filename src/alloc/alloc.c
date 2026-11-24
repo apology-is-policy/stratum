@@ -36,10 +36,13 @@
  * Data-area geometry (single-device MVP):
  *
  *   data_first_block = (STM_BOOTSTRAP_OFFSET + bootstrap_size_bytes) / 4096
- *   data_last_block  = (device_size_bytes - 2 × STM_LABEL_SIZE) / 4096 - 1
+ *   data_last_block  = (layout_bytes - 2 x STM_LABEL_SIZE) / 4096 - 1
  *
- * The two tail labels sit at the end of the device (ARCH §5.3.1), so the
- * data area is bounded above by `end_of_device - 2 × STM_LABEL_SIZE`.
+ * The two tail labels sit at the end of the device's layout (ARCH 5.3.1),
+ * the size its roster entry recorded when it joined the pool
+ * (stm_bdev_layout_bytes), so the data area is bounded above by
+ * `layout_bytes - 2 x STM_LABEL_SIZE`; space a device gained since stays
+ * unused.
  *
  * Thread safety: one mutex per stm_alloc protects the PENDING list and
  * serializes tree operations paired with that list. stm_btree_mt's own
@@ -506,15 +509,16 @@ static const stm_btree_store_vtable ALLOC_STORE_VT = {
 /* Data-area geometry.                                                        */
 /* ========================================================================= */
 
-static stm_status compute_data_area(stm_bdev *d, uint64_t bootstrap_size_bytes,
+static stm_status compute_data_area(const stm_bdev *d, uint64_t bootstrap_size_bytes,
                                      uint64_t *out_first_block,
                                      uint64_t *out_last_block)
 {
-    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
-    if (!caps) return STM_EINVAL;
+    if (!d) return STM_EINVAL;
+    uint64_t layout = stm_bdev_layout_bytes(d);
+    if (layout < (uint64_t)STM_LABEL_SIZE * 2u) return STM_ENOSPC;
 
     uint64_t head_end = STM_BOOTSTRAP_OFFSET + bootstrap_size_bytes;
-    uint64_t tail_start = caps->size_bytes - (uint64_t)STM_LABEL_SIZE * 2u;
+    uint64_t tail_start = layout - (uint64_t)STM_LABEL_SIZE * 2u;
     if (head_end >= tail_start) return STM_ENOSPC;
 
     /* Round head_end UP to a block boundary (should already be aligned
@@ -968,6 +972,28 @@ stm_status stm_alloc_get_device_id(const stm_alloc *a, uint16_t *out_device_id)
     *out_device_id = a->device_id;
     pthread_mutex_unlock(&ma->lock);
     return STM_OK;
+}
+
+stm_status stm_alloc_check_layout(const stm_alloc *a, const stm_bdev *dev)
+{
+    if (!a) return STM_EINVAL;
+    if (!dev) dev = a->bdev;
+    const stm_bdev_caps *caps = stm_bdev_caps_of(dev);
+    if (!caps) return STM_EINVAL;
+    if (stm_bdev_layout_bytes(dev) > caps->size_bytes) return STM_ERANGE;
+    stm_alloc *ma = (stm_alloc *)a;
+    pthread_mutex_lock(&ma->lock);
+    stm_bootstrap_stats bstats;
+    stm_status s = stm_bootstrap_stats_get(a->boot, &bstats);
+    uint64_t first = 0, last = 0;
+    if (s == STM_OK)
+        s = compute_data_area(dev, bstats.bootstrap_size_blocks * STM_UB_SIZE,
+                              &first, &last);
+    if (s == STM_OK)
+        s = first == a->data_first_block && last == a->data_last_block
+                ? STM_OK : STM_EINVAL;
+    pthread_mutex_unlock(&ma->lock);
+    return s;
 }
 
 void stm_alloc_close(stm_alloc *a)
