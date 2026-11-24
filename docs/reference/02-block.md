@@ -44,7 +44,7 @@ Open options:
 | `queue_depth` | Async queue size. 0 → backend default (512). |
 | `fixed_buffer_bytes` | io_uring only — fixed-buffer region size. |
 | `posix_threads` | Thread-pool size on POSIX async. 0 → CPU count, capped 64. |
-| `claimed_fd` | NULL, or where a descriptor the caller holds on the device is (`stm_bdev_claim_image` gives one): that open file is the device, `path` only names it, nothing is created, and `direct` cannot be asked. A negative one stands for none. |
+| `claimed_fd` | NULL, or where a descriptor the caller holds on the device is (`stm_bdev_claim_image` gives one): that open file is the device, `path` only names it, nothing is created, and `direct` cannot be asked. A negative one stands for none. The claim refuses a disk the system is using (mounted), `STM_EBUSY` with errno `EBUSY`: macOS opens no such disk, and on Linux the claim also opens a disk exclusively (`O_EXCL`), holding the exclusion while its descriptor is open. |
 
 `stm_bdev_caps` reports the backend actually selected, logical size,
 physical block size, max single-op size, whether TRIM / SQPOLL / DAX /
@@ -131,6 +131,8 @@ Three source files under `src/block/`:
   simulated via a fixed thread pool that drains an internal queue;
   completion delivery is via per-device lockless queue + condvar.
   Its sizing (`op_current_size`) fstats a regular file.
+  Its fsync on macOS is `F_FULLFSYNC` for a file; a disk answers that
+  ENOTTY, so a disk's is `fsync` then `DKIOCSYNCHRONIZECACHE`.
 - `iouring.c` — Linux io_uring backend. Sync ops issue a single SQE,
   wait in the same thread for its CQE. Async ops submit + return,
   driving completion via user-thread `poll_completions` +

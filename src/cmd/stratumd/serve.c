@@ -1693,12 +1693,16 @@ static stm_status stratumd_run_provision(const stm_stratumd_opts *opts, const in
 
 /*
  * Two daemons on one image each write commits the other knows nothing of, and
- * the pool is lost. A volume is a file, so opening it twice takes only two
- * windows.
+ * the pool is lost. A volume is a file or a disk, so opening it twice takes
+ * only two windows; a disk the system has mounted is another writer.
  */
 static stm_status image_lock(const char *path, int *out_fd)
 {
     stm_status s = stm_bdev_claim_image(path, false, out_fd);
+    if (s == STM_EBUSY && errno == EBUSY) {
+        fprintf(stderr, "stratumd: a disk the system is using (mounted?): %s\n", path);
+        return s;
+    }
     if (s == STM_EBUSY) {
         fprintf(stderr, "stratumd: already open in another stratumd: %s\n", path);
         return s;

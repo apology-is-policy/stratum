@@ -27,6 +27,7 @@
 
 #if defined(__APPLE__)
 #  include <sys/disk.h>
+#  include <sys/ioctl.h>
 #elif defined(__linux__)
 #  include <linux/fs.h>
 #  include <sys/ioctl.h>
@@ -78,6 +79,7 @@ typedef struct {
     uint32_t                nthreads;
     atomic_bool             stop;
 
+    bool                    is_disk;       /* not a regular file */
 } posix_bdev;
 
 /* ------------------------------------------------------------------------- */
@@ -154,10 +156,23 @@ static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t
     return posix_pwrite_full(d->fd, buf, len, (off_t)off);
 }
 
+#if defined(__APPLE__)
+/* A disk answers F_FULLFSYNC and F_BARRIERFSYNC ENOTTY: fsync() writes out what
+ * the system buffers for it, and the drive is then asked to write its own cache,
+ * as F_FULLFSYNC does for a file. */
+static stm_status disk_flush(int fd)
+{
+    if (fsync(fd) == -1) return errno_to_status(errno);
+    if (ioctl(fd, DKIOCSYNCHRONIZECACHE) == -1) return errno_to_status(errno);
+    return STM_OK;
+}
+#endif
+
 static stm_status op_fsync(stm_bdev *base)
 {
     posix_bdev *d = (posix_bdev *)base;
 #if defined(__APPLE__)
+    if (d->is_disk) return disk_flush(d->fd);
     /* On macOS, fsync() does not flush the disk cache. F_FULLFSYNC does. */
     if (fcntl(d->fd, F_FULLFSYNC) == -1) return errno_to_status(errno);
     return STM_OK;
@@ -171,6 +186,7 @@ static stm_status op_fdatasync(stm_bdev *base)
 {
     posix_bdev *d = (posix_bdev *)base;
 #if defined(__APPLE__)
+    if (d->is_disk) return disk_flush(d->fd);
     /* macOS has no fdatasync; F_BARRIERFSYNC (10.14+) is closest. */
     if (fcntl(d->fd, F_BARRIERFSYNC) == -1) {
         if (fsync(d->fd) == -1) return errno_to_status(errno);
@@ -580,6 +596,7 @@ stm_status stm_bdev_open_posix(const char *path,
     d->base.read_only = opts->read_only;
     d->base.path      = strdup(path);
     d->fd             = fd;
+    d->is_disk        = (st.st_mode & S_IFMT) != S_IFREG;
 
     d->base.caps.backend            = STM_BDEV_BACKEND_POSIX;
     d->base.caps.size_bytes         = query_size(fd, &st);
