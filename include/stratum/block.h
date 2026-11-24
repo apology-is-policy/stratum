@@ -257,7 +257,8 @@ typedef struct {
 } stm_op_result;
 
 /* Completion callback. `res` is stack-valid during the call only. Every op a
- * submit takes completes exactly once, whole or failed. */
+ * submit takes completes exactly once, whole or failed, short of the device's
+ * close, which drops what has not completed. */
 typedef void (*stm_bdev_completion_cb)(const stm_op_result *res);
 
 /* A span past caps.size_bytes completes at once with STM_EIO and no bytes:

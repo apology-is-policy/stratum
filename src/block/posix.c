@@ -636,9 +636,9 @@ stm_status stm_bdev_open_posix(const char *path,
         if (nprocs > 64) nprocs = 64;
         n = (uint32_t)nprocs;
     }
-    d->nthreads = n;
     d->threads  = calloc(n, sizeof *d->threads);
     if (!d->threads) { op_close(&d->base); return STM_ENOMEM; }
+    d->nthreads = n;
 
     for (uint32_t i = 0; i < n; i++) {
         if (pthread_create(&d->threads[i], NULL, worker_main, d) != 0) {

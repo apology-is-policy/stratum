@@ -113,6 +113,11 @@ static pending *pending_alloc(iouring_bdev *d)
 
 static void pending_release(iouring_bdev *d, pending *p)
 {
+    /* A second release would put the slot on the free list twice, and two ops in it. */
+    if (!p->in_use) {
+        fprintf(stderr, "stratum: io_uring op slot released twice\n");
+        abort();
+    }
     p->in_use = false;
     p->next_free = d->free_list;
     d->free_list = p;
@@ -353,8 +358,7 @@ static stm_status wait_for_slot(iouring_bdev *d)
 /* Submit one op and wait for completion, which is whole or failed. */
 static stm_status sync_one(iouring_bdev *d,
                            stm_op_kind kind,
-                           uint64_t off, void *buf, size_t len,
-                           stm_op_result *out)
+                           uint64_t off, void *buf, size_t len)
 {
     sync_wait w;
     w.res = (stm_op_result){ 0 };
@@ -407,8 +411,6 @@ static stm_status sync_one(iouring_bdev *d,
         }
     }
     pthread_mutex_unlock(&d->cq_lock);
-
-    if (out) *out = w.res;
     return w.res.status;
 }
 
@@ -417,18 +419,18 @@ static stm_status sync_one(iouring_bdev *d,
 static stm_status op_read(stm_bdev *base, uint64_t off, void *buf, size_t len)
 {
     if (len == 0) return STM_OK;
-    return sync_one((iouring_bdev *)base, STM_OP_READ, off, buf, len, NULL);
+    return sync_one((iouring_bdev *)base, STM_OP_READ, off, buf, len);
 }
 
 static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t len)
 {
     if (len == 0) return STM_OK;
-    return sync_one((iouring_bdev *)base, STM_OP_WRITE, off, (void *)buf, len, NULL);
+    return sync_one((iouring_bdev *)base, STM_OP_WRITE, off, (void *)buf, len);
 }
 
 static stm_status op_fsync(stm_bdev *base)
 {
-    return sync_one((iouring_bdev *)base, STM_OP_FSYNC, 0, NULL, 0, NULL);
+    return sync_one((iouring_bdev *)base, STM_OP_FSYNC, 0, NULL, 0);
 }
 
 static stm_status op_fdatasync(stm_bdev *base)
