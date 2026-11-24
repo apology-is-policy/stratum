@@ -128,21 +128,16 @@ struct volume_ask {
     bool     key_named;
 };
 
-/* A key kept beside a disk would be in /dev, which on Linux is lost at the next boot. */
-static void say_disk_needs_key(const char *image_path)
-{
-    fprintf(stderr,
-        "stratum-mkfs: %s is a disk, which has no directory of its own to keep its key "
-        "in: name where the key goes with --keyfile\n", image_path);
-}
-
 #if !defined(__thylacine__)
 /* 1, said, when a disk of `disk_bytes` cannot be what the command line asks. */
 static int disk_refused(const char *image_path, uint64_t disk_bytes,
                         const struct volume_ask *ask)
 {
+    /* A key kept beside a disk would be in /dev, which on Linux is lost at the next boot. */
     if (!ask->key_named) {
-        say_disk_needs_key(image_path);
+        fprintf(stderr,
+            "stratum-mkfs: %s is a disk, which has no directory of its own to keep its key "
+            "in: name where the key goes with --keyfile\n", image_path);
         return 1;
     }
     /* A disk cannot be resized, so it is formatted whole. */
@@ -1054,12 +1049,10 @@ int stm_cmd_mkfs_main(int argc, char **argv)
      * didn't specify --bootstrap explicitly. The libfs heuristic
      * (max(64 MiB, dev/1024)) is too generous for tiny test volumes
      * (would refuse 16-MiB images); ours is default_bootstrap_for's.
-     * A disk's size is known only once it is claimed: asked there. */
+     * Without --size the size is a disk's or the default, known only once the
+     * volume is claimed, and asked there; the volume is not looked at before. */
     bool bootstrap_named = bootstrap_bytes != 0;
-    struct stat image_st;
-    bool maybe_disk = stat(image_path, &image_st) == 0 &&
-                      (S_ISBLK(image_st.st_mode) || S_ISCHR(image_st.st_mode));
-    if (!maybe_disk &&
+    if (size_named &&
             size_volume(device_bytes, bootstrap_named, &bootstrap_bytes, "--size") != 0)
         return 1;
 
@@ -1071,10 +1064,6 @@ int stm_cmd_mkfs_main(int argc, char **argv)
 
     /* Default keyfile path is <image>.key. */
     bool key_named = keyfile_path != NULL;
-    if (maybe_disk && S_ISBLK(image_st.st_mode) && !key_named) {
-        say_disk_needs_key(image_path);
-        return 1;
-    }
     char default_key_path[1024];
     if (!keyfile_path) {
         int n = snprintf(default_key_path, sizeof default_key_path,
