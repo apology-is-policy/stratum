@@ -368,7 +368,8 @@ static int flock_ex_waiting(int fd)
  * locked as well, where every claim of the disk meets. */
 static bool block_twin_name(const struct stat *st, char *twin, size_t n)
 {
-    const char *r = devname(st->st_rdev, S_IFCHR);
+    char name[64];
+    const char *r = devname_r(st->st_rdev, S_IFCHR, name, (int)sizeof name);
     return r && strncmp(r, "rdisk", 5) == 0 && snprintf(twin, n, "/dev/%s", r + 1) < (int)n;
 }
 #endif
@@ -384,7 +385,9 @@ stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd, int 
     int fd = open(path, O_RDWR | flags, 0600);
     /* A disk the system has mounted: macOS refuses its block node any open. */
     if (fd < 0 && errno == EBUSY) return STM_EBUSY;
+#if defined(__linux__)
     bool rw = fd >= 0;
+#endif
     /* Whatever refuses writing (EACCES, EROFS, EPERM on an immutable file, ETXTBSY)
      * still leaves a read-only open, and so the lock. */
     if (fd < 0 && errno != ENOENT && errno != EISDIR && errno != EEXIST)
@@ -392,16 +395,17 @@ stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd, int 
     if (fd < 0) return errno == ENOENT ? STM_ENOENT : STM_EIO;
     struct stat st;
 #if defined(__linux__)
-    bool blk = false;
+    bool blkdev = false;
 #endif
     int hold = -1;
     if (fstat(fd, &st) == 0) {
 #if defined(__APPLE__)
         /* The raw node of a mounted disk opens read-write (measured: /dev/rdiskNsM
          * with its slice mounted, read-write or read-only), where its block node,
-         * even for reading, is refused EBUSY. */
+         * even for reading, is refused EBUSY. A claim that could open the raw node
+         * for reading alone holds the block node all the same. */
         char twin[64];
-        if (rw && S_ISCHR(st.st_mode) && block_twin_name(&st, twin, sizeof twin)) {
+        if (S_ISCHR(st.st_mode) && block_twin_name(&st, twin, sizeof twin)) {
             hold = open(twin, O_RDONLY | O_CLOEXEC | O_NOCTTY);
             if (hold < 0) {
                 int e = errno;
@@ -409,11 +413,15 @@ stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd, int 
                 errno = e;
                 return e == EBUSY ? STM_EBUSY : STM_EIO;
             }
+            struct stat ts;
+            if (fstat(hold, &ts) != 0 || !S_ISBLK(ts.st_mode) || ts.st_rdev != st.st_rdev) {
+                close(hold);
+                close(fd);
+                return STM_ESTALE;
+            }
         }
 #elif defined(__linux__)
-        blk = rw && S_ISBLK(st.st_mode);
-#else
-        (void)rw;
+        blkdev = S_ISBLK(st.st_mode);
 #endif
     }
 #if defined(__linux__)
@@ -421,7 +429,7 @@ stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd, int 
      * it (EBUSY: mounted, a RAID or LVM member, swap, or another claim), and
      * the exclusion is held while that descriptor is open. By name, not
      * through /proc, which may not be mounted. */
-    if (blk) {
+    if (rw && blkdev) {
         int x = open(path, O_RDWR | O_EXCL | O_NOCTTY | O_CLOEXEC);
         if (x < 0) {
             int e = errno;
@@ -455,7 +463,14 @@ stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd, int 
         return locked == 0 ? STM_OK : STM_ENOLCK;
     }
 #endif
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0 || (hold >= 0 && flock(hold, LOCK_EX | LOCK_NB) != 0)) {
+#if defined(__linux__)
+    /* A device opened for reading alone takes no exclusive open; its lock waits
+     * udev's out as well. */
+    int got = blkdev ? flock_ex_waiting(fd) : flock(fd, LOCK_EX | LOCK_NB);
+#else
+    int got = flock(fd, LOCK_EX | LOCK_NB);
+#endif
+    if (got != 0 || (hold >= 0 && flock(hold, LOCK_EX | LOCK_NB) != 0)) {
         int e = errno;
         close(fd);
         if (hold >= 0) close(hold);
