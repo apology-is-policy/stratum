@@ -1667,6 +1667,7 @@ static stm_status write_ub_to_all_devices(stm_sync *s,
     size_t n = stm_pool_device_count(s->pool);
     size_t confirmed = 0;
     size_t ro_skipped = 0;
+    size_t attempted = 0;                /* devices written; not REMOVED or FAULTED */
     stm_status last_hard_err = STM_OK;   /* R14 P3-5: for diag propagation */
     for (size_t i = 0; i < n; i++) {
         stm_bdev *d = stm_pool_device_bdev(s->pool, (uint16_t)i);
@@ -1682,6 +1683,7 @@ static stm_status write_ub_to_all_devices(stm_sync *s,
          * P5-4d-α skip. */
         const stm_pool_device *di = stm_pool_device_info(s->pool, (uint16_t)i);
         if (di && di->state == STM_DEV_STATE_FAULTED) continue;
+        attempted++;
 
         /* Copy shared bytes, then overwrite per-device fields. */
         stm_uberblock ub = *prototype_ub;
@@ -1707,10 +1709,13 @@ static stm_status write_ub_to_all_devices(stm_sync *s,
     size_t quorum = sync_quorum_n(s);
     if (confirmed >= quorum) return STM_OK;
 
-    /* R14 P3-5: if every device was RO and none had a hard failure,
-     * propagate STM_EROFS so the caller can distinguish "can't write"
-     * from "wrote but didn't achieve quorum". */
-    if (confirmed + ro_skipped == n && ro_skipped > 0) return STM_EROFS;
+    /* R14 P3-5: if every device written was RO and none had a hard
+     * failure, propagate STM_EROFS so the caller can distinguish "can't
+     * write" from "wrote but didn't achieve quorum". Against the devices
+     * written, not the roster: a REMOVED or FAULTED slot is never
+     * written; counted, it would fail every read-only open of a pool
+     * holding one (STM_EQUORUM). */
+    if (confirmed + ro_skipped == attempted && ro_skipped > 0) return STM_EROFS;
 
     /* R14 P3-5: if NO device confirmed and at least one returned a
      * specific I/O error (STM_EIO, STM_ENOSPC, etc.), propagate that

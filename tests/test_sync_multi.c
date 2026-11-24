@@ -1768,6 +1768,130 @@ STM_TEST(sync_multi_mirror_write_refuses_read_only) {
     unlink_paths();
 }
 
+/* Reopen the pool at g_paths from device 0's roster, as a remount does:
+ * every slot not REMOVED gets its device, read-only when `ro`, and a
+ * REMOVED slot none (its bds[] entry stays NULL). Answers stm_sync_open's
+ * status; the handles are out either way (*s only on STM_OK). */
+static stm_status reopen_from_roster(bool ro, stm_bdev *bds[NDEV],
+                                     stm_alloc *as[NDEV], stm_pool **pool,
+                                     stm_sync **s)
+{
+    for (size_t i = 0; i < NDEV; i++) {
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        bo.read_only = ro;
+        STM_ASSERT_OK(stm_bdev_open(g_paths[i], &bo, &bds[i]));
+        as[i] = NULL;
+    }
+    stm_uberblock ub;
+    uint32_t lbl = 0, slot = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(bds[0], &ub, &lbl, &slot));
+    uint16_t count = stm_load_le16(ub.ub_device_count);
+    STM_ASSERT_EQ(count, (uint16_t)NDEV);
+    stm_pool_device dev[STM_POOL_DEVICES_MAX];
+    memset(dev, 0, sizeof dev);
+    STM_ASSERT_OK(stm_pool_roster_decode(ub.ub_roster, count, dev));
+    stm_pool_open_opts po;
+    memset(&po, 0, sizeof po);
+    po.pool_uuid[0] = POOL_UUID[0];
+    po.pool_uuid[1] = POOL_UUID[1];
+    po.device_count = NDEV;
+    for (size_t i = 0; i < NDEV; i++) {
+        if (dev[i].state == STM_DEV_STATE_REMOVED) {
+            stm_bdev_close(bds[i]);
+            bds[i] = NULL;
+        }
+        dev[i].bdev = bds[i];
+        po.devices[i] = dev[i];
+    }
+    *pool = NULL;
+    STM_ASSERT_OK(stm_pool_open(&po, pool));
+    for (size_t i = 0; i < NDEV; i++) {
+        if (!bds[i]) continue;
+        STM_ASSERT_OK(stm_alloc_open_blank(bds[i], &as[i]));
+        STM_ASSERT_OK(stm_alloc_set_device_id(as[i], (uint16_t)i));
+    }
+    *s = NULL;
+    stm_status st = stm_sync_open(*pool, as[0], make_wk(), NULL, NULL, s);
+    if (st != STM_OK) return st;
+    for (size_t i = 1; i < NDEV; i++)
+        if (as[i]) STM_ASSERT_OK(stm_sync_attach_alloc(*s, (uint16_t)i, as[i]));
+    return STM_OK;
+}
+
+static void close_reopened(stm_bdev *bds[NDEV], stm_alloc *as[NDEV],
+                           stm_pool *pool, stm_sync *s)
+{
+    stm_sync_close(s);
+    close_multi_allocs(as);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+}
+
+/* A read-only open of a pool holding a REMOVED slot (`removed`) or a
+ * FAULTED one mounts read-only: the claim is refused by every device it
+ * is written to, and the slot is not one. Read-write, the same roster
+ * opens and claims (the fixture is a pool that opens; read-only is the
+ * one variable). */
+static void ro_open_with_a_slot_not_written(bool removed, const char *tag)
+{
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, tag, bds, as, &pool, &s);
+    if (removed) {
+        STM_ASSERT_OK(stm_pool_begin_evacuation(pool, 2, /*floor=*/2));
+        STM_ASSERT_OK(stm_sync_commit(s));
+        uint64_t op = 0, np = 0;
+        STM_ASSERT_ERR(stm_sync_evacuation_step(s, 2, 0, &op, &np), STM_ENOENT);
+        STM_ASSERT_OK(stm_pool_finish_evacuation(pool, 2));
+    } else {
+        STM_ASSERT_OK(stm_pool_fail_device(pool, 1));
+    }
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_info before;
+    STM_ASSERT_OK(stm_sync_info_get(s, &before));
+    stm_sync_close(s);
+    close_multi_allocs(as);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+
+    stm_bdev *rb[NDEV] = {0};
+    stm_alloc *ra[NDEV] = {0};
+    stm_pool *rp = NULL; stm_sync *rs = NULL;
+    STM_ASSERT_OK(reopen_from_roster(true, rb, ra, &rp, &rs));
+    const stm_pool_device *slot = stm_pool_device_info(rp, removed ? 2 : 1);
+    STM_ASSERT(slot != NULL);
+    if (slot) STM_ASSERT_EQ((int)slot->state,
+                            (int)(removed ? STM_DEV_STATE_REMOVED
+                                          : STM_DEV_STATE_FAULTED));
+    STM_ASSERT_EQ(rb[2] == NULL, removed);
+    if (rs) {
+        stm_sync_info ri;
+        STM_ASSERT_OK(stm_sync_info_get(rs, &ri));
+        STM_ASSERT_EQ(ri.auth_gen, before.auth_gen);
+        STM_ASSERT_ERR(stm_sync_commit(rs), STM_EROFS);
+    }
+    close_reopened(rb, ra, rp, rs);
+
+    STM_ASSERT_OK(reopen_from_roster(false, rb, ra, &rp, &rs));
+    if (rs) {
+        stm_sync_info wi;
+        STM_ASSERT_OK(stm_sync_info_get(rs, &wi));
+        STM_ASSERT_EQ(wi.auth_gen, before.auth_gen + 1u);
+        STM_ASSERT_OK(stm_sync_commit(rs));
+    }
+    close_reopened(rb, ra, rp, rs);
+    unlink_paths();
+}
+
+STM_TEST(sync_multi_a_read_only_open_with_a_removed_slot_mounts) {
+    ro_open_with_a_slot_not_written(true, "q_ro_rm");
+}
+
+STM_TEST(sync_multi_a_read_only_open_with_a_faulted_slot_mounts) {
+    ro_open_with_a_slot_not_written(false, "q_ro_flt");
+}
+
 /* ========================================================================= */
 /* P5-4a: device lifecycle — add_device integration with sync.                */
 /* ========================================================================= */
