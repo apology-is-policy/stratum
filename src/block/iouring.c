@@ -44,7 +44,10 @@ typedef struct pending {
     stm_op_kind            kind;
     stm_bdev_completion_cb cb;
     void                  *user;
+    uint8_t               *buf;          /* a write's is the caller's const buffer */
+    uint64_t               off;
     size_t                 len;
+    size_t                 done;         /* transferred by the op's earlier entries */
     struct pending        *next_free;
     bool                   in_use;
 } pending;
@@ -71,6 +74,8 @@ typedef struct {
 
     int               fail_submit_errno;   /* under lock; tests only */
     unsigned          fail_submit_count;
+    size_t            short_max;           /* under lock; tests only */
+    unsigned          short_count;
 } iouring_bdev;
 
 /* How long a kernel short of memory for requests is waited out. */
@@ -108,13 +113,56 @@ static pending *pending_alloc(iouring_bdev *d)
 
 static void pending_release(iouring_bdev *d, pending *p)
 {
+    /* A second release would put the slot on the free list twice, and two ops in it. */
+    if (!p->in_use) {
+        fprintf(stderr, "stratum: io_uring op slot released twice\n");
+        abort();
+    }
     p->in_use = false;
     p->next_free = d->free_list;
     d->free_list = p;
 }
 
+static stm_status submit_locked(iouring_bdev *d, pending *p,
+                                struct io_uring_sqe *sqe);
+
+/* What of the rest of p one entry asks the kernel for. Caller holds d->lock. */
+static unsigned int entry_len_locked(iouring_bdev *d, const pending *p)
+{
+    size_t rest = p->len - p->done;
+    if (d->short_count > 0 && rest > d->short_max) {
+        d->short_count--;
+        rest = d->short_max;
+    }
+    return (unsigned int)rest;
+}
+
+/* Puts the rest of a read or write the kernel did part of back in, as the next
+ * round of a pread loop does. Caller holds d->lock. False: it could not, and p
+ * is free again. */
+static bool resubmit_rest_locked(iouring_bdev *d, pending *p)
+{
+    struct io_uring_sqe *sqe = d->ring_dead ? NULL : io_uring_get_sqe(&d->ring);
+    if (!sqe) {
+        pending_release(d, p);
+        return false;
+    }
+    if (p->kind == STM_OP_READ)
+        io_uring_prep_read(sqe, d->fd, p->buf + p->done, entry_len_locked(d, p),
+                           p->off + p->done);
+    else
+        io_uring_prep_write(sqe, d->fd, p->buf + p->done, entry_len_locked(d, p),
+                            p->off + p->done);
+    return submit_locked(d, p, sqe) == STM_OK;
+}
+
 /* Dispatch CQEs to their registered callbacks. Returns count delivered.
- * Caller must be the reaper, and must NOT hold d->lock. */
+ * Caller must be the reaper, and must NOT hold d->lock.
+ *
+ * A read or write completes whole or failed, as posix's does: a short transfer
+ * goes back in for the rest (the op keeps its slot and stays in flight), and
+ * one that moves nothing with bytes left (the end of a file cut under the
+ * handle) fails STM_EIO. */
 static int drain_cqes(iouring_bdev *d, int max_events, bool blocking)
 {
     int delivered = 0;
@@ -143,20 +191,24 @@ static int drain_cqes(iouring_bdev *d, int max_events, bool blocking)
         pthread_mutex_lock(&d->lock);
         stm_op_result result = { .kind = p->kind, .user = p->user };
         stm_bdev_completion_cb cb = p->cb;
-        pending_release(d, p);
         atomic_fetch_sub(&d->inflight, 1);
+        bool rw = p->kind != STM_OP_FSYNC;
+        if (rw && res > 0 && (size_t)res < p->len - p->done) {
+            p->done += (size_t)res;
+            if (resubmit_rest_locked(d, p)) {
+                pthread_mutex_unlock(&d->lock);
+                continue;
+            }
+            res = -EIO;
+        } else {
+            if (rw && res >= 0) p->done += (size_t)res;
+            if (rw && res >= 0 && p->done < p->len) res = -EIO;
+            result.bytes = rw && res >= 0 ? p->len : 0;
+            pending_release(d, p);
+        }
         pthread_mutex_unlock(&d->lock);
 
-        if (res < 0) {
-            result.status = errno_to_status_ur(-res);
-            result.bytes  = 0;
-        } else if (result.kind == STM_OP_FSYNC) {
-            result.status = STM_OK;
-            result.bytes  = 0;
-        } else {
-            result.status = STM_OK;
-            result.bytes  = (size_t)res;
-        }
+        result.status = res < 0 ? errno_to_status_ur(-res) : STM_OK;
 
         cb(&result);
         delivered++;
@@ -229,6 +281,7 @@ static stm_status op_begin(iouring_bdev *d, stm_op_kind kind,
     p->cb   = cb;
     p->user = user;
     p->len  = len;
+    p->done = 0;
 
     struct io_uring_sqe *sqe = io_uring_get_sqe(&d->ring);
     if (!sqe) { pending_release(d, p); pthread_mutex_unlock(&d->lock); return STM_EAGAIN; }
@@ -302,12 +355,10 @@ static stm_status wait_for_slot(iouring_bdev *d)
     return n < 0 ? (stm_status)n : STM_OK;
 }
 
-/* Submit one op and wait for completion. One-shot — caller handles looping
- * for short transfers. */
+/* Submit one op and wait for completion, which is whole or failed. */
 static stm_status sync_one(iouring_bdev *d,
                            stm_op_kind kind,
-                           uint64_t off, void *buf, size_t len,
-                           stm_op_result *out)
+                           uint64_t off, void *buf, size_t len)
 {
     sync_wait w;
     w.res = (stm_op_result){ 0 };
@@ -360,52 +411,26 @@ static stm_status sync_one(iouring_bdev *d,
         }
     }
     pthread_mutex_unlock(&d->cq_lock);
-
-    if (out) *out = w.res;
     return w.res.status;
 }
 
-/*
- * Sync read: loop on short transfers the same way POSIX pread_full does.
- * A short completion indicates EOF hit mid-buffer or (on raw devices) a
- * transient partial. Zero bytes with OK status is treated as EOF → STM_EIO,
- * matching POSIX backend semantics so callers see one contract.
- */
+/* Sync read and write: one op, whole or failed (STM_EIO where a file cut under
+ * the handle ends first), as POSIX pread_full and pwrite_full are. */
 static stm_status op_read(stm_bdev *base, uint64_t off, void *buf, size_t len)
 {
-    iouring_bdev *d = (iouring_bdev *)base;
-    uint8_t *p = (uint8_t *)buf;
-    while (len > 0) {
-        stm_op_result res;
-        stm_status s = sync_one(d, STM_OP_READ, off, p, len, &res);
-        if (s != STM_OK) return s;
-        if (res.bytes == 0) return STM_EIO;  /* EOF with bytes remaining */
-        p   += res.bytes;
-        off += res.bytes;
-        len -= res.bytes;
-    }
-    return STM_OK;
+    if (len == 0) return STM_OK;
+    return sync_one((iouring_bdev *)base, STM_OP_READ, off, buf, len);
 }
 
 static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t len)
 {
-    iouring_bdev *d = (iouring_bdev *)base;
-    const uint8_t *p = (const uint8_t *)buf;
-    while (len > 0) {
-        stm_op_result res;
-        stm_status s = sync_one(d, STM_OP_WRITE, off, (void *)p, len, &res);
-        if (s != STM_OK) return s;
-        if (res.bytes == 0) return STM_EIO;
-        p   += res.bytes;
-        off += res.bytes;
-        len -= res.bytes;
-    }
-    return STM_OK;
+    if (len == 0) return STM_OK;
+    return sync_one((iouring_bdev *)base, STM_OP_WRITE, off, (void *)buf, len);
 }
 
 static stm_status op_fsync(stm_bdev *base)
 {
-    return sync_one((iouring_bdev *)base, STM_OP_FSYNC, 0, NULL, 0, NULL);
+    return sync_one((iouring_bdev *)base, STM_OP_FSYNC, 0, NULL, 0);
 }
 
 static stm_status op_fdatasync(stm_bdev *base)
@@ -509,7 +534,9 @@ static stm_status op_submit_read(stm_bdev *base, uint64_t off, void *buf,
     struct io_uring_sqe *sqe;
     stm_status s = op_begin(d, STM_OP_READ, cb, user, len, &p, &sqe);
     if (s != STM_OK) return s;
-    io_uring_prep_read(sqe, d->fd, buf, (unsigned int)len, off);
+    p->buf = (uint8_t *)buf;
+    p->off = off;
+    io_uring_prep_read(sqe, d->fd, buf, entry_len_locked(d, p), off);
 
     s = submit_locked(d, p, sqe);
     pthread_mutex_unlock(&d->lock);
@@ -527,7 +554,9 @@ static stm_status op_submit_write(stm_bdev *base, uint64_t off, const void *buf,
     struct io_uring_sqe *sqe;
     stm_status s = op_begin(d, STM_OP_WRITE, cb, user, len, &p, &sqe);
     if (s != STM_OK) return s;
-    io_uring_prep_write(sqe, d->fd, buf, (unsigned int)len, off);
+    p->buf = (uint8_t *)buf;
+    p->off = off;
+    io_uring_prep_write(sqe, d->fd, buf, entry_len_locked(d, p), off);
 
     s = submit_locked(d, p, sqe);
     pthread_mutex_unlock(&d->lock);
@@ -591,6 +620,17 @@ void stm_iouring_fail_submit(stm_bdev *base, int errnum, unsigned count)
     d->fail_submit_errno = errnum;
     d->fail_submit_count = count;
     pthread_mutex_unlock(&d->lock);
+}
+
+unsigned stm_iouring_short_entries(stm_bdev *base, size_t max_bytes, unsigned count)
+{
+    iouring_bdev *d = (iouring_bdev *)base;
+    pthread_mutex_lock(&d->lock);
+    unsigned left  = d->short_count;
+    d->short_max   = max_bytes;
+    d->short_count = max_bytes > 0 ? count : 0;
+    pthread_mutex_unlock(&d->lock);
+    return left;
 }
 
 static stm_status op_register_buffers(stm_bdev *base, void **bufs,

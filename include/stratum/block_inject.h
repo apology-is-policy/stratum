@@ -110,6 +110,23 @@ void stm_bdev_io_stats_reset(struct stm_bdev *d);
 void stm_bdev_iouring_fail_submit_for_test(struct stm_bdev *d, int errnum,
                                            unsigned count);
 
+/*
+ * io_uring only, a no-op answering 0 elsewhere: the next `count` kernel entries
+ * of reads and writes that would ask for more than `max_bytes` of what is left
+ * of their op ask for that much, as a short transfer leaves it (`max_bytes` 0
+ * disarms); an entry that asks no more is not counted. Answers how many entries
+ * the arming it replaces had left.
+ */
+unsigned stm_bdev_iouring_short_for_test(struct stm_bdev *d, size_t max_bytes,
+                                         unsigned count);
+
+/*
+ * POSIX only, a no-op elsewhere: from now on the backend makes at most `budget`
+ * more allocations for async ops, each one past it failing as if memory had
+ * run out; a negative `budget` lifts the cap.
+ */
+void stm_bdev_posix_alloc_budget_for_test(struct stm_bdev *d, int budget);
+
 #ifdef __cplusplus
 }
 #endif

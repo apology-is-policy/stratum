@@ -252,11 +252,13 @@ typedef enum {
 typedef struct {
     stm_op_kind kind;
     stm_status  status;     /* STM_OK on success, else negative */
-    size_t      bytes;      /* for READ/WRITE: bytes transferred */
+    size_t      bytes;      /* for READ/WRITE: the length asked, on STM_OK */
     void       *user;       /* echoed back from the submit call  */
 } stm_op_result;
 
-/* Completion callback. `res` is stack-valid during the call only. */
+/* Completion callback. `res` is stack-valid during the call only. Every op a
+ * submit takes completes exactly once, whole or failed, short of the device's
+ * close, which drops what has not completed. */
 typedef void (*stm_bdev_completion_cb)(const stm_op_result *res);
 
 /* A span past caps.size_bytes completes at once with STM_EIO and no bytes:
