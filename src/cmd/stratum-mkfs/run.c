@@ -122,7 +122,7 @@ static int size_volume(uint64_t bytes, bool bootstrap_named, uint64_t *bootstrap
                 pool, b);
     else if (s == STM_ENOSPC)
         fprintf(stderr, "stratum-mkfs: %s %llu leaves no room for data in %s %llu: "
-                "the volume holds 1.5M of labels besides it, and at least 4K of data\n",
+                "the volume keeps 1.5M for its labels besides it, and at least 4K for data\n",
                 pool, b, what, (unsigned long long)bytes);
     else if (s == STM_ENOTSUPPORTED)
         fprintf(stderr, "stratum-mkfs: %s %llu is larger than a bootstrap pool can be "

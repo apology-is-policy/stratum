@@ -1119,6 +1119,16 @@ static void setup_mirror_pool(uint8_t mn, const char *tag,
     STM_ASSERT_OK(stm_sync_commit(*sync_out));
 }
 
+static void teardown_mirror_pool_keep(stm_bdev *bds[NDEV],
+                                      stm_alloc *allocs[NDEV],
+                                      stm_pool *pool, stm_sync *s)
+{
+    stm_sync_close(s);
+    close_multi_allocs(allocs);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+}
+
 static void teardown_mirror_pool(stm_bdev *bds[NDEV],
                                    stm_alloc *allocs[NDEV],
                                    stm_pool *pool, stm_sync *s)
@@ -1777,16 +1787,18 @@ STM_TEST(sync_multi_mirror_write_refuses_read_only) {
 
 static void fault_gen_copies(stm_bdev *d, uint64_t gen);
 
-/* Reopen the pool at g_paths from device 0's roster, as a remount does:
- * every slot not REMOVED gets its device, read-only when `ro`, and a
- * REMOVED slot none (its bds[] entry stays NULL). unreadable_gen != 0:
- * every copy of that generation's slot on device 0 fails for good, read
- * after the roster. Answers stm_sync_open's status; the handles are out
- * either way (*s only on STM_OK). */
-static stm_status reopen_from_roster(bool ro, uint64_t unreadable_gen,
-                                     stm_bdev *bds[NDEV],
-                                     stm_alloc *as[NDEV], stm_pool **pool,
-                                     stm_sync **s)
+/* Reopen the pool at g_paths from device `roster_dev`'s roster, as a
+ * remount does: every slot not REMOVED gets its device, read-only when
+ * `ro`, and a REMOVED slot none (its bds[] entry stays NULL), nor a slot in
+ * the `gone` mask (a device no longer there). unreadable_gen != 0: every
+ * copy of that generation's slot on device 0 fails for good, read after
+ * the roster. A device in the `unattached` mask gets no allocator. Answers
+ * stm_sync_open's status; the handles are out either way (*s only on
+ * STM_OK). */
+static stm_status reopen_ex(bool ro, uint64_t unreadable_gen, size_t roster_dev,
+                            unsigned gone, unsigned unattached,
+                            stm_bdev *bds[NDEV], stm_alloc *as[NDEV],
+                            stm_pool **pool, stm_sync **s)
 {
     for (size_t i = 0; i < NDEV; i++) {
         stm_bdev_open_opts bo = stm_bdev_open_opts_default();
@@ -1797,7 +1809,7 @@ static stm_status reopen_from_roster(bool ro, uint64_t unreadable_gen,
     }
     stm_uberblock ub;
     uint32_t lbl = 0, slot = 0;
-    STM_ASSERT_OK(stm_sb_mount_scan(bds[0], &ub, &lbl, &slot));
+    STM_ASSERT_OK(stm_sb_mount_scan(bds[roster_dev], &ub, &lbl, &slot));
     uint16_t count = stm_load_le16(ub.ub_device_count);
     STM_ASSERT_EQ(count, (uint16_t)NDEV);
     stm_pool_device dev[STM_POOL_DEVICES_MAX];
@@ -1810,7 +1822,7 @@ static stm_status reopen_from_roster(bool ro, uint64_t unreadable_gen,
     po.pool_uuid[1] = POOL_UUID[1];
     po.device_count = NDEV;
     for (size_t i = 0; i < NDEV; i++) {
-        if (dev[i].state == STM_DEV_STATE_REMOVED) {
+        if (dev[i].state == STM_DEV_STATE_REMOVED || (gone & (1u << i))) {
             stm_bdev_close(bds[i]);
             bds[i] = NULL;
         }
@@ -1820,7 +1832,7 @@ static stm_status reopen_from_roster(bool ro, uint64_t unreadable_gen,
     *pool = NULL;
     STM_ASSERT_OK(stm_pool_open(&po, pool));
     for (size_t i = 0; i < NDEV; i++) {
-        if (!bds[i]) continue;
+        if (!bds[i] || (i != 0 && (unattached & (1u << i)))) continue;
         STM_ASSERT_OK(stm_alloc_open_blank(bds[i], &as[i]));
         STM_ASSERT_OK(stm_alloc_set_device_id(as[i], (uint16_t)i));
     }
@@ -1830,6 +1842,14 @@ static stm_status reopen_from_roster(bool ro, uint64_t unreadable_gen,
     for (size_t i = 1; i < NDEV; i++)
         if (as[i]) STM_ASSERT_OK(stm_sync_attach_alloc(*s, (uint16_t)i, as[i]));
     return STM_OK;
+}
+
+static stm_status reopen_from_roster(bool ro, uint64_t unreadable_gen,
+                                     stm_bdev *bds[NDEV],
+                                     stm_alloc *as[NDEV], stm_pool **pool,
+                                     stm_sync **s)
+{
+    return reopen_ex(ro, unreadable_gen, 0, 0, 0, bds, as, pool, s);
 }
 
 static void close_reopened(stm_bdev *bds[NDEV], stm_alloc *as[NDEV],
@@ -5369,6 +5389,163 @@ STM_TEST(sync_multi_commit_retry_writes_its_reservation_again) {
     rr_res_leg("rrres");
     rr_add_leg("rradd");
     rr_open_leg("rropen");
+}
+
+/* OPEN-BUGS (t): device 2 failed (gens 2 and 3 on devices 0 and 1),
+ * rejoined, and gens 4 and 5 were acknowledged by devices 1 and 2 while
+ * device 0 missed them, so device 0's roster still shows device 2 FAULTED.
+ * With device 2 gone, an open from that roster counts it an unknown vote
+ * that may hold gen 5 and refuses STM_EIO, writing nothing; counting it
+ * nothing, it mounted gen 3, past the acknowledged gen 5, and claimed over
+ * device 1's gen 4. With device 2 there it is read: gen 5 is the quorum's
+ * and its roster is not the one presented, STM_ECORRUPT. From device 1's
+ * roster with every device there, gen 5 mounts. */
+STM_TEST(sync_multi_open_counts_a_gone_device_an_unknown_vote) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "t_unk", bds, as, &pool, &s);
+    STM_ASSERT_OK(stm_pool_fail_device(pool, 2));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_pool_rejoin_device(pool, 2));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s, &info));
+    STM_ASSERT_EQ(info.auth_gen, 5u);
+    stm_sync_close(s);
+    close_multi_allocs(as);
+    stm_pool_close(pool);
+    uint8_t zeros[STM_UB_SIZE];
+    memset(zeros, 0, sizeof zeros);
+    for (uint64_t g = 4; g <= 5; g++)
+        for (uint32_t li = 0; li < STM_UB_COPIES; li++)
+            STM_ASSERT_OK(stm_bdev_write(bds[0], gen_copy_off(g, li), zeros,
+                                         sizeof zeros));
+    stm_uberblock before4;
+    STM_ASSERT_OK(stm_sb_label_read(bds[1], 0u, 4u, &before4));
+    STM_ASSERT_EQ(stm_load_le64(before4.ub_gen), 4u);
+    close_bdevs(bds);
+
+    stm_bdev *rb[NDEV] = {0};
+    stm_alloc *ra[NDEV] = {0};
+    stm_pool *rp = NULL; stm_sync *rs = NULL;
+    stm_status st = reopen_ex(false, 0, 0, 1u << 2, 0, rb, ra, &rp, &rs);
+    if (st == STM_OK && rs) {
+        stm_sync_info ri;
+        STM_ASSERT_OK(stm_sync_info_get(rs, &ri));
+        fprintf(stderr, "  gone: mounted gen %llu\n",
+                (unsigned long long)ri.mount_max_durable_gen);
+    }
+    STM_ASSERT_ERR(st, STM_EIO);
+    close_reopened(rb, ra, rp, rs);
+    {
+        stm_bdev *b1 = NULL;
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        STM_ASSERT_OK(stm_bdev_open(g_paths[1], &bo, &b1));
+        stm_uberblock after4;
+        STM_ASSERT_OK(stm_sb_label_read(b1, 0u, 4u, &after4));
+        STM_ASSERT_EQ(memcmp(&after4, &before4, sizeof after4), 0);
+        stm_bdev_close(b1);
+    }
+
+    STM_ASSERT_ERR(reopen_ex(false, 0, 0, 0, 0, rb, ra, &rp, &rs), STM_ECORRUPT);
+    close_reopened(rb, ra, rp, rs);
+
+    STM_ASSERT_OK(reopen_ex(false, 0, 1, 0, 0, rb, ra, &rp, &rs));
+    if (rs) {
+        stm_sync_info ri;
+        STM_ASSERT_OK(stm_sync_info_get(rs, &ri));
+        STM_ASSERT_EQ(ri.mount_max_durable_gen, 5u);
+    }
+    close_reopened(rb, ra, rp, rs);
+    unlink_paths();
+}
+
+/* OPEN-BUGS (t): a pool whose FAULTED device is gone opens without it,
+ * read-write and read-only, reads a block mirrored before, and commits
+ * read-write; before, stm_pool_open refused the slot and nothing opened
+ * the pool. The gone slot cannot rejoin, start an evacuation or take an
+ * allocator (STM_ENODEV), nor be removed: the pool records a tree for it
+ * that may hold replicas no read can see (STM_EBUSY), as for a device
+ * there whose allocator was not attached; with it attached and its tree
+ * empty, a device is removed (the control). */
+STM_TEST(sync_multi_degraded_pool_opens_without_a_gone_device) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "t_gone", bds, as, &pool, &s);
+    STM_ASSERT_OK(stm_pool_fail_device(pool, 2));
+    uint64_t paddrs[2] = { 0 };
+    uint8_t payload[STM_UB_SIZE];
+    for (size_t i = 0; i < sizeof payload; i++) payload[i] = (uint8_t)(i * 5u + 3u);
+    stm_blake3_hash want;
+    stm_blake3(payload, sizeof payload, &want);
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs));
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, 2u, payload, sizeof payload, NULL));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    teardown_mirror_pool_keep(bds, as, pool, s);
+
+    for (int ro = 0; ro <= 1; ro++) {
+        stm_bdev *rb[NDEV] = {0};
+        stm_alloc *ra[NDEV] = {0};
+        stm_pool *rp = NULL; stm_sync *rs = NULL;
+        STM_ASSERT_OK(reopen_ex(ro != 0, 0, 0, 1u << 2, 0, rb, ra, &rp, &rs));
+        if (rs) {
+            uint8_t back[STM_UB_SIZE];
+            memset(back, 0, sizeof back);
+            STM_ASSERT_OK(stm_sync_mirror_read(rs, paddrs, 2u, back, sizeof back,
+                                               want.bytes));
+            STM_ASSERT_EQ(memcmp(back, payload, sizeof back), 0);
+            if (ro) {
+                STM_ASSERT_ERR(stm_sync_commit(rs), STM_EROFS);
+            } else {
+                STM_ASSERT_OK(stm_sync_commit(rs));
+                STM_ASSERT_ERR(stm_pool_rejoin_device(rp, 2), STM_ENODEV);
+                STM_ASSERT_ERR(stm_pool_begin_evacuation(rp, 2, 1), STM_ENODEV);
+                /* An allocator that says it is device 2's, on another device. */
+                char xpath[300];
+                snprintf(xpath, sizeof xpath, "%s.x", g_paths[2]);
+                unlink(xpath);
+                stm_bdev *xb = NULL;
+                stm_alloc *xa = NULL;
+                stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+                STM_ASSERT_OK(stm_bdev_open(xpath, &bo, &xb));
+                STM_ASSERT_OK(stm_bdev_resize(xb, g_dev_bytes));
+                uint64_t xu[2] = { DEV_UUID_LO[2], DEV_UUID_HI };
+                STM_ASSERT_OK(stm_alloc_create(xb, POOL_UUID, xu, TEST_BOOTSTRAP_BYTES, &xa));
+                STM_ASSERT_OK(stm_alloc_set_device_id(xa, 2));
+                STM_ASSERT_ERR(stm_sync_attach_alloc(rs, 2, xa), STM_ENODEV);
+                stm_alloc_close(xa);
+                stm_bdev_close(xb);
+                unlink(xpath);
+                STM_ASSERT_ERR(stm_sync_remove_device(rs, 2, 1), STM_EBUSY);
+                const stm_pool_device *slot = stm_pool_device_info(rp, 2);
+                STM_ASSERT(slot && slot->state == STM_DEV_STATE_FAULTED);
+                STM_ASSERT_OK(stm_sync_commit(rs));
+            }
+        }
+        close_reopened(rb, ra, rp, rs);
+    }
+
+    /* A device there but not attached holds a tree the pool records. */
+    setup_mirror_pool(2, "t_unatt", bds, as, &pool, &s);
+    STM_ASSERT_OK(stm_sync_commit(s));
+    teardown_mirror_pool_keep(bds, as, pool, s);
+    {
+        stm_bdev *rb[NDEV] = {0};
+        stm_alloc *ra[NDEV] = {0};
+        stm_pool *rp = NULL; stm_sync *rs = NULL;
+        STM_ASSERT_OK(reopen_ex(false, 0, 0, 0, 1u << 2, rb, ra, &rp, &rs));
+        if (rs) STM_ASSERT_ERR(stm_sync_remove_device(rs, 2, 1), STM_EBUSY);
+        close_reopened(rb, ra, rp, rs);
+        STM_ASSERT_OK(reopen_ex(false, 0, 0, 0, 0, rb, ra, &rp, &rs));
+        if (rs) {
+            STM_ASSERT_OK(stm_sync_remove_device(rs, 2, 1));
+            STM_ASSERT_OK(stm_sync_commit(rs));
+        }
+        close_reopened(rb, ra, rp, rs);
+    }
+    unlink_paths();
 }
 
 STM_TEST_MAIN("sync_multi")

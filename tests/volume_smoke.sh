@@ -211,6 +211,28 @@ else
     no "mkfs over an existing volume stopped without saying why: $(tail -1 "$D/again.log")"
 fi
 [ "$(cksum < "$V")" = "$vh" ] && ok "the refused mkfs left the volume's bytes alone" || no "a refused mkfs changed the volume"
+# --force replaces a volume only with one it can lay out: a bootstrap that leaves the size no room
+# beside its labels for a block of data, or one not whole 4K blocks, is refused before anything is
+# written. On a copy, one block less of the same bootstrap formats (the control).
+for bad in 266862592 8388609; do
+    if printf '%s\n' "$PASS" | "$B" mkfs "$V" --size 256M --bootstrap "$bad" --force --passphrase-stdin > "$D/again.log" 2>&1; then
+        no "mkfs --force --bootstrap $bad answered success"
+    elif LC_ALL=C grep -Eq "^stratum-mkfs: --bootstrap $bad (leaves no room for data|is not a whole number of 4K blocks)" "$D/again.log"; then
+        ok "mkfs --force --bootstrap $bad is refused, and says why"
+    else
+        no "mkfs --force --bootstrap $bad stopped without saying why: $(tail -1 "$D/again.log")"
+    fi
+    [ "$(cksum < "$V")" = "$vh" ] && ok "mkfs --force --bootstrap $bad left the volume's bytes alone" \
+        || no "mkfs --force --bootstrap $bad changed the volume"
+    [ "$(cksum < "$V.key")" = "$kh" ] || no "mkfs --force --bootstrap $bad replaced the key"
+done
+cp "$V" "$D/ctl.stm" && cp "$V.key" "$D/ctl.stm.key" && chmod 600 "$D/ctl.stm.key"
+if printf '%s\n' "$PASS" | "$B" mkfs "$D/ctl.stm" --size 256M --bootstrap 266858496 --force --passphrase-stdin > "$D/ctl.log" 2>&1; then
+    ok "mkfs --force with a bootstrap that leaves one data block formats"
+else
+    no "mkfs --force --bootstrap 266858496: $(tail -1 "$D/ctl.log")"
+fi
+rm -f "$D/ctl.stm" "$D/ctl.stm.key"
 if printf '%s\n' other | "$B" mkfs "$D/new.stm" --size 64M --keyfile "$V.key" --passphrase-stdin > "$D/again.log" 2>&1; then
     no "a new volume replaced another volume's key"
 elif LC_ALL=C grep -q 'already exists' "$D/again.log"; then
@@ -226,7 +248,7 @@ fi
 # no key, and in a directory mkfs cannot write, that is still what is refused. One size larger, the
 # same bootstrap formats. Root writes a directory of mode 555 all the same, so as root that leg is
 # not run (a note says so).
-BOOT_NO="--bootstrap 71303168 must be < --size 67108864"
+BOOT_NO="stratum-mkfs: --bootstrap 71303168 leaves no room for data in --size 67108864"
 "$B" mkfs "$D/boot.stm" --bootstrap 68M < /dev/null > "$D/boot.log" 2>&1
 rc=$?
 rc_ro=

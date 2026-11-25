@@ -2347,7 +2347,16 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
     bool one_device = n == 1u;
     for (size_t i = 0; i < n; i++) {
         stm_bdev *di = stm_pool_device_bdev(p, (uint16_t)i);
-        if (!di) continue;
+        if (!di) {
+            /* REMOVED: no vote. A FAULTED slot whose device is gone
+             * (stm_pool_open admits one): an unknown vote, as a device
+             * whose scan refused -- it may have confirmed a commit the
+             * others did not, after a rejoin the roster read here does
+             * not show (quorum.tla: each FAULTED device is unknown). */
+            const stm_pool_device *dv = stm_pool_device_info(p, (uint16_t)i);
+            if (dv && dv->state != STM_DEV_STATE_REMOVED) unknown++;
+            continue;
+        }
         uint32_t lbl = 0, slot = 0;
         /* A device of a multi-device pool refuses by its own scan's rule,
          * which is not the pool's (quorum decides) -- except at a newer
@@ -4297,6 +4306,13 @@ stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
         stm_pool_unlock_shared(s->pool);
         return STM_EINVAL;
     }
+    /* A FAULTED slot whose device is gone: the allocator is another
+     * device's. */
+    if (!di_check->bdev) {
+        pthread_mutex_unlock(&s->lock);
+        stm_pool_unlock_shared(s->pool);
+        return STM_ENODEV;
+    }
     if (s->allocs[device_id] != NULL) {
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_EEXIST;
@@ -4816,10 +4832,15 @@ static stm_status sync_require_drained_locked(stm_sync *s, uint16_t device_id)
 
     stm_alloc *a = s->allocs[device_id];
     if (!a) {
-        /* No alloc attached means no tree at all — trivially drained.
-         * Pre-P5-3c this held for N=1 pools; post-P5-3c all devices
-         * should have allocs attached pre-commit, so this arm mostly
-         * handles the just-begin-evacuated-on-empty-device case. */
+        /* No alloc attached: drained only when the pool records no
+         * tree for the device. One it records may hold data no read
+         * here can see -- a caller that attached no allocator for it,
+         * or a FAULTED device that is gone (stm_pool_open admits one)
+         * -- and removing it would strip its replicas unseen. */
+        uint64_t root = 0;
+        if (s->roots &&
+            stm_alloc_roots_get(s->roots, device_id, &root, NULL, NULL) == STM_OK)
+            return STM_EBUSY;
         return STM_OK;
     }
     uint64_t probe_paddr = 0, probe_length = 0;
