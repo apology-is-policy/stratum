@@ -1851,6 +1851,14 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
      * PQ-hybrid-wrapped before persistence, so the wrap-public-key
      * half has to be available at create time. */
     if (!wk) return STM_EINVAL;
+    /* A create writes every live slot; a slot not REMOVED whose device is
+     * gone (a FAULTED one, which stm_pool_open admits) cannot be written. */
+    for (size_t i = 0; i < stm_pool_device_count(p); i++) {
+        const stm_pool_device *dv = stm_pool_device_info(p, (uint16_t)i);
+        if (dv && dv->state != STM_DEV_STATE_REMOVED &&
+            !stm_pool_device_bdev(p, (uint16_t)i))
+            return STM_ENODEV;
+    }
 
     /* P5-3a: validate + resolve the redundancy profile up-front,
      * before any on-disk state is created. NULL => {NONE}.
@@ -2744,12 +2752,14 @@ stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
         st = nfound == 0 ? STM_ECORRUPT : STM_EIO;
         goto done;
     }
-    /* No device is more than one gen past the gen a quorum holds (every
-     * write of a gen comes from a session whose open took the gen below
-     * it; quorum.tla NewestNearAuth), so a device newer than that answers
-     * a roster whose pick mounts below it: one blind to devices a later
-     * roster holds (a remove some devices took, after an add they did
-     * not), and the claim would roll their commits back. */
+    /* Each roster's pick refused a device it read more than one gen past
+     * the gen it took (NewestNearAuth). A handle the answer does not name
+     * was held only to its own roster's gen: a device an add brought in
+     * holds the add's reservation, written by a session whose
+     * authoritative gen was the one below it, and the answer's pick takes
+     * a gen under that one when a device of the answer lost it on every
+     * copy (read as never confirmed). Every handle is held to the
+     * answer's gen, and the claim would roll that gen back. */
     for (size_t k = 0; k < ndevs; k++) {
         uint64_t newest = best[k].valid ? stm_load_le64(best[k].ub.ub_gen) : 0;
         if (newest > found_auth && newest - found_auth > 1) {
