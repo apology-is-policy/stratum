@@ -185,15 +185,23 @@ void stm_sync_pool_serial(const stm_sync *s, uint8_t out[16]);
 /*
  * Mount-time open. Scans all labels × commit ring slots, picks the
  * authoritative uberblock (one device: its highest valid gen; more: the
- * quorum-th highest of the devices' best, with content quorum), and:
+ * quorum-th highest of the devices' best, its content read from each
+ * device's ring slot of that gen), and:
  *   - refuses STM_EIO, writing nothing, while a device whose scan refused
  *     could hold a newer commit: such a device is an unknown vote, as
  *     high as any (a device of a multi-device pool can miss writes), and
  *     the open refuses when the (quorum - unknown)-th highest gen the
  *     others read is above the quorum-th (quorum.tla Mount, vote 153);
- *   - refuses STM_EQUORUM when the devices read at exactly that gen
- *     disagree on content: a quorum of them must share one, and when
- *     fewer sit there, all of them (quorum.tla MinorityMustAgree);
+ *   - mounts the one content held at that gen that could have been
+ *     acknowledged: its holders (each device whose newest is that gen,
+ *     and each other whose ring slot of it decodes as it), the
+ *     devices whose slot of it has a copy torn or unreadable and none of
+ *     it, or whose ring came round, and the unknown votes reaching quorum;
+ *     refuses
+ *     STM_EIO, writing nothing, when two could have been; with none, the
+ *     content most devices hold, the lowest device index on a tie
+ *     (quorum.tla RingPick, MountNotStuck); refuses STM_EBADVERSION when
+ *     a slot it reads holds a newer build's uberblock;
  *   - writes a claim at authoritative_gen + 1 to every device not REMOVED
  *     or FAULTED, per the MountGenBump invariant (sync.tla). With quorum,
  *     auth_gen becomes the claim's gen and current_gen the claim's + 2.
@@ -288,8 +296,15 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
  * Commit. Writes Phase 1 reservation UB at auth+1, flushes, writes
  * Phase 3 final UB at auth+2, to every pool device in parallel.
  * Each phase requires quorum (⌊N/2⌋+1) of fsync confirmations; if
- * either phase lacks quorum, the commit aborts with STM_EQUORUM
- * and the in-RAM state is unchanged.
+ * either phase lacks quorum, the commit aborts with STM_EQUORUM.
+ * What a mount would take is unchanged (auth_gen, current_gen, the
+ * roots); the attempt's allocator and engine effects stay in RAM, and
+ * the reservation it wrote or tried is kept for the retry.
+ *
+ * A retry after any failure past the reservation's build (its write,
+ * the barrier, the final) reserves at the same gen and writes the
+ * reservation the last attempt to get that far wrote or tried, byte for
+ * byte, unless a device was added in between.
  *
  * On STM_OK, auth_gen has advanced by 2 (one commit) and the pool's
  * devices hold quorum-confirmed UBs at the reservation and final

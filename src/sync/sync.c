@@ -688,6 +688,21 @@ struct stm_sync {
      * for one commit's saving). */
     stm_uberblock     last_fin_ub;
     bool              have_last_fin_ub;
+
+    /* The shared prototype of the reservation this session last wrote
+     * or tried to write, at generation res_ub_gen. A failed final leaves
+     * current_gen where it was, so the retry's reservation lands at the
+     * same generation, which a quorum may already hold: the retry writes
+     * these bytes again rather than a rebuild whose allocator statistics
+     * or scrub state moved, so one session never leaves two contents in
+     * one slot (sync_open's pick counts a torn copy as possibly holding
+     * the acknowledged one). A device added in between rebuilds: the
+     * stashed roster does not name it. A fail, rejoin, evacuation or
+     * removal moves only state bytes (a removed slot persists), so every
+     * device the retry writes is still in the stashed roster. */
+    stm_uberblock     res_ub;
+    uint64_t          res_ub_gen;
+    bool              have_res_ub;
 };
 
 /* ========================================================================= */
@@ -2396,52 +2411,91 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
         return STM_ERANGE;
     }
 
-    /* Phase 3 (R14 P1 + P2): content-quorum agreement check.
+    /* Phase 3 (OPEN-BUGS (ah)): the content to mount, read from auth_gen's
+     * ring slot (quorum.tla Mount, RingPick).
      *
-     * Group visible devices at exactly auth_gen by their shared-field
-     * bytes. Shared fields are every byte of the UB EXCEPT the per-
-     * device region (ub_device_uuid, ub_device_id, ub_device_class,
-     * ub_device_role) and ub_csum (which varies because it covers
-     * the per-device region). Byte-level comparison via
-     * sync_ub_shared_bytes_match automatically covers every current
-     * and future shared field without hand-enumeration.
+     * A device keeps one uberblock per generation, in that generation's
+     * ring slot, so one that moved past auth_gen still holds its auth_gen
+     * uberblock where its newest does not show it. The holders: each
+     * device read whose newest is auth_gen, and each moved past it whose
+     * slot of auth_gen decodes as that generation (stm_sb_gen_read),
+     * grouped by shared bytes: every byte of the uberblock but the
+     * per-device region (ub_device_uuid, ub_device_id, ub_device_class,
+     * ub_device_role) and ub_csum (sync_ub_shared_bytes_match). A device
+     * below auth_gen whose slot decodes as it (any misread in its scan:
+     * copies read back zero, or one settled beside unreadable ones) holds
+     * it too: a holder that confirmed nothing can only add a group that
+     * could have been, never take one away.
      *
-     * Selection:
-     *   - If ≥ quorum visible devs are at exactly auth_gen: require
-     *     content-quorum among them (≥ quorum with identical shared
-     *     bytes). Otherwise STM_EQUORUM (genuine content ambiguity;
-     *     no single UB can be authoritative).
-     *   - If fewer than quorum devs are at exactly auth_gen (the
-     *     rest are ahead-of-auth orphans, which is how we recover
-     *     from partial-Phase-3 commits): canonical = the content all
-     *     of them hold. With four devices or more two of them can
-     *     disagree: an orphan final whose commit failed, and the claim
-     *     a later open made, acknowledged on devices the next commit
-     *     moved past it (their copies at auth_gen sit in ring slots
-     *     this check does not read, OPEN-BUGS (ah)). Taking either by
-     *     device order could mount the orphan, whose nodes that open's
-     *     sweep handed back (quorum.tla MinorityMustAgree,
-     *     MountKeepsPublished): STM_EQUORUM. Ahead-of-auth devices are
-     *     orphans that the next commit's writes will overwrite.
+     * Hidden: a device whose slot of auth_gen has a copy that does not
+     * settle or settles torn and no copy decoding as auth_gen, wherever its
+     * newest sits: past auth_gen, or below it, where a confirmed auth_gen
+     * torn on every copy leaves its scan (OPEN-BUGS (ai)); and one whose
+     * newest is auth_gen + 63 or more (its ring came round: a rollback's or
+     * a fault's, since a write of a gen needs an open of the gen below it,
+     * and the open mounts auth_gen). A slot each copy of which settles blank
+     * or as another lap did not take auth_gen, short of a fault on every
+     * copy (a confirmed write replaces each, STM_UB_COPIES_REQUIRED), and
+     * counts nothing.
      *
-     * Dissenting devices at auth_gen beside a quorum group there are
-     * legitimate orphans (ARCH section 5.8): the next commit's
-     * per-device writes overwrite them. Tolerating that dissent
-     * (instead of failing STM_ECORRUPT like the
-     * strict pre-R14 check) lets the impl recover from R14 P1's
-     * non-idempotent-retry divergence without operator intervention,
-     * and is the spec-compliant behavior per quorum.tla's
-     * ContentQuorumAtGen invariant. */
+     * The canonical group is the one that could have been acknowledged
+     * at auth_gen: its holders, the hidden devices and the unknown votes
+     * together reaching quorum. A device that confirmed an acknowledged
+     * content at auth_gen still holds it there unless hidden or unknown
+     * (or a fault hit every copy): a later write of auth_gen needs an open
+     * below it, which this pick and vote 153 exclude, or the retry of the
+     * commit that wrote it, and stm_sync_commit writes a retried
+     * reservation's bytes again (a device added between the attempts
+     * rebuilds them, OPEN-BUGS (ak)); an acknowledged final is never
+     * written again. A group of quorum holders is such a group, and then
+     * no other is: the rest of the devices are fewer. Two such groups: the
+     * hidden devices and the unknown votes could decide it, STM_EIO. None:
+     * nothing at auth_gen was acknowledged, and the largest group (the
+     * lowest device index on a tie) is canonical. Its trees are intact: an
+     * open frees nodes of trees but the one it mounts only once its claim
+     * is acknowledged (#791 below, and the trees it does not know of are
+     * free to it), and a node a commit frees goes back only at a commit
+     * after its final was acknowledged (stm_alloc_commit, free_gen <
+     * committed_gen; an evacuation step's frees go back sooner, on a
+     * device that takes no reservation again); a content that lost nodes
+     * so sits beside a claim acknowledged at auth_gen, which would be
+     * possible, or below a gen acknowledged above it (quorum.tla
+     * MountIntact).
+     *
+     * With every device read and every copy settled blank or valid no
+     * group is possible but one a quorum holds, so the open mounts
+     * (quorum.tla MountNotStuck). Dissenters are orphans the next commit's
+     * writes leave behind (ARCH section 5.8). Reading only the devices
+     * whose newest was auth_gen, the open refused while a minority there
+     * disagreed, and on a pool of three devices a claim the next
+     * reservation moved past, beside an orphan final kept by the device
+     * that missed the claim, refused every open (quorum_ring_buggy.cfg). */
     typedef struct { size_t rep; size_t count; } content_group;
     content_group groups[STM_POOL_DEVICES_MAX];
     size_t ngroups = 0;
-    size_t devs_at_auth = 0;
-    size_t any_at_auth = SIZE_MAX;
+    size_t hidden = 0;
     for (size_t i = 0; i < n; i++) {
         if (!scans[i].valid) continue;
-        if (stm_load_le64(scans[i].ub.ub_gen) != auth_gen) continue;
-        devs_at_auth++;
-        if (any_at_auth == SIZE_MAX) any_at_auth = i;
+        uint64_t newest = stm_load_le64(scans[i].ub.ub_gen);
+        if (newest != auth_gen) {
+            stm_uberblock held;
+            stm_status gr = STM_EIO;
+            if (newest < auth_gen ||
+                newest - auth_gen < STM_UB_SLOTS_PER_LABEL)
+                gr = stm_sb_gen_read(stm_pool_device_bdev(p, (uint16_t)i),
+                                     auth_gen, &held, why);
+            if (gr == STM_EBADVERSION) {
+                if (why) why->best_gen = newest;
+                free(scans);
+                return STM_EBADVERSION;
+            }
+            if (gr == STM_ENOENT) continue;
+            if (gr != STM_OK) {
+                hidden++;
+                continue;
+            }
+            scans[i].ub = held;
+        }
         bool matched = false;
         for (size_t g = 0; g < ngroups; g++) {
             if (sync_ub_shared_bytes_match(&scans[i].ub,
@@ -2458,30 +2512,25 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
         }
     }
     size_t canonical_idx = SIZE_MAX;
-    if (devs_at_auth >= quorum) {
-        /* Need content-quorum within the auth_gen devs. */
-        for (size_t g = 0; g < ngroups; g++) {
-            if (groups[g].count >= quorum) {
-                canonical_idx = groups[g].rep;
-                break;
-            }
-        }
-        if (canonical_idx == SIZE_MAX) {
-            free(scans);
-            return STM_EQUORUM;
-        }
-    } else if (ngroups <= 1) {
-        /* < quorum devs at exactly auth_gen, all agreeing -- the rest
-         * are ahead-of-auth orphans the next commit's per-device writes
-         * overwrite. */
-        canonical_idx = any_at_auth;
-    } else {
+    size_t possible = 0;
+    for (size_t g = 0; g < ngroups; g++) {
+        if (groups[g].count + hidden + unknown < quorum) continue;
+        if (possible++ == 0) canonical_idx = groups[g].rep;
+    }
+    if (possible > 1) {
         free(scans);
-        return STM_EQUORUM;
+        return STM_EIO;
+    }
+    size_t most = 0;
+    for (size_t g = 0; possible == 0 && g < ngroups; g++) {
+        if (groups[g].count > most) {
+            most = groups[g].count;
+            canonical_idx = groups[g].rep;
+        }
     }
     if (canonical_idx == SIZE_MAX) {
-        /* Invariant violation: compute_auth_gen returned auth_gen > 0
-         * but no device has gen == auth_gen. Should be unreachable. */
+        /* Invariant violation: compute_auth_gen returned auth_gen > 0,
+         * so a device's newest is auth_gen. Should be unreachable. */
         free(scans);
         return STM_ECORRUPT;
     }
@@ -3241,6 +3290,10 @@ stm_status stm_sync_commit(stm_sync *s)
                          /*cas_index_gen=*/     s->cas_index_root_gen,
                          /*merkle_root=*/       s->merkle_root,
                          &astats_res);
+        if (s->have_res_ub && s->res_ub_gen == reservation_gen &&
+            stm_load_le16(s->res_ub.ub_device_count) ==
+                stm_load_le16(res_prototype.ub_device_count))
+            res_prototype = s->res_ub;
     }
 
     /* CF-4 B: arm the barrier-defer windows. Every fsync issued between
@@ -3603,6 +3656,9 @@ stm_status stm_sync_commit(stm_sync *s)
      * the old position (reservation durable-before final, quorum.tla). */
     if (!is_fresh) {
         uint32_t res_slot  = stm_sb_ring_slot_for_gen(reservation_gen);
+        s->res_ub      = res_prototype;
+        s->res_ub_gen  = reservation_gen;
+        s->have_res_ub = true;
         stm_status rw = write_ub_to_all_devices(s, &res_prototype, res_slot);
         if (rw != STM_OK) {
             (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
