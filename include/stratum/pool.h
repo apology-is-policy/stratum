@@ -111,7 +111,8 @@ typedef struct {
  *   - device_count in [1, STM_POOL_DEVICES_MAX];
  *   - every LIVE device slot (state != REMOVED) has non-NULL bdev,
  *     but a FAULTED one may have none (its device is gone; the open
- *     counts it an unknown vote);
+ *     counts it an unknown vote, and opens only read-only, every device
+ *     there opened read-only: STM_EROFS otherwise);
  *   - REMOVED slots (P5-4b-i) have NULL bdev and keep their UUID
  *     for burned-UUID tracking;
  *   - every device's uuid is non-zero (all-zero is the reserved

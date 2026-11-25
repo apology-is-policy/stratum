@@ -2729,6 +2729,19 @@ stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
         st = nfound == 0 ? STM_ECORRUPT : STM_EIO;
         goto done;
     }
+    /* No device is more than one gen past the gen a quorum holds (every
+     * write of a gen comes from a session whose open took the gen below
+     * it; quorum.tla NewestNearAuth), so a device newer than that answers
+     * a roster whose pick mounts below it: one blind to devices a later
+     * roster holds (a remove some devices took, after an add they did
+     * not), and the claim would roll their commits back. */
+    for (size_t k = 0; k < ndevs; k++) {
+        uint64_t newest = best[k].valid ? stm_load_le64(best[k].ub.ub_gen) : 0;
+        if (newest > found_auth && newest - found_auth > 1) {
+            st = STM_EIO;
+            goto done;
+        }
+    }
 
     memset(out, 0, sizeof *out);
     out->pool_uuid[0] = cand[found].pool_uuid[0];
@@ -2791,6 +2804,18 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
     stm_status pk = sync_pick_canonical(n, pick_bdev, pick_state, why,
                                         &auth_gen, &ub);
     if (pk != STM_OK) return pk;
+    /* A slot not REMOVED whose device is gone (a FAULTED one, which
+     * stm_pool_open admits): the pool opens read-only, every device there
+     * opened read-only. Writing, placement and frees still take every live
+     * slot to have an allocator (OPEN-BUGS (ao)), and the gone device
+     * cannot leave the pool (OPEN-BUGS (ap)). */
+    bool gone = false, writable = false;
+    for (size_t i = 0; i < n; i++) {
+        if (pick_state[i] == STM_DEV_STATE_REMOVED) continue;
+        if (!pick_bdev[i]) gone = true;
+        else if (!stm_bdev_is_read_only(pick_bdev[i])) writable = true;
+    }
+    if (gone && writable) return STM_EROFS;
 
     /* P5-1 UB validation (generalized): verify the canonical UB's
      * pool_uuid + roster_hash + device_count match the caller's
@@ -4889,6 +4914,19 @@ stm_status stm_sync_mirror_read(stm_sync *s, const uint64_t paddrs[],
 /* P5-4b-ii-α: evacuation step.                                               */
 /* ========================================================================= */
 
+/* A device with no allocator attached: STM_OK when the pool records no tree
+ * for it (nothing to drain), STM_EBUSY when it records one (it may hold
+ * replicas no read here can see: a caller that attached no allocator, or a
+ * FAULTED device that is gone), and any other lookup failure as it is. */
+static stm_status sync_unattached_tree_locked(stm_sync *s, uint16_t device_id)
+{
+    if (!s->roots) return STM_OK;
+    uint64_t root = 0;
+    stm_status rg = stm_alloc_roots_get(s->roots, device_id, &root, NULL, NULL);
+    if (rg == STM_ENOENT) return STM_OK;
+    return rg == STM_OK ? STM_EBUSY : rg;
+}
+
 stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
                                        uint16_t survivor_device_id,
                                        uint64_t *out_old_paddr,
@@ -4943,10 +4981,11 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
 
     stm_alloc *target_alloc = s->allocs[target_device_id];
     if (!target_alloc) {
-        /* Nothing to drain — target has no attached alloc. Bubble up as
-         * "no data" so caller proceeds to finish_evacuation. */
+        /* No allocator: nothing to drain (STM_ENOENT) only when the pool
+         * records no tree for the target, as finish_evacuation decides. */
+        stm_status us = sync_unattached_tree_locked(s, target_device_id);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return STM_ENOENT;
+        return us == STM_OK ? STM_ENOENT : us;
     }
 
     /* Spec's EvacuatePaddr precondition: pick one allocated range on d.
@@ -5074,18 +5113,7 @@ static stm_status sync_require_drained_locked(stm_sync *s, uint16_t device_id)
     if (device_id >= stm_pool_device_count(s->pool)) return STM_EINVAL;
 
     stm_alloc *a = s->allocs[device_id];
-    if (!a) {
-        /* No alloc attached: drained only when the pool records no
-         * tree for the device. One it records may hold data no read
-         * here can see -- a caller that attached no allocator for it,
-         * or a FAULTED device that is gone (stm_pool_open admits one)
-         * -- and removing it would strip its replicas unseen. */
-        uint64_t root = 0;
-        if (s->roots &&
-            stm_alloc_roots_get(s->roots, device_id, &root, NULL, NULL) == STM_OK)
-            return STM_EBUSY;
-        return STM_OK;
-    }
+    if (!a) return sync_unattached_tree_locked(s, device_id);
     uint64_t probe_paddr = 0, probe_length = 0;
     stm_status fs = stm_alloc_first_allocated(a, &probe_paddr, &probe_length);
 

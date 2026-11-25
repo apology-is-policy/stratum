@@ -132,8 +132,9 @@ typedef struct {
      * 0 if no commits yet. */
     uint64_t alloc_root_paddr;
 
-    /* The handle refuses writes (STM_EROFS): its open's claim met only
-     * devices answering read-only, whether or not they were opened so. */
+    /* The handle refuses writes (STM_EROFS): every device its open's claim
+     * did not reach answered read-only (whether or not it was opened so),
+     * and the devices it reached were fewer than quorum. */
     bool read_only;
 } stm_sync_info;
 
@@ -315,8 +316,11 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
  *                otherwise, the first in devs order.
  *   STM_EIO      two rosters are the pool's: around an add or a remove
  *                whose commit some devices hold, which only its
- *                acknowledgement could decide. Hand in only the devices
- *                the pool holds.
+ *                acknowledgement could decide; or a device holds a gen
+ *                more than one past the gen the answer mounts (no device
+ *                is, quorum.tla NewestNearAuth: the answer is blind to a
+ *                later roster). Hand in every device of the pool you
+ *                have: a device no roster read names cannot vote.
  *   STM_ECORRUPT no roster is the pool's, or one read names a device in
  *                two slots.
  *   otherwise    a roster's pick refused (stm_sync_open_ex's refusals:
