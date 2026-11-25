@@ -387,6 +387,9 @@ to a rollback, never a silent one.)
 
 ```
 Fresh pool (auth_gen == 0):   1-phase -- write UB at gen=1 to all devices.
+                              Its final is stashed before the write, as a
+                              reservation is: a failed first commit's retry
+                              waits as one does (Phase 1' below).
 Subsequent commits:           2-phase, in the CF-4 B order below.
 
 Phase 2: Flush (first; its node writes and fsyncs go into the defer window)
@@ -616,8 +619,8 @@ first record went answers `STM_EWEDGED` and the sync wedges.
      it in that slot: a later write of auth_gen needs an open below it,
      which this pick and vote 153 exclude, or the retry of the commit
      that wrote it, and a retried reservation is written byte for byte
-     again (Phase 1' above; a device added between the attempts rebuilds
-     it, OPEN-BUGS (ak)), while an acknowledged final is never written
+     again, or nothing when the pool's slots changed between the attempts
+     (Phase 1' above), while an acknowledged final is never written
      again.
      A group could have been acknowledged when its holders, the hidden
      devices and the unknown votes reach quorum. One such group is
@@ -933,7 +936,13 @@ daemon design.
 
 - **First commit is 1-phase** (`auth == 0`). Subsequent commits are
   2-phase. The asymmetry is unusual but intentional — there's no
-  pre-flush state to preserve on rollback for a fresh pool.
+  pre-flush state to preserve on rollback for a fresh pool. A failed
+  first commit's retry rebuilds its final (the flush runs again) but
+  waits as a reservation's retry does: removal and replace refuse
+  STM_EBUSY, and a retry under changed slots wedges (review (s)(t)(u)(v)
+  round 7 F1: an add or a removal between the attempts let the retry be
+  acknowledged under the new roster while an open from the old one took
+  the first attempt's final at gen 1 and claimed over it).
 - **Per-device tree gens can diverge** when `stm_alloc_commit`
   short-circuits on a clean tree (R7c P2-5). `ub_alloc_root_gen`
   (v3→) and per-entry `root_gen` in the alloc-roots object

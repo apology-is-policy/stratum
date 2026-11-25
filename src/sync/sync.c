@@ -1667,9 +1667,10 @@ static inline size_t sync_quorum_n(const stm_sync *s)
 
 static void sync_wedge_locked(stm_sync *s);
 
-/* A commit failed past its reservation's build and has not been retried
- * to an acknowledgement: current_gen stays at the failed final's gen, one
- * past the stashed reservation's. */
+/* A commit failed past its reservation's build (a fresh pool's first
+ * commit: its final's write, stashed at gen 0) and has not been retried to
+ * an acknowledgement: current_gen stays at the failed final's gen, one
+ * past the stash's. */
 static bool sync_retry_pending(const stm_sync *s)
 {
     return s->have_res_ub && s->res_ub_gen + 1u == s->current_gen;
@@ -2503,9 +2504,9 @@ static stm_status sync_pick_canonical(size_t n, stm_bdev *const bdev[],
      * (or a fault hit every copy): a later write of auth_gen needs an open
      * below it, which this pick and vote 153 exclude, or the retry of the
      * commit that wrote it, and stm_sync_commit writes a retried
-     * reservation's bytes again (a device added between the attempts
-     * rebuilds them, OPEN-BUGS (ak)); an acknowledged final is never
-     * written again. A group of quorum holders is such a group, and then
+     * reservation's bytes again, or nothing when the pool's slots changed
+     * between the attempts; an acknowledged final is never written
+     * again. A group of quorum holders is such a group, and then
      * no other is: the rest of the devices are fewer. Two such groups: the
      * hidden devices and the unknown votes could decide it, STM_EIO. None:
      * nothing at auth_gen was acknowledged, and the largest group (the
@@ -3607,6 +3608,18 @@ stm_status stm_sync_commit(stm_sync *s)
     const bool is_fresh = (s->auth_gen == 0);
     const uint64_t reservation_gen = is_fresh ? 0 : (target_gen - 1);
 
+    /* A fresh pool's failed first commit left its final at gen 1 on some
+     * devices; its retry writes gen 1 again, under the quorum of the
+     * roster it was tried under or not at all (as a reservation's retry,
+     * below). */
+    if (is_fresh && s->have_res_ub && s->res_ub_gen == 0 &&
+        !sync_stash_roster_kept(s, &s->res_ub)) {
+        sync_wedge_locked(s);
+        pthread_mutex_unlock(&s->lock);
+        stm_pool_unlock_shared(s->pool);
+        return STM_EWEDGED;
+    }
+
     /* Phase 1 (non-fresh only): reservation UB = copy of previous
      * authoritative state with gen bumped. Pre-flush roots; rollback
      * target on Phase 3 failure.
@@ -4094,6 +4107,11 @@ stm_status stm_sync_commit(stm_sync *s)
         if (ai) stm_bootstrap_commit_defer_finalize(stm_alloc_bootstrap(ai));
     }
 
+    if (is_fresh) {
+        s->res_ub      = fin_prototype;
+        s->res_ub_gen  = 0;
+        s->have_res_ub = true;
+    }
     uint32_t fin_slot  = stm_sb_ring_slot_for_gen(target_gen);
     stm_status fw = write_ub_to_all_devices(s, &fin_prototype, fin_slot);
     if (fw != STM_OK) {

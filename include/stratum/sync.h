@@ -375,16 +375,18 @@ stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
  * nothing, wedges the handle and answers STM_EWEDGED. While a retry
  * waits, a commit takes no clean-commit skip.
  *
- * On STM_OK, auth_gen has advanced by 2 (one commit) and the pool's
- * devices hold quorum-confirmed UBs at the reservation and final
- * gens; or nothing changed since the last final this session
+ * On STM_OK, auth_gen has advanced by 2 (one commit; to 1 for a fresh
+ * pool's first) and the pool's devices hold quorum-confirmed UBs at the
+ * reservation and final gens; or nothing changed since the last final this session
  * acknowledged, no failed attempt waits, and nothing was written. An
  * engines' finalize failure (after the final reached quorum, or on that
  * clean skip) wedges the handle.
  *
  * The first commit on a fresh pool (auth_gen==0) is 1-phase: only
  * the final UB is written at gen=1. There is no pre-flush state to
- * preserve on rollback.
+ * preserve on rollback. Its retry after a failed write rebuilds that
+ * final but waits as a reservation's does: the same refusals, and a
+ * retry under changed slots wedges.
  *
  * Known MVP caveat (R7d P0-2): a crash between the internal
  * stm_alloc_commit (which flushes bootstrap state) and the Phase 3
