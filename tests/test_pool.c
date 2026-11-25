@@ -988,6 +988,8 @@ static stm_bdev *open_companion_device(const char *suffix)
     stm_bdev_open_opts opts = stm_bdev_open_opts_default();
     stm_bdev *d = NULL;
     STM_ASSERT_OK(stm_bdev_open(companion_path, &opts, &d));
+    /* The handle keeps the file; no path outlives the run. */
+    unlink(companion_path);
     STM_ASSERT_OK(stm_bdev_resize(d, TEST_DEVICE_BYTES));
     return d;
 }

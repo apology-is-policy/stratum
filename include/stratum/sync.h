@@ -214,7 +214,8 @@ void stm_sync_pool_serial(const stm_sync *s, uint8_t out[16]);
  *     than one gen past the gen it takes: no write puts a device there
  *     past a quorum of the roster it was written under (quorum.tla
  *     NewestNearAuth), so the roster handed in is not the one the newest
- *     commit was made under, and mounting would roll that commit back;
+ *     commit was made under (or a fault), and mounting would roll that
+ *     commit back;
  *   - refuses STM_EROFS, writing nothing, when a slot not REMOVED has no
  *     device (a FAULTED one, which stm_pool_open admits) and a device
  *     there was opened writable: such a pool opens read-only only;
@@ -315,7 +316,13 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
  * pick runs over the devices, a slot matched to the device whose newest
  * uberblock carries its device uuid. A slot not REMOVED that no device
  * matches (absent, blank, or its ring unreadable) is an unknown vote. A
- * roster is the pool's when the uberblock its pick takes carries it.
+ * roster is the pool's when the uberblock its pick takes carries it and no
+ * device handed in is more than one gen past the gen it takes. Such a
+ * device shows a commit acknowledged above that gen (no write puts a
+ * device more than one gen past a quorum of the roster it was written
+ * under, quorum.tla NewestNearAuth, which models one device set), and the
+ * roster is passed over: a disk a remove or a failed add left behind
+ * names its old roster, and the scan answers past it.
  * out: the pool uuid, the device count and the devices, each bdev the
  * matched handle or NULL (read_only false: the caller's to set; an ONLINE
  * slot with no device stm_pool_open refuses, OPEN-BUGS (an)); a handle no
@@ -327,19 +334,16 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
  *                otherwise, the first in devs order.
  *   STM_EIO      two rosters are the pool's: around an add or a remove
  *                whose commit some devices hold, which only its
- *                acknowledgement could decide; or a device handed in
- *                holds a gen more than one past the gen the answer
- *                mounts (no write puts a device past a quorum of the
- *                roster it was written under by more than one,
- *                quorum.tla NewestNearAuth, which models one device set:
- *                the answer is blind to a later roster, or lost a gen a
- *                quorum acknowledged). Hand in every device of the pool
- *                you have: a device no roster read names cannot vote.
- *   STM_ECORRUPT no roster is the pool's, or one read names a device in
- *                two slots.
- *   otherwise    a roster's pick refused (stm_sync_open_ex's refusals:
- *                STM_EIO for an unknown vote, STM_EQUORUM, ...), the
- *                first in the order tried (newest uberblock's first).
+ *                acknowledgement could decide; or none is and one was
+ *                passed over (a later roster no device handed in shows).
+ *                Hand in every device of the pool you have: a device no
+ *                roster read names cannot vote.
+ *   STM_ECORRUPT no roster is the pool's and none was passed over, or one
+ *                read names a device in two slots.
+ *   otherwise    a roster's pick refused other than by a device past
+ *                its gen (stm_sync_open_ex's refusals: STM_EIO for an
+ *                unknown vote, STM_EQUORUM, ...), the first in the order
+ *                tried (newest uberblock's first).
  */
 STM_MUST_USE
 stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,

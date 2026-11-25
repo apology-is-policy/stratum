@@ -2310,13 +2310,16 @@ static stm_status sync_reconcile_bootstrap(stm_sync *s) {
 
 /* The open's pick: the authoritative gen and the canonical uberblock of
  * devices bdev[0..n), whose roster states are state[] (a slot not REMOVED
- * with no device is an unknown vote). */
+ * with no device is an unknown vote). *out_past, if not NULL: the refusal
+ * is a device more than one gen past the gen taken. */
 static stm_status sync_pick_canonical(size_t n, stm_bdev *const bdev[],
                                       const stm_device_state state[],
                                       stm_sb_scan_refusal *why,
+                                      bool *out_past,
                                       uint64_t *out_auth_gen,
                                       stm_uberblock *out_ub)
 {
+    if (out_past) *out_past = false;
     /* P5-4b-i: iteration bound stays TOTAL device_count (REMOVED
      * slots still occupy their indices; skipped via NULL bdev).
      * Quorum denominator is LIVE count (REMOVED can't vote). */
@@ -2426,6 +2429,7 @@ static stm_status sync_pick_canonical(size_t n, stm_bdev *const bdev[],
         if (!scans[i].valid) continue;
         uint64_t newest = stm_load_le64(scans[i].ub.ub_gen);
         if (newest > auth_gen && newest - auth_gen > 1) {
+            if (out_past) *out_past = true;
             free(scans);
             return STM_EIO;
         }
@@ -2599,6 +2603,17 @@ static bool sync_roster_uuids_unique(const stm_pool_device dev[], size_t n)
     return true;
 }
 
+/* A handle whose newest gen is more than one past `auth`. */
+static bool sync_newest_past(const sync_scan best[], size_t ndevs,
+                             uint64_t auth)
+{
+    for (size_t k = 0; k < ndevs; k++) {
+        uint64_t newest = best[k].valid ? stm_load_le64(best[k].ub.ub_gen) : 0;
+        if (newest > auth && newest - auth > 1) return true;
+    }
+    return false;
+}
+
 /* Slot i gets the handle whose newest uberblock carries slot i's device
  * uuid; a REMOVED slot, or one no handle names, gets none. */
 static void sync_roster_map(const stm_pool_device dev[], size_t n,
@@ -2622,17 +2637,26 @@ static void sync_roster_map(const stm_pool_device dev[], size_t n,
 }
 
 /* OPEN-BUGS (s). Each roster tried is a pool the open could be handed; it
- * is the pool's when the uberblock its pick takes carries it. Rosters
- * that differ only in FAULTED/ONLINE states give one pick (a state counts
- * there only as REMOVED or not), so one of them at most is the pool's. Two
- * that differ in their slots or their REMOVED set (an add or a remove
- * whose commit some devices hold and others not) can both be: a lost add's
- * reservation above the commits the smaller roster acknowledged since, or
- * an acknowledged add above a device that missed it, and only the
+ * is the pool's when the uberblock its pick takes carries it and no device
+ * handed in is more than one gen past the gen it takes. A write of gen g
+ * comes from a session whose authoritative gen was g - 1 (a claim, a
+ * reservation) or g - 2 with the reservation at g - 1 confirmed by a
+ * quorum (a final), so such a device shows a commit acknowledged above
+ * that gen (quorum.tla NewestNearAuth, per roster), and the roster is
+ * passed over: in its pick, a device it names (a disk a remove or a failed
+ * add left behind names its old roster, whose pick lands below the
+ * pool's); after, one it does not (a device an add brought in, whose
+ * commit's reservation reached it alone, beside a device of the roster
+ * that lost the gen below on every copy). Rosters that differ only in
+ * FAULTED/ONLINE states give one pick (a state counts there only as
+ * REMOVED or not), so one of them at most is the pool's. Two that differ
+ * in their slots or their REMOVED set (an add or a remove whose commit
+ * some devices hold and others not) can both be, and only the
  * acknowledgement, which no device records, tells them apart: STM_EIO.
- * A roster whose pick refuses refuses the scan: the roster the pool
- * acknowledged its newest commit under may be the one an absent device
- * makes unknown, and a roster from before an add would mount below it. */
+ * Any other refusal of a roster's pick refuses the scan: the roster the
+ * pool acknowledged its newest commit under may be the one an absent
+ * device makes unknown. None the pool's: STM_EIO when one was passed over
+ * (a later roster no handle shows), else STM_ECORRUPT. */
 stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
                                 stm_sb_scan_refusal *why,
                                 stm_pool_open_opts *out,
@@ -2712,6 +2736,7 @@ stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
 
     size_t found = SIZE_MAX, nfound = 0;
     uint64_t found_auth = 0;
+    bool passed_over = false;
     stm_pool_device dev[STM_POOL_DEVICES_MAX];
     stm_bdev *map[STM_POOL_DEVICES_MAX];
     stm_device_state state[STM_POOL_DEVICES_MAX];
@@ -2728,8 +2753,14 @@ stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
         memset(&pwhy, 0, sizeof pwhy);
         uint64_t auth = 0;
         stm_uberblock ub;
+        bool past = false;
         st = sync_pick_canonical(cand[c].device_count, map, state, &pwhy,
-                                 &auth, &ub);
+                                 &past, &auth, &ub);
+        if (st != STM_OK && past) {
+            passed_over = true;
+            st = STM_OK;
+            continue;
+        }
         if (st != STM_OK) {
             if (why) *why = pwhy;
             goto done;
@@ -2737,6 +2768,10 @@ stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
         sync_roster r;
         sync_roster_of(&ub, &r);
         if (sync_roster_listed(&cand[c], 1, &r)) {
+            if (sync_newest_past(best, ndevs, auth)) {
+                passed_over = true;
+                continue;
+            }
             nfound++;
             found = c;
             found_auth = auth;
@@ -2749,23 +2784,8 @@ stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
         }
     }
     if (nfound != 1) {
-        st = nfound == 0 ? STM_ECORRUPT : STM_EIO;
+        st = nfound == 0 && !passed_over ? STM_ECORRUPT : STM_EIO;
         goto done;
-    }
-    /* Each roster's pick refused a device it read more than one gen past
-     * the gen it took (NewestNearAuth). A handle the answer does not name
-     * was held only to its own roster's gen: a device an add brought in
-     * holds the add's reservation, written by a session whose
-     * authoritative gen was the one below it, and the answer's pick takes
-     * a gen under that one when a device of the answer lost it on every
-     * copy (read as never confirmed). Every handle is held to the
-     * answer's gen, and the claim would roll that gen back. */
-    for (size_t k = 0; k < ndevs; k++) {
-        uint64_t newest = best[k].valid ? stm_load_le64(best[k].ub.ub_gen) : 0;
-        if (newest > found_auth && newest - found_auth > 1) {
-            st = STM_EIO;
-            goto done;
-        }
     }
 
     memset(out, 0, sizeof *out);
@@ -2817,8 +2837,8 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
     /* P5-4b-i: iteration bound stays TOTAL device_count (REMOVED
      * slots still occupy their indices; skipped via NULL bdev). */
     size_t n = stm_pool_device_count(p);
-    stm_bdev *pick_bdev[STM_POOL_DEVICES_MAX];
-    stm_device_state pick_state[STM_POOL_DEVICES_MAX];
+    stm_bdev *pick_bdev[STM_POOL_DEVICES_MAX] = { 0 };
+    stm_device_state pick_state[STM_POOL_DEVICES_MAX] = { 0 };
     for (size_t i = 0; i < n; i++) {
         const stm_pool_device *dv = stm_pool_device_info(p, (uint16_t)i);
         pick_bdev[i] = stm_pool_device_bdev(p, (uint16_t)i);
@@ -2826,7 +2846,7 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
     }
     uint64_t auth_gen = 0;
     stm_uberblock ub;
-    stm_status pk = sync_pick_canonical(n, pick_bdev, pick_state, why,
+    stm_status pk = sync_pick_canonical(n, pick_bdev, pick_state, why, NULL,
                                         &auth_gen, &ub);
     if (pk != STM_OK) return pk;
     /* A slot not REMOVED whose device is gone (a FAULTED one, which
