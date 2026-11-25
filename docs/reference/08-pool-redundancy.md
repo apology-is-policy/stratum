@@ -46,10 +46,13 @@ void       stm_pool_close(stm_pool *p);    // does NOT close bdevs (borrowed)
 
 `stm_pool_open_opts`: pool_uuid + device_count + device[] + read_only.
 `stm_pool_open` validates: device count in `[1, STM_POOL_DEVICES_MAX]`;
-live slots have non-NULL bdev; REMOVED slots have NULL bdev + preserved
+live slots have non-NULL bdev, a FAULTED one excepted (its device may be
+gone, below); REMOVED slots have NULL bdev + preserved
 UUID (burned-UUID tracking); UUIDs non-zero and unique within roster
 (live OR removed); role/class/state in range. On success, finalizes
-`stm_pool_roster_hash`.
+`stm_pool_roster_hash`. A multi-device remount builds the opts with
+`stm_sync_scan_roster` (07, the pool to open): the roster the pool's
+quorum holds, each slot's device matched by the uuid its uberblocks carry.
 
 ### Inspection
 

@@ -2300,37 +2300,22 @@ static stm_status sync_reconcile_bootstrap(stm_sync *s) {
     return STM_OK;
 }
 
-stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
-                          const stm_hybrid_keys *wk,
-                          struct stm_janus_client *janus,
-                          const stm_corvus_mount_cfg *corvus,
-                          stm_sync **out_sync)
+/* The open's pick: the authoritative gen and the canonical uberblock of
+ * devices bdev[0..n), whose roster states are state[] (a slot not REMOVED
+ * with no device is an unknown vote). */
+static stm_status sync_pick_canonical(size_t n, stm_bdev *const bdev[],
+                                      const stm_device_state state[],
+                                      stm_sb_scan_refusal *why,
+                                      uint64_t *out_auth_gen,
+                                      stm_uberblock *out_ub)
 {
-    return stm_sync_open_ex(p, a, wk, janus, corvus, NULL, out_sync);
-}
-
-stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
-                             const stm_hybrid_keys *wk,
-                             struct stm_janus_client *janus,
-                             const stm_corvus_mount_cfg *corvus,
-                             stm_sb_scan_refusal *why,
-                             stm_sync **out_sync)
-{
-    if (why) memset(why, 0, sizeof *why);
-    if (!p || !a || !out_sync) return STM_EINVAL;
-    if (stm_pool_device_count(p) == 0) return STM_EINVAL;
-    /* P4-4a/P4-4b: key source is mandatory, exactly one. */
-    if ((!wk && !janus) || (wk && janus)) return STM_EINVAL;
-
-    /* R9 P1-1: make sure libsodium is up before any crypto op. */
-    stm_status ci = stm_crypto_init();
-    if (ci != STM_OK) return ci;
-
     /* P5-4b-i: iteration bound stays TOTAL device_count (REMOVED
      * slots still occupy their indices; skipped via NULL bdev).
      * Quorum denominator is LIVE count (REMOVED can't vote). */
-    size_t n = stm_pool_device_count(p);
-    size_t quorum = stm_pool_live_device_count(p) / 2u + 1u;
+    size_t live = 0;
+    for (size_t i = 0; i < n; i++)
+        if (state[i] != STM_DEV_STATE_REMOVED) live++;
+    size_t quorum = live / 2u + 1u;
 
     /* Phase 1: scan every device's ring. Track valid UBs per device.
      * STM_ENOENT on a device means "blank / never used"; that device
@@ -2343,18 +2328,17 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
      * contiguous (stm_sb_mount_scan_ex's one_device) only when it has
      * been the pool's only device: one a remove left alone may have
      * missed writes while the others were there. */
-    bool one_live = stm_pool_live_device_count(p) == 1u;
+    bool one_live = live == 1u;
     bool one_device = n == 1u;
     for (size_t i = 0; i < n; i++) {
-        stm_bdev *di = stm_pool_device_bdev(p, (uint16_t)i);
+        stm_bdev *di = bdev[i];
         if (!di) {
             /* REMOVED: no vote. A FAULTED slot whose device is gone
              * (stm_pool_open admits one): an unknown vote, as a device
              * whose scan refused -- it may have confirmed a commit the
              * others did not, after a rejoin the roster read here does
              * not show (quorum.tla: each FAULTED device is unknown). */
-            const stm_pool_device *dv = stm_pool_device_info(p, (uint16_t)i);
-            if (dv && dv->state != STM_DEV_STATE_REMOVED) unknown++;
+            if (state[i] != STM_DEV_STATE_REMOVED) unknown++;
             continue;
         }
         uint32_t lbl = 0, slot = 0;
@@ -2491,8 +2475,7 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
             stm_status gr = STM_EIO;
             if (newest < auth_gen ||
                 newest - auth_gen < STM_UB_SLOTS_PER_LABEL)
-                gr = stm_sb_gen_read(stm_pool_device_bdev(p, (uint16_t)i),
-                                     auth_gen, &held, why);
+                gr = stm_sb_gen_read(bdev[i], auth_gen, &held, why);
             if (gr == STM_EBADVERSION) {
                 if (why) why->best_gen = newest;
                 free(scans);
@@ -2544,11 +2527,254 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
         return STM_ECORRUPT;
     }
 
-    /* Canonical UB reference. (Keep a copy on the stack for safety —
-     * scans[] is about to be freed.) */
-    stm_uberblock ub = scans[canonical_idx].ub;
+    *out_ub = scans[canonical_idx].ub;
+    *out_auth_gen = auth_gen;
     free(scans);
-    scans = NULL;
+    return STM_OK;
+}
+
+/* The roster fields of an uberblock: what makes a pool of its devices. */
+typedef struct {
+    uint64_t pool_uuid[2];
+    uint16_t device_count;
+    uint64_t roster_hash;
+    uint8_t  roster[STM_POOL_ROSTER_BYTES];
+} sync_roster;
+
+static void sync_roster_of(const stm_uberblock *ub, sync_roster *r)
+{
+    r->pool_uuid[0] = stm_load_le64(ub->ub_pool_uuid[0]);
+    r->pool_uuid[1] = stm_load_le64(ub->ub_pool_uuid[1]);
+    r->device_count = stm_load_le16(ub->ub_device_count);
+    r->roster_hash  = stm_load_le64(ub->ub_roster_hash);
+    memcpy(r->roster, ub->ub_roster, sizeof r->roster);
+}
+
+static bool sync_roster_listed(const sync_roster *list, size_t n,
+                               const sync_roster *r)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (list[i].pool_uuid[0] == r->pool_uuid[0] &&
+            list[i].pool_uuid[1] == r->pool_uuid[1] &&
+            list[i].device_count == r->device_count &&
+            list[i].roster_hash == r->roster_hash &&
+            memcmp(list[i].roster, r->roster, sizeof r->roster) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Slot i gets the handle whose newest uberblock carries slot i's device
+ * uuid; a REMOVED slot, or one no handle names, gets none. */
+static void sync_roster_map(const stm_pool_device dev[], size_t n,
+                            stm_bdev *const devs[], const sync_scan best[],
+                            size_t ndevs, stm_bdev *map[],
+                            stm_device_state state[])
+{
+    for (size_t i = 0; i < n; i++) {
+        state[i] = dev[i].state;
+        map[i] = NULL;
+        if (dev[i].state == STM_DEV_STATE_REMOVED) continue;
+        for (size_t k = 0; k < ndevs; k++) {
+            if (best[k].valid &&
+                stm_load_le64(best[k].ub.ub_device_uuid[0]) == dev[i].uuid[0] &&
+                stm_load_le64(best[k].ub.ub_device_uuid[1]) == dev[i].uuid[1]) {
+                map[i] = devs[k];
+                break;
+            }
+        }
+    }
+}
+
+/* OPEN-BUGS (s). Each roster tried is a pool the open could be handed; it
+ * is the pool's when the uberblock its pick takes carries it. Rosters
+ * that differ only in FAULTED/ONLINE states give one pick (a state counts
+ * there only as REMOVED or not), so one of them at most is the pool's. Two
+ * that differ in their slots or their REMOVED set (an add or a remove
+ * whose commit some devices hold and others not) can both be: a lost add's
+ * reservation above the commits the smaller roster acknowledged since, or
+ * an acknowledged add above a device that missed it, and only the
+ * acknowledgement, which no device records, tells them apart: STM_EIO.
+ * A roster whose pick refuses refuses the scan: the roster the pool
+ * acknowledged its newest commit under may be the one an absent device
+ * makes unknown, and a roster from before an add would mount below it. */
+stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
+                                stm_sb_scan_refusal *why,
+                                stm_pool_open_opts *out,
+                                uint64_t *out_auth_gen)
+{
+    if (why) memset(why, 0, sizeof *why);
+    if (!devs || !out || ndevs == 0 || ndevs > STM_POOL_DEVICES_MAX)
+        return STM_EINVAL;
+    for (size_t k = 0; k < ndevs; k++)
+        if (!devs[k]) return STM_EINVAL;
+    stm_status ci = stm_crypto_init();
+    if (ci != STM_OK) return ci;
+
+    const size_t cap = 2u * STM_POOL_DEVICES_MAX;
+    sync_scan *best = calloc(ndevs, sizeof *best);
+    stm_status *bst = calloc(ndevs, sizeof *bst);
+    stm_sb_scan_refusal *bwhy = calloc(ndevs, sizeof *bwhy);
+    sync_roster *cand = calloc(cap, sizeof *cand);
+    stm_status st = STM_OK;
+    if (!best || !bst || !bwhy || !cand) {
+        st = STM_ENOMEM;
+        goto done;
+    }
+
+    for (size_t k = 0; k < ndevs; k++) {
+        uint32_t lbl = 0, slot = 0;
+        bst[k] = stm_sb_mount_scan_ex(devs[k], false, &best[k].ub, &lbl, &slot,
+                                      &bwhy[k]);
+        if (bst[k] == STM_EBADVERSION) {
+            if (why) *why = bwhy[k];
+            st = STM_EBADVERSION;
+            goto done;
+        }
+        best[k].valid = bst[k] == STM_OK;
+    }
+    for (size_t k = 0; k < ndevs; k++) {
+        for (size_t j = 0; best[k].valid && j < k; j++) {
+            if (!best[j].valid) continue;
+            const stm_uberblock *a = &best[k].ub, *b = &best[j].ub;
+            if (stm_load_le64(a->ub_pool_uuid[0]) != stm_load_le64(b->ub_pool_uuid[0]) ||
+                stm_load_le64(a->ub_pool_uuid[1]) != stm_load_le64(b->ub_pool_uuid[1]) ||
+                (stm_load_le64(a->ub_device_uuid[0]) == stm_load_le64(b->ub_device_uuid[0]) &&
+                 stm_load_le64(a->ub_device_uuid[1]) == stm_load_le64(b->ub_device_uuid[1]))) {
+                st = STM_EINVAL;
+                goto done;
+            }
+        }
+    }
+
+    /* The rosters the handles' newest uberblocks name, newest first. */
+    size_t ncand = 0;
+    bool listed[STM_POOL_DEVICES_MAX] = { false };
+    for (;;) {
+        size_t next = SIZE_MAX;
+        for (size_t k = 0; k < ndevs; k++) {
+            if (!best[k].valid || listed[k]) continue;
+            if (next == SIZE_MAX ||
+                stm_load_le64(best[k].ub.ub_gen) > stm_load_le64(best[next].ub.ub_gen))
+                next = k;
+        }
+        if (next == SIZE_MAX) break;
+        listed[next] = true;
+        sync_roster r;
+        sync_roster_of(&best[next].ub, &r);
+        if (!sync_roster_listed(cand, ncand, &r)) cand[ncand++] = r;
+    }
+    if (ncand == 0) {
+        st = STM_ENOENT;
+        for (size_t k = 0; k < ndevs; k++) {
+            if (bst[k] == STM_ENOENT) continue;
+            if (why) *why = bwhy[k];
+            st = bst[k];
+            break;
+        }
+        goto done;
+    }
+
+    size_t found = SIZE_MAX, nfound = 0;
+    uint64_t found_auth = 0;
+    stm_pool_device dev[STM_POOL_DEVICES_MAX];
+    stm_bdev *map[STM_POOL_DEVICES_MAX];
+    stm_device_state state[STM_POOL_DEVICES_MAX];
+    for (size_t c = 0; c < ncand; c++) {
+        memset(dev, 0, sizeof dev);
+        st = stm_pool_roster_decode(cand[c].roster, cand[c].device_count, dev);
+        if (st != STM_OK) goto done;
+        sync_roster_map(dev, cand[c].device_count, devs, best, ndevs, map, state);
+        stm_sb_scan_refusal pwhy;
+        memset(&pwhy, 0, sizeof pwhy);
+        uint64_t auth = 0;
+        stm_uberblock ub;
+        st = sync_pick_canonical(cand[c].device_count, map, state, &pwhy,
+                                 &auth, &ub);
+        if (st != STM_OK) {
+            if (why) *why = pwhy;
+            goto done;
+        }
+        sync_roster r;
+        sync_roster_of(&ub, &r);
+        if (sync_roster_listed(&cand[c], 1, &r)) {
+            nfound++;
+            found = c;
+            found_auth = auth;
+        } else if (!sync_roster_listed(cand, ncand, &r)) {
+            if (ncand == cap) {
+                st = STM_EIO;
+                goto done;
+            }
+            cand[ncand++] = r;
+        }
+    }
+    if (nfound != 1) {
+        st = nfound == 0 ? STM_ECORRUPT : STM_EIO;
+        goto done;
+    }
+
+    memset(out, 0, sizeof *out);
+    out->pool_uuid[0] = cand[found].pool_uuid[0];
+    out->pool_uuid[1] = cand[found].pool_uuid[1];
+    out->device_count = cand[found].device_count;
+    st = stm_pool_roster_decode(cand[found].roster, cand[found].device_count,
+                                out->devices);
+    if (st != STM_OK) goto done;
+    sync_roster_map(out->devices, out->device_count, devs, best, ndevs, map,
+                    state);
+    for (size_t i = 0; i < out->device_count; i++) out->devices[i].bdev = map[i];
+    if (out_auth_gen) *out_auth_gen = found_auth;
+
+done:
+    free(cand);
+    free(bwhy);
+    free(bst);
+    free(best);
+    return st;
+}
+
+stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
+                          const stm_hybrid_keys *wk,
+                          struct stm_janus_client *janus,
+                          const stm_corvus_mount_cfg *corvus,
+                          stm_sync **out_sync)
+{
+    return stm_sync_open_ex(p, a, wk, janus, corvus, NULL, out_sync);
+}
+
+stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
+                             const stm_hybrid_keys *wk,
+                             struct stm_janus_client *janus,
+                             const stm_corvus_mount_cfg *corvus,
+                             stm_sb_scan_refusal *why,
+                             stm_sync **out_sync)
+{
+    if (why) memset(why, 0, sizeof *why);
+    if (!p || !a || !out_sync) return STM_EINVAL;
+    if (stm_pool_device_count(p) == 0) return STM_EINVAL;
+    /* P4-4a/P4-4b: key source is mandatory, exactly one. */
+    if ((!wk && !janus) || (wk && janus)) return STM_EINVAL;
+
+    /* R9 P1-1: make sure libsodium is up before any crypto op. */
+    stm_status ci = stm_crypto_init();
+    if (ci != STM_OK) return ci;
+
+    /* P5-4b-i: iteration bound stays TOTAL device_count (REMOVED
+     * slots still occupy their indices; skipped via NULL bdev). */
+    size_t n = stm_pool_device_count(p);
+    stm_bdev *pick_bdev[STM_POOL_DEVICES_MAX];
+    stm_device_state pick_state[STM_POOL_DEVICES_MAX];
+    for (size_t i = 0; i < n; i++) {
+        const stm_pool_device *dv = stm_pool_device_info(p, (uint16_t)i);
+        pick_bdev[i] = stm_pool_device_bdev(p, (uint16_t)i);
+        pick_state[i] = dv ? dv->state : STM_DEV_STATE_REMOVED;
+    }
+    uint64_t auth_gen = 0;
+    stm_uberblock ub;
+    stm_status pk = sync_pick_canonical(n, pick_bdev, pick_state, why,
+                                        &auth_gen, &ub);
+    if (pk != STM_OK) return pk;
 
     /* P5-1 UB validation (generalized): verify the canonical UB's
      * pool_uuid + roster_hash + device_count match the caller's

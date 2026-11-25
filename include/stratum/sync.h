@@ -297,6 +297,38 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
                              stm_sync **out_sync);
 
 /*
+ * The pool to open on devs[0..ndevs) (stm_pool_open, then stm_sync_open),
+ * writing nothing. Each device's newest uberblock names a roster, and so
+ * does the uberblock each roster's pick takes; with each roster the open's
+ * pick runs over the devices, a slot matched to the device whose newest
+ * uberblock carries its device uuid. A slot not REMOVED that no device
+ * matches (absent, blank, or its ring unreadable) is an unknown vote. A
+ * roster is the pool's when the uberblock its pick takes carries it.
+ * out: the pool uuid, the device count and the devices, each bdev the
+ * matched handle or NULL (read_only false: the caller's to set; an ONLINE
+ * slot with no device stm_pool_open refuses, OPEN-BUGS (an)); a handle no
+ * slot matches is left out. out_auth_gen, if not NULL: the gen the open
+ * would mount. why: as stm_sync_open_ex's, for the refusal returned.
+ *   STM_EINVAL   devs or out NULL, ndevs 0 or over STM_POOL_DEVICES_MAX, a
+ *                NULL handle, handles of two pools or two of one device.
+ *   STM_ENOENT   no device holds an uberblock; a device's scan refusal
+ *                otherwise, the first in devs order.
+ *   STM_EIO      two rosters are the pool's: around an add or a remove
+ *                whose commit some devices hold, which only its
+ *                acknowledgement could decide. Hand in only the devices
+ *                the pool holds.
+ *   STM_ECORRUPT no roster is the pool's.
+ *   otherwise    a roster's pick refused (stm_sync_open_ex's refusals:
+ *                STM_EIO for an unknown vote, STM_EQUORUM, ...), the
+ *                first in the order tried (newest uberblock's first).
+ */
+STM_MUST_USE
+stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
+                                struct stm_sb_scan_refusal *why,
+                                stm_pool_open_opts *out,
+                                uint64_t *out_auth_gen);
+
+/*
  * Commit. Writes Phase 1 reservation UB at auth+1, flushes, writes
  * Phase 3 final UB at auth+2, to every pool device in parallel.
  * Each phase requires quorum (⌊N/2⌋+1) of fsync confirmations; if
