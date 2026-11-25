@@ -30,7 +30,7 @@ chapter as specs get wider cross-reference tables).
 | `allocator.tla` | 3 | Refcount + deferred-free; unreserve; a send's hold on its blocks. | 24501221 distinct states, depth 29 (3 ranges, 3 owners, MaxGen 3) | `allocator_unreserve_after_write_buggy.cfg`, `allocator_send_sweep_ignores_pins_buggy.cfg`, `allocator_send_sweep_ignores_barrier_buggy.cfg`, `allocator_send_barrier_by_free_gen_buggy.cfg`, `allocator_send_free_before_deindex_buggy.cfg` |
 | `merkle.tla` | 4 | Per-node Merkle chain. | bounded | — |
 | `key_schema.tla` | 7 / TLY-A3 | Per-dataset key state machine + TLY-A3-keyslot mount machine (`wrapper_identity` + mount FSM + `MountResolvesKeyBeforeData`) + TLY-A3-keyslot-wrap UNWRAP-binding: `unwrap_path` tracking + `UnwrapUsesWrapBinding` — a mount that resolves a CORVUS slot sends corvus the same dataset-path binding the slot's WRAP recorded; a mismatch makes corvus reject the envelope → unmountable pool. | bounded | `key_schema_mount_serve_before_resolve_buggy.cfg`, `key_schema_unwrap_wrong_path_buggy.cfg` |
-| `quorum.tla` | 5 | Multi-device commit + mount-claim; the mount reads the ONLINE devices (vote 153) and picks content from each device's ring slot of the gen it takes (OPEN-BUGS (ah)). | 46473 distinct states; `quorum_faults.cfg` (one fault) 231200; `quorum_retry.cfg` (the code's retry) 164938; `quorum_pick.cfg` (four devices, one fault, three commits) @QP@ (each under the dead-slot VIEW and SYMMETRY) | `quorum_buggy.cfg`, `quorum_mount_buggy.cfg`, `quorum_pick_buggy.cfg`, `quorum_ring_buggy.cfg`, `quorum_hidden_buggy.cfg`, `quorum_intact_buggy.cfg` |
+| `quorum.tla` | 5 | Multi-device commit + mount-claim; the mount reads the ONLINE devices (vote 153) and picks content from each device's ring slot of the gen it takes (OPEN-BUGS (ah)). | 46473 distinct states; `quorum_faults.cfg` (one fault) 231200; `quorum_retry.cfg` (the code's retry) 164938; `quorum_faults_retry.cfg` (one fault, the divergent retry) 841565; `quorum_pick.cfg` (four devices, two commits) 227801; `quorum_pick_faults.cfg` (four devices, one fault, three commits; outside CI) @QPF@ (each under the dead-slot VIEW and SYMMETRY) | `quorum_buggy.cfg`, `quorum_mount_buggy.cfg`, `quorum_pick_buggy.cfg`, `quorum_ring_buggy.cfg`, `quorum_hidden_buggy.cfg`, `quorum_intact_buggy.cfg` |
 | `metadata_nonce.tla` | 5 | Per-device paddr-stamping for nonces. | 51939 states | `metadata_nonce_buggy.cfg` |
 | `device_lifecycle.tla` | 5 | Roster state machine (add/remove/fail/rejoin). | large cfg: 10.6M states at depth 21 | `device_lifecycle_buggy.cfg` |
 | `evac.tla` | 5 | Per-block evacuation atomicity. | 13 states, depth 5 | `evac_buggy.cfg`, `evac_remove_no_drain_buggy.cfg` |
@@ -330,10 +330,17 @@ reaching a quorum (`RingPick`); a content a quorum holds is one, and with
 none possible any held there mounts. `MountNotStuck`: every device online
 and every slot readable, no coordinator in flight, the mount can pick.
 `RingRead=FALSE` is the newest-only open (`NewestPick`, with
-`MinorityMustAgree`). `quorum_pick.cfg` (four devices, quorum 3, one
-fault, three commits) holds every invariant; with two commits the
-newest-only model had no state with a disagreeing minority at the
-mount's gen after an acknowledged final. `quorum_ring_buggy.cfg`
+`MinorityMustAgree`). `quorum_pick.cfg` (four devices, quorum 3, two
+commits) holds every invariant; `quorum_pick_buggy.cfg`, the newest-only
+pick at the same bounds, fails `MountKeepsPublished` (24 states): a claim
+acknowledged on three devices, the next commit's final on the fourth
+only, a crash, a claim over it acknowledged on the other three, the next
+reservation on two of them, a crash, and the mount meets the orphan final
+and the claim at its gen. The claim is written device by device, so two
+commits reach this. With a fault and a third commit the model
+(`quorum_pick_faults.cfg`) runs for hours, past a CI job, and is checked
+outside CI; `quorum_faults.cfg` checks the unknown votes on three
+devices. `quorum_ring_buggy.cfg`
 (`RingRead=FALSE`) fails `MountNotStuck` with no fault: a commit's final
 on one device, the next open's claim on another, a crash, and no open
 can ever mount (15 states); `quorum_hidden_buggy.cfg`
@@ -1986,6 +1993,10 @@ for cfg in scrub_beta scrub_durable scrub_beta_durable; do
 done
 java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
     -config quorum_faults.cfg quorum.tla 2>&1 | tail -3
+for cfg in quorum_retry quorum_faults_retry; do
+  java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+      -config ${cfg}.cfg quorum.tla 2>&1 | tail -3
+done
 
 # Buggy-config sanity (each must VIOLATE as expected):
 for cfg in quorum_buggy metadata_nonce_buggy device_lifecycle_buggy \
@@ -2022,6 +2033,9 @@ java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
     grep -E "Invariant|Error:" | head -2
 java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
     -config quorum_pick.cfg quorum.tla 2>&1 | tail -3
+# Hours, outside CI:
+java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+    -config quorum_pick_faults.cfg quorum.tla 2>&1 | tail -3
 java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
     -config quorum_pick_buggy.cfg quorum.tla 2>&1 | \
     grep -E "Invariant|Error:" | head -2
