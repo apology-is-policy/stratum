@@ -697,9 +697,15 @@ struct stm_sync {
      * or scrub state moved, so one session never leaves two contents in
      * one slot (sync_open's pick counts a torn copy as possibly holding
      * the acknowledged one). A device added in between rebuilds: the
-     * stashed roster does not name it. A fail, rejoin, evacuation or
-     * removal moves only state bytes (a removed slot persists), so every
-     * device the retry writes is still in the stashed roster. */
+     * stashed roster does not name it. A fail, rejoin or evacuation's
+     * start moves only state bytes, so every device the retry writes is
+     * still in the stashed roster, with the same quorum. A removal
+     * shrinks the quorum: the stashed roster's larger one could then
+     * hold the reservation while the retry's final is acknowledged under
+     * the smaller, and an open from the stashed roster would mount the
+     * reservation under it. So the sync's remove and finish-evacuation
+     * refuse while the stash waits for its retry (sync_retry_pending),
+     * and a retry that finds a slot removed some other way wedges. */
     stm_uberblock     res_ub;
     uint64_t          res_ub_gen;
     bool              have_res_ub;
@@ -1659,6 +1665,33 @@ static inline size_t sync_quorum_n(const stm_sync *s)
 }
 
 static void sync_wedge_locked(stm_sync *s);
+
+/* A commit failed past its reservation's build and has not been retried
+ * to an acknowledgement: current_gen stays at the failed final's gen, one
+ * past the stashed reservation's. */
+static bool sync_retry_pending(const stm_sync *s)
+{
+    return s->have_res_ub && s->res_ub_gen + 1u == s->current_gen;
+}
+
+/* The stashed reservation's roster removes exactly the slots the pool
+ * removes now: the quorum it was written under is the retry's. Caller
+ * holds the pool lock. */
+static bool sync_removed_set_kept(const stm_sync *s, const stm_uberblock *ub)
+{
+    uint16_t n = stm_load_le16(ub->ub_device_count);
+    stm_pool_device dev[STM_POOL_DEVICES_MAX] = { 0 };
+    if (n != stm_pool_device_count(s->pool)) return false;
+    if (stm_pool_roster_decode(ub->ub_roster, n, dev) != STM_OK) return false;
+    for (uint16_t i = 0; i < n; i++) {
+        const stm_pool_device *cur = stm_pool_device_info(s->pool, i);
+        if (!cur) return false;
+        if ((dev[i].state == STM_DEV_STATE_REMOVED) !=
+            (cur->state == STM_DEV_STATE_REMOVED))
+            return false;
+    }
+    return true;
+}
 
 /* Write an uberblock carrying `shared` content to every device in the
  * pool at ring slot `slot`, every copy (stm_sb_ub_write_copies: a device
@@ -2641,22 +2674,27 @@ static void sync_roster_map(const stm_pool_device dev[], size_t n,
  * handed in is more than one gen past the gen it takes. A write of gen g
  * comes from a session whose authoritative gen was g - 1 (a claim, a
  * reservation) or g - 2 with the reservation at g - 1 confirmed by a
- * quorum (a final), so such a device shows a commit acknowledged above
- * that gen (quorum.tla NewestNearAuth, per roster), and the roster is
- * passed over: in its pick, a device it names (a disk a remove or a failed
- * add left behind names its old roster, whose pick lands below the
- * pool's); after, one it does not (a device an add brought in, whose
- * commit's reservation reached it alone, beside a device of the roster
- * that lost the gen below on every copy). Rosters that differ only in
- * FAULTED/ONLINE states give one pick (a state counts there only as
- * REMOVED or not), so one of them at most is the pool's. Two that differ
- * in their slots or their REMOVED set (an add or a remove whose commit
- * some devices hold and others not) can both be, and only the
- * acknowledgement, which no device records, tells them apart: STM_EIO.
- * Any other refusal of a roster's pick refuses the scan: the roster the
- * pool acknowledged its newest commit under may be the one an absent
- * device makes unknown. None the pool's: STM_EIO when one was passed over
- * (a later roster no handle shows), else STM_ECORRUPT. */
+ * quorum (a final), so such a device holds a write above that gen that a
+ * quorum of another roster confirmed (quorum.tla NewestNearAuth, per
+ * roster; were it this roster's, its pick would take that gen), and the
+ * roster is passed over, the answer mounting at least that gen less one:
+ * in its pick, a device it names (a disk a remove or a failed add left
+ * behind names its old roster, whose pick lands below the pool's); after,
+ * one it does not (a device an add brought in whose commit's reservation
+ * or final missed devices of the old roster). Rosters that differ only in
+ * FAULTED/EVACUATING/ONLINE states give one pick (a state counts there
+ * only as REMOVED or not), so one of them at most is the pool's. Two that
+ * differ in their slots or their REMOVED set (an add or a remove whose
+ * reservation some devices hold and whose final none handed in does) can
+ * both be, and whether the final was acknowledged, which no device handed
+ * in shows, tells them apart: STM_EIO. (The retry of a failed commit
+ * reuses its reservation's roster, so the sync refuses a removal until
+ * that retry is acknowledged: sync_retry_pending.) Any other refusal of a
+ * roster's pick refuses the scan: the roster the pool acknowledged its
+ * newest commit under may be the one an absent device makes unknown
+ * (test: refuses_when_another_rosters_pick_refuses). None the pool's:
+ * STM_EIO when one was passed over (the later write no roster read
+ * takes), else STM_ECORRUPT. */
 stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
                                 stm_sb_scan_refusal *why,
                                 stm_pool_open_opts *out,
@@ -3613,8 +3651,15 @@ stm_status stm_sync_commit(stm_sync *s)
                          &astats_res);
         if (s->have_res_ub && s->res_ub_gen == reservation_gen &&
             stm_load_le16(s->res_ub.ub_device_count) ==
-                stm_load_le16(res_prototype.ub_device_count))
+                stm_load_le16(res_prototype.ub_device_count)) {
+            if (!sync_removed_set_kept(s, &s->res_ub)) {
+                sync_wedge_locked(s);
+                pthread_mutex_unlock(&s->lock);
+                stm_pool_unlock_shared(s->pool);
+                return STM_EWEDGED;
+            }
             res_prototype = s->res_ub;
+        }
     }
 
     /* CF-4 B: arm the barrier-defer windows. Every fsync issued between
@@ -5198,6 +5243,8 @@ stm_status stm_sync_remove_device(stm_sync *s, uint16_t device_id,
     uint16_t claim = stm_pool_replace_claim_locked(s->pool);
     if (claim != STM_POOL_REPLACE_CLAIM_NONE && claim == device_id) {
         ret = STM_EBUSY;
+    } else if (sync_retry_pending(s)) {
+        ret = STM_EBUSY;    /* the stashed reservation's quorum (res_ub) */
     } else {
         stm_status ds = sync_require_drained_locked(s, device_id);
         ret = ds;
@@ -5229,6 +5276,8 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id)
     uint16_t claim = stm_pool_replace_claim_locked(s->pool);
     if (claim != STM_POOL_REPLACE_CLAIM_NONE && claim == device_id) {
         ret = STM_EBUSY;
+    } else if (sync_retry_pending(s)) {
+        ret = STM_EBUSY;    /* as in stm_sync_remove_device */
     } else {
         stm_status ds = sync_require_drained_locked(s, device_id);
         ret = ds;
