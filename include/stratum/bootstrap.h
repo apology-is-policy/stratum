@@ -202,6 +202,16 @@ stm_status stm_bootstrap_create(stm_bdev *d,
                              stm_bootstrap **out_alloc);
 
 /*
+ * The size stm_bootstrap_create gives the bootstrap pool of a device laid
+ * out at `layout_bytes` when asked for `bootstrap_size_bytes`, or the
+ * status it refuses with: the same rules, and no I/O.
+ */
+STM_MUST_USE
+stm_status stm_bootstrap_size_for(uint64_t layout_bytes,
+                                  uint64_t bootstrap_size_bytes,
+                                  uint64_t *out_size_bytes);
+
+/*
  * Open an existing bootstrap pool. Reads both header slots; picks the
  * one with the highest bitmap_gen that validates (magic, version,
  * self-csum, bitmap csum). Loads that header's bitmap into RAM.

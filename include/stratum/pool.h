@@ -109,7 +109,10 @@ typedef struct {
 /*
  * Construct a pool handle from `opts`. Validates:
  *   - device_count in [1, STM_POOL_DEVICES_MAX];
- *   - every LIVE device slot (state != REMOVED) has non-NULL bdev;
+ *   - every LIVE device slot (state != REMOVED) has non-NULL bdev,
+ *     but a FAULTED one may have none (its device is gone; the open
+ *     counts it an unknown vote, and opens only read-only, every device
+ *     there opened read-only: STM_EROFS otherwise);
  *   - REMOVED slots (P5-4b-i) have NULL bdev and keep their UUID
  *     for burned-UUID tracking;
  *   - every device's uuid is non-zero (all-zero is the reserved
@@ -321,6 +324,10 @@ bool stm_pool_lock_is_free_for_test(stm_pool *p);
  * under the historical device. P5-4b must persist REMOVED slots
  * in the roster AND this walk must iterate through them.
  *
+ * With a sync attached, add only while no failed commit waits for its
+ * retry: that retry then writes nothing and wedges the sync (see
+ * stm_sync_commit).
+ *
  * Returns:
  *   STM_OK           — device added; roster_hash advanced.
  *   STM_EROFS        — pool was opened read_only.
@@ -411,7 +418,7 @@ stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
  *
  * RO pools refuse (STM_EROFS). An already-EVACUATING slot refuses
  * (STM_EINVAL — use evacuation_step or finish_evacuation, not double
- * begin). Same caller-serialization contract as add_device /
+ * begin). A FAULTED slot whose device is gone refuses (STM_ENODEV). Same caller-serialization contract as add_device /
  * remove_device — serialize against concurrent sync_commit until
  * P5-4b-ii-β lands the per-pool lock.
  */
@@ -482,6 +489,7 @@ stm_status stm_pool_fail_device(stm_pool *p, uint16_t device_id);
  *   STM_OK     — slot flipped to ONLINE; roster_hash advanced.
  *   STM_EROFS  — pool is read_only.
  *   STM_EINVAL — slot not FAULTED, or out-of-range.
+ *   STM_ENODEV -- the slot's device is gone (no bdev).
  */
 STM_MUST_USE
 stm_status stm_pool_rejoin_device(stm_pool *p, uint16_t device_id);

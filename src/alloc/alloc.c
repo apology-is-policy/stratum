@@ -509,12 +509,10 @@ static const stm_btree_store_vtable ALLOC_STORE_VT = {
 /* Data-area geometry.                                                        */
 /* ========================================================================= */
 
-static stm_status compute_data_area(const stm_bdev *d, uint64_t bootstrap_size_bytes,
-                                     uint64_t *out_first_block,
-                                     uint64_t *out_last_block)
+static stm_status data_area_for(uint64_t layout, uint64_t bootstrap_size_bytes,
+                                 uint64_t *out_first_block,
+                                 uint64_t *out_last_block)
 {
-    if (!d) return STM_EINVAL;
-    uint64_t layout = stm_bdev_layout_bytes(d);
     if (layout < (uint64_t)STM_LABEL_SIZE * 2u) return STM_ENOSPC;
 
     uint64_t head_end = STM_BOOTSTRAP_OFFSET + bootstrap_size_bytes;
@@ -533,6 +531,31 @@ static stm_status compute_data_area(const stm_bdev *d, uint64_t bootstrap_size_b
     *out_first_block = first_block;
     *out_last_block  = last_block;
     return STM_OK;
+}
+
+static stm_status compute_data_area(const stm_bdev *d, uint64_t bootstrap_size_bytes,
+                                     uint64_t *out_first_block,
+                                     uint64_t *out_last_block)
+{
+    if (!d) return STM_EINVAL;
+    return data_area_for(stm_bdev_layout_bytes(d), bootstrap_size_bytes,
+                         out_first_block, out_last_block);
+}
+
+stm_status stm_alloc_check_geometry(uint64_t layout_bytes,
+                                    uint64_t bootstrap_size_bytes,
+                                    uint64_t *out_bootstrap_bytes)
+{
+    uint64_t lo[STM_LABELS_PER_DEVICE];
+    stm_status s = stm_label_offsets(layout_bytes, lo);
+    uint64_t boot = 0;
+    if (s == STM_OK)
+        s = stm_bootstrap_size_for(layout_bytes, bootstrap_size_bytes, &boot);
+    uint64_t first = 0, last = 0;
+    if (s == STM_OK)
+        s = data_area_for(layout_bytes, boot, &first, &last);
+    if (s == STM_OK && out_bootstrap_bytes) *out_bootstrap_bytes = boot;
+    return s;
 }
 
 /* ========================================================================= */
@@ -597,9 +620,15 @@ stm_status stm_alloc_create(stm_bdev *d,
 {
     if (!d || !pool_uuid || !device_uuid || !out_alloc) return STM_EINVAL;
 
+    /* Asked before the bootstrap pool is written: a refusal after it would
+     * leave the device holding neither its old pool nor this one. */
+    stm_status s = stm_alloc_check_geometry(stm_bdev_layout_bytes(d),
+                                            bootstrap_size_bytes, NULL);
+    if (s != STM_OK) return s;
+
     stm_bootstrap *boot = NULL;
-    stm_status s = stm_bootstrap_create(d, pool_uuid, device_uuid,
-                                         bootstrap_size_bytes, &boot);
+    s = stm_bootstrap_create(d, pool_uuid, device_uuid,
+                             bootstrap_size_bytes, &boot);
     if (s != STM_OK) return s;
 
     /* Recover the actual bootstrap size (it may differ from the

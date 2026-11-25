@@ -153,6 +153,9 @@ nodes. File data lives in the data area, which has its own allocator.
 - The size is **fixed at format and cannot grow**. `stratum mkfs` picks device/16, clamped to 8-256 MiB,
   and `--bootstrap` overrides it. The library default is `max(64 MiB, device/1024)`; with it, a device
   of about 7 TiB or more fails at format unless a size is passed (*derived*).
+- A size the device cannot hold beside its labels and one block of data, or one not whole 4 KiB
+  blocks, is refused before format writes anything, the resize included: a refused format over a
+  pool, under `--force` too, leaves that pool as it was.
 
 ### 3.5 Trees
 

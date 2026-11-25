@@ -988,6 +988,8 @@ static stm_bdev *open_companion_device(const char *suffix)
     stm_bdev_open_opts opts = stm_bdev_open_opts_default();
     stm_bdev *d = NULL;
     STM_ASSERT_OK(stm_bdev_open(companion_path, &opts, &d));
+    /* The handle keeps the file; no path outlives the run. */
+    unlink(companion_path);
     STM_ASSERT_OK(stm_bdev_resize(d, TEST_DEVICE_BYTES));
     return d;
 }
@@ -2308,6 +2310,69 @@ STM_TEST(pool_replace_claim_locked_bypasses_check) {
     stm_bdev_close(d2);
     unlink(g_tmp_path);
     unlink(path2);
+}
+
+/* OPEN-BUGS (t): a FAULTED slot may come without its device (gone), and
+ * the roster hashes the same without it: the open can match the pool's
+ * canonical roster. Rejoin and the start of an evacuation refuse such a
+ * slot (STM_ENODEV): an ONLINE or EVACUATING slot has its device. Every
+ * other live state without one is refused at the open, and a FAULTED slot
+ * with its device rejoins (the controls). */
+STM_TEST(pool_open_admits_a_faulted_slot_whose_device_is_gone) {
+    make_tmp("gone");
+    stm_bdev *d = open_fresh_device();
+    stm_bdev *d2 = open_companion_device("gone");
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = POOL_UUID[0];
+    opts.pool_uuid[1] = POOL_UUID[1];
+    opts.device_count = 2;
+    for (int i = 0; i < 2; i++) {
+        const uint64_t *u = i == 0 ? DEVICE_UUID : DEVICE_UUID_B;
+        opts.devices[i].uuid[0]    = u[0];
+        opts.devices[i].uuid[1]    = u[1];
+        opts.devices[i].size_bytes = TEST_DEVICE_BYTES;
+        opts.devices[i].role       = STM_DEV_ROLE_DATA;
+        opts.devices[i].class_     = STM_DEV_CLASS_SSD;
+        opts.devices[i].state      = STM_DEV_STATE_ONLINE;
+    }
+    opts.devices[0].bdev = d;
+    opts.devices[1].state = STM_DEV_STATE_FAULTED;
+
+    opts.devices[1].bdev = d2;
+    stm_pool *with = NULL;
+    STM_ASSERT_OK(stm_pool_open(&opts, &with));
+    opts.devices[1].bdev = NULL;
+    stm_pool *gone = NULL;
+    STM_ASSERT_OK(stm_pool_open(&opts, &gone));
+    if (with && gone) {
+        STM_ASSERT_EQ(stm_pool_roster_hash(gone), stm_pool_roster_hash(with));
+        STM_ASSERT(stm_pool_device_bdev(gone, 1) == NULL);
+        STM_ASSERT_EQ(stm_pool_live_device_count(gone), 2u);
+        STM_ASSERT_ERR(stm_pool_rejoin_device(gone, 1), STM_ENODEV);
+        STM_ASSERT_ERR(stm_pool_begin_evacuation(gone, 1, 1), STM_ENODEV);
+        const stm_pool_device *info = stm_pool_device_info(gone, 1);
+        STM_ASSERT(info && info->state == STM_DEV_STATE_FAULTED);
+        STM_ASSERT_EQ(stm_pool_roster_hash(gone), stm_pool_roster_hash(with));
+        STM_ASSERT_OK(stm_pool_rejoin_device(with, 1));
+    }
+    stm_pool_close(with);
+    stm_pool_close(gone);
+
+    const stm_device_state need[] = { STM_DEV_STATE_ONLINE, STM_DEV_STATE_DEGRADED,
+                                      STM_DEV_STATE_OFFLINE, STM_DEV_STATE_EVACUATING };
+    for (size_t k = 0; k < sizeof need / sizeof need[0]; k++) {
+        opts.devices[1].state = need[k];
+        opts.devices[1].bdev = NULL;
+        stm_pool *p = NULL;
+        STM_ASSERT_ERR(stm_pool_open(&opts, &p), STM_EINVAL);
+        opts.devices[1].bdev = d2;
+        STM_ASSERT_OK(stm_pool_open(&opts, &p));
+        stm_pool_close(p);
+    }
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
 }
 
 STM_TEST_MAIN("pool")

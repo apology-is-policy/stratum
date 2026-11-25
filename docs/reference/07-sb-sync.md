@@ -387,6 +387,9 @@ to a rollback, never a silent one.)
 
 ```
 Fresh pool (auth_gen == 0):   1-phase -- write UB at gen=1 to all devices.
+                              Its final is stashed before the write, as a
+                              reservation is: a failed first commit's retry
+                              waits as one does (Phase 1' below).
 Subsequent commits:           2-phase, in the CF-4 B order below.
 
 Phase 2: Flush (first; its node writes and fsyncs go into the defer window)
@@ -420,13 +423,33 @@ Phase 1': Reservation (after the flush, before the barrier)
     the barrier, the final) reserves at the same gen (current_gen moves
     only when a final is acknowledged), where a quorum may hold the
     first attempt's reservation: it writes the bytes it wrote or tried
-    there again, built afresh only when a device was added in between
-    (the stashed roster does not name it; a fail, rejoin, evacuation or
-    removal moves only state bytes, OPEN-BUGS (ak)). A rebuild records
-    other allocator statistics or another roster, and
-    one power loss in its write could leave two contents at an
-    acknowledged gen, a device each, which no open could pick between
-    (review (ah) round 2 F1).
+    there again (a fail, rejoin or the start of an evacuation moves
+    only state bytes, the quorum unchanged). A rebuild records other
+    allocator statistics or another roster, and one power loss in its
+    write could leave two contents at an acknowledged gen, a device
+    each, which no open could pick between (review (ah) round 2 F1).
+    A removal or an add changes the quorum, so the sync's
+    stm_sync_remove_device, stm_sync_finish_evacuation and
+    stm_sync_replace_device_online wait for that retry, refusing
+    STM_EBUSY: a retry acknowledged by the new roster's quorum need not
+    hold a quorum of the stashed roster, whose own pick then takes the
+    first attempt's reservation (one gen below) or orphan final (at the
+    acknowledged gen), and an open from that roster claimed over the
+    acknowledged commit (review (s)(t)(u)(v) round 4 F1: four devices,
+    a removal, the retry's final missed by one of the three left; round
+    6 F1: one device added, the rebuilt retry acknowledged by the
+    larger quorum, OPEN-BUGS (ak)). A retry that finds the pool's slots
+    changed anyway (the pool primitives: a slot the stashed roster names
+    removed, or one added) writes nothing, wedges and answers
+    STM_EWEDGED. While a retry waits a commit takes no clean-commit
+    skip: that skip compares with the last acknowledged final, and a
+    rejoin could bring the roster back to it while the failed attempt's
+    reservation, carrying the FAULTED state, was the newest on disk
+    (round 5 F2: the commit answered STM_OK writing nothing and the
+    guard held for good). An engines' finalize failing after the final
+    reached quorum wedges the sync, as one on the clean skip does: the
+    failed engine stays pending and refuses every later flush, so the
+    handle no longer agrees with the pool it wrote.
 
 Barrier
     Stage each bootstrap's one slot-pair COW, then one data barrier per
@@ -541,6 +564,11 @@ first record went answers `STM_EWEDGED` and the sync wedges.
    others were there). A device whose scan refuses (STM_EIO; on a pool
    with more than one live device STM_ERANGE and STM_ECORRUPT too) is an
    unknown vote; one that finds no uberblock (STM_ENOENT) votes nothing.
+   A FAULTED slot whose device is gone (stm_pool_open admits one with no
+   bdev) is an unknown vote too: after a rejoin the roster presented does
+   not show, it may have confirmed a commit the others did not. Such a pool
+   opens only read-only, every device there opened read-only (STM_EROFS
+   otherwise; OPEN-BUGS (ao), (ap)).
    If no device gave a uberblock and one refused, the open answers
    STM_EIO, not STM_ENOENT (an unreadable pool is not a fresh one); a pool
    with one live device answers its STM_ERANGE or STM_ECORRUPT as it is.
@@ -555,6 +583,16 @@ first record went answers `STM_EWEDGED` and the sync wedges.
    a commit those devices and the others above it acknowledged, and the
    claim at auth + 1 would overwrite it. So the no-rollback rule above
    holds for any pool.
+   A device read whose newest is more than one gen past auth: return
+   STM_EIO, writing nothing. No write puts a device more than one gen
+   past a quorum of the roster it was written under (quorum.tla
+   NewestNearAuth: the claim and a reservation go to auth + 1, the final
+   to auth + 2 only once a quorum confirmed the reservation), so another
+   roster moved the pool on (a remove some devices took, after an add
+   others did not) or a fault: auth would roll an acknowledged commit
+   back. Review round 2 F1: the open from the two-device roster that a
+   device which missed an add and a remove still showed mounted gen 1
+   under an acknowledged gen 3, and claimed over it.
 3. Content pick (OPEN-BUGS (ah); quorum.tla Mount, RingPick):
      Holders: each device read whose newest is auth_gen, and each other
      whose ring slot of auth_gen decodes as that gen (stm_sb_gen_read,
@@ -565,10 +603,9 @@ first record went answers `STM_EWEDGED` and the sync wedges.
      take one away. Hidden: a device whose slot of auth_gen
      has a copy that settles torn or unreadable and none decoding as
      auth_gen, moved past auth_gen or below it (a confirmed auth_gen
-     torn on every copy leaves the scan's newest below, OPEN-BUGS (ai));
-     and one whose newest is auth_gen + 63 or more (the ring came round;
-     no reachable state has a device more than one gen past auth_gen,
-     quorum.tla NewestNearAuth, so this is a rollback's or a fault's). A
+     torn on every copy leaves the scan's newest below, OPEN-BUGS (ai)).
+     (No device reaches the pick more than one gen past auth_gen, step 2,
+     so none whose ring came round.) A
      device whose every copy of the slot settles blank or as an older
      lap did not take auth_gen, short of a fault on every copy (a
      confirmed write replaces each), and counts nothing. Review round 1
@@ -582,8 +619,8 @@ first record went answers `STM_EWEDGED` and the sync wedges.
      it in that slot: a later write of auth_gen needs an open below it,
      which this pick and vote 153 exclude, or the retry of the commit
      that wrote it, and a retried reservation is written byte for byte
-     again (Phase 1' above; a device added between the attempts rebuilds
-     it, OPEN-BUGS (ak)), while an acknowledged final is never written
+     again, or nothing when the pool's slots changed between the attempts
+     (Phase 1' above), while an acknowledged final is never written
      again.
      A group could have been acknowledged when its holders, the hidden
      devices and the unknown votes reach quorum. One such group is
@@ -645,6 +682,93 @@ first record went answers `STM_EWEDGED` and the sync wedges.
 `MountGenBump` (sync.tla) is the invariant: every mount must advance
 the durable gen past any in-flight gens that could have been written
 by a previous process. Prevents crash-recovery nonce reuse.
+
+### The pool to open (OPEN-BUGS (s))
+
+The open takes the pool it is handed and refuses (STM_ECORRUPT) when the
+uberblock its pick takes carries another roster. A caller holding only
+devices cannot take the roster from one device's newest uberblock: that
+can be an orphan of a commit that failed (after a fail, an evacuation or
+an add, its roster is not the quorum's), or a device that missed commits
+can show an older one.
+
+```c
+stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
+                                stm_sb_scan_refusal *why,
+                                stm_pool_open_opts *out,
+                                uint64_t *out_auth_gen);
+```
+
+It writes nothing. Each device's newest uberblock names a roster; with each
+roster the open's pick (steps 1 to 3 above, `sync_pick_canonical`, which
+the open runs too) runs over the devices, a slot matched to the device
+whose newest uberblock carries its device uuid. A slot not REMOVED that no
+device matches (absent, blank, or its ring unreadable) is an unknown vote:
+a blank device carries no uuid, so the scan never guesses which slot it
+is. A roster is the pool's when the uberblock its pick takes carries it;
+the roster that uberblock carries is tried too (the pool's roster may be
+no device's newest). `out` gets the pool uuid, the device count and the
+devices, each bdev the matched handle or NULL, ready for `stm_pool_open`
+(an ONLINE slot with no device it refuses, OPEN-BUGS (an)).
+
+A device handed in that is more than one gen past the gen a roster's
+pick takes shows that roster is not the pool's. A write of gen g comes
+from a session whose authoritative gen was g - 1 (a claim, a reservation),
+or g - 2 with the reservation at g - 1 confirmed by a quorum (a final): no
+write puts a device more than one gen past a quorum of the roster it was
+written under (quorum.tla NewestNearAuth, which models one device set), so
+a quorum held the gen below such a device's newest, above the roster's gen,
+under the session that wrote it: another roster's quorum (were it this
+roster's, its pick would take that gen). The roster is passed over, not answered and not
+refused, and an answer then mounts at least that device's gen less one, a
+descendant of every acknowledged gen:
+
+- in its pick (step 2), a device it names: a disk a remove or a failed add
+  left behind names its old roster, whose pick lands below the pool's
+  once the pool moved on (review round 3 F1: that pick's refusal refused
+  every scan of such a pool). A REMOVED slot counts nothing in a pick,
+  sound only once the remove was acknowledged: after an add devices 0 and
+  2 acknowledged at gen 3 and a remove of device 2 whose reservation (gen
+  4) reached device 0 alone, the remove's roster's pick takes gen 1 beside
+  device 0 at 4 and is passed over (review round 1 F1: it answered the
+  roster before the add at gen 1); with device 2 handed in, the add's
+  roster answers at 3;
+- after its pick, a device it does not name: a device an add brought in
+  whose commit's writes missed devices of the old roster. Its final on the
+  added device alone (the commit failed, no gen acknowledged above the old
+  roster's) leaves the old roster passed over and the larger one answering
+  at the reservation's gen, which a quorum of it holds (without this
+  filter, STM_EIO: two rosters); its reservation on the added device
+  alone, beside a device of the old roster that lost the gen below on
+  every copy (read as never confirmed), refuses STM_EIO, no roster left.
+
+Rosters that differ only in FAULTED/EVACUATING/ONLINE give one pick (a
+state counts there only as REMOVED or not), so one of them at most is the
+pool's. Two that differ in their slots or their REMOVED set can both be
+(an add whose reservation the larger roster's quorum holds, its final on
+no device handed in: whether the final was acknowledged is unknown, and
+each answer is safe in the single-fault model, review round 4 O1):
+STM_EIO. The retry of a failed commit reuses its reservation's roster, so
+a removal or an add waits for that retry (see the commit above):
+otherwise the new roster's final could be acknowledged while the stashed
+roster's quorum held the first attempt's writes, two rosters the pool's
+with the acknowledgement recorded. An
+add a device missed whose final a device holds is decided: the final was
+written once the larger roster's quorum confirmed the reservation, and the
+smaller roster is passed over. Any other refusal of a roster's pick
+refuses the scan: the roster the newest acknowledged commit was made under
+may be the one an absent device makes unknown (a crafted witness: devices
+0 and 1 hold a removal's acknowledged final at 5 beside the stashed
+four-device roster's reservation at 4 on every device; without device 1
+that roster's pick takes 4, and passing the refused one over answered it,
+review round 4 F2). Hand in every device of the pool you have; a device no
+roster read here names cannot vote.
+STM_EIO when no roster is the pool's and one was passed over (the later
+write no roster read takes: devices holding it were not handed in, or lost
+it); STM_EINVAL for handles of two pools or
+two of one device; STM_ECORRUPT when no roster is the pool's otherwise, or
+for a roster naming a device in two slots (two votes); STM_ENOENT when no
+device holds an uberblock, else the first device's own scan refusal.
 
 ### Uberblock build helper
 
@@ -765,7 +889,7 @@ atomically so add / attach / commit / detach composes in one step.
 |---|---|---|
 | `test_sb` | 62 | Encode / decode roundtrip; csum tamper rejected; magic tamper -> STM_ENOENT; version tamper -> STM_EBADVERSION; zero-gen rejected; label offsets; label_read / label_write; mount_scan picks highest valid; the bytes every version keeps (magic, version, the csum's domain, read without `stm_ub_csum`; an uberblock of those fields alone is a newer build's); a newer build's uberblock refuses the mount and the refusal names its slot (best+1, one of the kept fields alone, two in other slots naming the first, re-reads at best+1 and best+2, the one-device read of best-1; a torn one and an older one do not); every generation in all four labels: the write puts every copy and fails when one fails, a generation is found by any copy, one copy settles a slot, the first of differing copies is taken (in the first pass and when re-reads find them), a later copy beats a blank one before it, a refusal names the first unreadable copy, the one-device final call needs no copy of best-1 with best's trees, an older build's pool is named; the layout (v35): a grown device's tail labels are read where it joined (an acknowledged generation found there, a later write lands there, the new end stays blank; control: not grown), a device smaller than recorded refuses naming both sizes (a newer build's head copy refuses first), with no head copy the tail is read at the current size, and an uberblock recording another size, or none, refuses (a roster counting more than its 64 slots too); a handle laid out at a size no layout can have still reads its head labels.; a device shorter than its layout (cut under the handle, cut before the open, grown back under a handle opened short, cut while its copies are written) takes no copy, read-only answers STM_EROFS; vote 153: on a multi-device pool any slot unsettled with a copy unreadable refuses, naming the first generation past best it can hold (a device that missed gens: one device mounts best past it; a copy failing once is re-read and moves best across the gap; one copy unreadable costs nothing); round 1: a move asks the slots behind it again (one unreadable between the old best and the new refuses), a ring whose every copy read back zero once is settled and its newest found by either rule (a blank ring so read still answers STM_ENOENT), a grown device's head copies read back zero once are settled before the tail is laid out, and with the head blank the tail's copies so read are settled after the pass; round 2: copies that read back zero once and then fail answer STM_EIO, on a device holding a commit and on a blank one; a newer build's uberblock behind a zero read refuses, named from the head and, the head blank, from the tail; copies whose first read failed are read again and the newest found. OPEN-BUGS (ah): `stm_sb_gen_read` takes gen's uberblock from any copy, each read again until it settles (a first read back zero or failed), the first of differing copies in label order; takes gen's copy beside one blank or holding another lap; answers STM_ENOENT when every copy settles blank or as another lap, and STM_EIO when a copy does not settle or settles torn and none decodes as gen (unreadable, torn, zero then failing, one copy blank beside three unreadable or torn); a newer build's uberblock in any copy refuses, behind a zero read too, `why` naming the copy and its version. |
 | `test_sync` | 50 | Single-device commit + remount; MountGenBump; alloc-root tree encoded under correct key; version boundary refusals; every ring write lands in all four labels, a mount finds the newest generation by any copy, and no one unreadable label hides a commit; an allocator opened before the scan on a device that grew is refused, writing nothing (control: not grown); a device smaller than its recorded size refuses the open (STM_ERANGE), writing nothing; a pool made on a device larger than its roster records is laid out at the recorded size (its uberblock copies at the recorded tail, its data area below them), and an allocator made before stm_pool_open is refused; a one-device layout refusal keeps its status (STM_ECORRUPT) and names its copy.; a one-device pool's image cut under the open pool fails the next commit STM_ERANGE and is not regrown. |
-| `test_sync_multi` | 74 | 3-device quorum roundtrip; 1-of-3 device loss tolerated; sub-quorum refused (STM_EQUORUM); orphan-ahead-of-quorum ignored; content-quorum tested; alloc-roots indirection; v5/v6/v7 version refusals (the v5 test exercises one prior version; the decode accepts only `STM_UB_VERSION_MIN_COMPAT`..`STM_UB_VERSION`, and a newer build's uberblock refuses the pool); mirror(2) + mirror(3) roundtrips + tampered-replica fallback; reserve refuses NONE profile; attach_alloc arg validation; RO pool refuses write ops; wedge refusal; keyschema idempotent commit produces byte-identical UBs; replace_device_online resume from step-3 commit failure; same-uuid-different-alloc refused; slot-0 spoofing refused; multi-retry converges; **commit succeeds with one FAULTED device** (R21 P1); replace-claim blocks concurrent mutators on the claimed slot via sync-wrapper bypass-closed (R23 P3-4).; a replace whose rollback cannot remove the new slot wedges and answers the wedge; a newer build's uberblock on one device refuses the open and names its slot; attach refuses an allocator whose data area runs past its device's layout, and one on a device smaller than its layout; a dissenting device's own recorded size does not place the pool's writes on it; a device truncated below its recorded size gets no uberblock, keeps that size through the pool's open and commit, and never counts toward a commit's quorum; a read-only open of a pool holding a REMOVED slot, or a FAULTED one, mounts read-only and reads a block committed before (control: read-write, the same roster opens and claims); a commit that two FAULTED slots of three leave short of quorum fails STM_EQUORUM; vote 153: a commit acknowledged by two devices of three, one of them unreadable at the next open, refuses STM_EIO and writes nothing (control: healthy, it mounts; with the third device holding it too, the unknown vote cannot change the gen and it mounts), an attach over a bitmap open could not confirm reconciles it before any reserve (every node of the device's tree held after; a commit and a remount after), and a device removes left alone keeps the strict scan (a slot unreadable past best+2 refuses); (r): the metadata primary cut under the open pool fails the commit STM_ERANGE and wedges (control: another device cut, the commit is acknowledged and the next open mounts it); round 1: a device whose every ring copy read back zero once is settled and the open mounts the acknowledged gen over it; two devices at auth_gen, fewer than quorum, disagreeing (an orphan final and the acknowledged claim, four devices) refuse STM_EQUORUM by either device order, with or without reuse (control: they agree and the claim mounts); an attach reconciles a confirmed bitmap too (the bootstrap holds the tree's nodes alone after); both attach tests run on a tree of three nodes; round 2: a device whose every ring copy reads back zero once and then fails is an unknown vote, and the open refuses STM_EIO and writes nothing; an attach of an alloc carried over from an earlier session leaves its bootstrap as it was, the frees its commits left pending kept for the commit that releases them, and the commits and a remount after keep every node of the tree (control: reopened blank, those frees are reclaimed). OPEN-BUGS (ah): three devices, every one online, the claim a device moved past beside an orphan final mounts (it refused every open), and refuses STM_EIO, writing nothing, when that device's slot is torn, its scan refuses or its ring came round (control: newest 67, not 68); an orphan final and an open's claim each on one device mount the lower index's, and so with a device moved past whose slot was never written; a device lagging at gen 3 with its slot of 5 blank counts nothing and its own uberblock is no candidate; a confirmer of the acknowledged claim whose slot of 5 is torn (its scan reads 4) or, moved past 5, reads one copy back zero and three unreadable is counted hidden: STM_EIO, nothing written, where the open mounted the orphan or failed STM_ECORRUPT (controls: the slot intact, the one zero copy beside three holding the claim, and the slot its scan read back zero, so newest 4, decoding after: a holder below auth_gen, the claim mounts); a newer build in the slot read past the scan refuses STM_EBADVERSION, `why` naming the copy, its version and the device's newest; four devices, the minority test now mounts the claim from the moved-on devices' slots, with one of them torn too, and refuses STM_EIO with both, nothing written; three distinct contents at auth_gen mount device 0's (the largest group, the lowest index on a tie), where R14 P1 refused; a commit retried after its final failed writes its reservation's bytes again (an allocator reserve between the attempts; the first commit after an open, whose phase 2 sweeps the frees the session before it left pending; a device failed between the attempts; a first attempt whose reservation write itself failed), and one power loss in that write, tearing one device, leaves a pool that mounts the reservation's trees (control: nothing between the attempts, the bytes already the same); a device added between the attempts rebuilds it, and the pool then opens on the larger roster. |
+| `test_sync_multi` | 89 | 3-device quorum roundtrip; 1-of-3 device loss tolerated; sub-quorum refused (STM_EQUORUM); orphan-ahead-of-quorum ignored; content-quorum tested; alloc-roots indirection; v5/v6/v7 version refusals (the v5 test exercises one prior version; the decode accepts only `STM_UB_VERSION_MIN_COMPAT`..`STM_UB_VERSION`, and a newer build's uberblock refuses the pool); mirror(2) + mirror(3) roundtrips + tampered-replica fallback; reserve refuses NONE profile; attach_alloc arg validation; RO pool refuses write ops; wedge refusal; keyschema idempotent commit produces byte-identical UBs; replace_device_online resume from step-3 commit failure; same-uuid-different-alloc refused; slot-0 spoofing refused; multi-retry converges; **commit succeeds with one FAULTED device** (R21 P1); replace-claim blocks concurrent mutators on the claimed slot via sync-wrapper bypass-closed (R23 P3-4).; a replace whose rollback cannot remove the new slot wedges and answers the wedge; a newer build's uberblock on one device refuses the open and names its slot; attach refuses an allocator whose data area runs past its device's layout, and one on a device smaller than its layout; a dissenting device's own recorded size does not place the pool's writes on it; a device truncated below its recorded size gets no uberblock, keeps that size through the pool's open and commit, and never counts toward a commit's quorum; a read-only open of a pool holding a REMOVED slot, or a FAULTED one, mounts read-only and reads a block committed before (control: read-write, the same roster opens and claims); a commit that two FAULTED slots of three leave short of quorum fails STM_EQUORUM; vote 153: a commit acknowledged by two devices of three, one of them unreadable at the next open, refuses STM_EIO and writes nothing (control: healthy, it mounts; with the third device holding it too, the unknown vote cannot change the gen and it mounts), an attach over a bitmap open could not confirm reconciles it before any reserve (every node of the device's tree held after; a commit and a remount after), and a device removes left alone keeps the strict scan (a slot unreadable past best+2 refuses); (r): the metadata primary cut under the open pool fails the commit STM_ERANGE and wedges (control: another device cut, the commit is acknowledged and the next open mounts it); round 1: a device whose every ring copy read back zero once is settled and the open mounts the acknowledged gen over it; two devices at auth_gen, fewer than quorum, disagreeing (an orphan final and the acknowledged claim, four devices) refuse STM_EQUORUM by either device order, with or without reuse (control: they agree and the claim mounts); an attach reconciles a confirmed bitmap too (the bootstrap holds the tree's nodes alone after); both attach tests run on a tree of three nodes; round 2: a device whose every ring copy reads back zero once and then fails is an unknown vote, and the open refuses STM_EIO and writes nothing; an attach of an alloc carried over from an earlier session leaves its bootstrap as it was, the frees its commits left pending kept for the commit that releases them, and the commits and a remount after keep every node of the tree (control: reopened blank, those frees are reclaimed). OPEN-BUGS (ah): three devices, every one online, the claim a device moved past beside an orphan final mounts (it refused every open), and refuses STM_EIO, writing nothing, when that device's slot is torn or its scan refuses, and so when its newest is more than one past (67 and 68 alike: review round 2 F1); an orphan final and an open's claim each on one device mount the lower index's, and so with a device moved past whose slot was never written; a device lagging at gen 3 with its slot of 5 blank counts nothing and its own uberblock is no candidate; a confirmer of the acknowledged claim whose slot of 5 is torn (its scan reads 4) or, moved past 5, reads one copy back zero and three unreadable is counted hidden: STM_EIO, nothing written, where the open mounted the orphan or failed STM_ECORRUPT (controls: the slot intact, the one zero copy beside three holding the claim, and the slot its scan read back zero, so newest 4, decoding after: a holder below auth_gen, the claim mounts); a newer build in the slot read past the scan refuses STM_EBADVERSION, `why` naming the copy, its version and the device's newest; four devices, the minority test now mounts the claim from the moved-on devices' slots, with one of them torn too, and refuses STM_EIO with both, nothing written; three distinct contents at auth_gen mount device 0's (the largest group, the lowest index on a tie), where R14 P1 refused; a commit retried after its final failed writes its reservation's bytes again (an allocator reserve between the attempts; the first commit after an open, whose phase 2 sweeps the frees the session before it left pending; a device failed between the attempts; a first attempt whose reservation write itself failed), and one power loss in that write, tearing one device, leaves a pool that mounts the reservation's trees (control: nothing between the attempts, the bytes already the same); a device added between the attempts (stm_pool_add_device) makes the retry write nothing and wedge, the two-device pool reopening at the reservation (review (s)(t)(u)(v) round 6 F1: the retry rebuilt, and acknowledged by the three-device quorum it rolled back under an open from device 0's roster). OPEN-BUGS (t): device 2 failed, rejoined, and gens 4 and 5 acknowledged without device 0: an open from device 0's roster with device 2 gone counts it an unknown vote and refuses STM_EIO, writing nothing, where counting it nothing mounted gen 3 and claimed over device 1's gen 4 (controls: device 2 there, read, STM_ECORRUPT; device 1's roster, gen 5 mounts); a pool whose FAULTED device is gone opens read-only, reads a block mirrored before and refuses a commit, and read-write refuses STM_EROFS, writing nothing (OPEN-BUGS (ao)); the gone slot refuses rejoin, the start of an evacuation and an allocator (STM_ENODEV); a device there whose allocator was not attached is not removed (STM_EBUSY) nor called drained by an evacuation step (STM_EBUSY) (control: attached, its tree empty, it is removed); a device never attached, for which the pool records no tree, an evacuation step calls drained (STM_ENOENT) and the evacuation finishes; a create over a gone FAULTED slot refuses STM_ENODEV (control: the device there, it creates). OPEN-BUGS (s): `stm_sync_scan_roster`: after a failed commit whose reservation only device 0 holds (another roster), the open from device 0's roster refuses STM_ECORRUPT, and the scan answers the quorum's roster in either order of the handles, the pool opening from it at the last acknowledged gen and committing; after a rejoin device 0 missed it answers device 1's roster at gen 5, and with device 2 gone refuses STM_EIO; a gone FAULTED slot is answered with no device and the pool opens without it read-only (read-write STM_EROFS); around an add, reached by every device it answers the three-device roster; with device 1 missing it the two-device roster (its pick at gen 1 beside device 0 at 3) is passed over and the three-device roster answers at 3 (it refused STM_EIO, two rosters), the plain open from device 1's two-device roster refusing STM_EIO and writing nothing (device 0 exactly two past: it mounted gen 1 and claimed over gen 3; the bound loosened to two passes it), and without device 2 STM_EIO (the three-device roster's pick refuses: answering the two-device one mounted gen 1 under an acknowledged gen 3); with the add's final written nowhere both rosters are the pool's, STM_EIO; a roster no device's newest names, which the pick takes, is tried and answered; STM_EINVAL for no handles, too many, a NULL one, no out, one device twice and two pools (each beside its control; the other pool's device alone scans as its one-device pool), the first device's refusal when every ring is unreadable, STM_ENOENT for blank devices; a roster naming one device in two slots refuses STM_ECORRUPT (it would give that device two votes); after an add devices 0 and 2 acknowledged and a remove whose reservation reached device 0 alone, the scan without device 2 refuses STM_EIO (device 0's gen 4 is more than one past the answer; without that bound it took the two-device roster at gen 1), and with it the add's roster answers at 3, the remove's reservation unacknowledged (control: every write landed, the remove's roster at 5 opens); the plain open from device 1's own newest roster (two devices, gen 1) refuses STM_EIO, writing nothing (review round 2 F1: it mounted gen 1 and claimed over device 0's gen 4; control: every write landed, device 1's roster is the remove's and mounts 5); a one-device pool that took two devices and removed one, device 0 missing gens 2 to 5 and device 1 gen 5, refuses STM_EIO without device 2 (the remove's roster passed over in its pick; device 1, which device 0's one-device roster does not name, holds gen 4) and with it answers the add's roster at 3 (control: every write landed, the remove's roster at 5); a disk a failed add left behind, attached, names the two-device roster: once device 0 is two past it that roster is passed over and each scan answers the one-device pool, opened and committed three times (it refused every scan after the first); a two-device pool that acknowledged gen 3 and took a third device whose reservation reached it alone, device 1 having lost gen 3 on every copy, refuses STM_EIO: the added device's gen 4 is more than one past the answer's gen 2 (control: device 1 kept gen 3, the two-device roster at 3 opens); an add's final on the added device alone (the commit failed) leaves the two-device roster passed over and the three-device one answering at 2, its reservation (review round 4 F3); a crafted pool where devices 0 and 1 hold a removal's final at 5 beside the four-device roster's reservation at 4 on every device refuses STM_EIO without device 1 (the removal's roster's pick refuses on that unknown vote; passing it over answered the four-device roster at 4, review round 4 F2), and with device 1's slot of 5 blank answers that roster at 4 (control). Round 4 F1: a removal (stm_sync_remove_device, stm_sync_finish_evacuation) while a failed commit waits for its retry refuses STM_EBUSY and changes nothing; after the retry, its final missing device 2, it removes, and the scan and an open from device 2's own roster mount the acknowledged 5 (that open refuses STM_ECORRUPT, writing nothing, when the evacuation's start between the attempts put another roster in 5); the pool primitive's removal there makes the retry write nothing, wedge and answer STM_EWEDGED (control: the same removal after the retry, and the next commit rebuilds); round 5: with a fifth device added and devices 3 and 2 removed through the pool between the attempts, the retry, rebuilding for the larger count, still writes nothing and wedges (control: the same after the retry, and it commits); a wedged handle's remove and finish answer STM_EWEDGED; a device failed, a commit failed, the device rejoined (the roster the last acknowledged final's again): the next commit writes the retry and the removal proceeds, the pool opening at 5 (it answered STM_OK writing nothing, and the guard held); round 6: stm_sync_replace_device_online refuses STM_EBUSY while a failed commit waits for its retry, adding nothing, and after the retry the same replace completes. |
 
 ## Status
 
@@ -812,7 +936,22 @@ daemon design.
 
 - **First commit is 1-phase** (`auth == 0`). Subsequent commits are
   2-phase. The asymmetry is unusual but intentional — there's no
-  pre-flush state to preserve on rollback for a fresh pool.
+  pre-flush state to preserve on rollback for a fresh pool. A failed
+  first commit's retry rebuilds its final (the flush runs again) but
+  waits as a reservation's retry does: removal, finish-evacuation and
+  replace refuse STM_EBUSY, and a retry under changed slots wedges
+  (review (s)(t)(u)(v) round 7 F1: an add or a removal between the
+  attempts let the retry be acknowledged under the new roster while an
+  open from the old one took the first attempt's final at gen 1 and
+  claimed over it).
+- **A retry rebuilds its final** (1-phase or 2-phase). When the caller
+  changed anything between the attempts, the final's gen can hold two
+  contents, the failed attempt's on the devices the retry missed; an
+  open that cannot read a device holding the acknowledged final may then
+  count both possible and refuse STM_EIO. It never mounts the failed
+  attempt's: that one sits on at most N - quorum devices and the
+  acknowledged one on a quorum, whose unreadable holders count as
+  unknown votes for it (review (s)(t)(u)(v) round 8 F1; OPEN-BUGS (av)).
 - **Per-device tree gens can diverge** when `stm_alloc_commit`
   short-circuits on a clean tree (R7c P2-5). `ub_alloc_root_gen`
   (v3→) and per-entry `root_gen` in the alloc-roots object
@@ -821,6 +960,17 @@ daemon design.
   non-determinism in `build_uberblock` (e.g. uninitialized padding)
   would cause false divergence. Tests pin that UBs are byte-
   identical across devices at the same gen.
+- **The scan refuses two rosters** (`stm_sync_scan_roster`, OPEN-BUGS
+  (s)): around an add or a remove whose commit's reservation some devices
+  hold and whose final none does, both rosters can be self-consistent and
+  nothing on disk says which one was acknowledged: STM_EIO. Any other
+  refusal of a roster's pick refuses the scan, a stale roster's too: a
+  removed disk handed in names the roster from before its remove, and a
+  device of that roster thrown away since is an unknown vote there
+  (OPEN-BUGS (as)). Hand in every device of the pool you have, or open
+  with a roster known otherwise (the open refuses STM_EIO, writing
+  nothing, when a device it reads is more than one gen past the gen it
+  takes).
 - **Mount-claim requires quorum** — if a majority of devices are
   down or corrupt at mount time, mount fails. ARCH §5.11 describes
   a future emergency-mount mode that accepts sub-quorum with admin

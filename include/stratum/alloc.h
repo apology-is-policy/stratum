@@ -88,7 +88,8 @@ typedef struct {
  *
  * `bootstrap_size_bytes` follows `stm_bootstrap_create` rules: 0 for the
  * ARCH-default `max(64 MiB, device_size / 1024)`, or an explicit size
- * (multiple of 4 KiB).
+ * (multiple of 4 KiB). It writes nothing unless stm_alloc_check_geometry
+ * admits the device's layout.
  */
 STM_MUST_USE
 stm_status stm_alloc_create(stm_bdev *d,
@@ -96,6 +97,19 @@ stm_status stm_alloc_create(stm_bdev *d,
                              const uint64_t device_uuid[2],
                              uint64_t bootstrap_size_bytes,
                              stm_alloc **out_alloc);
+
+/*
+ * Whether a pool can be laid out on a device of `layout_bytes` with
+ * `bootstrap_size_bytes` asked (as stm_alloc_create takes it): the labels'
+ * rule (stm_label_offsets), the bootstrap pool's (stm_bootstrap_size_for)
+ * and a data area of at least one block between them, asked with no I/O.
+ * STM_OK sets *out_bootstrap_bytes, when not NULL, to the bootstrap pool's
+ * size; otherwise the status stm_alloc_create would refuse with.
+ */
+STM_MUST_USE
+stm_status stm_alloc_check_geometry(uint64_t layout_bytes,
+                                    uint64_t bootstrap_size_bytes,
+                                    uint64_t *out_bootstrap_bytes);
 
 /*
  * Open the bootstrap pool and return an allocator handle with an

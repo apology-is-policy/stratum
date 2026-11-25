@@ -690,16 +690,25 @@ struct stm_sync {
     bool              have_last_fin_ub;
 
     /* The shared prototype of the reservation this session last wrote
-     * or tried to write, at generation res_ub_gen. A failed final leaves
+     * or tried to write, at generation res_ub_gen (a fresh pool's first
+     * commit has none: it stashes its final, gen 1, at res_ub_gen 0, so
+     * sync_retry_pending holds alike). A failed final leaves
      * current_gen where it was, so the retry's reservation lands at the
      * same generation, which a quorum may already hold: the retry writes
      * these bytes again rather than a rebuild whose allocator statistics
      * or scrub state moved, so one session never leaves two contents in
      * one slot (sync_open's pick counts a torn copy as possibly holding
-     * the acknowledged one). A device added in between rebuilds: the
-     * stashed roster does not name it. A fail, rejoin, evacuation or
-     * removal moves only state bytes (a removed slot persists), so every
-     * device the retry writes is still in the stashed roster. */
+     * the acknowledged one). A fail, rejoin or evacuation's start moves
+     * only state bytes, so every device the retry writes is still in the
+     * stashed roster, with the same quorum. A removal or an add changes
+     * the quorum: a retry acknowledged by the new roster's quorum need not
+     * hold a quorum of the stashed roster, whose own pick then takes the
+     * first attempt's reservation or orphan final, one gen below or at the
+     * acknowledged one, and an open from it claims over that. So the
+     * sync's remove, finish-evacuation and replace refuse while the stash
+     * waits for its retry (sync_retry_pending), and a retry that finds
+     * the pool's slots changed some other way (the pool primitives)
+     * writes nothing and wedges (sync_stash_roster_kept). */
     stm_uberblock     res_ub;
     uint64_t          res_ub_gen;
     bool              have_res_ub;
@@ -1660,6 +1669,35 @@ static inline size_t sync_quorum_n(const stm_sync *s)
 
 static void sync_wedge_locked(stm_sync *s);
 
+/* A commit failed past its reservation's build (a fresh pool's first
+ * commit: its final's write, stashed at gen 0) and has not been retried to
+ * an acknowledgement: current_gen stays at the failed final's gen, one
+ * past the stash's. */
+static bool sync_retry_pending(const stm_sync *s)
+{
+    return s->have_res_ub && s->res_ub_gen + 1u == s->current_gen;
+}
+
+/* The pool's slots are the stashed reservation's: none added since, and
+ * each removed now exactly when it was then, so the retry writes those
+ * bytes under the quorum they were written under. Caller holds the pool
+ * lock. */
+static bool sync_stash_roster_kept(const stm_sync *s, const stm_uberblock *ub)
+{
+    uint16_t n = stm_load_le16(ub->ub_device_count);
+    stm_pool_device dev[STM_POOL_DEVICES_MAX] = { 0 };
+    if (n != stm_pool_device_count(s->pool)) return false;
+    if (stm_pool_roster_decode(ub->ub_roster, n, dev) != STM_OK) return false;
+    for (uint16_t i = 0; i < n; i++) {
+        const stm_pool_device *cur = stm_pool_device_info(s->pool, i);
+        if (!cur) return false;
+        if ((dev[i].state == STM_DEV_STATE_REMOVED) !=
+            (cur->state == STM_DEV_STATE_REMOVED))
+            return false;
+    }
+    return true;
+}
+
 /* Write an uberblock carrying `shared` content to every device in the
  * pool at ring slot `slot`, every copy (stm_sb_ub_write_copies: a device
  * confirms only when STM_UB_COPIES_REQUIRED copies are durable). The
@@ -1851,6 +1889,14 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
      * PQ-hybrid-wrapped before persistence, so the wrap-public-key
      * half has to be available at create time. */
     if (!wk) return STM_EINVAL;
+    /* A create writes every live slot; a slot not REMOVED whose device is
+     * gone (a FAULTED one, which stm_pool_open admits) cannot be written. */
+    for (size_t i = 0; i < stm_pool_device_count(p); i++) {
+        const stm_pool_device *dv = stm_pool_device_info(p, (uint16_t)i);
+        if (dv && dv->state != STM_DEV_STATE_REMOVED &&
+            !stm_pool_device_bdev(p, (uint16_t)i))
+            return STM_ENODEV;
+    }
 
     /* P5-3a: validate + resolve the redundancy profile up-front,
      * before any on-disk state is created. NULL => {NONE}.
@@ -2300,37 +2346,25 @@ static stm_status sync_reconcile_bootstrap(stm_sync *s) {
     return STM_OK;
 }
 
-stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
-                          const stm_hybrid_keys *wk,
-                          struct stm_janus_client *janus,
-                          const stm_corvus_mount_cfg *corvus,
-                          stm_sync **out_sync)
+/* The open's pick: the authoritative gen and the canonical uberblock of
+ * devices bdev[0..n), whose roster states are state[] (a slot not REMOVED
+ * with no device is an unknown vote). *out_past, if not NULL: the refusal
+ * is a device more than one gen past the gen taken. */
+static stm_status sync_pick_canonical(size_t n, stm_bdev *const bdev[],
+                                      const stm_device_state state[],
+                                      stm_sb_scan_refusal *why,
+                                      bool *out_past,
+                                      uint64_t *out_auth_gen,
+                                      stm_uberblock *out_ub)
 {
-    return stm_sync_open_ex(p, a, wk, janus, corvus, NULL, out_sync);
-}
-
-stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
-                             const stm_hybrid_keys *wk,
-                             struct stm_janus_client *janus,
-                             const stm_corvus_mount_cfg *corvus,
-                             stm_sb_scan_refusal *why,
-                             stm_sync **out_sync)
-{
-    if (why) memset(why, 0, sizeof *why);
-    if (!p || !a || !out_sync) return STM_EINVAL;
-    if (stm_pool_device_count(p) == 0) return STM_EINVAL;
-    /* P4-4a/P4-4b: key source is mandatory, exactly one. */
-    if ((!wk && !janus) || (wk && janus)) return STM_EINVAL;
-
-    /* R9 P1-1: make sure libsodium is up before any crypto op. */
-    stm_status ci = stm_crypto_init();
-    if (ci != STM_OK) return ci;
-
+    if (out_past) *out_past = false;
     /* P5-4b-i: iteration bound stays TOTAL device_count (REMOVED
      * slots still occupy their indices; skipped via NULL bdev).
      * Quorum denominator is LIVE count (REMOVED can't vote). */
-    size_t n = stm_pool_device_count(p);
-    size_t quorum = stm_pool_live_device_count(p) / 2u + 1u;
+    size_t live = 0;
+    for (size_t i = 0; i < n; i++)
+        if (state[i] != STM_DEV_STATE_REMOVED) live++;
+    size_t quorum = live / 2u + 1u;
 
     /* Phase 1: scan every device's ring. Track valid UBs per device.
      * STM_ENOENT on a device means "blank / never used"; that device
@@ -2343,11 +2377,19 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
      * contiguous (stm_sb_mount_scan_ex's one_device) only when it has
      * been the pool's only device: one a remove left alone may have
      * missed writes while the others were there. */
-    bool one_live = stm_pool_live_device_count(p) == 1u;
+    bool one_live = live == 1u;
     bool one_device = n == 1u;
     for (size_t i = 0; i < n; i++) {
-        stm_bdev *di = stm_pool_device_bdev(p, (uint16_t)i);
-        if (!di) continue;
+        stm_bdev *di = bdev[i];
+        if (!di) {
+            /* REMOVED: no vote. A FAULTED slot whose device is gone
+             * (stm_pool_open admits one): an unknown vote, as a device
+             * whose scan refused -- it may have confirmed a commit the
+             * others did not, after a rejoin the roster read here does
+             * not show (quorum.tla: each FAULTED device is unknown). */
+            if (state[i] != STM_DEV_STATE_REMOVED) unknown++;
+            continue;
+        }
         uint32_t lbl = 0, slot = 0;
         /* A device of a multi-device pool refuses by its own scan's rule,
          * which is not the pool's (quorum decides) -- except at a newer
@@ -2411,6 +2453,26 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
         return STM_ERANGE;
     }
 
+    /* No device is more than one gen past the gen a quorum of the roster
+     * it was written under holds (quorum.tla NewestNearAuth: a gen is
+     * written by a session whose open took the gen below it, the claim at
+     * auth + 1, a commit's reservation at its auth + 1 and its final at
+     * auth + 2 only once the reservation's quorum confirmed). A device
+     * further past auth_gen shows a roster other than this one moved the
+     * pool on (a remove some devices took, after an add others did not:
+     * this roster's pick, blind to it, takes a gen below a commit a quorum
+     * acknowledged, and the claim would roll it back), or a rollback's or
+     * a fault's ring. */
+    for (size_t i = 0; i < n; i++) {
+        if (!scans[i].valid) continue;
+        uint64_t newest = stm_load_le64(scans[i].ub.ub_gen);
+        if (newest > auth_gen && newest - auth_gen > 1) {
+            if (out_past) *out_past = true;
+            free(scans);
+            return STM_EIO;
+        }
+    }
+
     /* Phase 3 (OPEN-BUGS (ah)): the content to mount, read from auth_gen's
      * ring slot (quorum.tla Mount, RingPick).
      *
@@ -2430,10 +2492,9 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
      * Hidden: a device whose slot of auth_gen has a copy that does not
      * settle or settles torn and no copy decoding as auth_gen, wherever its
      * newest sits: past auth_gen, or below it, where a confirmed auth_gen
-     * torn on every copy leaves its scan (OPEN-BUGS (ai)); and one whose
-     * newest is auth_gen + 63 or more (its ring came round: a rollback's or
-     * a fault's, since a write of a gen needs an open of the gen below it,
-     * and the open mounts auth_gen). A slot each copy of which settles blank
+     * torn on every copy leaves its scan (OPEN-BUGS (ai)). (A device whose
+     * ring came round past auth_gen has refused above: no newest is more
+     * than auth_gen + 1.) A slot each copy of which settles blank
      * or as another lap did not take auth_gen, short of a fault on every
      * copy (a confirmed write replaces each, STM_UB_COPIES_REQUIRED), and
      * counts nothing.
@@ -2445,9 +2506,9 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
      * (or a fault hit every copy): a later write of auth_gen needs an open
      * below it, which this pick and vote 153 exclude, or the retry of the
      * commit that wrote it, and stm_sync_commit writes a retried
-     * reservation's bytes again (a device added between the attempts
-     * rebuilds them, OPEN-BUGS (ak)); an acknowledged final is never
-     * written again. A group of quorum holders is such a group, and then
+     * reservation's bytes again, or nothing when the pool's slots changed
+     * between the attempts; an acknowledged final is never written
+     * again. A group of quorum holders is such a group, and then
      * no other is: the rest of the devices are fewer. Two such groups: the
      * hidden devices and the unknown votes could decide it, STM_EIO. None:
      * nothing at auth_gen was acknowledged, and the largest group (the
@@ -2479,11 +2540,7 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
         uint64_t newest = stm_load_le64(scans[i].ub.ub_gen);
         if (newest != auth_gen) {
             stm_uberblock held;
-            stm_status gr = STM_EIO;
-            if (newest < auth_gen ||
-                newest - auth_gen < STM_UB_SLOTS_PER_LABEL)
-                gr = stm_sb_gen_read(stm_pool_device_bdev(p, (uint16_t)i),
-                                     auth_gen, &held, why);
+            stm_status gr = stm_sb_gen_read(bdev[i], auth_gen, &held, why);
             if (gr == STM_EBADVERSION) {
                 if (why) why->best_gen = newest;
                 free(scans);
@@ -2535,11 +2592,319 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
         return STM_ECORRUPT;
     }
 
-    /* Canonical UB reference. (Keep a copy on the stack for safety —
-     * scans[] is about to be freed.) */
-    stm_uberblock ub = scans[canonical_idx].ub;
+    *out_ub = scans[canonical_idx].ub;
+    *out_auth_gen = auth_gen;
     free(scans);
-    scans = NULL;
+    return STM_OK;
+}
+
+/* The roster fields of an uberblock: what makes a pool of its devices. */
+typedef struct {
+    uint64_t pool_uuid[2];
+    uint16_t device_count;
+    uint64_t roster_hash;
+    uint8_t  roster[STM_POOL_ROSTER_BYTES];
+} sync_roster;
+
+static void sync_roster_of(const stm_uberblock *ub, sync_roster *r)
+{
+    r->pool_uuid[0] = stm_load_le64(ub->ub_pool_uuid[0]);
+    r->pool_uuid[1] = stm_load_le64(ub->ub_pool_uuid[1]);
+    r->device_count = stm_load_le16(ub->ub_device_count);
+    r->roster_hash  = stm_load_le64(ub->ub_roster_hash);
+    memcpy(r->roster, ub->ub_roster, sizeof r->roster);
+}
+
+static bool sync_roster_listed(const sync_roster *list, size_t n,
+                               const sync_roster *r)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (list[i].pool_uuid[0] == r->pool_uuid[0] &&
+            list[i].pool_uuid[1] == r->pool_uuid[1] &&
+            list[i].device_count == r->device_count &&
+            list[i].roster_hash == r->roster_hash &&
+            memcmp(list[i].roster, r->roster, sizeof r->roster) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* A decoded roster naming one device in two slots would hand one device
+ * two votes; stm_pool_open refuses it too. */
+static bool sync_roster_uuids_unique(const stm_pool_device dev[], size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        for (size_t j = 0; j < i; j++)
+            if (dev[i].uuid[0] == dev[j].uuid[0] &&
+                dev[i].uuid[1] == dev[j].uuid[1])
+                return false;
+    return true;
+}
+
+/* A handle whose newest gen is more than one past `auth`. */
+static bool sync_newest_past(const sync_scan best[], size_t ndevs,
+                             uint64_t auth)
+{
+    for (size_t k = 0; k < ndevs; k++) {
+        uint64_t newest = best[k].valid ? stm_load_le64(best[k].ub.ub_gen) : 0;
+        if (newest > auth && newest - auth > 1) return true;
+    }
+    return false;
+}
+
+/* Slot i gets the handle whose newest uberblock carries slot i's device
+ * uuid; a REMOVED slot, or one no handle names, gets none. */
+static void sync_roster_map(const stm_pool_device dev[], size_t n,
+                            stm_bdev *const devs[], const sync_scan best[],
+                            size_t ndevs, stm_bdev *map[],
+                            stm_device_state state[])
+{
+    for (size_t i = 0; i < n; i++) {
+        state[i] = dev[i].state;
+        map[i] = NULL;
+        if (dev[i].state == STM_DEV_STATE_REMOVED) continue;
+        for (size_t k = 0; k < ndevs; k++) {
+            if (best[k].valid &&
+                stm_load_le64(best[k].ub.ub_device_uuid[0]) == dev[i].uuid[0] &&
+                stm_load_le64(best[k].ub.ub_device_uuid[1]) == dev[i].uuid[1]) {
+                map[i] = devs[k];
+                break;
+            }
+        }
+    }
+}
+
+/* OPEN-BUGS (s). Each roster tried is a pool the open could be handed; it
+ * is the pool's when the uberblock its pick takes carries it and no device
+ * handed in is more than one gen past the gen it takes. A write of gen g
+ * comes from a session whose authoritative gen was g - 1 (a claim, a
+ * reservation) or g - 2 with the reservation at g - 1 confirmed by a
+ * quorum (a final), so a quorum held the gen below such a device's newest,
+ * above this roster's gen, under the session that wrote it (quorum.tla
+ * NewestNearAuth, per roster; were it this roster's quorum, its pick
+ * would take that gen), and the roster is passed over, the answer
+ * mounting at least that device's gen less one:
+ * in its pick, a device it names (a disk a remove or a failed add left
+ * behind names its old roster, whose pick lands below the pool's); after,
+ * one it does not (a device an add brought in whose commit's reservation
+ * or final missed devices of the old roster). Rosters that differ only in
+ * FAULTED/EVACUATING/ONLINE states give one pick (a state counts there
+ * only as REMOVED or not), so one of them at most is the pool's. Two that
+ * differ in their slots or their REMOVED set (an add or a remove whose
+ * reservation some devices hold and whose final none handed in does) can
+ * both be, and whether the final was acknowledged, which no device handed
+ * in shows, tells them apart: STM_EIO. (The retry of a failed commit
+ * reuses its reservation's roster, so the sync refuses a roster change until
+ * that retry is acknowledged: sync_retry_pending.) Any other refusal of a
+ * roster's pick refuses the scan: the roster the pool acknowledged its
+ * newest commit under may be the one an absent device makes unknown
+ * (test: refuses_when_another_rosters_pick_refuses). None the pool's:
+ * STM_EIO when one was passed over (the later write no roster read
+ * takes), else STM_ECORRUPT. */
+stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
+                                stm_sb_scan_refusal *why,
+                                stm_pool_open_opts *out,
+                                uint64_t *out_auth_gen)
+{
+    if (why) memset(why, 0, sizeof *why);
+    if (!devs || !out || ndevs == 0 || ndevs > STM_POOL_DEVICES_MAX)
+        return STM_EINVAL;
+    for (size_t k = 0; k < ndevs; k++)
+        if (!devs[k]) return STM_EINVAL;
+    stm_status ci = stm_crypto_init();
+    if (ci != STM_OK) return ci;
+
+    const size_t cap = 2u * STM_POOL_DEVICES_MAX;
+    sync_scan *best = calloc(ndevs, sizeof *best);
+    stm_status *bst = calloc(ndevs, sizeof *bst);
+    stm_sb_scan_refusal *bwhy = calloc(ndevs, sizeof *bwhy);
+    sync_roster *cand = calloc(cap, sizeof *cand);
+    stm_status st = STM_OK;
+    if (!best || !bst || !bwhy || !cand) {
+        st = STM_ENOMEM;
+        goto done;
+    }
+
+    for (size_t k = 0; k < ndevs; k++) {
+        uint32_t lbl = 0, slot = 0;
+        bst[k] = stm_sb_mount_scan_ex(devs[k], false, &best[k].ub, &lbl, &slot,
+                                      &bwhy[k]);
+        if (bst[k] == STM_EBADVERSION) {
+            if (why) *why = bwhy[k];
+            st = STM_EBADVERSION;
+            goto done;
+        }
+        best[k].valid = bst[k] == STM_OK;
+    }
+    for (size_t k = 0; k < ndevs; k++) {
+        for (size_t j = 0; best[k].valid && j < k; j++) {
+            if (!best[j].valid) continue;
+            const stm_uberblock *a = &best[k].ub, *b = &best[j].ub;
+            if (stm_load_le64(a->ub_pool_uuid[0]) != stm_load_le64(b->ub_pool_uuid[0]) ||
+                stm_load_le64(a->ub_pool_uuid[1]) != stm_load_le64(b->ub_pool_uuid[1]) ||
+                (stm_load_le64(a->ub_device_uuid[0]) == stm_load_le64(b->ub_device_uuid[0]) &&
+                 stm_load_le64(a->ub_device_uuid[1]) == stm_load_le64(b->ub_device_uuid[1]))) {
+                st = STM_EINVAL;
+                goto done;
+            }
+        }
+    }
+
+    /* The rosters the handles' newest uberblocks name, newest first. */
+    size_t ncand = 0;
+    bool listed[STM_POOL_DEVICES_MAX] = { false };
+    for (;;) {
+        size_t next = SIZE_MAX;
+        for (size_t k = 0; k < ndevs; k++) {
+            if (!best[k].valid || listed[k]) continue;
+            if (next == SIZE_MAX ||
+                stm_load_le64(best[k].ub.ub_gen) > stm_load_le64(best[next].ub.ub_gen))
+                next = k;
+        }
+        if (next == SIZE_MAX) break;
+        listed[next] = true;
+        sync_roster r;
+        sync_roster_of(&best[next].ub, &r);
+        if (!sync_roster_listed(cand, ncand, &r)) cand[ncand++] = r;
+    }
+    if (ncand == 0) {
+        st = STM_ENOENT;
+        for (size_t k = 0; k < ndevs; k++) {
+            if (bst[k] == STM_ENOENT) continue;
+            if (why) *why = bwhy[k];
+            st = bst[k];
+            break;
+        }
+        goto done;
+    }
+
+    size_t found = SIZE_MAX, nfound = 0;
+    uint64_t found_auth = 0;
+    bool passed_over = false;
+    stm_pool_device dev[STM_POOL_DEVICES_MAX];
+    stm_bdev *map[STM_POOL_DEVICES_MAX];
+    stm_device_state state[STM_POOL_DEVICES_MAX];
+    for (size_t c = 0; c < ncand; c++) {
+        memset(dev, 0, sizeof dev);
+        if (stm_pool_roster_decode(cand[c].roster, cand[c].device_count,
+                                   dev) != STM_OK ||
+            !sync_roster_uuids_unique(dev, cand[c].device_count)) {
+            st = STM_ECORRUPT;
+            goto done;
+        }
+        sync_roster_map(dev, cand[c].device_count, devs, best, ndevs, map, state);
+        stm_sb_scan_refusal pwhy;
+        memset(&pwhy, 0, sizeof pwhy);
+        uint64_t auth = 0;
+        stm_uberblock ub;
+        bool past = false;
+        st = sync_pick_canonical(cand[c].device_count, map, state, &pwhy,
+                                 &past, &auth, &ub);
+        if (st != STM_OK && past) {
+            passed_over = true;
+            st = STM_OK;
+            continue;
+        }
+        if (st != STM_OK) {
+            if (why) *why = pwhy;
+            goto done;
+        }
+        sync_roster r;
+        sync_roster_of(&ub, &r);
+        if (sync_roster_listed(&cand[c], 1, &r)) {
+            if (sync_newest_past(best, ndevs, auth)) {
+                passed_over = true;
+                continue;
+            }
+            nfound++;
+            found = c;
+            found_auth = auth;
+        } else if (!sync_roster_listed(cand, ncand, &r)) {
+            if (ncand == cap) {
+                st = STM_EIO;
+                goto done;
+            }
+            cand[ncand++] = r;
+        }
+    }
+    if (nfound != 1) {
+        st = nfound == 0 && !passed_over ? STM_ECORRUPT : STM_EIO;
+        goto done;
+    }
+
+    memset(out, 0, sizeof *out);
+    out->pool_uuid[0] = cand[found].pool_uuid[0];
+    out->pool_uuid[1] = cand[found].pool_uuid[1];
+    out->device_count = cand[found].device_count;
+    st = stm_pool_roster_decode(cand[found].roster, cand[found].device_count,
+                                out->devices);
+    if (st != STM_OK) goto done;
+    sync_roster_map(out->devices, out->device_count, devs, best, ndevs, map,
+                    state);
+    for (size_t i = 0; i < out->device_count; i++) out->devices[i].bdev = map[i];
+    if (out_auth_gen) *out_auth_gen = found_auth;
+
+done:
+    free(cand);
+    free(bwhy);
+    free(bst);
+    free(best);
+    return st;
+}
+
+stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
+                          const stm_hybrid_keys *wk,
+                          struct stm_janus_client *janus,
+                          const stm_corvus_mount_cfg *corvus,
+                          stm_sync **out_sync)
+{
+    return stm_sync_open_ex(p, a, wk, janus, corvus, NULL, out_sync);
+}
+
+stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
+                             const stm_hybrid_keys *wk,
+                             struct stm_janus_client *janus,
+                             const stm_corvus_mount_cfg *corvus,
+                             stm_sb_scan_refusal *why,
+                             stm_sync **out_sync)
+{
+    if (why) memset(why, 0, sizeof *why);
+    if (!p || !a || !out_sync) return STM_EINVAL;
+    if (stm_pool_device_count(p) == 0) return STM_EINVAL;
+    /* P4-4a/P4-4b: key source is mandatory, exactly one. */
+    if ((!wk && !janus) || (wk && janus)) return STM_EINVAL;
+
+    /* R9 P1-1: make sure libsodium is up before any crypto op. */
+    stm_status ci = stm_crypto_init();
+    if (ci != STM_OK) return ci;
+
+    /* P5-4b-i: iteration bound stays TOTAL device_count (REMOVED
+     * slots still occupy their indices; skipped via NULL bdev). */
+    size_t n = stm_pool_device_count(p);
+    stm_bdev *pick_bdev[STM_POOL_DEVICES_MAX] = { 0 };
+    stm_device_state pick_state[STM_POOL_DEVICES_MAX] = { 0 };
+    for (size_t i = 0; i < n; i++) {
+        const stm_pool_device *dv = stm_pool_device_info(p, (uint16_t)i);
+        pick_bdev[i] = stm_pool_device_bdev(p, (uint16_t)i);
+        pick_state[i] = dv ? dv->state : STM_DEV_STATE_REMOVED;
+    }
+    uint64_t auth_gen = 0;
+    stm_uberblock ub;
+    stm_status pk = sync_pick_canonical(n, pick_bdev, pick_state, why, NULL,
+                                        &auth_gen, &ub);
+    if (pk != STM_OK) return pk;
+    /* A slot not REMOVED whose device is gone (a FAULTED one, which
+     * stm_pool_open admits): the pool opens read-only, every device there
+     * opened read-only. Writing, placement and frees still take every live
+     * slot to have an allocator (OPEN-BUGS (ao)), and the gone device
+     * cannot leave the pool (OPEN-BUGS (ap)). */
+    bool gone = false, writable = false;
+    for (size_t i = 0; i < n; i++) {
+        if (pick_state[i] == STM_DEV_STATE_REMOVED) continue;
+        if (!pick_bdev[i]) gone = true;
+        else if (!stm_bdev_is_read_only(pick_bdev[i])) writable = true;
+    }
+    if (gone && writable) return STM_EROFS;
 
     /* P5-1 UB validation (generalized): verify the canonical UB's
      * pool_uuid + roster_hash + device_count match the caller's
@@ -3245,6 +3610,18 @@ stm_status stm_sync_commit(stm_sync *s)
     const bool is_fresh = (s->auth_gen == 0);
     const uint64_t reservation_gen = is_fresh ? 0 : (target_gen - 1);
 
+    /* A fresh pool's failed first commit left its final at gen 1 on some
+     * devices; its retry writes gen 1 again, under the quorum of the
+     * roster it was tried under or not at all (as a reservation's retry,
+     * below). */
+    if (is_fresh && s->have_res_ub && s->res_ub_gen == 0 &&
+        !sync_stash_roster_kept(s, &s->res_ub)) {
+        sync_wedge_locked(s);
+        pthread_mutex_unlock(&s->lock);
+        stm_pool_unlock_shared(s->pool);
+        return STM_EWEDGED;
+    }
+
     /* Phase 1 (non-fresh only): reservation UB = copy of previous
      * authoritative state with gen bumped. Pre-flush roots; rollback
      * target on Phase 3 failure.
@@ -3290,10 +3667,15 @@ stm_status stm_sync_commit(stm_sync *s)
                          /*cas_index_gen=*/     s->cas_index_root_gen,
                          /*merkle_root=*/       s->merkle_root,
                          &astats_res);
-        if (s->have_res_ub && s->res_ub_gen == reservation_gen &&
-            stm_load_le16(s->res_ub.ub_device_count) ==
-                stm_load_le16(res_prototype.ub_device_count))
+        if (s->have_res_ub && s->res_ub_gen == reservation_gen) {
+            if (!sync_stash_roster_kept(s, &s->res_ub)) {
+                sync_wedge_locked(s);
+                pthread_mutex_unlock(&s->lock);
+                stm_pool_unlock_shared(s->pool);
+                return STM_EWEDGED;
+            }
             res_prototype = s->res_ub;
+        }
     }
 
     /* CF-4 B: arm the barrier-defer windows. Every fsync issued between
@@ -3640,11 +4022,18 @@ stm_status stm_sync_commit(stm_sync *s)
      * FINALIZE — the flush of a clean engine kept its prior root triple
      * (engine.c: a no-op commit preserves root gen), so adoption is a
      * no-op; ABORT would drop the resident memtree (crash-equivalent),
-     * wrong for a no-op. A finalize failure wedges via the caller
-     * exactly as on the commit path. */
-    if (s->have_last_fin_ub &&
+     * wrong for a no-op. A finalize failure wedges, as on the commit
+     * path: the failed engine stays pending and refuses every later
+     * flush.
+     *
+     * Not while a failed attempt waits for its retry: its reservation
+     * (and maybe its final) is newer on disk than the last final this
+     * session acknowledged, and a rejoin can bring the roster back to
+     * that final's, so equal content does not mean nothing to write. */
+    if (s->have_last_fin_ub && !sync_retry_pending(s) &&
         ub_content_equal_masked(&fin_prototype, &s->last_fin_ub)) {
         stm_status cfs = stm_dataset_index_commit_engines_finalize(s->dataset_idx);
+        if (cfs != STM_OK) sync_wedge_locked(s);
         out_rc = cfs;
         goto out_cancel;
     }
@@ -3720,6 +4109,11 @@ stm_status stm_sync_commit(stm_sync *s)
         if (ai) stm_bootstrap_commit_defer_finalize(stm_alloc_bootstrap(ai));
     }
 
+    if (is_fresh) {
+        s->res_ub      = fin_prototype;
+        s->res_ub_gen  = 0;
+        s->have_res_ub = true;
+    }
     uint32_t fin_slot  = stm_sb_ring_slot_for_gen(target_gen);
     stm_status fw = write_ub_to_all_devices(s, &fin_prototype, fin_slot);
     if (fw != STM_OK) {
@@ -3745,6 +4139,11 @@ stm_status stm_sync_commit(stm_sync *s)
      * trees intact, superseded nodes merely leaked. */
     stm_status mfs = stm_dataset_index_commit_engines_finalize(s->dataset_idx);
     if (mfs != STM_OK) {
+        /* The final is durable but this session never publishes it, and
+         * the failed engine stays pending, refusing every later flush:
+         * the handle no longer agrees with the pool it wrote. The sync
+         * wedges as the fs does. */
+        sync_wedge_locked(s);
         { out_rc = mfs; goto out_cancel; }
     }
 
@@ -3846,6 +4245,7 @@ stm_status stm_sync_info_get(const stm_sync *s, stm_sync_info *out)
     out->mount_max_durable_gen = s->mount_max_durable;
     out->live_slot_idx         = s->live_slot_idx;
     out->alloc_root_paddr      = s->alloc_root_paddr;
+    out->read_only             = s->read_only;
 
     pthread_mutex_unlock(&ms->lock);
     return STM_OK;
@@ -4297,6 +4697,13 @@ stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
         stm_pool_unlock_shared(s->pool);
         return STM_EINVAL;
     }
+    /* A FAULTED slot whose device is gone: the allocator is another
+     * device's. */
+    if (!di_check->bdev) {
+        pthread_mutex_unlock(&s->lock);
+        stm_pool_unlock_shared(s->pool);
+        return STM_ENODEV;
+    }
     if (s->allocs[device_id] != NULL) {
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_EEXIST;
@@ -4630,6 +5037,19 @@ stm_status stm_sync_mirror_read(stm_sync *s, const uint64_t paddrs[],
 /* P5-4b-ii-α: evacuation step.                                               */
 /* ========================================================================= */
 
+/* A device with no allocator attached: STM_OK when the pool records no tree
+ * for it (nothing to drain), STM_EBUSY when it records one (it may hold
+ * replicas no read here can see: a caller that attached no allocator, or a
+ * FAULTED device that is gone), and any other lookup failure as it is. */
+static stm_status sync_unattached_tree_locked(stm_sync *s, uint16_t device_id)
+{
+    if (!s->roots) return STM_OK;
+    uint64_t root = 0;
+    stm_status rg = stm_alloc_roots_get(s->roots, device_id, &root, NULL, NULL);
+    if (rg == STM_ENOENT) return STM_OK;
+    return rg == STM_OK ? STM_EBUSY : rg;
+}
+
 stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
                                        uint16_t survivor_device_id,
                                        uint64_t *out_old_paddr,
@@ -4684,10 +5104,11 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
 
     stm_alloc *target_alloc = s->allocs[target_device_id];
     if (!target_alloc) {
-        /* Nothing to drain — target has no attached alloc. Bubble up as
-         * "no data" so caller proceeds to finish_evacuation. */
+        /* No allocator: nothing to drain (STM_ENOENT) only when the pool
+         * records no tree for the target, as finish_evacuation decides. */
+        stm_status us = sync_unattached_tree_locked(s, target_device_id);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return STM_ENOENT;
+        return us == STM_OK ? STM_ENOENT : us;
     }
 
     /* Spec's EvacuatePaddr precondition: pick one allocated range on d.
@@ -4815,13 +5236,7 @@ static stm_status sync_require_drained_locked(stm_sync *s, uint16_t device_id)
     if (device_id >= stm_pool_device_count(s->pool)) return STM_EINVAL;
 
     stm_alloc *a = s->allocs[device_id];
-    if (!a) {
-        /* No alloc attached means no tree at all — trivially drained.
-         * Pre-P5-3c this held for N=1 pools; post-P5-3c all devices
-         * should have allocs attached pre-commit, so this arm mostly
-         * handles the just-begin-evacuated-on-empty-device case. */
-        return STM_OK;
-    }
+    if (!a) return sync_unattached_tree_locked(s, device_id);
     uint64_t probe_paddr = 0, probe_length = 0;
     stm_status fs = stm_alloc_first_allocated(a, &probe_paddr, &probe_length);
 
@@ -4859,8 +5274,12 @@ stm_status stm_sync_remove_device(stm_sync *s, uint16_t device_id,
 
     stm_status ret;
     uint16_t claim = stm_pool_replace_claim_locked(s->pool);
-    if (claim != STM_POOL_REPLACE_CLAIM_NONE && claim == device_id) {
+    if (s->wedged) {
+        ret = STM_EWEDGED;
+    } else if (claim != STM_POOL_REPLACE_CLAIM_NONE && claim == device_id) {
         ret = STM_EBUSY;
+    } else if (sync_retry_pending(s)) {
+        ret = STM_EBUSY;    /* the stashed reservation's quorum (res_ub) */
     } else {
         stm_status ds = sync_require_drained_locked(s, device_id);
         ret = ds;
@@ -4890,8 +5309,12 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id)
 
     stm_status ret;
     uint16_t claim = stm_pool_replace_claim_locked(s->pool);
-    if (claim != STM_POOL_REPLACE_CLAIM_NONE && claim == device_id) {
+    if (s->wedged) {
+        ret = STM_EWEDGED;
+    } else if (claim != STM_POOL_REPLACE_CLAIM_NONE && claim == device_id) {
         ret = STM_EBUSY;
+    } else if (sync_retry_pending(s)) {
+        ret = STM_EBUSY;    /* as in stm_sync_remove_device */
     } else {
         stm_status ds = sync_require_drained_locked(s, device_id);
         ret = ds;
@@ -5143,6 +5566,14 @@ stm_status stm_sync_replace_device_online(
      * claim is already held by another in-flight replace, refuse
      * STM_EBUSY and roll back the add. */
     stm_pool_lock_exclusive(s->pool);
+    pthread_mutex_lock(&s->lock);
+    bool retry_pending = sync_retry_pending(s);
+    pthread_mutex_unlock(&s->lock);
+    if (retry_pending) {
+        /* The add would change the stashed reservation's quorum (res_ub). */
+        stm_pool_unlock_exclusive(s->pool);
+        return STM_EBUSY;
+    }
     size_t count_before = stm_pool_device_count(s->pool);
     stm_status as = stm_pool_add_device_locked(s->pool, new_device);
     stm_status cls = STM_OK;

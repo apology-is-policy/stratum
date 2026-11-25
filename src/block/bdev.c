@@ -270,6 +270,8 @@ stm_status stm_bdev_write(stm_bdev *d, uint64_t offset, const void *buf, size_t 
     if (!span_fits(d, offset, len)) return STM_EINVAL;
 #ifdef STRATUM_BUILD_TESTING_HOOKS
     io_observe(d, true, offset, len);
+    if (atomic_load_explicit(&d->inject_writes_erofs, memory_order_relaxed))
+        return STM_EROFS;
 #endif
     if (inject_should_fail(d)) return STM_EIO;
     atomic_fetch_add_explicit(&d->io_writes, 1, memory_order_relaxed);
@@ -502,6 +504,11 @@ uint32_t stm_bdev_inject_fired_count(const stm_bdev *d)
 {
     if (!d) return 0;
     return (uint32_t)atomic_load_explicit(&d->inject_fired, memory_order_relaxed);
+}
+
+void stm_bdev_inject_writes_read_only(stm_bdev *d, bool on)
+{
+    if (d) atomic_store_explicit(&d->inject_writes_erofs, on, memory_order_relaxed);
 }
 
 void stm_bdev_inject_read_fail_after(stm_bdev *d, int64_t n_reads)

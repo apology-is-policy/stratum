@@ -1119,6 +1119,16 @@ static void setup_mirror_pool(uint8_t mn, const char *tag,
     STM_ASSERT_OK(stm_sync_commit(*sync_out));
 }
 
+static void teardown_mirror_pool_keep(stm_bdev *bds[NDEV],
+                                      stm_alloc *allocs[NDEV],
+                                      stm_pool *pool, stm_sync *s)
+{
+    stm_sync_close(s);
+    close_multi_allocs(allocs);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+}
+
 static void teardown_mirror_pool(stm_bdev *bds[NDEV],
                                    stm_alloc *allocs[NDEV],
                                    stm_pool *pool, stm_sync *s)
@@ -1777,16 +1787,18 @@ STM_TEST(sync_multi_mirror_write_refuses_read_only) {
 
 static void fault_gen_copies(stm_bdev *d, uint64_t gen);
 
-/* Reopen the pool at g_paths from device 0's roster, as a remount does:
- * every slot not REMOVED gets its device, read-only when `ro`, and a
- * REMOVED slot none (its bds[] entry stays NULL). unreadable_gen != 0:
- * every copy of that generation's slot on device 0 fails for good, read
- * after the roster. Answers stm_sync_open's status; the handles are out
- * either way (*s only on STM_OK). */
-static stm_status reopen_from_roster(bool ro, uint64_t unreadable_gen,
-                                     stm_bdev *bds[NDEV],
-                                     stm_alloc *as[NDEV], stm_pool **pool,
-                                     stm_sync **s)
+/* Reopen the pool at g_paths from device `roster_dev`'s roster, as a
+ * remount does: every slot not REMOVED gets its device, read-only when
+ * `ro`, and a REMOVED slot none (its bds[] entry stays NULL), nor a slot in
+ * the `gone` mask (a device no longer there). unreadable_gen != 0: every
+ * copy of that generation's slot on device 0 fails for good, read after
+ * the roster. A device in the `unattached` mask gets no allocator. Answers
+ * stm_sync_open's status; the handles are out either way (*s only on
+ * STM_OK). */
+static stm_status reopen_ex(bool ro, uint64_t unreadable_gen, size_t roster_dev,
+                            unsigned gone, unsigned unattached,
+                            stm_bdev *bds[NDEV], stm_alloc *as[NDEV],
+                            stm_pool **pool, stm_sync **s)
 {
     for (size_t i = 0; i < NDEV; i++) {
         stm_bdev_open_opts bo = stm_bdev_open_opts_default();
@@ -1797,7 +1809,7 @@ static stm_status reopen_from_roster(bool ro, uint64_t unreadable_gen,
     }
     stm_uberblock ub;
     uint32_t lbl = 0, slot = 0;
-    STM_ASSERT_OK(stm_sb_mount_scan(bds[0], &ub, &lbl, &slot));
+    STM_ASSERT_OK(stm_sb_mount_scan(bds[roster_dev], &ub, &lbl, &slot));
     uint16_t count = stm_load_le16(ub.ub_device_count);
     STM_ASSERT_EQ(count, (uint16_t)NDEV);
     stm_pool_device dev[STM_POOL_DEVICES_MAX];
@@ -1810,7 +1822,7 @@ static stm_status reopen_from_roster(bool ro, uint64_t unreadable_gen,
     po.pool_uuid[1] = POOL_UUID[1];
     po.device_count = NDEV;
     for (size_t i = 0; i < NDEV; i++) {
-        if (dev[i].state == STM_DEV_STATE_REMOVED) {
+        if (dev[i].state == STM_DEV_STATE_REMOVED || (gone & (1u << i))) {
             stm_bdev_close(bds[i]);
             bds[i] = NULL;
         }
@@ -1820,7 +1832,7 @@ static stm_status reopen_from_roster(bool ro, uint64_t unreadable_gen,
     *pool = NULL;
     STM_ASSERT_OK(stm_pool_open(&po, pool));
     for (size_t i = 0; i < NDEV; i++) {
-        if (!bds[i]) continue;
+        if (!bds[i] || (i != 0 && (unattached & (1u << i)))) continue;
         STM_ASSERT_OK(stm_alloc_open_blank(bds[i], &as[i]));
         STM_ASSERT_OK(stm_alloc_set_device_id(as[i], (uint16_t)i));
     }
@@ -1830,6 +1842,14 @@ static stm_status reopen_from_roster(bool ro, uint64_t unreadable_gen,
     for (size_t i = 1; i < NDEV; i++)
         if (as[i]) STM_ASSERT_OK(stm_sync_attach_alloc(*s, (uint16_t)i, as[i]));
     return STM_OK;
+}
+
+static stm_status reopen_from_roster(bool ro, uint64_t unreadable_gen,
+                                     stm_bdev *bds[NDEV],
+                                     stm_alloc *as[NDEV], stm_pool **pool,
+                                     stm_sync **s)
+{
+    return reopen_ex(ro, unreadable_gen, 0, 0, 0, bds, as, pool, s);
 }
 
 static void close_reopened(stm_bdev *bds[NDEV], stm_alloc *as[NDEV],
@@ -1890,6 +1910,7 @@ static void ro_open_with_a_slot_not_written(bool removed, const char *tag)
         stm_sync_info ri;
         STM_ASSERT_OK(stm_sync_info_get(rs, &ri));
         STM_ASSERT_EQ(ri.auth_gen, before.auth_gen);
+        STM_ASSERT_TRUE(ri.read_only);
         STM_ASSERT_ERR(stm_sync_commit(rs), STM_EROFS);
         uint8_t back[STM_UB_SIZE];
         memset(back, 0, sizeof back);
@@ -1904,6 +1925,7 @@ static void ro_open_with_a_slot_not_written(bool removed, const char *tag)
         stm_sync_info wi;
         STM_ASSERT_OK(stm_sync_info_get(rs, &wi));
         STM_ASSERT_EQ(wi.auth_gen, before.auth_gen + 1u);
+        STM_ASSERT_FALSE(wi.read_only);
         STM_ASSERT_OK(stm_sync_commit(rs));
     }
     close_reopened(rb, ra, rp, rs);
@@ -3248,6 +3270,8 @@ STM_TEST(sync_multi_pool_lock_writer_serializes_with_readers) {
         unlink(path);
         stm_bdev *new_bd = NULL;
         STM_ASSERT_OK(stm_bdev_open(path, &bo, &new_bd));
+        /* The handle keeps the file; no path outlives the run. */
+        unlink(path);
         STM_ASSERT_OK(stm_bdev_resize(new_bd, TEST_DEVICE_BYTES));
         stm_pool_device add = {
             .uuid   = { 0xb00bULL + i, 0xdeadULL + i },
@@ -4788,12 +4812,12 @@ static void t3_leg(int x, unsigned claimed, unsigned moved, bool commit,
  * write could change the pool. Device 2's slot of 5 holds the claim, a
  * quorum of holders: the open mounts it (the orphan's tree was swept and
  * reused by the commit). Then the claim's holders made unreadable by
- * device 2's slot torn, or its scan refused (an unknown vote), or its
- * ring come round past slot(5) (newest 68; no write path puts a device
- * more than one gen past auth_gen, quorum.tla NewestNearAuth, so this
- * state is synthetic and the branch defensive): the orphan and the claim
- * could each have been acknowledged, STM_EIO, nothing written. Control
- * for the last: newest 67, in slot(4), mounts the claim. */
+ * device 2's slot torn, or its scan refused (an unknown vote): the orphan
+ * and the claim could each have been acknowledged, STM_EIO, nothing
+ * written. And a device newest more than one gen past auth_gen (68, its
+ * ring come round past slot(5), or 67, not): no write path puts one there
+ * (quorum.tla NewestNearAuth), the state is synthetic, and the open
+ * refuses it STM_EIO, writing nothing. */
 STM_TEST(sync_multi_open_reads_a_claim_a_device_moved_past) {
     t3_result r;
     t3_leg(0, 0x6u, 0x4u, true, 2, T3_NONE, "ahclaim", &r);
@@ -4801,13 +4825,10 @@ STM_TEST(sync_multi_open_reads_a_claim_a_device_moved_past) {
     STM_ASSERT(r.orphan_root != r.claim_root);
     STM_ASSERT_OK(r.open);
     STM_ASSERT_EQ(r.took, r.claim_root);
-    t3_leg(0, 0x6u, 0x4u, true, 2, T3_NOWRAP, "ahnowrap", &r);
-    STM_ASSERT_OK(r.open);
-    STM_ASSERT_EQ(r.took, r.claim_root);
-    static const t3_fault hide[] = { T3_TORN, T3_UNREADABLE, T3_WRAP };
-    static const char *const tags[] = { "ahtorn", "ahunread", "ahwrap" };
-    for (size_t k = 0; k < 3; k++) {
-        t3_leg(0, 0x6u, 0x4u, true, 2, hide[k], tags[k], &r);
+    static const t3_fault refuse[] = { T3_TORN, T3_UNREADABLE, T3_WRAP, T3_NOWRAP };
+    static const char *const tags[] = { "ahtorn", "ahunread", "ahwrap", "ahnowrap" };
+    for (size_t k = 0; k < 4; k++) {
+        t3_leg(0, 0x6u, 0x4u, true, 2, refuse[k], tags[k], &r);
         STM_ASSERT_ERR(r.open, STM_EIO);
         STM_ASSERT_EQ(r.writes, 0u);
     }
@@ -5233,12 +5254,14 @@ static void rr_res_leg(const char *tag)
     unlink_paths();
 }
 
-/* Two devices; the final at 5 fails on device 1, then device 2 is added.
- * The stashed reservation's roster does not name device 2, so the retry
- * builds the reservation afresh on three devices; with the retry's final
- * lost on devices 1 and 2 that reservation is what the pool mounts, and
- * it opens on the three-device roster (the stash written to device 2
- * carries a device count of two, and that open refuses). */
+/* Two devices; the final at 5 fails on device 1, then device 2 is added
+ * (stm_pool_add_device). The stashed reservation's roster does not name
+ * it, and a rebuilt reservation acknowledged by the three-device quorum
+ * need not hold a quorum of the two-device roster, whose own pick then
+ * takes the first attempt's writes (review (s)(t)(u)(v) round 6 F1: an
+ * open from device 0's roster mounted 4 and claimed over the acknowledged
+ * 5). The retry writes nothing and wedges; the two-device pool reopens at
+ * the reservation, gen 3's trees. */
 static void rr_add_leg(const char *tag)
 {
     make_paths(tag);
@@ -5272,8 +5295,8 @@ static void rr_add_leg(const char *tag)
     STM_ASSERT_OK(stm_sync_commit(s));                             /* 2, 3 */
     STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
     STM_ASSERT_ERR(rr_commit_failing(s, b, false, 2u), STM_EQUORUM);
-    uint8_t f1d0[STM_UB_COPIES][STM_UB_SIZE];
-    q4_copy_gen(b[0], 5, true, f1d0);
+    const uint64_t root4 = q4_root(b[0], 4);
+    STM_ASSERT(root4 != 0);
     stm_pool_device add = {
         .uuid       = { DEV_UUID_LO[2], DEV_UUID_HI },
         .size_bytes = TEST_DEVICE_BYTES,
@@ -5283,27 +5306,32 @@ static void rr_add_leg(const char *tag)
         .bdev       = b[2],
     };
     STM_ASSERT_OK(stm_pool_add_device(p, &add));
-    STM_ASSERT_OK(stm_sync_commit(s));                             /* 4, 5 */
-    stm_uberblock R2;
-    STM_ASSERT_OK(stm_sb_label_read(b[0], 0u, 4u, &R2));
+    uint64_t w0 = total_writes(b);
+    stm_status cs = stm_sync_commit(s);
+    uint64_t w = total_writes(b) - w0;
+    stm_test_info("[%s] retry after the add: %d, %llu writes", tag, (int)cs,
+                  (unsigned long long)w);
+    STM_ASSERT_ERR(cs, STM_EWEDGED);
+    STM_ASSERT_EQ(w, 0u);
     stm_sync_close(s);
     stm_alloc_close(a);
     stm_pool_close(p);
-    q4_zero_gen(b[1], 5);
-    q4_zero_gen(b[2], 5);
-    q4_copy_gen(b[0], 5, false, f1d0);
     close_bdevs(b);
+
     open_bdevs(b);
-    uint64_t took = 0, w = 0;
-    stm_status st = rr_open(b, &took, &w);
-    stm_test_info("[%s] reservation's device count %u; open %d, took %llu, "
-                  "writes %llu", tag,
-                  (unsigned)stm_load_le16(R2.ub_device_count), (int)st,
-                  (unsigned long long)took, (unsigned long long)w);
-    STM_ASSERT_OK(st);
-    STM_ASSERT_EQ(stm_load_le16(R2.ub_device_count), 3u);
-    STM_ASSERT_EQ(took, stm_load_le64(R2.ub_alloc_root.bp_paddr));
-    STM_ASSERT_EQ(w, (uint64_t)NDEV * STM_UB_COPIES);
+    for (int i = 0; i < 2; i++) po.devices[i].bdev = b[i];
+    p = NULL;
+    STM_ASSERT_OK(stm_pool_open(&po, &p));
+    a = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(b[0], &a));
+    s = NULL;
+    STM_ASSERT_OK(stm_sync_open(p, a, make_wk(), NULL, NULL, &s));
+    stm_sync_info si;
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    STM_ASSERT_EQ(si.alloc_root_paddr, root4);
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
     close_bdevs(b);
     unlink_paths();
 }
@@ -5369,6 +5397,1780 @@ STM_TEST(sync_multi_commit_retry_writes_its_reservation_again) {
     rr_res_leg("rrres");
     rr_add_leg("rradd");
     rr_open_leg("rropen");
+}
+
+/* ========================================================================= */
+/* (s)(t)(u)(v) round 4 F1: a removal waits for a failed commit's retry.     */
+/* ========================================================================= */
+
+/* rr_commit_failing over four devices: the final's slot fails on `mask`. */
+static stm_status rq_commit_failing(stm_sync *s, stm_bdev *b[Q4], unsigned mask)
+{
+    stm_sync_info si;
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    rr_obs_ctx c[Q4];
+    stm_bdev_io_observer o[Q4];
+    for (int i = 0; i < Q4; i++) {
+        c[i] = (rr_obs_ctx){ si.current_gen,
+                             ((mask >> i) & 1u) ? STM_UB_COPIES : 0, b[i] };
+        o[i] = (stm_bdev_io_observer){ rr_obs, &c[i] };
+        if ((mask >> i) & 1u) stm_bdev_set_io_observer_for_test(b[i], &o[i]);
+    }
+    stm_status st = stm_sync_commit(s);
+    for (int i = 0; i < Q4; i++) {
+        if ((mask >> i) & 1u) stm_bdev_set_io_observer_for_test(b[i], NULL);
+        STM_ASSERT_EQ(c[i].armed, 0);
+    }
+    return st;
+}
+
+static uint64_t total_writes1(stm_bdev *d)
+{
+    uint64_t w = 0;
+    stm_bdev_io_stats(d, &w, NULL, NULL);
+    return w;
+}
+
+static uint64_t q4_writes(stm_bdev *b[Q4])
+{
+    uint64_t sum = 0;
+    for (int i = 0; i < Q4; i++) {
+        uint64_t w = 0;
+        stm_bdev_io_stats(b[i], &w, NULL, NULL);
+        sum += w;
+    }
+    return sum;
+}
+
+static void q4_paths(const char *tag)
+{
+    for (int i = 0; i < Q4; i++) {
+        snprintf(g_q4_paths[i], sizeof g_q4_paths[i],
+                 "/tmp/stm_v2_sync_multi_q4_%s_%d_%d.bin", tag, (int)getpid(),
+                 i);
+        unlink(g_q4_paths[i]);
+    }
+}
+
+static void q4_unlink(void)
+{
+    for (int i = 0; i < Q4; i++) unlink(g_q4_paths[i]);
+}
+
+/* Four devices (quorum 3) acknowledge gen 3; then a commit whose
+ * reservation at 4 reaches all four and whose final at 5 reaches device 0
+ * alone (STM_EQUORUM). Its retry writes that reservation's bytes again,
+ * with the four-device roster's quorum. RW_REMOVE: stm_sync_remove_device
+ * of device 3 refuses STM_EBUSY until the retry is acknowledged, then
+ * removes it; the retry's final misses device 2, so a quorum of the
+ * four-device roster holds it (removed first, device 2's own roster's
+ * open mounted the reservation at 4 under the acknowledged 5 and claimed
+ * over it). RW_FINISH: the same for stm_sync_finish_evacuation (the
+ * evacuation's start, state bytes only, is not refused). RW_POOL: the
+ * pool primitive removes device 3 in between anyway, and the retry writes
+ * nothing, wedges and answers STM_EWEDGED, and the sync's remove and
+ * finish then answer the wedge; `pending` false is the control, the same
+ * removal after the retry, and the next commit rebuilds. With `add`, a
+ * fifth device is added first and devices 3 and 2 are removed: the retry
+ * wedges too (review round 5 F1: the wedge waited on an equal count, the
+ * retry rebuilt for the larger one, and with device 1 missing the rebuilt
+ * reservation the stashed roster held its reservation at 4 on three of
+ * four, an open from device 2's roster mounting 4 under the acknowledged
+ * 5); the control commits after the retry. */
+enum { RW_REMOVE, RW_FINISH, RW_POOL };
+static char g_q4_fifth[256];
+static void rw_leg(const char *tag, int mode, bool pending, bool add)
+{
+    q4_paths(tag);
+    stm_bdev *b[Q4] = {0};
+    stm_bdev *b4 = NULL;
+    stm_alloc *a4 = NULL;
+    q4_open(b);
+    stm_pool *p = q4_pool(b);
+    stm_alloc *a = NULL;
+    uint64_t du[2] = { 1, DEV_UUID_HI };
+    STM_ASSERT_OK(stm_alloc_create(b[0], POOL_UUID, du, TEST_BOOTSTRAP_BYTES,
+                                   &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(p, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 1 */
+    uint64_t dp = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 2, 3 */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_ERR(rq_commit_failing(s, b, 0xEu), STM_EQUORUM);
+    stm_sync_info si;
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    STM_ASSERT_EQ(si.auth_gen, 3u);
+    STM_ASSERT_EQ(si.current_gen, 5u);
+    for (int i = 0; i < Q4; i++) STM_ASSERT(q4_root(b[i], 4) != 0);
+
+    if (mode == RW_POOL) {
+        if (!pending) STM_ASSERT_OK(stm_sync_commit(s));          /* 4, 5 */
+        if (add) {
+            snprintf(g_q4_fifth, sizeof g_q4_fifth,
+                     "/tmp/stm_v2_sync_multi_q4_%s_%d_4.bin", tag, (int)getpid());
+            unlink(g_q4_fifth);
+            stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+            STM_ASSERT_OK(stm_bdev_open(g_q4_fifth, &bo, &b4));
+            STM_ASSERT_OK(stm_bdev_resize(b4, TEST_DEVICE_BYTES));
+            uint64_t du4[2] = { 5, DEV_UUID_HI };
+            STM_ASSERT_OK(stm_alloc_create(b4, POOL_UUID, du4,
+                                           TEST_BOOTSTRAP_BYTES, &a4));
+            STM_ASSERT_OK(stm_alloc_set_device_id(a4, 4));
+            stm_pool_device ad = {
+                .uuid = { 5, DEV_UUID_HI }, .size_bytes = TEST_DEVICE_BYTES,
+                .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+                .state = STM_DEV_STATE_ONLINE, .bdev = b4,
+            };
+            STM_ASSERT_OK(stm_pool_add_device(p, &ad));
+            STM_ASSERT_OK(stm_sync_attach_alloc(s, 4, a4));
+        }
+        STM_ASSERT_OK(stm_pool_remove_device(p, 3, 1));
+        if (add) STM_ASSERT_OK(stm_pool_remove_device(p, 2, 1));
+        uint64_t w0 = q4_writes(b) + (b4 ? total_writes1(b4) : 0);
+        stm_status cs = stm_sync_commit(s);
+        uint64_t w = q4_writes(b) + (b4 ? total_writes1(b4) : 0) - w0;
+        stm_test_info("[%s] commit after the pool's removal: %d, %llu writes",
+                      tag, (int)cs, (unsigned long long)w);
+        STM_ASSERT_OK(stm_sync_info_get(s, &si));
+        if (pending) {
+            STM_ASSERT_ERR(cs, STM_EWEDGED);
+            STM_ASSERT_EQ(w, 0u);
+            STM_ASSERT_ERR(stm_sync_commit(s), STM_EWEDGED);
+            STM_ASSERT_ERR(stm_sync_remove_device(s, 1, 1), STM_EWEDGED);
+            STM_ASSERT_ERR(stm_sync_finish_evacuation(s, 1), STM_EWEDGED);
+            STM_ASSERT_EQ(si.auth_gen, 3u);
+        } else {
+            STM_ASSERT_OK(cs);                                     /* 6, 7 */
+            STM_ASSERT_EQ(si.auth_gen, 7u);
+        }
+        stm_sync_close(s);
+        stm_alloc_close(a);
+        if (a4) stm_alloc_close(a4);
+        stm_pool_close(p);
+        q4_close(b);
+        if (b4) stm_bdev_close(b4);
+        if (add) unlink(g_q4_fifth);
+        q4_unlink();
+        return;
+    }
+
+    if (mode == RW_FINISH) {
+        STM_ASSERT_OK(stm_pool_begin_evacuation(p, 3, 1));
+        STM_ASSERT_ERR(stm_sync_finish_evacuation(s, 3), STM_EBUSY);
+        STM_ASSERT_EQ(stm_pool_device_info(p, 3)->state,
+                      STM_DEV_STATE_EVACUATING);
+    } else {
+        STM_ASSERT_ERR(stm_sync_remove_device(s, 3, 1), STM_EBUSY);
+        STM_ASSERT_EQ(stm_pool_device_info(p, 3)->state, STM_DEV_STATE_ONLINE);
+    }
+    STM_ASSERT_OK(rq_commit_failing(s, b, 0x4u));                  /* 4, 5 */
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    STM_ASSERT_EQ(si.auth_gen, 5u);
+    const uint64_t root5 = q4_root(b[0], 5);
+    STM_ASSERT(root5 != 0);
+    STM_ASSERT(root5 != q4_root(b[0], 4));
+    STM_ASSERT_EQ(q4_root(b[2], 5), 0u);
+    if (mode == RW_FINISH) STM_ASSERT_OK(stm_sync_finish_evacuation(s, 3));
+    else                   STM_ASSERT_OK(stm_sync_remove_device(s, 3, 1));
+    STM_ASSERT_EQ(stm_pool_device_info(p, 3)->state, STM_DEV_STATE_REMOVED);
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    q4_close(b);
+
+    /* The removal was never committed. The scan answers the roster the
+     * retry's final carries at 5 (device 3 EVACUATING after RW_FINISH),
+     * and the pool opens from it at 5. Device 2's newest is the
+     * reservation at 4: an open from its roster (four devices ONLINE)
+     * mounts the acknowledged 5 (RW_REMOVE), or refuses STM_ECORRUPT,
+     * writing nothing, when 5 carries the evacuation's start. */
+    q4_open(b);
+    stm_pool_open_opts po;
+    uint64_t auth = 0;
+    STM_ASSERT_OK(stm_sync_scan_roster(b, Q4, NULL, &po, &auth));
+    STM_ASSERT_EQ(auth, 5u);
+    STM_ASSERT_EQ(po.device_count, 4u);
+    for (int i = 0; i < Q4; i++) {
+        STM_ASSERT_EQ(po.devices[i].state,
+                      mode == RW_FINISH && i == 3 ? STM_DEV_STATE_EVACUATING
+                                                  : STM_DEV_STATE_ONLINE);
+        po.devices[i].bdev = b[i];
+    }
+    for (int from2 = 0; from2 < 2; from2++) {
+        p = NULL;
+        if (from2) p = q4_pool(b);
+        else       STM_ASSERT_OK(stm_pool_open(&po, &p));
+        a = NULL;
+        STM_ASSERT_OK(stm_alloc_open_blank(b[0], &a));
+        s = NULL;
+        uint64_t w0 = q4_writes(b);
+        stm_status os = stm_sync_open(p, a, make_wk(), NULL, NULL, &s);
+        stm_test_info("[%s] open from %s roster: %d", tag,
+                      from2 ? "device 2's" : "the scan's", (int)os);
+        if (from2 && mode == RW_FINISH) {
+            STM_ASSERT_ERR(os, STM_ECORRUPT);
+            STM_ASSERT_EQ(q4_writes(b) - w0, 0u);
+        } else {
+            STM_ASSERT_OK(os);
+            STM_ASSERT_OK(stm_sync_info_get(s, &si));
+            STM_ASSERT_EQ(si.alloc_root_paddr, root5);
+            stm_sync_close(s);
+        }
+        stm_alloc_close(a);
+        stm_pool_close(p);
+    }
+    q4_close(b);
+    q4_unlink();
+}
+
+/* Round 5 F2: device 2 failed, a commit (its roster carries device 2
+ * FAULTED, so not clean) whose final fails on devices 1 and 3, device 2
+ * rejoined: the roster is again the last acknowledged final's and nothing
+ * else changed. The commit still writes the retry (it answered STM_OK
+ * writing nothing, the failed attempt's reservation the newest on disk,
+ * and the removal guard held for good); the removal then proceeds, and the
+ * pool opens at 5 from the all-ONLINE roster. */
+static void rw_rejoin_leg(const char *tag)
+{
+    q4_paths(tag);
+    stm_bdev *b[Q4] = {0};
+    q4_open(b);
+    stm_pool *p = q4_pool(b);
+    stm_alloc *a = NULL;
+    uint64_t du[2] = { 1, DEV_UUID_HI };
+    STM_ASSERT_OK(stm_alloc_create(b[0], POOL_UUID, du, TEST_BOOTSTRAP_BYTES,
+                                   &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(p, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 1 */
+    uint64_t dp = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 2, 3 */
+    STM_ASSERT_OK(stm_pool_fail_device(p, 2));
+    STM_ASSERT_ERR(rq_commit_failing(s, b, 0xAu), STM_EQUORUM);
+    STM_ASSERT_OK(stm_pool_rejoin_device(p, 2));
+    uint64_t w0 = q4_writes(b);
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 4, 5 */
+    uint64_t w = q4_writes(b) - w0;
+    stm_sync_info si;
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    stm_test_info("[%s] commit after the rejoin: auth %llu, %llu writes", tag,
+                  (unsigned long long)si.auth_gen, (unsigned long long)w);
+    STM_ASSERT_EQ(si.auth_gen, 5u);
+    STM_ASSERT(w > 0);
+    STM_ASSERT_OK(stm_sync_remove_device(s, 3, 1));
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    q4_close(b);
+
+    q4_open(b);
+    p = q4_pool(b);
+    a = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(b[0], &a));
+    s = NULL;
+    STM_ASSERT_OK(stm_sync_open(p, a, make_wk(), NULL, NULL, &s));
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    STM_ASSERT_EQ(si.alloc_root_paddr, q4_root(b[0], 5));
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    q4_close(b);
+    q4_unlink();
+}
+
+/* Round 6 F1: stm_sync_replace_device_online's add waits for a failed
+ * commit's retry too, refusing STM_EBUSY and adding nothing; after the
+ * retry the same replace of device 3 by a fifth device completes. */
+static void rw_replace_leg(const char *tag)
+{
+    q4_paths(tag);
+    stm_bdev *b[Q4] = {0};
+    q4_open(b);
+    stm_pool *p = q4_pool(b);
+    stm_alloc *a = NULL;
+    uint64_t du[2] = { 1, DEV_UUID_HI };
+    STM_ASSERT_OK(stm_alloc_create(b[0], POOL_UUID, du, TEST_BOOTSTRAP_BYTES,
+                                   &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(p, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 1 */
+    uint64_t dp = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 2, 3 */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_ERR(rq_commit_failing(s, b, 0xEu), STM_EQUORUM);
+    snprintf(g_q4_fifth, sizeof g_q4_fifth,
+             "/tmp/stm_v2_sync_multi_q4_%s_%d_4.bin", tag, (int)getpid());
+    unlink(g_q4_fifth);
+    stm_bdev *b4 = NULL;
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(g_q4_fifth, &bo, &b4));
+    STM_ASSERT_OK(stm_bdev_resize(b4, TEST_DEVICE_BYTES));
+    uint64_t du4[2] = { 5, DEV_UUID_HI };
+    stm_alloc *a4 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(b4, POOL_UUID, du4, TEST_BOOTSTRAP_BYTES,
+                                   &a4));
+    stm_pool_device nd = {
+        .uuid = { 5, DEV_UUID_HI }, .size_bytes = TEST_DEVICE_BYTES,
+        .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state = STM_DEV_STATE_ONLINE, .bdev = b4,
+    };
+    uint16_t nid = 0;
+    STM_ASSERT_ERR(stm_sync_replace_device_online(s, 3, &nd, a4, 1, &nid),
+                   STM_EBUSY);
+    STM_ASSERT_EQ(stm_pool_device_count(p), 4u);
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 4, 5 */
+    stm_status rs = stm_sync_replace_device_online(s, 3, &nd, a4, 1, &nid);
+    stm_test_info("[%s] replace after the retry: %d, new slot %u", tag,
+                  (int)rs, (unsigned)nid);
+    STM_ASSERT_OK(rs);
+    STM_ASSERT_EQ(nid, 4u);
+    STM_ASSERT_EQ(stm_pool_device_info(p, 3)->state, STM_DEV_STATE_REMOVED);
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_alloc_close(a4);
+    stm_pool_close(p);
+    q4_close(b);
+    stm_bdev_close(b4);
+    unlink(g_q4_fifth);
+    q4_unlink();
+}
+
+/* Round 7 F1: a fresh pool's first commit, its final at 1 failing on
+ * devices 1 to 3 (STM_EQUORUM), waits for its retry as a reservation's
+ * does: stm_sync_remove_device refuses STM_EBUSY; after an add through
+ * the pool (`add`) the retry writes nothing and wedges (without the
+ * stash it was acknowledged under the five-device roster while an open
+ * from the four-device one took the first attempt's final at 1 and
+ * claimed over it). Control: no add, the retry is acknowledged at 1 and
+ * the removal proceeds. */
+static void rw_fresh_leg(const char *tag, bool add)
+{
+    q4_paths(tag);
+    stm_bdev *b[Q4] = {0};
+    q4_open(b);
+    stm_pool *p = q4_pool(b);
+    stm_alloc *a = NULL;
+    uint64_t du[2] = { 1, DEV_UUID_HI };
+    STM_ASSERT_OK(stm_alloc_create(b[0], POOL_UUID, du, TEST_BOOTSTRAP_BYTES,
+                                   &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(p, a, make_wk(), NULL, &s));
+    STM_ASSERT_ERR(rq_commit_failing(s, b, 0xEu), STM_EQUORUM);
+    stm_sync_info si;
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    STM_ASSERT_EQ(si.auth_gen, 0u);
+    STM_ASSERT(q4_root(b[0], 1) != 0);
+    STM_ASSERT_ERR(stm_sync_remove_device(s, 3, 1), STM_EBUSY);
+    stm_bdev *b4 = NULL;
+    if (add) {
+        snprintf(g_q4_fifth, sizeof g_q4_fifth,
+                 "/tmp/stm_v2_sync_multi_q4_%s_%d_4.bin", tag, (int)getpid());
+        unlink(g_q4_fifth);
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        STM_ASSERT_OK(stm_bdev_open(g_q4_fifth, &bo, &b4));
+        STM_ASSERT_OK(stm_bdev_resize(b4, TEST_DEVICE_BYTES));
+        stm_pool_device ad = {
+            .uuid = { 5, DEV_UUID_HI }, .size_bytes = TEST_DEVICE_BYTES,
+            .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+            .state = STM_DEV_STATE_ONLINE, .bdev = b4,
+        };
+        STM_ASSERT_OK(stm_pool_add_device(p, &ad));
+    }
+    uint64_t w0 = q4_writes(b) + (b4 ? total_writes1(b4) : 0);
+    stm_status cs = stm_sync_commit(s);
+    uint64_t w = q4_writes(b) + (b4 ? total_writes1(b4) : 0) - w0;
+    stm_test_info("[%s] first commit's retry: %d, %llu writes", tag, (int)cs,
+                  (unsigned long long)w);
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    if (add) {
+        STM_ASSERT_ERR(cs, STM_EWEDGED);
+        STM_ASSERT_EQ(w, 0u);
+        STM_ASSERT_EQ(si.auth_gen, 0u);
+    } else {
+        STM_ASSERT_OK(cs);
+        STM_ASSERT_EQ(si.auth_gen, 1u);
+        STM_ASSERT_OK(stm_sync_remove_device(s, 3, 1));
+    }
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    q4_close(b);
+    if (b4) stm_bdev_close(b4);
+    if (add) unlink(g_q4_fifth);
+    q4_unlink();
+}
+
+STM_TEST(sync_multi_removal_waits_for_a_failed_commits_retry) {
+    rw_leg("rwrm", RW_REMOVE, true, false);
+    rw_leg("rwfe", RW_FINISH, true, false);
+    rw_leg("rwpool", RW_POOL, true, false);
+    rw_leg("rwpoolc", RW_POOL, false, false);
+    rw_leg("rwadd", RW_POOL, true, true);
+    rw_leg("rwaddc", RW_POOL, false, true);
+    rw_rejoin_leg("rwrj");
+    rw_replace_leg("rwrp");
+    rw_fresh_leg("rwfr", true);
+    rw_fresh_leg("rwfrc", false);
+}
+
+/* Device d's newest uberblock: its gen, its slot count and its live count. */
+static void q4_newest(stm_bdev *d, uint64_t *gen, uint16_t *count, size_t *live)
+{
+    stm_uberblock ub;
+    uint32_t lbl = 0, slot = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
+    *gen = stm_load_le64(ub.ub_gen);
+    *count = stm_load_le16(ub.ub_device_count);
+    stm_pool_device dev[STM_POOL_DEVICES_MAX];
+    memset(dev, 0, sizeof dev);
+    STM_ASSERT_OK(stm_pool_roster_decode(ub.ub_roster, *count, dev));
+    *live = 0;
+    for (uint16_t i = 0; i < *count; i++)
+        if (dev[i].state != STM_DEV_STATE_REMOVED) (*live)++;
+}
+
+/* Round 4 F2: a pick's refusal other than the bound refuses the scan,
+ * where passing that roster over could answer a stale one. The state is
+ * crafted: the removal guard above leaves no API path to it. Four devices
+ * acknowledge gen 3 (roster R1); device 3 is removed and gens 4 and 5 are
+ * acknowledged by the three left (R2). Then every device's slot of 4
+ * takes its own gen-3 uberblock as gen 4 (R1's reservation at 4, which a
+ * retry reusing it across the removal would have left) and device 2's
+ * slot of 5 is cleared: devices 0 and 1 hold R2 at 5, the quorum of R2,
+ * and R1's pick takes 4 (three of four hold it, device 0 one past). With
+ * device 1 not handed in, R2's pick refuses (vote 153: device 1 may hold
+ * 5) and the scan refuses STM_EIO; passing R2 over answered R1 at 4,
+ * under the acknowledged 5. Control: device 1 handed in with its slot of
+ * 5 blank (gen 5 lost there too, the (ai) family): R2's pick takes R1's
+ * gen 4, refusing nothing, and the scan answers R1 at 4. */
+STM_TEST(sync_multi_scan_roster_refuses_when_another_rosters_pick_refuses) {
+    q4_paths("s_poison");
+    stm_bdev *b[Q4] = {0};
+    q4_open(b);
+    stm_pool *p = q4_pool(b);
+    stm_alloc *a = NULL;
+    uint64_t du[2] = { 1, DEV_UUID_HI };
+    STM_ASSERT_OK(stm_alloc_create(b[0], POOL_UUID, du, TEST_BOOTSTRAP_BYTES,
+                                   &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(p, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 1 */
+    uint64_t dp = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 2, 3 */
+    STM_ASSERT_OK(stm_sync_remove_device(s, 3, 1));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 4, 5 */
+    stm_sync_info si;
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    STM_ASSERT_EQ(si.auth_gen, 5u);
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    STM_ASSERT_EQ(q4_root(b[3], 4), 0u);
+    for (int i = 0; i < Q4; i++) t3_regen(b[i], 3, 4);
+    q4_zero_gen(b[2], 5);
+    const uint64_t want_gen[Q4] = { 5, 5, 4, 4 };
+    const size_t want_live[Q4] = { 3, 3, 4, 4 };
+    for (int i = 0; i < Q4; i++) {
+        uint64_t g = 0; uint16_t c = 0; size_t live = 0;
+        q4_newest(b[i], &g, &c, &live);
+        STM_ASSERT_EQ(g, want_gen[i]);
+        STM_ASSERT_EQ(c, 4u);
+        STM_ASSERT_EQ(live, want_live[i]);
+    }
+
+    stm_bdev *h023[3] = { b[0], b[2], b[3] };
+    stm_pool_open_opts po;
+    uint64_t auth = 0;
+    stm_status st = stm_sync_scan_roster(h023, 3, NULL, &po, &auth);
+    stm_test_info("device 1 not handed in: scan %d", (int)st);
+    STM_ASSERT_ERR(st, STM_EIO);
+
+    q4_zero_gen(b[1], 5);
+    st = stm_sync_scan_roster(b, Q4, NULL, &po, &auth);
+    stm_test_info("device 1's slot of 5 blank: scan %d, auth %llu", (int)st,
+                  (unsigned long long)auth);
+    STM_ASSERT_OK(st);
+    STM_ASSERT_EQ(auth, 4u);
+    STM_ASSERT_EQ(po.device_count, 4u);
+    for (int i = 0; i < Q4; i++)
+        STM_ASSERT_EQ(po.devices[i].state, STM_DEV_STATE_ONLINE);
+    q4_close(b);
+    q4_unlink();
+}
+
+/* OPEN-BUGS (t): device 2 failed (gens 2 and 3 on devices 0 and 1),
+ * rejoined, and gens 4 and 5 were acknowledged by devices 1 and 2 while
+ * device 0 missed them, so device 0's roster still shows device 2 FAULTED.
+ * With device 2 gone, an open from that roster counts it an unknown vote
+ * that may hold gen 5 and refuses STM_EIO, writing nothing; counting it
+ * nothing, it mounted gen 3, past the acknowledged gen 5, and claimed over
+ * device 1's gen 4. With device 2 there it is read: gen 5 is the quorum's
+ * and its roster is not the one presented, STM_ECORRUPT. From device 1's
+ * roster with every device there, gen 5 mounts. */
+STM_TEST(sync_multi_open_counts_a_gone_device_an_unknown_vote) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "t_unk", bds, as, &pool, &s);
+    STM_ASSERT_OK(stm_pool_fail_device(pool, 2));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_pool_rejoin_device(pool, 2));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s, &info));
+    STM_ASSERT_EQ(info.auth_gen, 5u);
+    stm_sync_close(s);
+    close_multi_allocs(as);
+    stm_pool_close(pool);
+    uint8_t zeros[STM_UB_SIZE];
+    memset(zeros, 0, sizeof zeros);
+    for (uint64_t g = 4; g <= 5; g++)
+        for (uint32_t li = 0; li < STM_UB_COPIES; li++)
+            STM_ASSERT_OK(stm_bdev_write(bds[0], gen_copy_off(g, li), zeros,
+                                         sizeof zeros));
+    stm_uberblock before4;
+    STM_ASSERT_OK(stm_sb_label_read(bds[1], 0u, 4u, &before4));
+    STM_ASSERT_EQ(stm_load_le64(before4.ub_gen), 4u);
+    close_bdevs(bds);
+
+    stm_bdev *rb[NDEV] = {0};
+    stm_alloc *ra[NDEV] = {0};
+    stm_pool *rp = NULL; stm_sync *rs = NULL;
+    stm_status st = reopen_ex(false, 0, 0, 1u << 2, 0, rb, ra, &rp, &rs);
+    if (st == STM_OK && rs) {
+        stm_sync_info ri;
+        STM_ASSERT_OK(stm_sync_info_get(rs, &ri));
+        fprintf(stderr, "  gone: mounted gen %llu\n",
+                (unsigned long long)ri.mount_max_durable_gen);
+    }
+    STM_ASSERT_ERR(st, STM_EIO);
+    close_reopened(rb, ra, rp, rs);
+    {
+        stm_bdev *b1 = NULL;
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        STM_ASSERT_OK(stm_bdev_open(g_paths[1], &bo, &b1));
+        stm_uberblock after4;
+        STM_ASSERT_OK(stm_sb_label_read(b1, 0u, 4u, &after4));
+        STM_ASSERT_EQ(memcmp(&after4, &before4, sizeof after4), 0);
+        stm_bdev_close(b1);
+    }
+
+    STM_ASSERT_ERR(reopen_ex(false, 0, 0, 0, 0, rb, ra, &rp, &rs), STM_ECORRUPT);
+    close_reopened(rb, ra, rp, rs);
+
+    STM_ASSERT_OK(reopen_ex(false, 0, 1, 0, 0, rb, ra, &rp, &rs));
+    if (rs) {
+        stm_sync_info ri;
+        STM_ASSERT_OK(stm_sync_info_get(rs, &ri));
+        STM_ASSERT_EQ(ri.mount_max_durable_gen, 5u);
+    }
+    close_reopened(rb, ra, rp, rs);
+    unlink_paths();
+}
+
+/* OPEN-BUGS (t): a pool whose FAULTED device is gone opens without it
+ * read-only, reads a block mirrored before and refuses a commit
+ * (STM_EROFS); before, stm_pool_open refused the slot and nothing opened
+ * the pool. Read-write it refuses STM_EROFS, writing nothing (the
+ * read-only open after mounts the same gen): the write paths still take
+ * every live slot to have an allocator (OPEN-BUGS (ao)). The gone slot
+ * cannot rejoin, start an evacuation or take an allocator (STM_ENODEV). A
+ * device there whose allocator was not attached holds a tree the pool
+ * records, and is not removed (STM_EBUSY), nor called drained by an
+ * evacuation step; attached, its tree empty, it is removed (the control). */
+STM_TEST(sync_multi_degraded_pool_opens_without_a_gone_device) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "t_gone", bds, as, &pool, &s);
+    STM_ASSERT_OK(stm_pool_fail_device(pool, 2));
+    uint64_t paddrs[2] = { 0 };
+    uint8_t payload[STM_UB_SIZE];
+    for (size_t i = 0; i < sizeof payload; i++) payload[i] = (uint8_t)(i * 5u + 3u);
+    stm_blake3_hash want;
+    stm_blake3(payload, sizeof payload, &want);
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs));
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, 2u, payload, sizeof payload, NULL));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_info before;
+    STM_ASSERT_OK(stm_sync_info_get(s, &before));
+    teardown_mirror_pool_keep(bds, as, pool, s);
+
+    for (int ro = 0; ro <= 1; ro++) {
+        stm_bdev *rb[NDEV] = {0};
+        stm_alloc *ra[NDEV] = {0};
+        stm_pool *rp = NULL; stm_sync *rs = NULL;
+        stm_status st = reopen_ex(ro != 0, 0, 0, 1u << 2, 0, rb, ra, &rp, &rs);
+        if (!ro) {
+            STM_ASSERT_ERR(st, STM_EROFS);
+            close_reopened(rb, ra, rp, rs);
+            continue;
+        }
+        STM_ASSERT_OK(st);
+        if (rs) {
+            stm_sync_info ri;
+            STM_ASSERT_OK(stm_sync_info_get(rs, &ri));
+            STM_ASSERT_EQ(ri.mount_max_durable_gen, before.auth_gen);
+            STM_ASSERT_TRUE(ri.read_only);
+            uint8_t back[STM_UB_SIZE];
+            memset(back, 0, sizeof back);
+            STM_ASSERT_OK(stm_sync_mirror_read(rs, paddrs, 2u, back, sizeof back,
+                                               want.bytes));
+            STM_ASSERT_EQ(memcmp(back, payload, sizeof back), 0);
+            STM_ASSERT_ERR(stm_sync_commit(rs), STM_EROFS);
+            STM_ASSERT_ERR(stm_pool_rejoin_device(rp, 2), STM_ENODEV);
+            STM_ASSERT_ERR(stm_pool_begin_evacuation(rp, 2, 1), STM_ENODEV);
+            /* An allocator that says it is device 2's, on another device. */
+            char xpath[300];
+            snprintf(xpath, sizeof xpath, "%s.x", g_paths[2]);
+            unlink(xpath);
+            stm_bdev *xb = NULL;
+            stm_alloc *xa = NULL;
+            stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+            STM_ASSERT_OK(stm_bdev_open(xpath, &bo, &xb));
+            STM_ASSERT_OK(stm_bdev_resize(xb, g_dev_bytes));
+            uint64_t xu[2] = { DEV_UUID_LO[2], DEV_UUID_HI };
+            STM_ASSERT_OK(stm_alloc_create(xb, POOL_UUID, xu, TEST_BOOTSTRAP_BYTES, &xa));
+            STM_ASSERT_OK(stm_alloc_set_device_id(xa, 2));
+            STM_ASSERT_ERR(stm_sync_attach_alloc(rs, 2, xa), STM_ENODEV);
+            stm_alloc_close(xa);
+            stm_bdev_close(xb);
+            unlink(xpath);
+            const stm_pool_device *slot = stm_pool_device_info(rp, 2);
+            STM_ASSERT(slot && slot->state == STM_DEV_STATE_FAULTED);
+        }
+        close_reopened(rb, ra, rp, rs);
+    }
+
+    unlink_paths();
+
+    /* A device there but not attached holds a tree the pool records. */
+    setup_mirror_pool(2, "t_unatt", bds, as, &pool, &s);
+    STM_ASSERT_OK(stm_sync_commit(s));
+    teardown_mirror_pool_keep(bds, as, pool, s);
+    {
+        stm_bdev *rb[NDEV] = {0};
+        stm_alloc *ra[NDEV] = {0};
+        stm_pool *rp = NULL; stm_sync *rs = NULL;
+        STM_ASSERT_OK(reopen_ex(false, 0, 0, 0, 1u << 2, rb, ra, &rp, &rs));
+        if (rs) {
+            STM_ASSERT_ERR(stm_sync_remove_device(rs, 2, 1), STM_EBUSY);
+            STM_ASSERT_OK(stm_pool_begin_evacuation(rp, 2, 1));
+            uint64_t op = 0, np = 0;
+            STM_ASSERT_ERR(stm_sync_evacuation_step(rs, 2, 1, &op, &np), STM_EBUSY);
+        }
+        close_reopened(rb, ra, rp, rs);
+        STM_ASSERT_OK(reopen_ex(false, 0, 0, 0, 0, rb, ra, &rp, &rs));
+        if (rs) {
+            STM_ASSERT_OK(stm_sync_remove_device(rs, 2, 1));
+            STM_ASSERT_OK(stm_sync_commit(rs));
+        }
+        close_reopened(rb, ra, rp, rs);
+    }
+    unlink_paths();
+
+    /* A device never attached holds no tree the pool records: the step
+     * answers STM_ENOENT and the evacuation finishes (the control). */
+    make_paths("t_noatt");
+    open_multi_allocs(bds, as);
+    pool = make_multi_pool(bds);
+    stm_redundancy_profile prof = { .kind = STM_RED_MIRROR, .mirror_n = 2 };
+    s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, as[0], make_wk(), &prof, &s));
+    STM_ASSERT_OK(stm_sync_attach_alloc(s, 1, as[1]));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_pool_begin_evacuation(pool, 2, 1));
+    uint64_t nop = 0, nnp = 0;
+    STM_ASSERT_ERR(stm_sync_evacuation_step(s, 2, 1, &nop, &nnp), STM_ENOENT);
+    STM_ASSERT_OK(stm_sync_finish_evacuation(s, 2));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* A create writes every live slot: over a FAULTED slot whose device is
+ * gone it refuses STM_ENODEV; the device there, it creates (the control). */
+STM_TEST(sync_multi_create_refuses_a_gone_faulted_slot) {
+    for (int there = 0; there <= 1; there++) {
+        make_paths(there ? "c_gone_ok" : "c_gone");
+        stm_bdev *bds[NDEV] = {0};
+        stm_alloc *as[NDEV] = {0};
+        open_multi_allocs(bds, as);
+        stm_pool_open_opts opts;
+        memset(&opts, 0, sizeof opts);
+        opts.pool_uuid[0] = POOL_UUID[0];
+        opts.pool_uuid[1] = POOL_UUID[1];
+        opts.device_count = NDEV;
+        for (size_t i = 0; i < NDEV; i++) {
+            opts.devices[i].uuid[0]    = DEV_UUID_LO[i];
+            opts.devices[i].uuid[1]    = DEV_UUID_HI;
+            opts.devices[i].size_bytes = g_dev_bytes;
+            opts.devices[i].role       = STM_DEV_ROLE_DATA;
+            opts.devices[i].class_     = STM_DEV_CLASS_SSD;
+            opts.devices[i].state      = i == 2 ? STM_DEV_STATE_FAULTED
+                                                : STM_DEV_STATE_ONLINE;
+            opts.devices[i].bdev       = (i == 2 && !there) ? NULL : bds[i];
+        }
+        stm_pool *p = NULL;
+        STM_ASSERT_OK(stm_pool_open(&opts, &p));
+        stm_redundancy_profile prof = { .kind = STM_RED_MIRROR, .mirror_n = 2 };
+        stm_sync *s = NULL;
+        stm_status cs = stm_sync_create(p, as[0], make_wk(), &prof, &s);
+        if (there) {
+            STM_ASSERT_OK(cs);
+            STM_ASSERT_OK(stm_sync_attach_alloc(s, 1, as[1]));
+            STM_ASSERT_OK(stm_sync_commit(s));
+            stm_sync_close(s);
+        } else {
+            STM_ASSERT_ERR(cs, STM_ENODEV);
+            STM_ASSERT(s == NULL);
+        }
+        close_multi_allocs(as);
+        stm_pool_close(p);
+        close_bdevs(bds);
+        unlink_paths();
+    }
+}
+
+/* ========================================================================= */
+/* OPEN-BUGS (s): stm_sync_scan_roster.                                       */
+/* ========================================================================= */
+
+static void open_paths(stm_bdev *h[NDEV])
+{
+    for (size_t i = 0; i < NDEV; i++) {
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        h[i] = NULL;
+        STM_ASSERT_OK(stm_bdev_open(g_paths[i], &bo, &h[i]));
+    }
+}
+
+/* Open the pool a scan answered, each slot's allocator on its handle, and
+ * commit unless it opened read-only; answers the gen the open mounted (0 if
+ * it did not open) and the open's status in *ost. */
+static uint64_t open_scanned_st(const stm_pool_open_opts *po, stm_status *ost)
+{
+    stm_pool *p = NULL;
+    STM_ASSERT_OK(stm_pool_open(po, &p));
+    stm_alloc *as[STM_POOL_DEVICES_MAX] = {0};
+    for (size_t i = 0; p && i < po->device_count; i++) {
+        if (!po->devices[i].bdev) continue;
+        STM_ASSERT_OK(stm_alloc_open_blank(po->devices[i].bdev, &as[i]));
+        STM_ASSERT_OK(stm_alloc_set_device_id(as[i], (uint16_t)i));
+    }
+    uint64_t mounted = 0;
+    stm_sync *s = NULL;
+    *ost = STM_EINVAL;
+    if (p && as[0]) {
+        *ost = stm_sync_open(p, as[0], make_wk(), NULL, NULL, &s);
+        for (size_t i = 1; s && i < po->device_count; i++)
+            if (as[i]) STM_ASSERT_OK(stm_sync_attach_alloc(s, (uint16_t)i, as[i]));
+        if (s) {
+            stm_sync_info si;
+            STM_ASSERT_OK(stm_sync_info_get(s, &si));
+            mounted = si.mount_max_durable_gen;
+            if (!si.read_only) STM_ASSERT_OK(stm_sync_commit(s));
+            stm_sync_close(s);
+        }
+    }
+    for (size_t i = 0; i < STM_POOL_DEVICES_MAX; i++)
+        if (as[i]) stm_alloc_close(as[i]);
+    stm_pool_close(p);
+    return mounted;
+}
+
+static uint64_t open_scanned(const stm_pool_open_opts *po)
+{
+    stm_status ost = STM_OK;
+    uint64_t mounted = open_scanned_st(po, &ost);
+    STM_ASSERT_OK(ost);
+    return mounted;
+}
+
+/* The scan answered device order h[i] for slot i, and the states of the
+ * roster `ub` carries. */
+static void assert_scanned_roster(const stm_pool_open_opts *po,
+                                  const stm_uberblock *ub, stm_bdev *h[NDEV])
+{
+    stm_pool_device want[STM_POOL_DEVICES_MAX];
+    memset(want, 0, sizeof want);
+    STM_ASSERT_OK(stm_pool_roster_decode(ub->ub_roster, NDEV, want));
+    STM_ASSERT_EQ(po->pool_uuid[0], POOL_UUID[0]);
+    STM_ASSERT_EQ(po->pool_uuid[1], POOL_UUID[1]);
+    STM_ASSERT_EQ(po->device_count, (size_t)NDEV);
+    STM_ASSERT_FALSE(po->read_only);
+    for (size_t i = 0; i < NDEV; i++) {
+        STM_ASSERT_EQ((int)po->devices[i].state, (int)want[i].state);
+        STM_ASSERT_EQ(po->devices[i].uuid[0], DEV_UUID_LO[i]);
+        STM_ASSERT(po->devices[i].bdev == h[i]);
+    }
+}
+
+/* Device 1 failed, a commit, device 2 failed, a commit that failed:
+ * device 0 holds that commit's reservation, whose roster shows both
+ * FAULTED; the quorum holds the commit before, device 1 FAULTED. The open
+ * from device 0's roster refuses STM_ECORRUPT. The scan answers the
+ * quorum's roster in any order of the handles, and the pool opens from it
+ * at the last commit acknowledged, and commits. */
+STM_TEST(sync_multi_scan_roster_answers_the_quorums_roster) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "s_probe", bds, as, &pool, &s);
+    STM_ASSERT_OK(stm_pool_fail_device(pool, 1));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_info before;
+    STM_ASSERT_OK(stm_sync_info_get(s, &before));
+    STM_ASSERT_OK(stm_pool_fail_device(pool, 2));
+    STM_ASSERT_ERR(stm_sync_commit(s), STM_EQUORUM);
+    teardown_mirror_pool_keep(bds, as, pool, s);
+
+    stm_bdev *rb[NDEV] = {0};
+    stm_alloc *ra[NDEV] = {0};
+    stm_pool *rp = NULL; stm_sync *rs = NULL;
+    STM_ASSERT_ERR(reopen_ex(false, 0, 0, 0, 0, rb, ra, &rp, &rs), STM_ECORRUPT);
+    close_reopened(rb, ra, rp, rs);
+
+    stm_bdev *h[NDEV] = {0};
+    open_paths(h);
+    stm_uberblock newest0, quorum;
+    uint32_t lbl = 0, slot = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(h[0], &newest0, &lbl, &slot));
+    STM_ASSERT_OK(stm_sb_mount_scan(h[2], &quorum, &lbl, &slot));
+    STM_ASSERT_EQ(stm_load_le64(newest0.ub_gen), before.auth_gen + 1u);
+    STM_ASSERT_EQ(stm_load_le64(quorum.ub_gen), before.auth_gen);
+    STM_ASSERT(stm_load_le64(newest0.ub_roster_hash) !=
+               stm_load_le64(quorum.ub_roster_hash));
+    static const size_t orders[2][NDEV] = { { 0, 1, 2 }, { 2, 0, 1 } };
+    stm_pool_open_opts po;
+    for (size_t o = 0; o < 2; o++) {
+        stm_bdev *in[NDEV];
+        for (size_t k = 0; k < NDEV; k++) in[k] = h[orders[o][k]];
+        uint64_t auth = 0;
+        memset(&po, 0xa5, sizeof po);
+        STM_ASSERT_OK(stm_sync_scan_roster(in, NDEV, NULL, &po, &auth));
+        STM_ASSERT_EQ(auth, before.auth_gen);
+        assert_scanned_roster(&po, &quorum, h);
+        STM_ASSERT_EQ((int)po.devices[1].state, (int)STM_DEV_STATE_FAULTED);
+        STM_ASSERT_EQ((int)po.devices[2].state, (int)STM_DEV_STATE_ONLINE);
+    }
+    STM_ASSERT_EQ(open_scanned(&po), before.auth_gen);
+    close_bdevs(h);
+    unlink_paths();
+}
+
+/* Device 2 failed and rejoined, and the gens after its rejoin (4, 5)
+ * never reached device 0, whose roster still shows it FAULTED. The scan
+ * answers device 1's roster at gen 5, and the pool opens from it at 5.
+ * With device 2 gone, each roster's pick counts it an unknown vote that
+ * may hold gen 5, and the scan refuses STM_EIO. */
+STM_TEST(sync_multi_scan_roster_reads_past_a_roster_a_device_missed) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "s_rejoin", bds, as, &pool, &s);
+    STM_ASSERT_OK(stm_pool_fail_device(pool, 2));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_pool_rejoin_device(pool, 2));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s, &info));
+    STM_ASSERT_EQ(info.auth_gen, 5u);
+    stm_sync_close(s);
+    close_multi_allocs(as);
+    stm_pool_close(pool);
+    uint8_t zeros[STM_UB_SIZE];
+    memset(zeros, 0, sizeof zeros);
+    for (uint64_t g = 4; g <= 5; g++)
+        for (uint32_t li = 0; li < STM_UB_COPIES; li++)
+            STM_ASSERT_OK(stm_bdev_write(bds[0], gen_copy_off(g, li), zeros,
+                                         sizeof zeros));
+    close_bdevs(bds);
+
+    stm_bdev *h[NDEV] = {0};
+    open_paths(h);
+    stm_uberblock newest1;
+    uint32_t lbl = 0, slot = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(h[1], &newest1, &lbl, &slot));
+    STM_ASSERT_EQ(stm_load_le64(newest1.ub_gen), 5u);
+    stm_pool_open_opts po;
+    uint64_t auth = 0;
+    STM_ASSERT_OK(stm_sync_scan_roster(h, NDEV, NULL, &po, &auth));
+    STM_ASSERT_EQ(auth, 5u);
+    assert_scanned_roster(&po, &newest1, h);
+    STM_ASSERT_EQ((int)po.devices[2].state, (int)STM_DEV_STATE_ONLINE);
+    stm_pool_open_opts gone;
+    STM_ASSERT_ERR(stm_sync_scan_roster(h, 2, NULL, &gone, NULL), STM_EIO);
+    STM_ASSERT_EQ(open_scanned(&po), 5u);
+    close_bdevs(h);
+    unlink_paths();
+}
+
+/* With device 2 FAULTED and gone, the scan answers the roster with its
+ * slot FAULTED and no device, and the pool opens from it without device 2:
+ * read-only ((t)); read-write it refuses STM_EROFS. */
+STM_TEST(sync_multi_scan_roster_leaves_a_gone_faulted_slot_empty) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "s_gone", bds, as, &pool, &s);
+    STM_ASSERT_OK(stm_pool_fail_device(pool, 2));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_info before;
+    STM_ASSERT_OK(stm_sync_info_get(s, &before));
+    teardown_mirror_pool_keep(bds, as, pool, s);
+
+    stm_bdev *h[NDEV] = {0};
+    open_paths(h);
+    stm_pool_open_opts po;
+    uint64_t auth = 0;
+    STM_ASSERT_OK(stm_sync_scan_roster(h, 2, NULL, &po, &auth));
+    STM_ASSERT_EQ(auth, before.auth_gen);
+    STM_ASSERT_EQ(po.device_count, (size_t)NDEV);
+    STM_ASSERT(po.devices[0].bdev == h[0]);
+    STM_ASSERT(po.devices[1].bdev == h[1]);
+    STM_ASSERT(po.devices[2].bdev == NULL);
+    STM_ASSERT_EQ((int)po.devices[2].state, (int)STM_DEV_STATE_FAULTED);
+    stm_status ost = STM_OK;
+    STM_ASSERT_EQ(open_scanned_st(&po, &ost), 0u);
+    STM_ASSERT_ERR(ost, STM_EROFS);
+    close_bdevs(h);
+    for (size_t i = 0; i < NDEV; i++) {
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        bo.read_only = true;
+        h[i] = NULL;
+        STM_ASSERT_OK(stm_bdev_open(g_paths[i], &bo, &h[i]));
+    }
+    STM_ASSERT_OK(stm_sync_scan_roster(h, 2, NULL, &po, &auth));
+    STM_ASSERT_EQ(open_scanned_st(&po, &ost), before.auth_gen);
+    STM_ASSERT_OK(ost);
+    close_bdevs(h);
+    unlink_paths();
+}
+
+/* The roster device `dev`'s newest uberblock carries, on the handles `h`
+ * (none for a REMOVED slot). */
+static void roster_of_device(stm_bdev *h[NDEV], size_t dev,
+                             stm_pool_open_opts *po, uint64_t *gen)
+{
+    stm_uberblock ub;
+    uint32_t lbl = 0, slot = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(h[dev], &ub, &lbl, &slot));
+    uint16_t count = stm_load_le16(ub.ub_device_count);
+    STM_ASSERT(count >= 1 && count <= NDEV);
+    memset(po, 0, sizeof *po);
+    po->pool_uuid[0] = POOL_UUID[0];
+    po->pool_uuid[1] = POOL_UUID[1];
+    po->device_count = count;
+    STM_ASSERT_OK(stm_pool_roster_decode(ub.ub_roster, count, po->devices));
+    for (size_t i = 0; i < count; i++)
+        po->devices[i].bdev =
+            po->devices[i].state == STM_DEV_STATE_REMOVED ? NULL : h[i];
+    *gen = stm_load_le64(ub.ub_gen);
+}
+
+/* A pool of two devices took a third, and the add's commit (gens 2 and 3)
+ * reached every device: the scan answers the three-device roster at 3.
+ * With device 1 missing that commit (`missed`), the two-device roster's
+ * pick takes gen 1 beside device 0 at 3: device 0's final at 3 was written
+ * once a quorum of the three-device roster confirmed gen 2, so the
+ * two-device roster is passed over and the scan answers the three-device
+ * one at 3; the plain open from device 1's own two-device roster refuses
+ * STM_EIO, writing nothing (device 0 exactly two past: it mounted gen 1
+ * and claimed over the acknowledged 3). Without device 2, the
+ * three-device roster's pick refuses (device 2 an unknown vote that may
+ * hold gen 3), and so does the scan, STM_EIO. With the final written
+ * nowhere (`final` 0), whether it was acknowledged is unknown: both
+ * rosters are the pool's and the scan refuses STM_EIO. With the final on
+ * the added device alone (`final` 2: the commit failed, nothing
+ * acknowledged above gen 1), the two-device roster's pick still takes
+ * gen 1, two below device 2's 3, so it is passed over and the
+ * three-device roster answers at 2, its reservation, which devices 0 and
+ * 2 hold (review round 4 F3). */
+static void scan_add_leg(bool missed, int final)
+{
+    make_paths(final == 0 ? "s_add_r" : final == 2 ? "s_add_a"
+               : missed ? "s_add_m" : "s_add");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool_open_opts popts;
+    memset(&popts, 0, sizeof popts);
+    popts.pool_uuid[0] = POOL_UUID[0];
+    popts.pool_uuid[1] = POOL_UUID[1];
+    popts.device_count = 2;
+    for (size_t i = 0; i < 2; i++) {
+        popts.devices[i].uuid[0]    = DEV_UUID_LO[i];
+        popts.devices[i].uuid[1]    = DEV_UUID_HI;
+        popts.devices[i].size_bytes = g_dev_bytes;
+        popts.devices[i].role       = STM_DEV_ROLE_DATA;
+        popts.devices[i].class_     = STM_DEV_CLASS_SSD;
+        popts.devices[i].state      = STM_DEV_STATE_ONLINE;
+        popts.devices[i].bdev       = bds[i];
+    }
+    stm_pool *pool = NULL;
+    STM_ASSERT_OK(stm_pool_open(&popts, &pool));
+    stm_alloc *a[NDEV] = {0};
+    for (size_t i = 0; i < NDEV; i++) {
+        STM_ASSERT_OK(stm_alloc_create(bds[i], POOL_UUID,
+                                       (uint64_t[]){ DEV_UUID_LO[i], DEV_UUID_HI },
+                                       TEST_BOOTSTRAP_BYTES, &a[i]));
+        STM_ASSERT_OK(stm_alloc_set_device_id(a[i], (uint16_t)i));
+    }
+    stm_redundancy_profile prof = { .kind = STM_RED_MIRROR, .mirror_n = 2 };
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a[0], make_wk(), &prof, &s));
+    STM_ASSERT_OK(stm_sync_attach_alloc(s, 1, a[1]));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_pool_device add_dev = {
+        .uuid       = { DEV_UUID_LO[2], DEV_UUID_HI },
+        .size_bytes = g_dev_bytes,
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = bds[2],
+    };
+    STM_ASSERT_OK(stm_pool_add_device(pool, &add_dev));
+    STM_ASSERT_OK(stm_sync_attach_alloc(s, 2, a[2]));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s, &info));
+    STM_ASSERT_EQ(info.auth_gen, 3u);
+    stm_sync_close(s);
+    for (size_t i = 0; i < NDEV; i++) stm_alloc_close(a[i]);
+    stm_pool_close(pool);
+    if (missed) {
+        uint8_t zeros[STM_UB_SIZE];
+        memset(zeros, 0, sizeof zeros);
+        for (uint32_t li = 0; li < STM_UB_COPIES; li++) {
+            for (uint64_t g = 2; g <= 3; g++)
+                STM_ASSERT_OK(stm_bdev_write(bds[1], gen_copy_off(g, li), zeros,
+                                             sizeof zeros));
+            for (size_t d = 0; final != 1 && d < (final ? 1u : NDEV); d += 2)
+                STM_ASSERT_OK(stm_bdev_write(bds[d], gen_copy_off(3, li), zeros,
+                                             sizeof zeros));
+        }
+    }
+    close_bdevs(bds);
+
+    stm_bdev *h[NDEV] = {0};
+    open_paths(h);
+    stm_pool_open_opts po;
+    uint64_t auth = 0;
+    stm_status st = stm_sync_scan_roster(h, NDEV, NULL, &po, &auth);
+    if (final == 0) {
+        if (st == STM_OK)
+            fprintf(stderr, "  add's final nowhere: scan took %zu devices, gen %llu\n",
+                    po.device_count, (unsigned long long)auth);
+        STM_ASSERT_ERR(st, STM_EIO);
+        close_bdevs(h);
+        unlink_paths();
+        return;
+    }
+    if (final == 2) {
+        stm_test_info("add's final on device 2 alone: scan %d, %zu devices, gen %llu",
+                      (int)st, po.device_count, (unsigned long long)auth);
+        STM_ASSERT_OK(st);
+        STM_ASSERT_EQ(auth, 2u);
+        STM_ASSERT_EQ(po.device_count, (size_t)NDEV);
+        close_bdevs(h);
+        unlink_paths();
+        return;
+    }
+    STM_ASSERT_OK(st);
+    STM_ASSERT_EQ(auth, 3u);
+    STM_ASSERT_EQ(po.device_count, (size_t)NDEV);
+    for (size_t i = 0; i < NDEV; i++) STM_ASSERT(po.devices[i].bdev == h[i]);
+    stm_pool_open_opts own;
+    uint64_t own_gen = 0, gen0 = 0;
+    roster_of_device(h, 1, &own, &own_gen);
+    STM_ASSERT_EQ(own_gen, missed ? 1u : 3u);
+    STM_ASSERT_EQ(own.device_count, missed ? (size_t)2 : (size_t)NDEV);
+    if (missed) {
+        stm_status ost = STM_OK;
+        STM_ASSERT_EQ(open_scanned_st(&own, &ost), 0u);
+        STM_ASSERT_ERR(ost, STM_EIO);
+        roster_of_device(h, 0, &own, &gen0);
+        STM_ASSERT_EQ(gen0, 3u);
+        roster_of_device(h, 1, &own, &own_gen);
+        STM_ASSERT_EQ(own_gen, 1u);
+        stm_pool_open_opts two;
+        uint64_t auth2 = 0;
+        st = stm_sync_scan_roster(h, 2, NULL, &two, &auth2);
+        if (st == STM_OK)
+            fprintf(stderr, "  add missed, no device 2: scan took %zu devices, gen %llu\n",
+                    two.device_count, (unsigned long long)auth2);
+        STM_ASSERT_ERR(st, STM_EIO);
+    }
+    STM_ASSERT_EQ(open_scanned(&po), 3u);
+    close_bdevs(h);
+    unlink_paths();
+}
+
+STM_TEST(sync_multi_scan_roster_around_an_add) {
+    scan_add_leg(false, 1);
+    scan_add_leg(true, 1);
+    scan_add_leg(true, 0);
+    scan_add_leg(true, 2);
+}
+
+/* A pool of two devices took a third (gens 2, 3), then removed it (gens
+ * 4, 5). With `missed`, device 1 missed gens 2 to 5 and device 0 gen 5:
+ * the add's commit is acknowledged by devices 0 and 2, the remove's
+ * reservation reached device 0 alone. Without device 2 the remove's roster
+ * (device 2 REMOVED) does not count it, and its pick takes gen 1, whose
+ * two-device roster then answered, mounting gen 1 under the acknowledged
+ * gen 3; device 0 holds gen 4, more than one past it, so both are passed
+ * over and the scan refuses STM_EIO. With device 2 too, the add's roster
+ * answers at 3 (the remove's reservation reached device 0 alone, not
+ * acknowledged). The plain open from device 1's own newest roster (two
+ * devices, gen 1) refuses STM_EIO, writing nothing. Every write landed:
+ * the remove's roster at 5, which device 1's newest carries too (the
+ * control). */
+static void scan_rm_leg(bool missed, size_t nh)
+{
+    make_paths(missed ? "s_rm_m" : "s_rm");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool_open_opts popts;
+    memset(&popts, 0, sizeof popts);
+    popts.pool_uuid[0] = POOL_UUID[0];
+    popts.pool_uuid[1] = POOL_UUID[1];
+    popts.device_count = 2;
+    for (size_t i = 0; i < 2; i++) {
+        popts.devices[i].uuid[0]    = DEV_UUID_LO[i];
+        popts.devices[i].uuid[1]    = DEV_UUID_HI;
+        popts.devices[i].size_bytes = g_dev_bytes;
+        popts.devices[i].role       = STM_DEV_ROLE_DATA;
+        popts.devices[i].class_     = STM_DEV_CLASS_SSD;
+        popts.devices[i].state      = STM_DEV_STATE_ONLINE;
+        popts.devices[i].bdev       = bds[i];
+    }
+    stm_pool *pool = NULL;
+    STM_ASSERT_OK(stm_pool_open(&popts, &pool));
+    stm_alloc *a[NDEV] = {0};
+    for (size_t i = 0; i < NDEV; i++) {
+        STM_ASSERT_OK(stm_alloc_create(bds[i], POOL_UUID,
+                                       (uint64_t[]){ DEV_UUID_LO[i], DEV_UUID_HI },
+                                       TEST_BOOTSTRAP_BYTES, &a[i]));
+        STM_ASSERT_OK(stm_alloc_set_device_id(a[i], (uint16_t)i));
+    }
+    stm_redundancy_profile prof = { .kind = STM_RED_MIRROR, .mirror_n = 2 };
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a[0], make_wk(), &prof, &s));
+    STM_ASSERT_OK(stm_sync_attach_alloc(s, 1, a[1]));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_pool_device add_dev = {
+        .uuid       = { DEV_UUID_LO[2], DEV_UUID_HI },
+        .size_bytes = g_dev_bytes,
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = bds[2],
+    };
+    STM_ASSERT_OK(stm_pool_add_device(pool, &add_dev));
+    STM_ASSERT_OK(stm_sync_attach_alloc(s, 2, a[2]));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_sync_remove_device(s, 2, 2));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s, &info));
+    STM_ASSERT_EQ(info.auth_gen, 5u);
+    stm_sync_close(s);
+    for (size_t i = 0; i < NDEV; i++) stm_alloc_close(a[i]);
+    stm_pool_close(pool);
+    if (missed) {
+        uint8_t zeros[STM_UB_SIZE];
+        memset(zeros, 0, sizeof zeros);
+        for (uint64_t g = 2; g <= 5; g++)
+            for (uint32_t li = 0; li < STM_UB_COPIES; li++)
+                STM_ASSERT_OK(stm_bdev_write(bds[1], gen_copy_off(g, li), zeros,
+                                             sizeof zeros));
+        for (uint32_t li = 0; li < STM_UB_COPIES; li++)
+            STM_ASSERT_OK(stm_bdev_write(bds[0], gen_copy_off(5, li), zeros,
+                                         sizeof zeros));
+    }
+    close_bdevs(bds);
+
+    stm_bdev *h[NDEV] = {0};
+    open_paths(h);
+    stm_pool_open_opts po;
+    uint64_t auth = 0;
+    stm_status st = stm_sync_scan_roster(h, nh, NULL, &po, &auth);
+    if (missed && nh < NDEV) {
+        if (st == STM_OK)
+            fprintf(stderr, "  remove missed (%zu handles): scan took %zu devices, gen %llu\n",
+                    nh, po.device_count, (unsigned long long)auth);
+        STM_ASSERT_ERR(st, STM_EIO);
+    } else if (missed) {
+        STM_ASSERT_OK(st);
+        STM_ASSERT_EQ(auth, 3u);
+        STM_ASSERT_EQ(po.device_count, (size_t)NDEV);
+        for (size_t i = 0; i < NDEV; i++) {
+            STM_ASSERT_EQ((int)po.devices[i].state, (int)STM_DEV_STATE_ONLINE);
+            STM_ASSERT(po.devices[i].bdev == h[i]);
+        }
+    } else {
+        STM_ASSERT_OK(st);
+        STM_ASSERT_EQ(auth, 5u);
+        STM_ASSERT_EQ(po.device_count, (size_t)NDEV);
+        STM_ASSERT_EQ((int)po.devices[2].state, (int)STM_DEV_STATE_REMOVED);
+        STM_ASSERT(po.devices[2].bdev == NULL);
+    }
+    stm_pool_open_opts own;
+    uint64_t own_gen = 0, gen0 = 0;
+    roster_of_device(h, 1, &own, &own_gen);
+    STM_ASSERT_EQ(own_gen, missed ? 1u : 5u);
+    STM_ASSERT_EQ(own.device_count, missed ? (size_t)2 : (size_t)NDEV);
+    stm_status ost = STM_OK;
+    uint64_t mounted = open_scanned_st(&own, &ost);
+    if (missed) {
+        STM_ASSERT_ERR(ost, STM_EIO);
+        STM_ASSERT_EQ(mounted, 0u);
+        roster_of_device(h, 0, &own, &gen0);
+        STM_ASSERT_EQ(gen0, 4u);
+        roster_of_device(h, 1, &own, &own_gen);
+        STM_ASSERT_EQ(own_gen, 1u);
+    } else {
+        STM_ASSERT_OK(ost);
+        STM_ASSERT_EQ(mounted, 5u);
+    }
+    if (missed && nh == NDEV) STM_ASSERT_EQ(open_scanned(&po), 3u);
+    close_bdevs(h);
+    unlink_paths();
+}
+
+/* A one-device pool took two more (gens 2, 3), then removed device 2
+ * (gens 4, 5). With `missed`, device 0 missed gens 2 to 5 and device 1 gen
+ * 5: the add's commit is acknowledged by devices 1 and 2, the remove's
+ * reservation reached device 1 alone. The remove's roster's pick takes gen
+ * 1 beside device 1 at 4 and is passed over; the one-device roster device
+ * 0's newest carries is the pool's at gen 1 on the only device it names,
+ * but device 1, which it does not name, holds gen 4: passed over too, and
+ * the scan refuses STM_EIO. With device 2, the add's roster answers at 3.
+ * Every write landed: the remove's roster at 5 (the control). */
+static void scan_rm1_leg(bool missed)
+{
+    make_paths(missed ? "s_rm1_m" : "s_rm1");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool_open_opts popts;
+    memset(&popts, 0, sizeof popts);
+    popts.pool_uuid[0] = POOL_UUID[0];
+    popts.pool_uuid[1] = POOL_UUID[1];
+    popts.device_count = 1;
+    popts.devices[0].uuid[0]    = DEV_UUID_LO[0];
+    popts.devices[0].uuid[1]    = DEV_UUID_HI;
+    popts.devices[0].size_bytes = g_dev_bytes;
+    popts.devices[0].role       = STM_DEV_ROLE_DATA;
+    popts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    popts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    popts.devices[0].bdev       = bds[0];
+    stm_pool *pool = NULL;
+    STM_ASSERT_OK(stm_pool_open(&popts, &pool));
+    stm_alloc *a[NDEV] = {0};
+    for (size_t i = 0; i < NDEV; i++) {
+        STM_ASSERT_OK(stm_alloc_create(bds[i], POOL_UUID,
+                                       (uint64_t[]){ DEV_UUID_LO[i], DEV_UUID_HI },
+                                       TEST_BOOTSTRAP_BYTES, &a[i]));
+        STM_ASSERT_OK(stm_alloc_set_device_id(a[i], (uint16_t)i));
+    }
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a[0], make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    for (size_t i = 1; i < NDEV; i++) {
+        stm_pool_device add_dev = {
+            .uuid       = { DEV_UUID_LO[i], DEV_UUID_HI },
+            .size_bytes = g_dev_bytes,
+            .role       = STM_DEV_ROLE_DATA,
+            .class_     = STM_DEV_CLASS_SSD,
+            .state      = STM_DEV_STATE_ONLINE,
+            .bdev       = bds[i],
+        };
+        STM_ASSERT_OK(stm_pool_add_device(pool, &add_dev));
+        STM_ASSERT_OK(stm_sync_attach_alloc(s, (uint16_t)i, a[i]));
+    }
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_sync_remove_device(s, 2, 1));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s, &info));
+    STM_ASSERT_EQ(info.auth_gen, 5u);
+    stm_sync_close(s);
+    for (size_t i = 0; i < NDEV; i++) stm_alloc_close(a[i]);
+    stm_pool_close(pool);
+    if (missed) {
+        uint8_t zeros[STM_UB_SIZE];
+        memset(zeros, 0, sizeof zeros);
+        for (uint64_t g = 2; g <= 5; g++)
+            for (uint32_t li = 0; li < STM_UB_COPIES; li++)
+                STM_ASSERT_OK(stm_bdev_write(bds[0], gen_copy_off(g, li), zeros,
+                                             sizeof zeros));
+        for (uint32_t li = 0; li < STM_UB_COPIES; li++)
+            STM_ASSERT_OK(stm_bdev_write(bds[1], gen_copy_off(5, li), zeros,
+                                         sizeof zeros));
+    }
+    close_bdevs(bds);
+
+    stm_bdev *h[NDEV] = {0};
+    open_paths(h);
+    stm_pool_open_opts own;
+    uint64_t own_gen = 0;
+    roster_of_device(h, 0, &own, &own_gen);
+    STM_ASSERT_EQ(own_gen, missed ? 1u : 5u);
+    STM_ASSERT_EQ(own.device_count, missed ? (size_t)1 : (size_t)NDEV);
+    stm_pool_open_opts po;
+    uint64_t auth = 0;
+    stm_status st = stm_sync_scan_roster(h, 2, NULL, &po, &auth);
+    if (missed) {
+        if (st == STM_OK)
+            fprintf(stderr, "  one-device remove missed: scan took %zu devices, gen %llu\n",
+                    po.device_count, (unsigned long long)auth);
+        STM_ASSERT_ERR(st, STM_EIO);
+        STM_ASSERT_OK(stm_sync_scan_roster(h, NDEV, NULL, &po, &auth));
+        STM_ASSERT_EQ(auth, 3u);
+        STM_ASSERT_EQ(po.device_count, (size_t)NDEV);
+        STM_ASSERT_EQ((int)po.devices[2].state, (int)STM_DEV_STATE_ONLINE);
+        STM_ASSERT_EQ(open_scanned(&po), 3u);
+    } else {
+        STM_ASSERT_OK(st);
+        STM_ASSERT_EQ(auth, 5u);
+        STM_ASSERT_EQ(po.device_count, (size_t)NDEV);
+        STM_ASSERT_EQ((int)po.devices[2].state, (int)STM_DEV_STATE_REMOVED);
+        STM_ASSERT_EQ(open_scanned(&po), 5u);
+    }
+    close_bdevs(h);
+    unlink_paths();
+}
+
+STM_TEST(sync_multi_scan_roster_around_a_remove_a_device_missed) {
+    scan_rm_leg(false, 2);
+    scan_rm_leg(true, 2);
+    scan_rm_leg(true, NDEV);
+    scan_rm1_leg(false);
+    scan_rm1_leg(true);
+}
+
+/* A pool of two devices acknowledged gen 3 on both, then took a third,
+ * whose commit's reservation (gen 4, the three-device roster) reached
+ * device 2 alone. With `lost`, device 1 lost gen 3 on every copy (a fault:
+ * the pick reads it as never confirmed), so the two-device roster's pick
+ * takes gen 2 and is the pool's; the three-device roster's pick takes gen
+ * 3, whose content carries the two-device roster. Device 2, which the
+ * answer does not name, holds gen 4, written by a session whose
+ * authoritative gen was 3: the scan refuses STM_EIO, where it answered gen
+ * 2 under the acknowledged 3. Device 1 kept gen 3: the two-device roster at
+ * 3, opening there (the control). */
+static void scan_lost_leg(bool lost)
+{
+    make_paths(lost ? "s_lost_m" : "s_lost");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool_open_opts popts;
+    memset(&popts, 0, sizeof popts);
+    popts.pool_uuid[0] = POOL_UUID[0];
+    popts.pool_uuid[1] = POOL_UUID[1];
+    popts.device_count = 2;
+    for (size_t i = 0; i < 2; i++) {
+        popts.devices[i].uuid[0]    = DEV_UUID_LO[i];
+        popts.devices[i].uuid[1]    = DEV_UUID_HI;
+        popts.devices[i].size_bytes = g_dev_bytes;
+        popts.devices[i].role       = STM_DEV_ROLE_DATA;
+        popts.devices[i].class_     = STM_DEV_CLASS_SSD;
+        popts.devices[i].state      = STM_DEV_STATE_ONLINE;
+        popts.devices[i].bdev       = bds[i];
+    }
+    stm_pool *pool = NULL;
+    STM_ASSERT_OK(stm_pool_open(&popts, &pool));
+    stm_alloc *a[NDEV] = {0};
+    for (size_t i = 0; i < NDEV; i++) {
+        STM_ASSERT_OK(stm_alloc_create(bds[i], POOL_UUID,
+                                       (uint64_t[]){ DEV_UUID_LO[i], DEV_UUID_HI },
+                                       TEST_BOOTSTRAP_BYTES, &a[i]));
+        STM_ASSERT_OK(stm_alloc_set_device_id(a[i], (uint16_t)i));
+    }
+    stm_redundancy_profile prof = { .kind = STM_RED_MIRROR, .mirror_n = 2 };
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a[0], make_wk(), &prof, &s));
+    STM_ASSERT_OK(stm_sync_attach_alloc(s, 1, a[1]));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    uint64_t paddrs[2] = { 0 };
+    uint8_t payload[STM_UB_SIZE];
+    memset(payload, 0x5a, sizeof payload);
+    size_t n_confirmed = 0;
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs));
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, 2u, payload, sizeof payload,
+                                        &n_confirmed));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_pool_device add_dev = {
+        .uuid       = { DEV_UUID_LO[2], DEV_UUID_HI },
+        .size_bytes = g_dev_bytes,
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = bds[2],
+    };
+    STM_ASSERT_OK(stm_pool_add_device(pool, &add_dev));
+    STM_ASSERT_OK(stm_sync_attach_alloc(s, 2, a[2]));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s, &info));
+    STM_ASSERT_EQ(info.auth_gen, 5u);
+    stm_sync_close(s);
+    for (size_t i = 0; i < NDEV; i++) stm_alloc_close(a[i]);
+    stm_pool_close(pool);
+    uint8_t zeros[STM_UB_SIZE];
+    memset(zeros, 0, sizeof zeros);
+    for (uint32_t li = 0; li < STM_UB_COPIES; li++) {
+        for (size_t d = 0; d < 2; d++)
+            for (uint64_t g = 4; g <= 5; g++)
+                STM_ASSERT_OK(stm_bdev_write(bds[d], gen_copy_off(g, li), zeros,
+                                             sizeof zeros));
+        STM_ASSERT_OK(stm_bdev_write(bds[2], gen_copy_off(5, li), zeros,
+                                     sizeof zeros));
+        if (lost)
+            STM_ASSERT_OK(stm_bdev_write(bds[1], gen_copy_off(3, li), zeros,
+                                         sizeof zeros));
+    }
+    close_bdevs(bds);
+
+    stm_bdev *h[NDEV] = {0};
+    open_paths(h);
+    stm_pool_open_opts own;
+    uint64_t own_gen = 0;
+    roster_of_device(h, 2, &own, &own_gen);
+    STM_ASSERT_EQ(own_gen, 4u);
+    STM_ASSERT_EQ(own.device_count, (size_t)NDEV);
+    roster_of_device(h, 1, &own, &own_gen);
+    STM_ASSERT_EQ(own_gen, lost ? 2u : 3u);
+    STM_ASSERT_EQ(own.device_count, (size_t)2);
+    stm_pool_open_opts po;
+    uint64_t auth = 0;
+    stm_status st = stm_sync_scan_roster(h, NDEV, NULL, &po, &auth);
+    if (lost) {
+        if (st == STM_OK)
+            fprintf(stderr, "  gen 3 lost: scan took %zu devices, gen %llu\n",
+                    po.device_count, (unsigned long long)auth);
+        STM_ASSERT_ERR(st, STM_EIO);
+    } else {
+        STM_ASSERT_OK(st);
+        STM_ASSERT_EQ(auth, 3u);
+        STM_ASSERT_EQ(po.device_count, (size_t)2);
+        STM_ASSERT_EQ(open_scanned(&po), 3u);
+    }
+    close_bdevs(h);
+    unlink_paths();
+}
+
+STM_TEST(sync_multi_scan_roster_refuses_below_a_device_it_leaves_out) {
+    scan_lost_leg(false);
+    scan_lost_leg(true);
+}
+
+/* A one-device pool took a second device, and the add's first commit's
+ * reservation (gen 2, the two-device roster) reached device 1 alone: the
+ * pool is the one-device roster at gen 1, opened and committed after.
+ * Device 1, left attached, names the two-device roster, whose pick lands
+ * below device 0 once device 0 is two past it: passed over, the scan
+ * answers the one-device roster each time (it refused every scan after the
+ * first while that pick's refusal refused the scan). */
+STM_TEST(sync_multi_scan_roster_passes_over_a_disk_a_failed_add_left) {
+    make_paths("s_left");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool_open_opts popts;
+    memset(&popts, 0, sizeof popts);
+    popts.pool_uuid[0] = POOL_UUID[0];
+    popts.pool_uuid[1] = POOL_UUID[1];
+    popts.device_count = 1;
+    popts.devices[0].uuid[0]    = DEV_UUID_LO[0];
+    popts.devices[0].uuid[1]    = DEV_UUID_HI;
+    popts.devices[0].size_bytes = g_dev_bytes;
+    popts.devices[0].role       = STM_DEV_ROLE_DATA;
+    popts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    popts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    popts.devices[0].bdev       = bds[0];
+    stm_pool *pool = NULL;
+    STM_ASSERT_OK(stm_pool_open(&popts, &pool));
+    stm_alloc *a[2] = {0};
+    for (size_t i = 0; i < 2; i++) {
+        STM_ASSERT_OK(stm_alloc_create(bds[i], POOL_UUID,
+                                       (uint64_t[]){ DEV_UUID_LO[i], DEV_UUID_HI },
+                                       TEST_BOOTSTRAP_BYTES, &a[i]));
+        STM_ASSERT_OK(stm_alloc_set_device_id(a[i], (uint16_t)i));
+    }
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a[0], make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_pool_device add_dev = {
+        .uuid       = { DEV_UUID_LO[1], DEV_UUID_HI },
+        .size_bytes = g_dev_bytes,
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = bds[1],
+    };
+    STM_ASSERT_OK(stm_pool_add_device(pool, &add_dev));
+    STM_ASSERT_OK(stm_sync_attach_alloc(s, 1, a[1]));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_close(s);
+    for (size_t i = 0; i < 2; i++) stm_alloc_close(a[i]);
+    stm_pool_close(pool);
+    uint8_t zeros[STM_UB_SIZE];
+    memset(zeros, 0, sizeof zeros);
+    for (uint32_t li = 0; li < STM_UB_COPIES; li++) {
+        for (uint64_t g = 2; g <= 3; g++)
+            STM_ASSERT_OK(stm_bdev_write(bds[0], gen_copy_off(g, li), zeros,
+                                         sizeof zeros));
+        STM_ASSERT_OK(stm_bdev_write(bds[1], gen_copy_off(3, li), zeros,
+                                     sizeof zeros));
+    }
+    close_bdevs(bds);
+
+    stm_bdev *h[NDEV] = {0};
+    open_paths(h);
+    stm_pool_open_opts own;
+    uint64_t gen0 = 0, gen1 = 0;
+    roster_of_device(h, 1, &own, &gen1);
+    STM_ASSERT_EQ(gen1, 2u);
+    STM_ASSERT_EQ(own.device_count, (size_t)2);
+    for (int k = 0; k < 3; k++) {
+        roster_of_device(h, 0, &own, &gen0);
+        STM_ASSERT_EQ(own.device_count, (size_t)1);
+        stm_pool_open_opts po;
+        uint64_t auth = 0;
+        stm_status st = stm_sync_scan_roster(h, 2, NULL, &po, &auth);
+        if (st != STM_OK)
+            fprintf(stderr, "  scan %d of both: %d (device 0 at %llu)\n", k, (int)st,
+                    (unsigned long long)gen0);
+        STM_ASSERT_OK(st);
+        STM_ASSERT_EQ(auth, gen0);
+        STM_ASSERT_EQ(po.device_count, (size_t)1);
+        STM_ASSERT(po.devices[0].bdev == h[0]);
+        STM_ASSERT_EQ(open_scanned(&po), gen0);
+    }
+    roster_of_device(h, 0, &own, &gen0);
+    STM_ASSERT(gen0 > 3u);
+    roster_of_device(h, 1, &own, &gen1);
+    STM_ASSERT_EQ(gen1, 2u);
+    close_bdevs(h);
+    unlink_paths();
+}
+
+/* The roster of `h` with the slots in `faulted` FAULTED, encoded, and its
+ * hash. */
+static void roster_variant(stm_bdev *h[NDEV], unsigned faulted,
+                           uint8_t out[STM_POOL_ROSTER_BYTES], uint64_t *hash)
+{
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = POOL_UUID[0];
+    opts.pool_uuid[1] = POOL_UUID[1];
+    opts.device_count = NDEV;
+    for (size_t i = 0; i < NDEV; i++) {
+        opts.devices[i].uuid[0]    = DEV_UUID_LO[i];
+        opts.devices[i].uuid[1]    = DEV_UUID_HI;
+        opts.devices[i].size_bytes = g_dev_bytes;
+        opts.devices[i].role       = STM_DEV_ROLE_DATA;
+        opts.devices[i].class_     = STM_DEV_CLASS_SSD;
+        opts.devices[i].state      = (faulted & (1u << i)) ? STM_DEV_STATE_FAULTED
+                                                           : STM_DEV_STATE_ONLINE;
+        opts.devices[i].bdev       = h[i];
+    }
+    stm_pool *p = NULL;
+    STM_ASSERT_OK(stm_pool_open(&opts, &p));
+    stm_pool_roster_encode(p, out);
+    *hash = stm_pool_roster_hash(p);
+    stm_pool_close(p);
+}
+
+/* d's uberblock of gen `from`, its roster the variant `faulted`, written
+ * as gen `to` (every copy of that gen's slot). */
+static void restamp(stm_bdev *h[NDEV], size_t d, uint64_t from, uint64_t to,
+                    unsigned faulted)
+{
+    stm_uberblock ub;
+    STM_ASSERT_OK(stm_sb_label_read(h[d], 0u, stm_sb_ring_slot_for_gen(from), &ub));
+    STM_ASSERT_EQ(stm_load_le64(ub.ub_gen), from);
+    uint64_t hash = 0;
+    roster_variant(h, faulted, ub.ub_roster, &hash);
+    ub.ub_roster_hash = stm_store_le64(hash);
+    ub.ub_gen = stm_store_le64(to);
+    STM_ASSERT_OK(stm_sb_ub_write_copies(h[d], stm_sb_ring_slot_for_gen(to), &ub));
+}
+
+/* The roster the pick takes may be no device's newest. Gen 3 on every
+ * device under roster R (all ONLINE); then device 0's newest made a gen 4
+ * under another roster, and devices 1 and 2's gen 3 rewritten under two
+ * more: no gen-3 content has a quorum, and the pick takes device 0's (the
+ * lowest index), whose roster R no device's newest names. The scan tries
+ * R from the pick and answers it; the pool opens from it at gen 3. */
+STM_TEST(sync_multi_scan_roster_tries_the_roster_its_pick_takes) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "s_clos", bds, as, &pool, &s);
+    uint64_t paddrs[2] = { 0 };
+    uint8_t payload[STM_UB_SIZE];
+    memset(payload, 0x5c, sizeof payload);
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs));
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, 2u, payload, sizeof payload, NULL));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s, &info));
+    STM_ASSERT_EQ(info.auth_gen, 3u);
+    teardown_mirror_pool_keep(bds, as, pool, s);
+
+    stm_bdev *h[NDEV] = {0};
+    open_paths(h);
+    stm_uberblock r;
+    STM_ASSERT_OK(stm_sb_label_read(h[0], 0u, stm_sb_ring_slot_for_gen(3), &r));
+    restamp(h, 0, 3, 4, 1u << 1);
+    restamp(h, 1, 3, 3, 1u << 2);
+    restamp(h, 2, 3, 3, (1u << 1) | (1u << 2));
+    for (size_t d = 0; d < NDEV; d++) {
+        stm_uberblock nb;
+        uint32_t lbl = 0, slot = 0;
+        STM_ASSERT_OK(stm_sb_mount_scan(h[d], &nb, &lbl, &slot));
+        STM_ASSERT(stm_load_le64(nb.ub_roster_hash) != stm_load_le64(r.ub_roster_hash));
+    }
+    stm_pool_open_opts po;
+    uint64_t auth = 0;
+    STM_ASSERT_OK(stm_sync_scan_roster(h, NDEV, NULL, &po, &auth));
+    STM_ASSERT_EQ(auth, 3u);
+    assert_scanned_roster(&po, &r, h);
+    STM_ASSERT_EQ(open_scanned(&po), 3u);
+    close_bdevs(h);
+    unlink_paths();
+}
+
+/* Every device's newest uberblock re-written naming device 0 in slot 1
+ * too: the scan refuses STM_ECORRUPT rather than give device 0 two votes. */
+STM_TEST(sync_multi_scan_roster_refuses_a_roster_naming_a_device_twice) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "s_twice", bds, as, &pool, &s);
+    teardown_mirror_pool_keep(bds, as, pool, s);
+    stm_bdev *h[NDEV] = {0};
+    open_paths(h);
+    stm_pool_open_opts po;
+    STM_ASSERT_OK(stm_sync_scan_roster(h, NDEV, NULL, &po, NULL));
+    for (size_t d = 0; d < NDEV; d++) {
+        stm_uberblock ub;
+        STM_ASSERT_OK(stm_sb_label_read(h[d], 0u, stm_sb_ring_slot_for_gen(1), &ub));
+        STM_ASSERT_EQ(stm_load_le64(ub.ub_gen), 1u);
+        memcpy(ub.ub_roster + STM_POOL_ROSTER_SLOT_SIZE, ub.ub_roster,
+               STM_POOL_ROSTER_SLOT_SIZE);
+        ub.ub_roster_hash = stm_store_le64(stm_pool_roster_hash_of_bytes(ub.ub_roster));
+        STM_ASSERT_OK(stm_sb_ub_write_copies(h[d], stm_sb_ring_slot_for_gen(1), &ub));
+    }
+    STM_ASSERT_ERR(stm_sync_scan_roster(h, NDEV, NULL, &po, NULL), STM_ECORRUPT);
+    close_bdevs(h);
+    unlink_paths();
+}
+
+/* A one-device pool of another pool uuid on `path`. */
+static stm_bdev *other_pool_device(const char *path)
+{
+    static const uint64_t other[2] = { 0x1111u, 0x2222u };
+    uint64_t du[2] = { 0x77u, DEV_UUID_HI };
+    unlink(path);
+    stm_bdev *b = NULL;
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(path, &bo, &b));
+    STM_ASSERT_OK(stm_bdev_resize(b, g_dev_bytes));
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = other[0];
+    opts.pool_uuid[1] = other[1];
+    opts.device_count = 1;
+    opts.devices[0].uuid[0]    = du[0];
+    opts.devices[0].uuid[1]    = du[1];
+    opts.devices[0].size_bytes = g_dev_bytes;
+    opts.devices[0].role       = STM_DEV_ROLE_DATA;
+    opts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    opts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    opts.devices[0].bdev       = b;
+    stm_pool *p = NULL;
+    STM_ASSERT_OK(stm_pool_open(&opts, &p));
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(b, other, du, TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(p, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    return b;
+}
+
+/* The scan's refusals of what is not one pool: STM_EINVAL for no handles,
+ * too many, a NULL one, no out, one device twice, devices of two pools
+ * (each beside its control, device 1's handle in its place; the other
+ * pool's device alone scans as its own one-device pool); STM_ENOENT for
+ * blank devices only. */
+STM_TEST(sync_multi_scan_roster_refuses_what_is_not_one_pool) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "s_inval", bds, as, &pool, &s);
+    teardown_mirror_pool_keep(bds, as, pool, s);
+
+    stm_bdev *h[NDEV] = {0};
+    open_paths(h);
+    stm_pool_open_opts po;
+    STM_ASSERT_ERR(stm_sync_scan_roster(NULL, 1, NULL, &po, NULL), STM_EINVAL);
+    STM_ASSERT_ERR(stm_sync_scan_roster(h, 0, NULL, &po, NULL), STM_EINVAL);
+    STM_ASSERT_ERR(stm_sync_scan_roster(h, NDEV, NULL, NULL, NULL), STM_EINVAL);
+    stm_bdev *withnull[2] = { h[0], NULL };
+    STM_ASSERT_ERR(stm_sync_scan_roster(withnull, 2, NULL, &po, NULL), STM_EINVAL);
+    stm_bdev *many[STM_POOL_DEVICES_MAX + 1];
+    for (size_t i = 0; i < STM_POOL_DEVICES_MAX + 1; i++) many[i] = h[i % NDEV];
+    STM_ASSERT_ERR(stm_sync_scan_roster(many, STM_POOL_DEVICES_MAX + 1, NULL, &po,
+                                        NULL), STM_EINVAL);
+
+    stm_bdev *pair[2] = { h[0], h[1] };
+    STM_ASSERT_OK(stm_sync_scan_roster(pair, 2, NULL, &po, NULL));
+    STM_ASSERT(po.devices[0].bdev == h[0] && po.devices[1].bdev == h[1]);
+    stm_bdev *dup = NULL;
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(g_paths[0], &bo, &dup));
+    pair[1] = dup;
+    STM_ASSERT_ERR(stm_sync_scan_roster(pair, 2, NULL, &po, NULL), STM_EINVAL);
+    stm_bdev_close(dup);
+    char opath[300];
+    snprintf(opath, sizeof opath, "%s.other", g_paths[0]);
+    stm_bdev *ob = other_pool_device(opath);
+    stm_bdev *one[1] = { ob };
+    STM_ASSERT_OK(stm_sync_scan_roster(one, 1, NULL, &po, NULL));
+    STM_ASSERT_EQ(po.device_count, (size_t)1);
+    STM_ASSERT(po.devices[0].bdev == ob);
+    pair[1] = ob;
+    STM_ASSERT_ERR(stm_sync_scan_roster(pair, 2, NULL, &po, NULL), STM_EINVAL);
+    stm_bdev_close(ob);
+    unlink(opath);
+    /* Every device's only uberblock unreadable: no roster, and the scan
+     * answers the first device's refusal, not STM_ENOENT. */
+    for (size_t d = 0; d < NDEV; d++) fault_gen_copies(h[d], 1);
+    stm_uberblock tub;
+    uint32_t tl = 0, ts = 0;
+    stm_sb_scan_refusal twhy;
+    stm_status tst = stm_sb_mount_scan_ex(h[0], false, &tub, &tl, &ts, &twhy);
+    STM_ASSERT(tst != STM_OK && tst != STM_ENOENT);
+    STM_ASSERT_ERR(stm_sync_scan_roster(h, NDEV, NULL, &po, NULL), tst);
+    close_bdevs(h);
+    unlink_paths();
+
+    make_paths("s_blank");
+    open_bdevs(h);
+    STM_ASSERT_ERR(stm_sync_scan_roster(h, NDEV, NULL, &po, NULL), STM_ENOENT);
+    close_bdevs(h);
+    unlink_paths();
 }
 
 STM_TEST_MAIN("sync_multi")

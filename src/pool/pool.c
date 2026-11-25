@@ -250,8 +250,10 @@ stm_status stm_pool_open(const stm_pool_open_opts *opts, stm_pool **out)
             /* Live (ONLINE / FAULTED / DEGRADED / OFFLINE / EVACUATING):
              * bdev non-NULL. EVACUATING is still readable and its
              * alloc tree is still live — data-half of remove_device
-             * (P5-4b-ii) drains it range-by-range. */
-            if (!d->bdev) return STM_EINVAL;
+             * (P5-4b-ii) drains it range-by-range. A FAULTED slot may
+             * have none: its device is gone, the pool is written without
+             * it, and stm_sync_open_ex counts it an unknown vote. */
+            if (!d->bdev && d->state != STM_DEV_STATE_FAULTED) return STM_EINVAL;
             /* Its labels and data area are laid out at this size. */
             uint64_t lo[STM_LABELS_PER_DEVICE];
             if (stm_label_offsets(d->size_bytes, lo) != STM_OK)
@@ -727,6 +729,9 @@ stm_status stm_pool_begin_evacuation_locked(stm_pool *p, uint16_t device_id,
         slot->state != STM_DEV_STATE_FAULTED) {
         return STM_EINVAL;
     }
+    /* A FAULTED slot whose device is gone has nothing to drain from, and
+     * an EVACUATING slot must have its device (stm_pool_open). */
+    if (!slot->bdev) return STM_ENODEV;
 
     /* AtMostOneEvacuating (evac.tla): at most one EVACUATING slot at a
      * time. The spec's AtMostOneEvacuating invariant encodes this as
@@ -879,6 +884,8 @@ stm_status stm_pool_rejoin_device_locked(stm_pool *p, uint16_t device_id)
      * P5-4d-β. Pre-β, mirror_read falls back to other replicas when
      * the stale content's csum fails. */
     if (slot->state != STM_DEV_STATE_FAULTED) return STM_EINVAL;
+    /* Its device is gone: an ONLINE slot has one (stm_pool_open). */
+    if (!slot->bdev) return STM_ENODEV;
 
     slot->state = STM_DEV_STATE_ONLINE;
     p->roster_hash = hash_of_devs(p->devices, p->device_count);

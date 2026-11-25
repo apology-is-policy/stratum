@@ -50,6 +50,12 @@ uint32_t stm_bdev_inject_fired_count(const struct stm_bdev *d);
 void     stm_bdev_inject_read_fail_after(struct stm_bdev *d, int64_t n_reads);
 uint32_t stm_bdev_inject_read_fired_count(const struct stm_bdev *d);
 
+/* While on, every stm_bdev_write answers STM_EROFS without writing, as a
+ * medium that refuses writes under a handle opened for them does; the
+ * handle stays read-write (stm_bdev_is_read_only false). Fires only in a
+ * build with testing hooks. */
+void     stm_bdev_inject_writes_read_only(struct stm_bdev *d, bool on);
+
 /* Read ranges armed at once (stm_bdev_inject_read_range*): enough for
  * every copy of an uberblock slot to carry several faults. */
 #define STM_BDEV_INJECT_READ_RANGES 32u

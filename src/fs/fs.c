@@ -1302,6 +1302,8 @@ stm_status stm_fs_format(const char *path, stm_fs_format_opts *opts)
     if (!path || !opts) return STM_EINVAL;
     /* P4-4a: keyfile is mandatory. */
     if (!opts->keyfile_path) return STM_EINVAL;
+    /* stm_pool_open refuses a zero device uuid: asked before anything is written. */
+    if (opts->device_uuid[0] == 0 && opts->device_uuid[1] == 0) return STM_EINVAL;
 
     /* Load wrap keys up-front so an unreadable keyfile fails BEFORE
      * we touch the pool device. SWISS-4m: passphrase-aware variant
@@ -1325,6 +1327,16 @@ stm_status stm_fs_format(const char *path, stm_fs_format_opts *opts)
     stm_status s = stm_bdev_open(path, &bopts, &d);
     if (s != STM_OK) { stm_hybrid_keys_wipe(&wk); return s; }
 
+    /* Nothing is written, the resize included, until the layout is known
+     * to take the pool: a refused format leaves the device as it was,
+     * under --force too. */
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    if (!caps) { stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return STM_EIO; }
+    s = stm_alloc_check_geometry(opts->device_size_bytes > 0 ? opts->device_size_bytes
+                                                             : caps->size_bytes,
+                                 opts->bootstrap_size_bytes, NULL);
+    if (s != STM_OK) { stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
+
     /* Resize if the caller asked for it (typical for loopback files
      * that start empty). */
     if (opts->device_size_bytes > 0) {
@@ -1334,9 +1346,10 @@ stm_status stm_fs_format(const char *path, stm_fs_format_opts *opts)
 
     /* Wipe label regions before anything else writes to them. See
      * format_wipe_labels doc. Uses the bdev's actual size (post-resize),
-     * which the roster records below and the layout follows. */
-    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
-    if (!caps) { stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return STM_EIO; }
+     * which the roster records below and the layout follows; asked again
+     * of that size, should a backend have sized the device otherwise. */
+    s = stm_alloc_check_geometry(caps->size_bytes, opts->bootstrap_size_bytes, NULL);
+    if (s != STM_OK) { stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
     stm_bdev_set_layout_bytes(d, caps->size_bytes);
     s = format_wipe_labels(d, caps->size_bytes);
     if (s != STM_OK) { stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
@@ -1861,6 +1874,18 @@ stm_status stm_fs_mount(const char *path,
         (void)munlock(corvus_token, STM_CORVUS_TOKEN_LEN);
         free(corvus_token);
         corvus_token = NULL;
+    }
+    /* A read-write ask whose claim met a medium refusing writes opened a
+     * read-only sync: the mount refuses rather than serve a read-write fs
+     * whose every write fails (the caller may mount read-only). */
+    if (s == STM_OK && !opts->read_only) {
+        stm_sync_info si;
+        s = stm_sync_info_get(sync, &si);
+        if (s == STM_OK && si.read_only) s = STM_EROFS;
+        if (s != STM_OK) {
+            stm_sync_close(sync);
+            sync = NULL;
+        }
     }
     if (s != STM_OK) {
         stm_alloc_close(a);

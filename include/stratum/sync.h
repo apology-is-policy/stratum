@@ -131,6 +131,12 @@ typedef struct {
     /* Allocator-tree root paddr recorded in the last committed uberblock.
      * 0 if no commits yet. */
     uint64_t alloc_root_paddr;
+
+    /* The handle refuses writes (STM_EROFS): of the devices its open's
+     * claim was written to (FAULTED and REMOVED slots are not), every one
+     * that did not take it answered read-only (whether or not it was
+     * opened so), at least one did, and fewer than quorum took it. */
+    bool read_only;
 } stm_sync_info;
 
 /* ========================================================================= */
@@ -160,6 +166,9 @@ typedef struct {
  * {kind = STM_RED_NONE}. Validated per `stm_redundancy_profile`
  * contract above; invalid inputs return STM_EINVAL /
  * STM_ENOTSUPPORTED before any on-disk state is created.
+ *
+ * A slot not REMOVED whose device is gone (a FAULTED slot with no bdev)
+ * refuses STM_ENODEV, writing nothing.
  */
 STM_MUST_USE
 stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
@@ -196,12 +205,20 @@ void stm_sync_pool_serial(const stm_sync *s, uint8_t out[16]);
  *     acknowledged: its holders (each device whose newest is that gen,
  *     and each other whose ring slot of it decodes as it), the
  *     devices whose slot of it has a copy torn or unreadable and none of
- *     it, or whose ring came round, and the unknown votes reaching quorum;
- *     refuses
+ *     it, and the unknown votes reaching quorum; refuses
  *     STM_EIO, writing nothing, when two could have been; with none, the
  *     content most devices hold, the lowest device index on a tie
  *     (quorum.tla RingPick, MountNotStuck); refuses STM_EBADVERSION when
  *     a slot it reads holds a newer build's uberblock;
+ *   - refuses STM_EIO, writing nothing, when a device's newest is more
+ *     than one gen past the gen it takes: no write puts a device there
+ *     past a quorum of the roster it was written under (quorum.tla
+ *     NewestNearAuth), so the roster handed in is not the one the newest
+ *     commit was made under (or a fault), and mounting would roll that
+ *     commit back;
+ *   - refuses STM_EROFS, writing nothing, when a slot not REMOVED has no
+ *     device (a FAULTED one, which stm_pool_open admits) and a device
+ *     there was opened writable: such a pool opens read-only only;
  *   - writes a claim at authoritative_gen + 1 to every device not REMOVED
  *     or FAULTED, per the MountGenBump invariant (sync.tla). With quorum,
  *     auth_gen becomes the claim's gen and current_gen the claim's + 2.
@@ -293,6 +310,52 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
                              stm_sync **out_sync);
 
 /*
+ * The pool to open on devs[0..ndevs) (stm_pool_open, then stm_sync_open),
+ * writing nothing. Each device's newest uberblock names a roster, and so
+ * does the uberblock each roster's pick takes; with each roster the open's
+ * pick runs over the devices, a slot matched to the device whose newest
+ * uberblock carries its device uuid. A slot not REMOVED that no device
+ * matches (absent, blank, or its ring unreadable) is an unknown vote. A
+ * roster is the pool's when the uberblock its pick takes carries it and no
+ * device handed in is more than one gen past the gen it takes. Such a
+ * device was written by a session under which a quorum held the gen
+ * below its newest (no write puts a device more than one gen past a
+ * quorum of the roster it was written under, quorum.tla NewestNearAuth,
+ * which models one device set), above this roster's gen, so that quorum
+ * was another roster's; the roster is passed over: a disk a remove or a
+ * failed add left behind names its old roster, and the scan answers past
+ * it. An answer then mounts at least that device's gen less one.
+ * out: the pool uuid, the device count and the devices, each bdev the
+ * matched handle or NULL (read_only false: the caller's to set; an ONLINE
+ * slot with no device stm_pool_open refuses, OPEN-BUGS (an)); a handle no
+ * slot matches is left out. out_auth_gen, if not NULL: the gen the open
+ * would mount. why: as stm_sync_open_ex's, for the refusal returned.
+ *   STM_EINVAL   devs or out NULL, ndevs 0 or over STM_POOL_DEVICES_MAX, a
+ *                NULL handle, handles of two pools or two of one device.
+ *   STM_ENOENT   no device holds an uberblock; a device's scan refusal
+ *                otherwise, the first in devs order.
+ *   STM_EIO      two rosters are the pool's: around an add or a remove
+ *                whose reservation some devices hold and whose final no
+ *                device handed in does, so whether it was acknowledged
+ *                is unknown; or none is and one was passed over (the
+ *                later write no roster read takes: devices holding it
+ *                were not handed in, or lost it). Hand in every device
+ *                of the pool you have: a device no roster read names
+ *                cannot vote.
+ *   STM_ECORRUPT no roster is the pool's and none was passed over, or one
+ *                read names a device in two slots.
+ *   otherwise    a roster's pick refused other than by a device past
+ *                its gen (stm_sync_open_ex's refusals: STM_EIO for an
+ *                unknown vote, STM_EQUORUM, ...), the first in the order
+ *                tried (newest uberblock's first).
+ */
+STM_MUST_USE
+stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
+                                struct stm_sb_scan_refusal *why,
+                                stm_pool_open_opts *out,
+                                uint64_t *out_auth_gen);
+
+/*
  * Commit. Writes Phase 1 reservation UB at auth+1, flushes, writes
  * Phase 3 final UB at auth+2, to every pool device in parallel.
  * Each phase requires quorum (⌊N/2⌋+1) of fsync confirmations; if
@@ -304,15 +367,34 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
  * A retry after any failure past the reservation's build (its write,
  * the barrier, the final) reserves at the same gen and writes the
  * reservation the last attempt to get that far wrote or tried, byte for
- * byte, unless a device was added in between.
+ * byte. Until that retry is acknowledged, stm_sync_remove_device,
+ * stm_sync_finish_evacuation and stm_sync_replace_device_online refuse
+ * STM_EBUSY: the stashed reservation's roster carries the quorum it was
+ * written under. A retry that finds the pool's slots changed in between
+ * anyway (stm_pool_add_device, or a pool primitive's removal) writes
+ * nothing, wedges the handle and answers STM_EWEDGED. While a retry
+ * waits, a commit takes no clean-commit skip.
  *
- * On STM_OK, auth_gen has advanced by 2 (one commit) and the pool's
- * devices hold quorum-confirmed UBs at the reservation and final
- * gens.
+ * On STM_OK, auth_gen has advanced by 2 (one commit; to 1 for a fresh
+ * pool's first) and the pool's devices hold quorum-confirmed UBs at the
+ * reservation and final gens (the final alone for a fresh pool's
+ * first); or nothing changed since the last final this session
+ * acknowledged, no failed attempt waits, and nothing was written. An
+ * engines' finalize failure (after the final reached quorum, or on that
+ * clean skip) wedges the handle.
  *
  * The first commit on a fresh pool (auth_gen==0) is 1-phase: only
  * the final UB is written at gen=1. There is no pre-flush state to
- * preserve on rollback.
+ * preserve on rollback. Its retry after a failed write rebuilds that
+ * final but waits as a reservation's does: the same refusals, and a
+ * retry under changed slots wedges.
+ *
+ * A retry rebuilds its final (1-phase or 2-phase). When the caller
+ * changed anything between the attempts, the final's gen can hold two
+ * contents, the failed attempt's on the devices the retry missed; an
+ * open that cannot read a device holding the acknowledged final may
+ * then count both possible and refuse STM_EIO. It never mounts the
+ * failed attempt's (OPEN-BUGS (av)).
  *
  * Known MVP caveat (R7d P0-2): a crash between the internal
  * stm_alloc_commit (which flushes bootstrap state) and the Phase 3
@@ -572,6 +654,7 @@ uint64_t stm_sync_reconcile_freed_nodes(const stm_sync *s);
  *
  * Returns STM_EEXIST if a slot is already filled for device_id.
  * Returns STM_EINVAL on range / shape violations.
+ * Returns STM_ENODEV for a FAULTED slot whose device is gone.
  */
 STM_MUST_USE
 stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
@@ -682,14 +765,22 @@ stm_status stm_sync_mirror_read(stm_sync *s, const uint64_t paddrs[],
  * Returns:
  *   STM_OK        — one range evacuated; paddrs populated.
  *   STM_ENOENT    — target alloc tree has no live allocated entries
- *                    (tree empty or all PENDING). Caller finalizes via
- *                    stm_pool_finish_evacuation + sync_commit.
+ *                    (tree empty or all PENDING), or no allocator is
+ *                    attached for it and the pool records no tree for
+ *                    it. Caller finalizes via stm_sync_finish_evacuation
+ *                    + sync_commit (the pool primitive skips the drain
+ *                    check).
+ *   STM_EBUSY     -- no allocator is attached for the target and the pool
+ *                    records a tree for it: it cannot be shown drained
+ *                    (attach it and retry).
  *   STM_EINVAL    — target not EVACUATING, survivor not ONLINE or is
  *                    the target, out-of-range ids, shape errors.
  *   STM_EROFS     — pool opened read_only.
  *   STM_EWEDGED   — sync handle wedged (post-quorum-loss state).
  *   STM_EQUORUM / STM_EIO / STM_ENOMEM — backend failures; no state
- *                    change on target's tree (rolled back).
+ *                    change on target's tree (rolled back). A failure
+ *                    reading the pool's record of the target's tree
+ *                    (stm_alloc_roots_get) is answered as it is.
  */
 STM_MUST_USE
 stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
@@ -710,8 +801,18 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
  *   STM_EBUSY          — target has allocated data; call
  *                         stm_pool_begin_evacuation → evacuation_step
  *                         loop → stm_sync_finish_evacuation.
+ *                         Also when no allocator is attached for it and
+ *                         the pool records a tree for it (a FAULTED
+ *                         device that is gone among them): it cannot be
+ *                         shown drained.
+ *                         Also while a commit that failed past its
+ *                         reservation's build waits for its retry (see
+ *                         stm_sync_commit): commit again first.
+ *   STM_EWEDGED        -- the sync handle is wedged.
  *   STM_ENOTSUPPORTED  — device_id == 0 (metadata primary; P5-4c).
  *   STM_EINVAL / STM_EROFS — as for stm_pool_remove_device.
+ *   A failure reading the pool's record of the tree
+ *   (stm_alloc_roots_get) is answered as it is.
  */
 STM_MUST_USE
 stm_status stm_sync_remove_device(stm_sync *s, uint16_t device_id,
@@ -744,9 +845,16 @@ stm_status stm_sync_remove_device(stm_sync *s, uint16_t device_id,
  *   STM_OK             — slot flipped to REMOVED; alloc detached.
  *                         Caller owns the detached alloc; close it.
  *   STM_EBUSY          — target tree still has allocated ranges
- *                         (more evacuation_step calls needed).
+ *                         (more evacuation_step calls needed); also when
+ *                         no allocator is attached for it and the pool
+ *                         records a tree for it (it cannot be shown
+ *                         drained); and while a failed commit waits for
+ *                         its retry, as for stm_sync_remove_device.
+ *   STM_EWEDGED        -- the sync handle is wedged.
  *   STM_EINVAL         — slot not EVACUATING or out-of-range.
  *   STM_EROFS          — RO pool.
+ *   A failure reading the pool's record of the tree
+ *   (stm_alloc_roots_get) is answered as it is.
  */
 STM_MUST_USE
 stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id);
@@ -802,6 +910,10 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id);
  *   supported via the R19 EVACUATING-resume path. Re-invoke with
  *   same `old_device_id` + same `new_alloc`; the wrapper detects
  *   EVACUATING + already-attached alloc and resumes from step 6.
+ * - STM_EBUSY at step 6 after a reopen whose caller did not attach the
+ *   old device's allocator: the old device cannot be shown drained, and
+ *   nothing past step 5 is durable. Attach it (stm_sync_attach_alloc)
+ *   and re-invoke, which resumes from step 6.
  *
  * **Resume criterion** (R22 P3-2 / P3-5 — clarifies the "retry with
  * same args" contract):
@@ -883,7 +995,9 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id);
  *   STM_ENOTSUPPORTED  — old slot FAULTED (reconstruct path unimplemented)
  *                         or old_device_id == 0.
  *   STM_EINVAL         — shape / state errors.
- *   STM_EBUSY          — another slot is EVACUATING.
+ *   STM_EBUSY          -- another slot is EVACUATING; or, before the add,
+ *                         a commit that failed waits for its retry (see
+ *                         stm_sync_commit): commit again first.
  *   STM_ENOSPC         — roster at STM_POOL_DEVICES_MAX.
  *   STM_EEXIST         — new_device->uuid collides with roster.
  *   STM_EROFS          — RO pool.

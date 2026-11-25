@@ -56,6 +56,14 @@ stm_status stm_alloc_create(stm_bdev *d,
                              uint64_t bootstrap_size_bytes,   // 0 = ARCH default
                              stm_alloc **out);
 
+// No I/O: whether stm_alloc_create can lay a pool out at this size
+stm_status stm_alloc_check_geometry(uint64_t layout_bytes,
+                                    uint64_t bootstrap_size_bytes,
+                                    uint64_t *out_bootstrap_bytes);
+stm_status stm_bootstrap_size_for(uint64_t layout_bytes,
+                                  uint64_t bootstrap_size_bytes,
+                                  uint64_t *out_size_bytes);
+
 stm_status stm_alloc_open      (stm_bdev *d, stm_alloc **out);   // alias
 stm_status stm_alloc_open_blank(stm_bdev *d, stm_alloc **out);
 stm_status stm_alloc_load_tree_at(stm_alloc *a,
@@ -74,6 +82,17 @@ stm_status stm_alloc_set_crypt_ctx(stm_alloc *a,
 stm_status stm_alloc_set_device_id(stm_alloc *a, uint16_t device_id);
 stm_status stm_alloc_get_device_id(const stm_alloc *a, uint16_t *out);
 ```
+
+`stm_alloc_check_geometry` asks, with no I/O, every rule a layout must
+meet: the labels' (`stm_label_offsets`), the bootstrap pool's
+(`stm_bootstrap_size_for`, the rule `stm_bootstrap_create` applies) and
+a data area of at least one block between the bootstrap pool and the
+tail labels. `stm_alloc_create` writes nothing until it admits the
+device's layout; `stm_fs_format` asks it of the size the device will
+have before it resizes, and of the size it has before the label wipe,
+and `stratum mkfs` asks it before it claims the volume. A refused format
+leaves the device as it was, the pool a `--force` format would have
+replaced included.
 
 `stm_alloc_open_blank` returns an allocator whose data-area tree is
 empty; the caller (usually `stm_sync_open`) then hydrates the tree
@@ -536,7 +555,7 @@ carries a dirty flag; a clean-state commit returns the cached
 | Suite | Count | Coverage |
 |---|---|---|
 | `test_bootstrap` | 37 | Bootstrap-pool format (v2), open-roundtrip, node- and 8-node-unit reserve/free/commit, bitmap ping-pong, torn-write recovery (incl. a flip in the last block of the 14-block region), capacity boundaries, the widened bitmap region carrying a >32768-node pool (high-index bit round-trip), and `STM_ENOTSUPPORTED` past `STM_BOOTSTRAP_MAX_NODES`; the mount-time reconcile frees unmarked nodes, keeps marked runs whole, and keeps a pending free's node allocated for the commit that releases it (control: not freed, the node is an orphan and swept). |
-| `test_alloc` | 32 | Tree insertion order, gap-scan reserve, free-then-pending, commit-sweeps-pending, refcount transitions, double-free rejected, full-tree scan, stats, accel is_allocated consistency, device_id stamping, set_device_id-refused-after-reserve, first_allocated + first_allocated_from basic cases, corrupt-tree-entry → STM_ECORRUPT, **first_allocated_from boundary cases** (R20 P3-2 close: NULL args; `min_start_block ≥ 2^48` → STM_EINVAL; empty tree; inclusive lower bound at exact start_block; cursor past end-of-range → next entry; cursor mid-range → next entry by start_block; PENDING-skip; cursor below first entry returns leftmost). |
+| `test_alloc` | 50 | The geometry check against `stm_alloc_create` at each rule's edge (a refused create leaves the device's bytes alone); tree insertion order, gap-scan reserve, free-then-pending, commit-sweeps-pending, refcount transitions, double-free rejected, full-tree scan, stats, accel is_allocated consistency, device_id stamping, set_device_id-refused-after-reserve, first_allocated + first_allocated_from basic cases, corrupt-tree-entry -> STM_ECORRUPT, **first_allocated_from boundary cases** (R20 P3-2 close: NULL args; `min_start_block >= 2^48` -> STM_EINVAL; empty tree; inclusive lower bound at exact start_block; cursor past end-of-range -> next entry; cursor mid-range -> next entry by start_block; PENDING-skip; cursor below first entry returns leftmost). |
 | `test_alloc_roots` | 10 | Roots-object set/get/count/iter/commit/load roundtrip; idempotent commit; tamper detection (wrong csum / wrong key / wrong gen). |
 | `test_sync_multi` (indirectly) | — | Exercises `stm_alloc_set_device_id`, multi-alloc attach, roots-object load, mirror reservation across devices. |
 
