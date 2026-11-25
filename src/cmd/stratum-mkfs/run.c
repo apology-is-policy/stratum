@@ -37,7 +37,9 @@
  *   2  the format failed, or the volume is formatted and its key did not take, or
  *      is not reached by, the name it was to have
  */
+#include <stratum/alloc.h>
 #include <stratum/block.h>
+#include <stratum/bootstrap.h>
 #include <stratum/cmds.h>
 #include <stratum/fs.h>
 #include <stratum/keyfile.h>
@@ -110,12 +112,29 @@ static int size_volume(uint64_t bytes, bool bootstrap_named, uint64_t *bootstrap
         return 1;
     }
     if (!bootstrap_named) *bootstrap = default_bootstrap_for(bytes);
-    if (*bootstrap >= bytes) {
-        fprintf(stderr, "stratum-mkfs: --bootstrap %llu must be < %s %llu\n",
-                (unsigned long long)*bootstrap, what, (unsigned long long)bytes);
-        return 1;
-    }
-    return 0;
+    /* The format's own rules, asked before anything is claimed or written. */
+    stm_status s = stm_alloc_check_geometry(bytes, *bootstrap, NULL);
+    if (s == STM_OK) return 0;
+    const char *pool = bootstrap_named ? "--bootstrap" : "the bootstrap pool";
+    unsigned long long b = (unsigned long long)*bootstrap;
+    if (s == STM_EINVAL && *bootstrap % STM_UB_SIZE != 0)
+        fprintf(stderr, "stratum-mkfs: %s %llu is not a whole number of 4K blocks\n",
+                pool, b);
+    else if (s == STM_ENOSPC)
+        fprintf(stderr, "stratum-mkfs: %s %llu leaves no room for data in %s %llu: "
+                "the volume holds 1.5M of labels besides it, and at least 4K of data\n",
+                pool, b, what, (unsigned long long)bytes);
+    else if (s == STM_ENOTSUPPORTED)
+        fprintf(stderr, "stratum-mkfs: %s %llu is larger than a bootstrap pool can be "
+                "(%llu)\n", pool, b,
+                (unsigned long long)(((uint64_t)STM_BOOTSTRAP_MAX_NODES
+                                      * STM_BOOTSTRAP_NODE_BLOCKS
+                                      + STM_BOOTSTRAP_DATA_START_BLOCK
+                                      + STM_BOOTSTRAP_NODE_BLOCKS - 1) * STM_UB_SIZE));
+    else
+        fprintf(stderr, "stratum-mkfs: %s %llu cannot be laid out in %s %llu: "
+                "status=%d\n", pool, b, what, (unsigned long long)bytes, (int)s);
+    return 1;
 }
 
 /* What the command line asks of the volume, for a disk to be held to once its size

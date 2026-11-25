@@ -1467,4 +1467,103 @@ STM_TEST(alloc_serials_differ) {
     unlink(g_tmp_path);
 }
 
+/* A device of `bytes` holding nothing but `byte`. */
+static void fill_device(const char *path, uint64_t bytes, uint8_t byte)
+{
+    FILE *f = fopen(path, "wb");
+    STM_ASSERT(f != NULL);
+    if (!f) return;
+    static uint8_t chunk[65536];
+    memset(chunk, byte, sizeof chunk);
+    for (uint64_t done = 0; done < bytes; ) {
+        size_t n = bytes - done < sizeof chunk ? (size_t)(bytes - done) : sizeof chunk;
+        STM_ASSERT_EQ(fwrite(chunk, 1, n, f), n);
+        done += n;
+    }
+    STM_ASSERT_EQ(fclose(f), 0);
+}
+
+static bool device_holds_only(const char *path, uint64_t bytes, uint8_t byte)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    static uint8_t chunk[65536];
+    uint64_t seen = 0;
+    bool same = true;
+    size_t n;
+    while (same && (n = fread(chunk, 1, sizeof chunk, f)) > 0) {
+        for (size_t i = 0; i < n; i++)
+            if (chunk[i] != byte) { same = false; break; }
+        seen += n;
+    }
+    fclose(f);
+    return same && seen == bytes;
+}
+
+/* The geometry check answers what stm_alloc_create does on a device laid
+ * out at that size, at each rule's edge, and a create it refuses leaves the
+ * device as it was: before the check the data-area rule refused only after
+ * the bootstrap pool was written. */
+STM_TEST(alloc_check_geometry_agrees_with_create) {
+    const uint64_t K = STM_UB_SIZE, M = UINT64_C(1024) * 1024u;
+    const uint64_t L = STM_DEVICE_MIN_BYTES;
+    /* Bootstrap pool + data area: the layout less 1 MiB ahead, 512 KiB behind. */
+    const uint64_t room = L - STM_BOOTSTRAP_OFFSET - 2u * (uint64_t)STM_LABEL_SIZE;
+    const uint64_t node0 = (uint64_t)STM_BOOTSTRAP_DATA_START_BLOCK * K;
+    const uint64_t node = (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS * K;
+    const struct { uint64_t layout, boot; stm_status want; } cases[] = {
+        { L,        room - K,         STM_OK     },  /* one data block */
+        { L,        room,             STM_ENOSPC },  /* none: the bootstrap rule admits it */
+        { L,        room + K,         STM_ENOSPC },
+        { L,        4u * M + 512u,    STM_EINVAL },  /* not whole 4 KiB blocks */
+        { L,        0,                STM_ENOSPC },  /* the default, 64 MiB */
+        { L,        node0 + node,     STM_OK     },  /* one node */
+        { L,        node0 + node - K, STM_ENOSPC },  /* no node */
+        { L,        node0,            STM_ENOSPC },
+        { L - K,    4u * M,           STM_EINVAL },  /* under the labels' minimum */
+        { L + 6000, room,             STM_OK     },  /* a layout not whole blocks */
+        { L + 6000, room + K,         STM_ENOSPC },
+        { 66u * M,  0,                STM_OK     },  /* the default, with room */
+        { 65u * M + M / 2u, 0,        STM_ENOSPC },  /* the default, filling it */
+    };
+    uint64_t pool_uuid[2]   = { 0xA1A1A1A1A1A1A1A1ULL, 0xB2B2B2B2B2B2B2B2ULL };
+    uint64_t device_uuid[2] = { 0xC3C3C3C3C3C3C3C3ULL, 0xD4D4D4D4D4D4D4D4ULL };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        uint64_t boot = 0;
+        STM_ASSERT_ERR(stm_alloc_check_geometry(cases[i].layout, cases[i].boot, &boot),
+                       cases[i].want);
+        make_tmp("ckgeom");
+        fill_device(g_tmp_path, cases[i].layout, 0x5A);
+        stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+        stm_bdev *d = NULL;
+        STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d));
+        if (!d) continue;
+        STM_ASSERT_EQ(stm_bdev_layout_bytes(d), cases[i].layout);
+        stm_alloc *a = NULL;
+        stm_status s = stm_alloc_create(d, pool_uuid, device_uuid, cases[i].boot, &a);
+        if (s != (stm_status)cases[i].want)
+            fprintf(stderr, "case %zu: layout %llu boot %llu: create %d, want %d\n", i,
+                    (unsigned long long)cases[i].layout,
+                    (unsigned long long)cases[i].boot, (int)s, (int)cases[i].want);
+        STM_ASSERT_ERR(s, cases[i].want);
+        if (s == STM_OK && a) {
+            stm_alloc_stats st;
+            STM_ASSERT_OK(stm_alloc_stats_get(a, &st));
+            STM_ASSERT_EQ(st.data_first_block, (STM_BOOTSTRAP_OFFSET + boot) / K);
+            stm_alloc_close(a);
+        }
+        stm_bdev_close(d);
+        if (s != STM_OK)
+            STM_ASSERT_TRUE(device_holds_only(g_tmp_path, cases[i].layout, 0x5A));
+        unlink(g_tmp_path);
+    }
+
+    /* The node bound, asked of the arithmetic alone (a device past 7 GiB). */
+    const uint64_t big = UINT64_C(16) * 1024u * M;
+    const uint64_t most = node0 + (uint64_t)STM_BOOTSTRAP_MAX_NODES * node;
+    STM_ASSERT_OK(stm_alloc_check_geometry(big, most, NULL));
+    STM_ASSERT_OK(stm_alloc_check_geometry(big, most + node - K, NULL));
+    STM_ASSERT_ERR(stm_alloc_check_geometry(big, most + node, NULL), STM_ENOTSUPPORTED);
+}
+
 STM_TEST_MAIN("alloc")

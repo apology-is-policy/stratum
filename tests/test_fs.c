@@ -13739,3 +13739,100 @@ STM_TEST(fs_mount_zeroes_the_refusal_before_its_argument_check) {
     STM_ASSERT_EQ(why.gen, 0u);
     unlink(g_tmp_path);
 }
+
+/* The whole image, or NULL; *len its length. */
+static uint8_t *read_image(const char *path, uint64_t *len)
+{
+    *len = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0) { fclose(f); return NULL; }
+    uint8_t *buf = malloc(st.st_size > 0 ? (size_t)st.st_size : 1u);
+    if (buf && fread(buf, 1, (size_t)st.st_size, f) != (size_t)st.st_size) {
+        free(buf);
+        buf = NULL;
+    }
+    fclose(f);
+    if (buf) *len = (uint64_t)st.st_size;
+    return buf;
+}
+
+static void assert_pool_mounts(void)
+{
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (fs) STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* A format refused for its layout or its arguments writes nothing, the
+ * resize included: the pool it was asked to replace still mounts, byte for
+ * byte. Before, the labels were wiped (and a grown file grown) before the
+ * bootstrap pool and the data area were checked. Each refusal has a control
+ * one variable away that formats. */
+STM_TEST(fs_format_refused_leaves_the_old_pool) {
+    make_tmp("fmtref");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    assert_pool_mounts();
+
+    /* The bootstrap pool and data area: the device less 1 MiB ahead and
+     * 512 KiB behind. */
+    const uint64_t K = STM_UB_SIZE, M = UINT64_C(1024) * 1024u;
+    const uint64_t room = TEST_DEVICE_BYTES - STM_BOOTSTRAP_OFFSET
+                        - 2u * (uint64_t)STM_LABEL_SIZE;
+    const struct { uint64_t size, boot; bool zero_dev; stm_status want; } legs[] = {
+        { TEST_DEVICE_BYTES, TEST_BOOTSTRAP_BYTES + 512u, false, STM_EINVAL },
+        { TEST_DEVICE_BYTES, room,                        false, STM_ENOSPC },
+        { TEST_DEVICE_BYTES, room + K,                    false, STM_ENOSPC },
+        { 0,                 room,                        false, STM_ENOSPC },
+        { 32u * M,           32u * M - M - M / 2u,        false, STM_ENOSPC },
+        { TEST_DEVICE_BYTES, TEST_BOOTSTRAP_BYTES,        true,  STM_EINVAL },
+    };
+    for (size_t i = 0; i < sizeof legs / sizeof legs[0]; i++) {
+        stm_fs_format_opts o = default_format_opts();
+        o.device_size_bytes = legs[i].size;
+        o.bootstrap_size_bytes = legs[i].boot;
+        o.pool_uuid[0] ^= 0x7777u;
+        if (legs[i].zero_dev) { o.device_uuid[0] = 0; o.device_uuid[1] = 0; }
+        /* Taken here: a read-write mount writes. */
+        uint64_t len0 = 0;
+        uint8_t *img0 = read_image(g_tmp_path, &len0);
+        STM_ASSERT(img0 != NULL);
+        STM_ASSERT_EQ(len0, TEST_DEVICE_BYTES);
+        stm_status s = stm_fs_format(g_tmp_path, &o);
+        if (s != (stm_status)legs[i].want)
+            fprintf(stderr, "leg %zu: format %d, want %d\n", i, (int)s, (int)legs[i].want);
+        STM_ASSERT_ERR(s, legs[i].want);
+        uint64_t len = 0;
+        uint8_t *img = read_image(g_tmp_path, &len);
+        STM_ASSERT(img != NULL);
+        STM_ASSERT_EQ(len, len0);
+        STM_ASSERT_TRUE(img && img0 && len == len0 && memcmp(img, img0, (size_t)len0) == 0);
+        free(img);
+        free(img0);
+        assert_pool_mounts();
+    }
+
+    /* The controls: one block less of bootstrap pool leaves one data block,
+     * and the format lays its pool down and mounts it. */
+    stm_fs_format_opts o = default_format_opts();
+    o.bootstrap_size_bytes = room - K;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &o));
+    assert_pool_mounts();
+    o = default_format_opts();
+    o.device_size_bytes = 32u * M;
+    o.bootstrap_size_bytes = 32u * M - M - M / 2u - K;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &o));
+    struct stat st;
+    STM_ASSERT_EQ(stat(g_tmp_path, &st), 0);
+    STM_ASSERT_EQ((uint64_t)st.st_size, 32u * M);
+    assert_pool_mounts();
+    o = default_format_opts();
+    o.device_size_bytes = 32u * M;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &o));
+    assert_pool_mounts();
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}

@@ -340,12 +340,11 @@ static stm_status decode_hdr(const uint8_t buf[STM_UB_SIZE],
 /* Bootstrap-size computation.                                                */
 /* ========================================================================= */
 
-static stm_status compute_bootstrap_size(stm_bdev *d,
-                                          uint64_t requested_bytes,
-                                          uint64_t *out_size_bytes)
+stm_status stm_bootstrap_size_for(uint64_t layout,
+                                  uint64_t requested_bytes,
+                                  uint64_t *out_size_bytes)
 {
-    if (!d) return STM_EINVAL;
-    uint64_t layout = stm_bdev_layout_bytes(d);
+    if (!out_size_bytes) return STM_EINVAL;
 
     /* Head labels (2 × 256K) + margin (512K) = 1 MiB before pool.
      * Tail labels (2 × 256K) = 512K after pool. */
@@ -430,7 +429,8 @@ stm_status stm_bootstrap_create(stm_bdev *d,
     if (!d || !pool_uuid || !device_uuid || !out_alloc) return STM_EINVAL;
 
     uint64_t size_bytes = 0;
-    stm_status s = compute_bootstrap_size(d, bootstrap_size_bytes, &size_bytes);
+    stm_status s = stm_bootstrap_size_for(stm_bdev_layout_bytes(d),
+                                          bootstrap_size_bytes, &size_bytes);
     if (s != STM_OK) return s;
 
     stm_bootstrap *a = alloc_new(d, size_bytes, pool_uuid, device_uuid);
