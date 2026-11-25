@@ -131,6 +131,10 @@ typedef struct {
     /* Allocator-tree root paddr recorded in the last committed uberblock.
      * 0 if no commits yet. */
     uint64_t alloc_root_paddr;
+
+    /* The handle refuses writes (STM_EROFS): its open's claim met only
+     * devices answering read-only, whether or not they were opened so. */
+    bool read_only;
 } stm_sync_info;
 
 /* ========================================================================= */
@@ -572,6 +576,7 @@ uint64_t stm_sync_reconcile_freed_nodes(const stm_sync *s);
  *
  * Returns STM_EEXIST if a slot is already filled for device_id.
  * Returns STM_EINVAL on range / shape violations.
+ * Returns STM_ENODEV for a FAULTED slot whose device is gone.
  */
 STM_MUST_USE
 stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
@@ -710,6 +715,10 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
  *   STM_EBUSY          — target has allocated data; call
  *                         stm_pool_begin_evacuation → evacuation_step
  *                         loop → stm_sync_finish_evacuation.
+ *                         Also when no allocator is attached for it and
+ *                         the pool records a tree for it (a FAULTED
+ *                         device that is gone among them): it cannot be
+ *                         shown drained.
  *   STM_ENOTSUPPORTED  — device_id == 0 (metadata primary; P5-4c).
  *   STM_EINVAL / STM_EROFS — as for stm_pool_remove_device.
  */

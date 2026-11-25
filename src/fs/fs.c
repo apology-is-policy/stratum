@@ -1875,6 +1875,18 @@ stm_status stm_fs_mount(const char *path,
         free(corvus_token);
         corvus_token = NULL;
     }
+    /* A read-write ask whose claim met a medium refusing writes opened a
+     * read-only sync: the mount refuses rather than serve a read-write fs
+     * whose every write fails (the caller may mount read-only). */
+    if (s == STM_OK && !opts->read_only) {
+        stm_sync_info si;
+        s = stm_sync_info_get(sync, &si);
+        if (s == STM_OK && si.read_only) s = STM_EROFS;
+        if (s != STM_OK) {
+            stm_sync_close(sync);
+            sync = NULL;
+        }
+    }
     if (s != STM_OK) {
         stm_alloc_close(a);
         stm_pool_close(pool);

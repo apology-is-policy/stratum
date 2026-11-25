@@ -3855,6 +3855,7 @@ stm_status stm_sync_info_get(const stm_sync *s, stm_sync_info *out)
     out->mount_max_durable_gen = s->mount_max_durable;
     out->live_slot_idx         = s->live_slot_idx;
     out->alloc_root_paddr      = s->alloc_root_paddr;
+    out->read_only             = s->read_only;
 
     pthread_mutex_unlock(&ms->lock);
     return STM_OK;

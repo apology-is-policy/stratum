@@ -1910,6 +1910,7 @@ static void ro_open_with_a_slot_not_written(bool removed, const char *tag)
         stm_sync_info ri;
         STM_ASSERT_OK(stm_sync_info_get(rs, &ri));
         STM_ASSERT_EQ(ri.auth_gen, before.auth_gen);
+        STM_ASSERT_TRUE(ri.read_only);
         STM_ASSERT_ERR(stm_sync_commit(rs), STM_EROFS);
         uint8_t back[STM_UB_SIZE];
         memset(back, 0, sizeof back);
@@ -1924,6 +1925,7 @@ static void ro_open_with_a_slot_not_written(bool removed, const char *tag)
         stm_sync_info wi;
         STM_ASSERT_OK(stm_sync_info_get(rs, &wi));
         STM_ASSERT_EQ(wi.auth_gen, before.auth_gen + 1u);
+        STM_ASSERT_FALSE(wi.read_only);
         STM_ASSERT_OK(stm_sync_commit(rs));
     }
     close_reopened(rb, ra, rp, rs);

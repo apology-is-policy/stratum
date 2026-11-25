@@ -141,6 +141,16 @@ stm_status stm_pool_rejoin_device_locked    (...);
 - `rejoin`: FAULTED → ONLINE.
 - Dev 0 guard (R17 P1-1): refuses `device_id == 0`.
 - RO refuses.
+- A FAULTED slot's device may be gone: `stm_pool_open` admits the slot
+  with no bdev (every other live state needs one; the roster hashes the
+  same without it), and the open counts it an unknown vote (07, the mount
+  flow, step 1). `rejoin` and `begin` refuse it STM_ENODEV (an ONLINE or
+  EVACUATING slot has its device), so does `stm_sync_attach_alloc`, and
+  `stm_sync_remove_device` refuses it STM_EBUSY: the roots object records
+  a tree for it that may hold replicas no read can see, and a device with
+  no allocator attached is drained only when the pool records no tree for
+  it. It leaves the roster only through the FAULTED reconstruct
+  (P5-4c-beta, unbuilt).
 - **FAULTED-skip is symmetric across all sync I/O paths** (R21 /
   P5-6 P1 + P2-5):
   - `mirror_read` — ONLINE + EVACUATING read-accepted; FAULTED +
@@ -364,8 +374,8 @@ EVACUATING / REMOVED transitions are implemented.
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_pool` | 54 | open validation (zero count / duplicate UUID / malformed / a recorded size no layout fits); roster encode/decode + hash determinism + identity-change sensitivity; fs format/mount roundtrip; v4/v5 version refusals; pool-mismatch refused; add_device; remove floor + burned-UUID; begin/finish evacuation guards; device-0 refusals across all mutators; fail/rejoin cycle + mirror_read FAULTED skip; RO pool refuses every mutator; replace-in-flight claim mechanics (set/clear/idempotent same-slot/refuse different-slot/expected_slot authorization/_locked-bypass; **R23 P3-2: add_device collision-only**, succeeds at non-claimed tail); the recorded-size layout (v35): add_device lays a device out at its size, and a grown device keeps its data area RW and RO while a shrunk one refuses the mount, RW and RO. |
-| `test_sync_multi` | 74 | (See [07-sb-sync.md](07-sb-sync.md).) Multi-device quorum commit, mirror reservation, replace_device_online happy path + unsupported-paths, evacuation step happy path + non-evacuating-refused, safe-removal drain check, concurrent-reader/writer TSan stress, replace-resume-from-ADDED-ONLINE, replace-claim-blocks-concurrent-mutators, replace-multi-retry-converges, sync-wrapper-bypass closed. |
+| `test_pool` | 55 | open validation (zero count / duplicate UUID / malformed / a recorded size no layout fits; a FAULTED slot without its device admitted, the roster hash the same, rejoin and evacuation then refused STM_ENODEV, every other live state without one refused); roster encode/decode + hash determinism + identity-change sensitivity; fs format/mount roundtrip; v4/v5 version refusals; pool-mismatch refused; add_device; remove floor + burned-UUID; begin/finish evacuation guards; device-0 refusals across all mutators; fail/rejoin cycle + mirror_read FAULTED skip; RO pool refuses every mutator; replace-in-flight claim mechanics (set/clear/idempotent same-slot/refuse different-slot/expected_slot authorization/_locked-bypass; **R23 P3-2: add_device collision-only**, succeeds at non-claimed tail); the recorded-size layout (v35): add_device lays a device out at its size, and a grown device keeps its data area RW and RO while a shrunk one refuses the mount, RW and RO. |
+| `test_sync_multi` | 76 | (See [07-sb-sync.md](07-sb-sync.md).) Multi-device quorum commit, mirror reservation, replace_device_online happy path + unsupported-paths, evacuation step happy path + non-evacuating-refused, safe-removal drain check, concurrent-reader/writer TSan stress, replace-resume-from-ADDED-ONLINE, replace-claim-blocks-concurrent-mutators, replace-multi-retry-converges, sync-wrapper-bypass closed. |
 
 ## Status
 

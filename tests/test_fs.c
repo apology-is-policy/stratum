@@ -13836,3 +13836,65 @@ STM_TEST(fs_format_refused_leaves_the_old_pool) {
     unlink(g_tmp_path);
     unlink(g_key_path);
 }
+
+static void erofs_writes_hook(struct stm_bdev *d, int phase, void *arg)
+{
+    (void)arg;
+    if (phase == STM_FS_MOUNT_HOOK_SYNC_OPEN) stm_bdev_inject_writes_read_only(d, true);
+}
+
+/* OPEN-BUGS (u): a read-write mount on a medium that refuses writes under a
+ * handle opened for them refuses STM_EROFS: its claim met only read-only
+ * answers, the sync opened read-only, and the mount served a read-write fs
+ * whose every write failed. Read-only on the same medium it mounts, and the
+ * stats say so; with the medium writable the read-write mount opens (the
+ * controls). The refused mount wrote nothing. */
+STM_TEST(fs_mount_read_write_refuses_a_medium_refusing_writes) {
+    make_tmp("rwro");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    uint64_t len0 = 0;
+    uint8_t *img0 = read_image(g_tmp_path, &len0);
+    STM_ASSERT(img0 != NULL);
+
+    stm_fs_set_mount_open_hook_for_test(erofs_writes_hook, NULL);
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = (stm_fs *)0x1;
+    stm_status st = stm_fs_mount(g_tmp_path, &mopts, &fs);
+    if (st == STM_OK && fs) {
+        stm_fs_stats fst;
+        STM_ASSERT_OK(stm_fs_stats_get(fs, &fst));
+        fprintf(stderr, "  rw on a refusing medium: mounted, fs read_only %d\n",
+                (int)fst.read_only);
+        (void)stm_fs_unmount(fs);
+    }
+    STM_ASSERT_ERR(st, STM_EROFS);
+    uint64_t len = 0;
+    uint8_t *img = read_image(g_tmp_path, &len);
+    STM_ASSERT_TRUE(img && img0 && len == len0 && memcmp(img, img0, (size_t)len0) == 0);
+    free(img);
+    free(img0);
+
+    mopts.read_only = true;
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (fs) {
+        stm_fs_stats fst;
+        STM_ASSERT_OK(stm_fs_stats_get(fs, &fst));
+        STM_ASSERT_TRUE(fst.read_only);
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+    }
+    stm_fs_set_mount_open_hook_for_test(NULL, NULL);
+
+    mopts.read_only = false;
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (fs) {
+        stm_fs_stats fst;
+        STM_ASSERT_OK(stm_fs_stats_get(fs, &fst));
+        STM_ASSERT_FALSE(fst.read_only);
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+    }
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}

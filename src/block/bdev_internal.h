@@ -61,6 +61,8 @@ struct stm_bdev {
      * a build with testing hooks. */
     atomic_int_fast64_t        inject_read_countdown;
     atomic_uint_fast32_t       inject_read_fired;
+    /* Writes answer STM_EROFS (stm_bdev_inject_writes_read_only). */
+    atomic_bool                inject_writes_erofs;
     /* Reads meeting a byte range (stm_bdev_inject_read_range), up to
      * STM_BDEV_INJECT_READ_RANGES:
      * by rr_kind, each answers rr_answer without reading, or with STM_OK
