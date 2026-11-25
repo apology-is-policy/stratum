@@ -318,12 +318,13 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
  * matches (absent, blank, or its ring unreadable) is an unknown vote. A
  * roster is the pool's when the uberblock its pick takes carries it and no
  * device handed in is more than one gen past the gen it takes. Such a
- * device holds a write above that gen that a quorum of another roster
- * confirmed (no write puts a device more than one gen past a quorum of
- * the roster it was written under, quorum.tla NewestNearAuth, which
- * models one device set), and the roster is passed over: a disk a remove
- * or a failed add left behind names its old roster, and the scan answers
- * past it. An answer then mounts at least that device's gen less one.
+ * device was written by a session under which a quorum held the gen
+ * below its newest (no write puts a device more than one gen past a
+ * quorum of the roster it was written under, quorum.tla NewestNearAuth,
+ * which models one device set), above this roster's gen, so that quorum
+ * was another roster's; the roster is passed over: a disk a remove or a
+ * failed add left behind names its old roster, and the scan answers past
+ * it. An answer then mounts at least that device's gen less one.
  * out: the pool uuid, the device count and the devices, each bdev the
  * matched handle or NULL (read_only false: the caller's to set; an ONLINE
  * slot with no device stm_pool_open refuses, OPEN-BUGS (an)); a handle no
@@ -369,13 +370,17 @@ stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
  * byte, unless a device was added in between. Until that retry is
  * acknowledged, stm_sync_remove_device and stm_sync_finish_evacuation
  * refuse STM_EBUSY: the stashed reservation's roster carries the quorum
- * it was written under. A retry that finds a slot removed in between
- * anyway (the pool primitives) writes nothing, wedges the handle and
- * answers STM_EWEDGED.
+ * it was written under. A retry that finds a slot that roster names
+ * removed in between anyway (the pool primitives; with or without a
+ * device added too) writes nothing, wedges the handle and answers
+ * STM_EWEDGED. While a retry waits, a commit always writes.
  *
  * On STM_OK, auth_gen has advanced by 2 (one commit) and the pool's
  * devices hold quorum-confirmed UBs at the reservation and final
- * gens.
+ * gens; or nothing changed since the last final this session
+ * acknowledged, no failed attempt waits, and nothing was written. A
+ * failure after the final reached quorum (the engines' finalize)
+ * wedges the handle.
  *
  * The first commit on a fresh pool (auth_gen==0) is 1-phase: only
  * the final UB is written at gen=1. There is no pre-flush state to
@@ -793,6 +798,7 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
  *                         Also while a commit that failed past its
  *                         reservation's build waits for its retry (see
  *                         stm_sync_commit): commit again first.
+ *   STM_EWEDGED        -- the sync handle is wedged.
  *   STM_ENOTSUPPORTED  — device_id == 0 (metadata primary; P5-4c).
  *   STM_EINVAL / STM_EROFS — as for stm_pool_remove_device.
  *   A failure reading the pool's record of the tree
@@ -834,6 +840,7 @@ stm_status stm_sync_remove_device(stm_sync *s, uint16_t device_id,
  *                         records a tree for it (it cannot be shown
  *                         drained); and while a failed commit waits for
  *                         its retry, as for stm_sync_remove_device.
+ *   STM_EWEDGED        -- the sync handle is wedged.
  *   STM_EINVAL         — slot not EVACUATING or out-of-range.
  *   STM_EROFS          — RO pool.
  *   A failure reading the pool's record of the tree

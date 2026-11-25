@@ -705,7 +705,8 @@ struct stm_sync {
      * the smaller, and an open from the stashed roster would mount the
      * reservation under it. So the sync's remove and finish-evacuation
      * refuse while the stash waits for its retry (sync_retry_pending),
-     * and a retry that finds a slot removed some other way wedges. */
+     * and a retry that finds a slot the stashed roster names removed
+     * some other way wedges, whether or not a device was added too. */
     stm_uberblock     res_ub;
     uint64_t          res_ub_gen;
     bool              have_res_ub;
@@ -1674,14 +1675,15 @@ static bool sync_retry_pending(const stm_sync *s)
     return s->have_res_ub && s->res_ub_gen + 1u == s->current_gen;
 }
 
-/* The stashed reservation's roster removes exactly the slots the pool
- * removes now: the quorum it was written under is the retry's. Caller
- * holds the pool lock. */
+/* Every slot the stashed reservation's roster names is removed now
+ * exactly when it was then: no removal shrank the quorum that reservation
+ * was written under (slots added since are not compared). Caller holds
+ * the pool lock. */
 static bool sync_removed_set_kept(const stm_sync *s, const stm_uberblock *ub)
 {
     uint16_t n = stm_load_le16(ub->ub_device_count);
     stm_pool_device dev[STM_POOL_DEVICES_MAX] = { 0 };
-    if (n != stm_pool_device_count(s->pool)) return false;
+    if (n > stm_pool_device_count(s->pool)) return false;
     if (stm_pool_roster_decode(ub->ub_roster, n, dev) != STM_OK) return false;
     for (uint16_t i = 0; i < n; i++) {
         const stm_pool_device *cur = stm_pool_device_info(s->pool, i);
@@ -2674,10 +2676,11 @@ static void sync_roster_map(const stm_pool_device dev[], size_t n,
  * handed in is more than one gen past the gen it takes. A write of gen g
  * comes from a session whose authoritative gen was g - 1 (a claim, a
  * reservation) or g - 2 with the reservation at g - 1 confirmed by a
- * quorum (a final), so such a device holds a write above that gen that a
- * quorum of another roster confirmed (quorum.tla NewestNearAuth, per
- * roster; were it this roster's, its pick would take that gen), and the
- * roster is passed over, the answer mounting at least that gen less one:
+ * quorum (a final), so a quorum held the gen below such a device's newest,
+ * above this roster's gen, under the session that wrote it (quorum.tla
+ * NewestNearAuth, per roster; were it this roster's quorum, its pick
+ * would take that gen), and the roster is passed over, the answer
+ * mounting at least that device's gen less one:
  * in its pick, a device it names (a disk a remove or a failed add left
  * behind names its old roster, whose pick lands below the pool's); after,
  * one it does not (a device an add brought in whose commit's reservation
@@ -3649,16 +3652,16 @@ stm_status stm_sync_commit(stm_sync *s)
                          /*cas_index_gen=*/     s->cas_index_root_gen,
                          /*merkle_root=*/       s->merkle_root,
                          &astats_res);
-        if (s->have_res_ub && s->res_ub_gen == reservation_gen &&
-            stm_load_le16(s->res_ub.ub_device_count) ==
-                stm_load_le16(res_prototype.ub_device_count)) {
+        if (s->have_res_ub && s->res_ub_gen == reservation_gen) {
             if (!sync_removed_set_kept(s, &s->res_ub)) {
                 sync_wedge_locked(s);
                 pthread_mutex_unlock(&s->lock);
                 stm_pool_unlock_shared(s->pool);
                 return STM_EWEDGED;
             }
-            res_prototype = s->res_ub;
+            if (stm_load_le16(s->res_ub.ub_device_count) ==
+                stm_load_le16(res_prototype.ub_device_count))
+                res_prototype = s->res_ub;
         }
     }
 
@@ -4007,8 +4010,13 @@ stm_status stm_sync_commit(stm_sync *s)
      * (engine.c: a no-op commit preserves root gen), so adoption is a
      * no-op; ABORT would drop the resident memtree (crash-equivalent),
      * wrong for a no-op. A finalize failure wedges via the caller
-     * exactly as on the commit path. */
-    if (s->have_last_fin_ub &&
+     * exactly as on the commit path.
+     *
+     * Not while a failed attempt waits for its retry: its reservation
+     * (and maybe its final) is newer on disk than the last final this
+     * session acknowledged, and a rejoin can bring the roster back to
+     * that final's, so equal content does not mean nothing to write. */
+    if (s->have_last_fin_ub && !sync_retry_pending(s) &&
         ub_content_equal_masked(&fin_prototype, &s->last_fin_ub)) {
         stm_status cfs = stm_dataset_index_commit_engines_finalize(s->dataset_idx);
         out_rc = cfs;
@@ -4111,6 +4119,10 @@ stm_status stm_sync_commit(stm_sync *s)
      * trees intact, superseded nodes merely leaked. */
     stm_status mfs = stm_dataset_index_commit_engines_finalize(s->dataset_idx);
     if (mfs != STM_OK) {
+        /* The final is durable but this session never publishes it: a
+         * later commit would retry at its gen and could write another
+         * content there. The sync wedges as the fs does. */
+        sync_wedge_locked(s);
         { out_rc = mfs; goto out_cancel; }
     }
 
@@ -5241,7 +5253,9 @@ stm_status stm_sync_remove_device(stm_sync *s, uint16_t device_id,
 
     stm_status ret;
     uint16_t claim = stm_pool_replace_claim_locked(s->pool);
-    if (claim != STM_POOL_REPLACE_CLAIM_NONE && claim == device_id) {
+    if (s->wedged) {
+        ret = STM_EWEDGED;
+    } else if (claim != STM_POOL_REPLACE_CLAIM_NONE && claim == device_id) {
         ret = STM_EBUSY;
     } else if (sync_retry_pending(s)) {
         ret = STM_EBUSY;    /* the stashed reservation's quorum (res_ub) */
@@ -5274,7 +5288,9 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id)
 
     stm_status ret;
     uint16_t claim = stm_pool_replace_claim_locked(s->pool);
-    if (claim != STM_POOL_REPLACE_CLAIM_NONE && claim == device_id) {
+    if (s->wedged) {
+        ret = STM_EWEDGED;
+    } else if (claim != STM_POOL_REPLACE_CLAIM_NONE && claim == device_id) {
         ret = STM_EBUSY;
     } else if (sync_retry_pending(s)) {
         ret = STM_EBUSY;    /* as in stm_sync_remove_device */

@@ -5417,6 +5417,13 @@ static stm_status rq_commit_failing(stm_sync *s, stm_bdev *b[Q4], unsigned mask)
     return st;
 }
 
+static uint64_t total_writes1(stm_bdev *d)
+{
+    uint64_t w = 0;
+    stm_bdev_io_stats(d, &w, NULL, NULL);
+    return w;
+}
+
 static uint64_t q4_writes(stm_bdev *b[Q4])
 {
     uint64_t sum = 0;
@@ -5454,13 +5461,23 @@ static void q4_unlink(void)
  * over it). RW_FINISH: the same for stm_sync_finish_evacuation (the
  * evacuation's start, state bytes only, is not refused). RW_POOL: the
  * pool primitive removes device 3 in between anyway, and the retry writes
- * nothing, wedges and answers STM_EWEDGED; `pending` false is the control,
- * the same removal after the retry, and the next commit rebuilds. */
+ * nothing, wedges and answers STM_EWEDGED, and the sync's remove and
+ * finish then answer the wedge; `pending` false is the control, the same
+ * removal after the retry, and the next commit rebuilds. With `add`, a
+ * fifth device is added first and devices 3 and 2 are removed: the retry
+ * rebuilds for the larger count, so the wedge must not wait on an equal
+ * count (review round 5 F1: it rebuilt, and with device 1 missing the
+ * rebuilt reservation the stashed roster held its reservation at 4 on
+ * three of four, an open from device 2's roster mounting 4 under the
+ * acknowledged 5). */
 enum { RW_REMOVE, RW_FINISH, RW_POOL };
-static void rw_leg(const char *tag, int mode, bool pending)
+static char g_q4_fifth[256];
+static void rw_leg(const char *tag, int mode, bool pending, bool add)
 {
     q4_paths(tag);
     stm_bdev *b[Q4] = {0};
+    stm_bdev *b4 = NULL;
+    stm_alloc *a4 = NULL;
     q4_open(b);
     stm_pool *p = q4_pool(b);
     stm_alloc *a = NULL;
@@ -5482,25 +5499,52 @@ static void rw_leg(const char *tag, int mode, bool pending)
     for (int i = 0; i < Q4; i++) STM_ASSERT(q4_root(b[i], 4) != 0);
 
     if (mode == RW_POOL) {
+        if (!pending) STM_ASSERT_OK(stm_sync_commit(s));          /* 4, 5 */
+        if (add) {
+            snprintf(g_q4_fifth, sizeof g_q4_fifth,
+                     "/tmp/stm_v2_sync_multi_q4_%s_%d_4.bin", tag, (int)getpid());
+            unlink(g_q4_fifth);
+            stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+            STM_ASSERT_OK(stm_bdev_open(g_q4_fifth, &bo, &b4));
+            STM_ASSERT_OK(stm_bdev_resize(b4, TEST_DEVICE_BYTES));
+            uint64_t du4[2] = { 5, DEV_UUID_HI };
+            STM_ASSERT_OK(stm_alloc_create(b4, POOL_UUID, du4,
+                                           TEST_BOOTSTRAP_BYTES, &a4));
+            STM_ASSERT_OK(stm_alloc_set_device_id(a4, 4));
+            stm_pool_device ad = {
+                .uuid = { 5, DEV_UUID_HI }, .size_bytes = TEST_DEVICE_BYTES,
+                .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+                .state = STM_DEV_STATE_ONLINE, .bdev = b4,
+            };
+            STM_ASSERT_OK(stm_pool_add_device(p, &ad));
+            STM_ASSERT_OK(stm_sync_attach_alloc(s, 4, a4));
+        }
+        STM_ASSERT_OK(stm_pool_remove_device(p, 3, 1));
+        if (add) STM_ASSERT_OK(stm_pool_remove_device(p, 2, 1));
+        uint64_t w0 = q4_writes(b) + (b4 ? total_writes1(b4) : 0);
+        stm_status cs = stm_sync_commit(s);
+        uint64_t w = q4_writes(b) + (b4 ? total_writes1(b4) : 0) - w0;
+        stm_test_info("[%s] commit after the pool's removal: %d, %llu writes",
+                      tag, (int)cs, (unsigned long long)w);
+        STM_ASSERT_OK(stm_sync_info_get(s, &si));
         if (pending) {
-            STM_ASSERT_OK(stm_pool_remove_device(p, 3, 1));
-            uint64_t w0 = q4_writes(b);
+            STM_ASSERT_ERR(cs, STM_EWEDGED);
+            STM_ASSERT_EQ(w, 0u);
             STM_ASSERT_ERR(stm_sync_commit(s), STM_EWEDGED);
-            STM_ASSERT_EQ(q4_writes(b) - w0, 0u);
-            STM_ASSERT_ERR(stm_sync_commit(s), STM_EWEDGED);
-            STM_ASSERT_OK(stm_sync_info_get(s, &si));
+            STM_ASSERT_ERR(stm_sync_remove_device(s, 1, 1), STM_EWEDGED);
+            STM_ASSERT_ERR(stm_sync_finish_evacuation(s, 1), STM_EWEDGED);
             STM_ASSERT_EQ(si.auth_gen, 3u);
         } else {
-            STM_ASSERT_OK(stm_sync_commit(s));                     /* 4, 5 */
-            STM_ASSERT_OK(stm_pool_remove_device(p, 3, 1));
-            STM_ASSERT_OK(stm_sync_commit(s));                     /* 6, 7 */
-            STM_ASSERT_OK(stm_sync_info_get(s, &si));
+            STM_ASSERT_OK(cs);                                     /* 6, 7 */
             STM_ASSERT_EQ(si.auth_gen, 7u);
         }
         stm_sync_close(s);
         stm_alloc_close(a);
+        if (a4) stm_alloc_close(a4);
         stm_pool_close(p);
         q4_close(b);
+        if (b4) stm_bdev_close(b4);
+        if (add) unlink(g_q4_fifth);
         q4_unlink();
         return;
     }
@@ -5574,11 +5618,70 @@ static void rw_leg(const char *tag, int mode, bool pending)
     q4_unlink();
 }
 
+/* Round 5 F2: device 2 failed, a commit (its roster carries device 2
+ * FAULTED, so not clean) whose final fails on devices 1 and 3, device 2
+ * rejoined: the roster is again the last acknowledged final's and nothing
+ * else changed. The commit still writes the retry (it answered STM_OK
+ * writing nothing, the failed attempt's reservation the newest on disk,
+ * and the removal guard held for good); the removal then proceeds, and the
+ * pool opens at 5 from the all-ONLINE roster. */
+static void rw_rejoin_leg(const char *tag)
+{
+    q4_paths(tag);
+    stm_bdev *b[Q4] = {0};
+    q4_open(b);
+    stm_pool *p = q4_pool(b);
+    stm_alloc *a = NULL;
+    uint64_t du[2] = { 1, DEV_UUID_HI };
+    STM_ASSERT_OK(stm_alloc_create(b[0], POOL_UUID, du, TEST_BOOTSTRAP_BYTES,
+                                   &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(p, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 1 */
+    uint64_t dp = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 2, 3 */
+    STM_ASSERT_OK(stm_pool_fail_device(p, 2));
+    STM_ASSERT_ERR(rq_commit_failing(s, b, 0xAu), STM_EQUORUM);
+    STM_ASSERT_OK(stm_pool_rejoin_device(p, 2));
+    uint64_t w0 = q4_writes(b);
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 4, 5 */
+    uint64_t w = q4_writes(b) - w0;
+    stm_sync_info si;
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    stm_test_info("[%s] commit after the rejoin: auth %llu, %llu writes", tag,
+                  (unsigned long long)si.auth_gen, (unsigned long long)w);
+    STM_ASSERT_EQ(si.auth_gen, 5u);
+    STM_ASSERT(w > 0);
+    STM_ASSERT_OK(stm_sync_remove_device(s, 3, 1));
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    q4_close(b);
+
+    q4_open(b);
+    p = q4_pool(b);
+    a = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(b[0], &a));
+    s = NULL;
+    STM_ASSERT_OK(stm_sync_open(p, a, make_wk(), NULL, NULL, &s));
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    STM_ASSERT_EQ(si.alloc_root_paddr, q4_root(b[0], 5));
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
+    q4_close(b);
+    q4_unlink();
+}
+
 STM_TEST(sync_multi_removal_waits_for_a_failed_commits_retry) {
-    rw_leg("rwrm", RW_REMOVE, true);
-    rw_leg("rwfe", RW_FINISH, true);
-    rw_leg("rwpool", RW_POOL, true);
-    rw_leg("rwpoolc", RW_POOL, false);
+    rw_leg("rwrm", RW_REMOVE, true, false);
+    rw_leg("rwfe", RW_FINISH, true, false);
+    rw_leg("rwpool", RW_POOL, true, false);
+    rw_leg("rwpoolc", RW_POOL, false, false);
+    rw_leg("rwadd", RW_POOL, true, true);
+    rw_leg("rwaddc", RW_POOL, false, true);
+    rw_rejoin_leg("rwrj");
 }
 
 /* Device d's newest uberblock: its gen, its slot count and its live count. */
