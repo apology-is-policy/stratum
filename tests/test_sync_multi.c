@@ -6134,8 +6134,9 @@ static stm_bdev *other_pool_device(const char *path)
 
 /* The scan's refusals of what is not one pool: STM_EINVAL for no handles,
  * too many, a NULL one, no out, one device twice, devices of two pools
- * (each beside its control, device 1's handle in its place); STM_ENOENT
- * for blank devices only. */
+ * (each beside its control, device 1's handle in its place; the other
+ * pool's device alone scans as its own one-device pool); STM_ENOENT for
+ * blank devices only. */
 STM_TEST(sync_multi_scan_roster_refuses_what_is_not_one_pool) {
     stm_bdev *bds[NDEV] = {0};
     stm_alloc *as[NDEV] = {0};
@@ -6168,6 +6169,10 @@ STM_TEST(sync_multi_scan_roster_refuses_what_is_not_one_pool) {
     char opath[300];
     snprintf(opath, sizeof opath, "%s.other", g_paths[0]);
     stm_bdev *ob = other_pool_device(opath);
+    stm_bdev *one[1] = { ob };
+    STM_ASSERT_OK(stm_sync_scan_roster(one, 1, NULL, &po, NULL));
+    STM_ASSERT_EQ(po.device_count, (size_t)1);
+    STM_ASSERT(po.devices[0].bdev == ob);
     pair[1] = ob;
     STM_ASSERT_ERR(stm_sync_scan_roster(pair, 2, NULL, &po, NULL), STM_EINVAL);
     stm_bdev_close(ob);
