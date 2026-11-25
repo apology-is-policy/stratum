@@ -4810,12 +4810,12 @@ static void t3_leg(int x, unsigned claimed, unsigned moved, bool commit,
  * write could change the pool. Device 2's slot of 5 holds the claim, a
  * quorum of holders: the open mounts it (the orphan's tree was swept and
  * reused by the commit). Then the claim's holders made unreadable by
- * device 2's slot torn, or its scan refused (an unknown vote), or its
- * ring come round past slot(5) (newest 68; no write path puts a device
- * more than one gen past auth_gen, quorum.tla NewestNearAuth, so this
- * state is synthetic and the branch defensive): the orphan and the claim
- * could each have been acknowledged, STM_EIO, nothing written. Control
- * for the last: newest 67, in slot(4), mounts the claim. */
+ * device 2's slot torn, or its scan refused (an unknown vote): the orphan
+ * and the claim could each have been acknowledged, STM_EIO, nothing
+ * written. And a device newest more than one gen past auth_gen (68, its
+ * ring come round past slot(5), or 67, not): no write path puts one there
+ * (quorum.tla NewestNearAuth), the state is synthetic, and the open
+ * refuses it STM_EIO, writing nothing. */
 STM_TEST(sync_multi_open_reads_a_claim_a_device_moved_past) {
     t3_result r;
     t3_leg(0, 0x6u, 0x4u, true, 2, T3_NONE, "ahclaim", &r);
@@ -4823,12 +4823,9 @@ STM_TEST(sync_multi_open_reads_a_claim_a_device_moved_past) {
     STM_ASSERT(r.orphan_root != r.claim_root);
     STM_ASSERT_OK(r.open);
     STM_ASSERT_EQ(r.took, r.claim_root);
-    t3_leg(0, 0x6u, 0x4u, true, 2, T3_NOWRAP, "ahnowrap", &r);
-    STM_ASSERT_OK(r.open);
-    STM_ASSERT_EQ(r.took, r.claim_root);
-    static const t3_fault hide[] = { T3_TORN, T3_UNREADABLE, T3_WRAP };
-    static const char *const tags[] = { "ahtorn", "ahunread", "ahwrap" };
-    for (size_t k = 0; k < 3; k++) {
+    static const t3_fault hide[] = { T3_TORN, T3_UNREADABLE, T3_WRAP, T3_NOWRAP };
+    static const char *const tags[] = { "ahtorn", "ahunread", "ahwrap", "ahnowrap" };
+    for (size_t k = 0; k < 4; k++) {
         t3_leg(0, 0x6u, 0x4u, true, 2, hide[k], tags[k], &r);
         STM_ASSERT_ERR(r.open, STM_EIO);
         STM_ASSERT_EQ(r.writes, 0u);

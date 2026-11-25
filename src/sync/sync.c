@@ -2404,6 +2404,25 @@ static stm_status sync_pick_canonical(size_t n, stm_bdev *const bdev[],
         return STM_ERANGE;
     }
 
+    /* No device is more than one gen past the gen a quorum of the roster
+     * it was written under holds (quorum.tla NewestNearAuth: a gen is
+     * written by a session whose open took the gen below it, the claim at
+     * auth + 1, a commit's reservation at its auth + 1 and its final at
+     * auth + 2 only once the reservation's quorum confirmed). A device
+     * further past auth_gen shows a roster other than this one moved the
+     * pool on (a remove some devices took, after an add others did not:
+     * this roster's pick, blind to it, takes a gen below a commit a quorum
+     * acknowledged, and the claim would roll it back), or a rollback's or
+     * a fault's ring. */
+    for (size_t i = 0; i < n; i++) {
+        if (!scans[i].valid) continue;
+        uint64_t newest = stm_load_le64(scans[i].ub.ub_gen);
+        if (newest > auth_gen && newest - auth_gen > 1) {
+            free(scans);
+            return STM_EIO;
+        }
+    }
+
     /* Phase 3 (OPEN-BUGS (ah)): the content to mount, read from auth_gen's
      * ring slot (quorum.tla Mount, RingPick).
      *
@@ -2423,10 +2442,9 @@ static stm_status sync_pick_canonical(size_t n, stm_bdev *const bdev[],
      * Hidden: a device whose slot of auth_gen has a copy that does not
      * settle or settles torn and no copy decoding as auth_gen, wherever its
      * newest sits: past auth_gen, or below it, where a confirmed auth_gen
-     * torn on every copy leaves its scan (OPEN-BUGS (ai)); and one whose
-     * newest is auth_gen + 63 or more (its ring came round: a rollback's or
-     * a fault's, since a write of a gen needs an open of the gen below it,
-     * and the open mounts auth_gen). A slot each copy of which settles blank
+     * torn on every copy leaves its scan (OPEN-BUGS (ai)). (A device whose
+     * ring came round past auth_gen has refused above: no newest is more
+     * than auth_gen + 1.) A slot each copy of which settles blank
      * or as another lap did not take auth_gen, short of a fault on every
      * copy (a confirmed write replaces each, STM_UB_COPIES_REQUIRED), and
      * counts nothing.
@@ -2472,10 +2490,7 @@ static stm_status sync_pick_canonical(size_t n, stm_bdev *const bdev[],
         uint64_t newest = stm_load_le64(scans[i].ub.ub_gen);
         if (newest != auth_gen) {
             stm_uberblock held;
-            stm_status gr = STM_EIO;
-            if (newest < auth_gen ||
-                newest - auth_gen < STM_UB_SLOTS_PER_LABEL)
-                gr = stm_sb_gen_read(bdev[i], auth_gen, &held, why);
+            stm_status gr = stm_sb_gen_read(bdev[i], auth_gen, &held, why);
             if (gr == STM_EBADVERSION) {
                 if (why) why->best_gen = newest;
                 free(scans);
