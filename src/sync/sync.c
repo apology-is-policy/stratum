@@ -2564,6 +2564,18 @@ static bool sync_roster_listed(const sync_roster *list, size_t n,
     return false;
 }
 
+/* A decoded roster naming one device in two slots would hand one device
+ * two votes; stm_pool_open refuses it too. */
+static bool sync_roster_uuids_unique(const stm_pool_device dev[], size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        for (size_t j = 0; j < i; j++)
+            if (dev[i].uuid[0] == dev[j].uuid[0] &&
+                dev[i].uuid[1] == dev[j].uuid[1])
+                return false;
+    return true;
+}
+
 /* Slot i gets the handle whose newest uberblock carries slot i's device
  * uuid; a REMOVED slot, or one no handle names, gets none. */
 static void sync_roster_map(const stm_pool_device dev[], size_t n,
@@ -2682,8 +2694,12 @@ stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
     stm_device_state state[STM_POOL_DEVICES_MAX];
     for (size_t c = 0; c < ncand; c++) {
         memset(dev, 0, sizeof dev);
-        st = stm_pool_roster_decode(cand[c].roster, cand[c].device_count, dev);
-        if (st != STM_OK) goto done;
+        if (stm_pool_roster_decode(cand[c].roster, cand[c].device_count,
+                                   dev) != STM_OK ||
+            !sync_roster_uuids_unique(dev, cand[c].device_count)) {
+            st = STM_ECORRUPT;
+            goto done;
+        }
         sync_roster_map(dev, cand[c].device_count, devs, best, ndevs, map, state);
         stm_sb_scan_refusal pwhy;
         memset(&pwhy, 0, sizeof pwhy);

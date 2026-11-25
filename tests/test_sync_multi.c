@@ -5933,6 +5933,32 @@ STM_TEST(sync_multi_scan_roster_tries_the_roster_its_pick_takes) {
     unlink_paths();
 }
 
+/* Every device's newest uberblock re-written naming device 0 in slot 1
+ * too: the scan refuses STM_ECORRUPT rather than give device 0 two votes. */
+STM_TEST(sync_multi_scan_roster_refuses_a_roster_naming_a_device_twice) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "s_twice", bds, as, &pool, &s);
+    teardown_mirror_pool_keep(bds, as, pool, s);
+    stm_bdev *h[NDEV] = {0};
+    open_paths(h);
+    stm_pool_open_opts po;
+    STM_ASSERT_OK(stm_sync_scan_roster(h, NDEV, NULL, &po, NULL));
+    for (size_t d = 0; d < NDEV; d++) {
+        stm_uberblock ub;
+        STM_ASSERT_OK(stm_sb_label_read(h[d], 0u, stm_sb_ring_slot_for_gen(1), &ub));
+        STM_ASSERT_EQ(stm_load_le64(ub.ub_gen), 1u);
+        memcpy(ub.ub_roster + STM_POOL_ROSTER_SLOT_SIZE, ub.ub_roster,
+               STM_POOL_ROSTER_SLOT_SIZE);
+        ub.ub_roster_hash = stm_store_le64(stm_pool_roster_hash_of_bytes(ub.ub_roster));
+        STM_ASSERT_OK(stm_sb_ub_write_copies(h[d], stm_sb_ring_slot_for_gen(1), &ub));
+    }
+    STM_ASSERT_ERR(stm_sync_scan_roster(h, NDEV, NULL, &po, NULL), STM_ECORRUPT);
+    close_bdevs(h);
+    unlink_paths();
+}
+
 /* A one-device pool of another pool uuid on `path`. */
 static stm_bdev *other_pool_device(const char *path)
 {

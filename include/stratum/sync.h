@@ -317,7 +317,8 @@ stm_status stm_sync_open_ex(stm_pool *p, stm_alloc *a,
  *                whose commit some devices hold, which only its
  *                acknowledgement could decide. Hand in only the devices
  *                the pool holds.
- *   STM_ECORRUPT no roster is the pool's.
+ *   STM_ECORRUPT no roster is the pool's, or one read names a device in
+ *                two slots.
  *   otherwise    a roster's pick refused (stm_sync_open_ex's refusals:
  *                STM_EIO for an unknown vote, STM_EQUORUM, ...), the
  *                first in the order tried (newest uberblock's first).
