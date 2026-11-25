@@ -90,6 +90,10 @@ stm_add_test(test_keyschema_rotate test_keyschema_rotate.c)
 stm_add_test(test_keyfile_passphrase test_keyfile_passphrase.c)
 stm_add_test(test_pool       test_pool.c)
 stm_add_test(test_sync_multi test_sync_multi.c)
+# Its cases format and open pools of up to five file devices: 16 s alone on
+# the macOS host the gate runs on, past 60 s under ctest -j4 there (59.6 s
+# for its first 70 cases), 3 s to 5 s in CI.
+set_tests_properties(test_sync_multi PROPERTIES TIMEOUT 180)
 stm_add_test(test_scrub      test_scrub.c)
 stm_add_test(test_dcache_concurrent test_dcache_concurrent.c)
 # Its hammer runs for as long as its writer does. Under a thread sanitizer in CI

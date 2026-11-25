@@ -372,9 +372,19 @@ only invariant) fails it (20 states).
 The state space: a slot below `AuthoritativeGen` is read by nothing but
 `DevGen`, as the device's newest, unless it is `pub_gen`'s, and stays so
 (cfg `VIEW View` zeroes those; a cfg with `MountCountsUnknown=FALSE`
-mounts below `AuthoritativeGen` and does without it), and nothing tells
-one device from another but its state (`SYMMETRY Symmetry`, devices as
-model values).
+mounts below `AuthoritativeGen` and does without it; with `MaxRetries` at
+most 1, as in every cfg here, a retry's reservation slot is never below
+it), and nothing tells one device from another but its state (`SYMMETRY
+Symmetry`, devices as model values). With both, TLC picks a state's
+permutation on the whole state (the least in its value order) and
+fingerprints the view of that, so two states the view merges can take
+different permutations and count twice: with more than one worker the
+distinct-state count differs from run to run (`quorum.cfg` 45214 to
+47140 over four runs), one worker repeats it (46338 under two
+fingerprint seeds), and the view alone repeats its own (63904). The
+partition TLC checks is finer than the view's, never coarser, so the
+check is as sound as the view and the symmetry; the counts above are
+single runs.
 
 Spec-to-code: `src/sync/sync.c::sync_commit, sync_open, write_ub_to_all_devices,
 sync_ub_shared_bytes_match`.
