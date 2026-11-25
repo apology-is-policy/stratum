@@ -324,6 +324,10 @@ bool stm_pool_lock_is_free_for_test(stm_pool *p);
  * under the historical device. P5-4b must persist REMOVED slots
  * in the roster AND this walk must iterate through them.
  *
+ * With a sync attached, add only while no failed commit waits for its
+ * retry: that retry then writes nothing and wedges the sync (see
+ * stm_sync_commit).
+ *
  * Returns:
  *   STM_OK           — device added; roster_hash advanced.
  *   STM_EROFS        — pool was opened read_only.

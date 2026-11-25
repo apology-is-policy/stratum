@@ -367,20 +367,20 @@ stm_status stm_sync_scan_roster(stm_bdev *const devs[], size_t ndevs,
  * A retry after any failure past the reservation's build (its write,
  * the barrier, the final) reserves at the same gen and writes the
  * reservation the last attempt to get that far wrote or tried, byte for
- * byte, unless a device was added in between. Until that retry is
- * acknowledged, stm_sync_remove_device and stm_sync_finish_evacuation
- * refuse STM_EBUSY: the stashed reservation's roster carries the quorum
- * it was written under. A retry that finds a slot that roster names
- * removed in between anyway (the pool primitives; with or without a
- * device added too) writes nothing, wedges the handle and answers
- * STM_EWEDGED. While a retry waits, a commit always writes.
+ * byte. Until that retry is acknowledged, stm_sync_remove_device,
+ * stm_sync_finish_evacuation and stm_sync_replace_device_online refuse
+ * STM_EBUSY: the stashed reservation's roster carries the quorum it was
+ * written under. A retry that finds the pool's slots changed in between
+ * anyway (stm_pool_add_device, or a pool primitive's removal) writes
+ * nothing, wedges the handle and answers STM_EWEDGED. While a retry
+ * waits, a commit takes no clean-commit skip.
  *
  * On STM_OK, auth_gen has advanced by 2 (one commit) and the pool's
  * devices hold quorum-confirmed UBs at the reservation and final
  * gens; or nothing changed since the last final this session
- * acknowledged, no failed attempt waits, and nothing was written. A
- * failure after the final reached quorum (the engines' finalize)
- * wedges the handle.
+ * acknowledged, no failed attempt waits, and nothing was written. An
+ * engines' finalize failure (after the final reached quorum, or on that
+ * clean skip) wedges the handle.
  *
  * The first commit on a fresh pool (auth_gen==0) is 1-phase: only
  * the final UB is written at gen=1. There is no pre-flush state to
@@ -985,7 +985,9 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id);
  *   STM_ENOTSUPPORTED  — old slot FAULTED (reconstruct path unimplemented)
  *                         or old_device_id == 0.
  *   STM_EINVAL         — shape / state errors.
- *   STM_EBUSY          — another slot is EVACUATING.
+ *   STM_EBUSY          -- another slot is EVACUATING; or, before the add,
+ *                         a commit that failed waits for its retry (see
+ *                         stm_sync_commit): commit again first.
  *   STM_ENOSPC         — roster at STM_POOL_DEVICES_MAX.
  *   STM_EEXIST         — new_device->uuid collides with roster.
  *   STM_EROFS          — RO pool.

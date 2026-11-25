@@ -5254,12 +5254,14 @@ static void rr_res_leg(const char *tag)
     unlink_paths();
 }
 
-/* Two devices; the final at 5 fails on device 1, then device 2 is added.
- * The stashed reservation's roster does not name device 2, so the retry
- * builds the reservation afresh on three devices; with the retry's final
- * lost on devices 1 and 2 that reservation is what the pool mounts, and
- * it opens on the three-device roster (the stash written to device 2
- * carries a device count of two, and that open refuses). */
+/* Two devices; the final at 5 fails on device 1, then device 2 is added
+ * (stm_pool_add_device). The stashed reservation's roster does not name
+ * it, and a rebuilt reservation acknowledged by the three-device quorum
+ * need not hold a quorum of the two-device roster, whose own pick then
+ * takes the first attempt's writes (review (s)(t)(u)(v) round 6 F1: an
+ * open from device 0's roster mounted 4 and claimed over the acknowledged
+ * 5). The retry writes nothing and wedges; the two-device pool reopens at
+ * the reservation, gen 3's trees. */
 static void rr_add_leg(const char *tag)
 {
     make_paths(tag);
@@ -5293,8 +5295,8 @@ static void rr_add_leg(const char *tag)
     STM_ASSERT_OK(stm_sync_commit(s));                             /* 2, 3 */
     STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
     STM_ASSERT_ERR(rr_commit_failing(s, b, false, 2u), STM_EQUORUM);
-    uint8_t f1d0[STM_UB_COPIES][STM_UB_SIZE];
-    q4_copy_gen(b[0], 5, true, f1d0);
+    const uint64_t root4 = q4_root(b[0], 4);
+    STM_ASSERT(root4 != 0);
     stm_pool_device add = {
         .uuid       = { DEV_UUID_LO[2], DEV_UUID_HI },
         .size_bytes = TEST_DEVICE_BYTES,
@@ -5304,27 +5306,32 @@ static void rr_add_leg(const char *tag)
         .bdev       = b[2],
     };
     STM_ASSERT_OK(stm_pool_add_device(p, &add));
-    STM_ASSERT_OK(stm_sync_commit(s));                             /* 4, 5 */
-    stm_uberblock R2;
-    STM_ASSERT_OK(stm_sb_label_read(b[0], 0u, 4u, &R2));
+    uint64_t w0 = total_writes(b);
+    stm_status cs = stm_sync_commit(s);
+    uint64_t w = total_writes(b) - w0;
+    stm_test_info("[%s] retry after the add: %d, %llu writes", tag, (int)cs,
+                  (unsigned long long)w);
+    STM_ASSERT_ERR(cs, STM_EWEDGED);
+    STM_ASSERT_EQ(w, 0u);
     stm_sync_close(s);
     stm_alloc_close(a);
     stm_pool_close(p);
-    q4_zero_gen(b[1], 5);
-    q4_zero_gen(b[2], 5);
-    q4_copy_gen(b[0], 5, false, f1d0);
     close_bdevs(b);
+
     open_bdevs(b);
-    uint64_t took = 0, w = 0;
-    stm_status st = rr_open(b, &took, &w);
-    stm_test_info("[%s] reservation's device count %u; open %d, took %llu, "
-                  "writes %llu", tag,
-                  (unsigned)stm_load_le16(R2.ub_device_count), (int)st,
-                  (unsigned long long)took, (unsigned long long)w);
-    STM_ASSERT_OK(st);
-    STM_ASSERT_EQ(stm_load_le16(R2.ub_device_count), 3u);
-    STM_ASSERT_EQ(took, stm_load_le64(R2.ub_alloc_root.bp_paddr));
-    STM_ASSERT_EQ(w, (uint64_t)NDEV * STM_UB_COPIES);
+    for (int i = 0; i < 2; i++) po.devices[i].bdev = b[i];
+    p = NULL;
+    STM_ASSERT_OK(stm_pool_open(&po, &p));
+    a = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(b[0], &a));
+    s = NULL;
+    STM_ASSERT_OK(stm_sync_open(p, a, make_wk(), NULL, NULL, &s));
+    stm_sync_info si;
+    STM_ASSERT_OK(stm_sync_info_get(s, &si));
+    STM_ASSERT_EQ(si.alloc_root_paddr, root4);
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(p);
     close_bdevs(b);
     unlink_paths();
 }
@@ -5674,6 +5681,64 @@ static void rw_rejoin_leg(const char *tag)
     q4_unlink();
 }
 
+/* Round 6 F1: stm_sync_replace_device_online's add waits for a failed
+ * commit's retry too, refusing STM_EBUSY and adding nothing; after the
+ * retry the same replace of device 3 by a fifth device completes. */
+static void rw_replace_leg(const char *tag)
+{
+    q4_paths(tag);
+    stm_bdev *b[Q4] = {0};
+    q4_open(b);
+    stm_pool *p = q4_pool(b);
+    stm_alloc *a = NULL;
+    uint64_t du[2] = { 1, DEV_UUID_HI };
+    STM_ASSERT_OK(stm_alloc_create(b[0], POOL_UUID, du, TEST_BOOTSTRAP_BYTES,
+                                   &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(p, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 1 */
+    uint64_t dp = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 2, 3 */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp));
+    STM_ASSERT_ERR(rq_commit_failing(s, b, 0xEu), STM_EQUORUM);
+    snprintf(g_q4_fifth, sizeof g_q4_fifth,
+             "/tmp/stm_v2_sync_multi_q4_%s_%d_4.bin", tag, (int)getpid());
+    unlink(g_q4_fifth);
+    stm_bdev *b4 = NULL;
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(g_q4_fifth, &bo, &b4));
+    STM_ASSERT_OK(stm_bdev_resize(b4, TEST_DEVICE_BYTES));
+    uint64_t du4[2] = { 5, DEV_UUID_HI };
+    stm_alloc *a4 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(b4, POOL_UUID, du4, TEST_BOOTSTRAP_BYTES,
+                                   &a4));
+    stm_pool_device nd = {
+        .uuid = { 5, DEV_UUID_HI }, .size_bytes = TEST_DEVICE_BYTES,
+        .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state = STM_DEV_STATE_ONLINE, .bdev = b4,
+    };
+    uint16_t nid = 0;
+    STM_ASSERT_ERR(stm_sync_replace_device_online(s, 3, &nd, a4, 1, &nid),
+                   STM_EBUSY);
+    STM_ASSERT_EQ(stm_pool_device_count(p), 4u);
+    STM_ASSERT_OK(stm_sync_commit(s));                             /* 4, 5 */
+    stm_status rs = stm_sync_replace_device_online(s, 3, &nd, a4, 1, &nid);
+    stm_test_info("[%s] replace after the retry: %d, new slot %u", tag,
+                  (int)rs, (unsigned)nid);
+    STM_ASSERT_OK(rs);
+    STM_ASSERT_EQ(nid, 4u);
+    STM_ASSERT_EQ(stm_pool_device_info(p, 3)->state, STM_DEV_STATE_REMOVED);
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_alloc_close(a4);
+    stm_pool_close(p);
+    q4_close(b);
+    stm_bdev_close(b4);
+    unlink(g_q4_fifth);
+    q4_unlink();
+}
+
 STM_TEST(sync_multi_removal_waits_for_a_failed_commits_retry) {
     rw_leg("rwrm", RW_REMOVE, true, false);
     rw_leg("rwfe", RW_FINISH, true, false);
@@ -5682,6 +5747,7 @@ STM_TEST(sync_multi_removal_waits_for_a_failed_commits_retry) {
     rw_leg("rwadd", RW_POOL, true, true);
     rw_leg("rwaddc", RW_POOL, false, true);
     rw_rejoin_leg("rwrj");
+    rw_replace_leg("rwrp");
 }
 
 /* Device d's newest uberblock: its gen, its slot count and its live count. */

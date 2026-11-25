@@ -696,17 +696,17 @@ struct stm_sync {
      * these bytes again rather than a rebuild whose allocator statistics
      * or scrub state moved, so one session never leaves two contents in
      * one slot (sync_open's pick counts a torn copy as possibly holding
-     * the acknowledged one). A device added in between rebuilds: the
-     * stashed roster does not name it. A fail, rejoin or evacuation's
-     * start moves only state bytes, so every device the retry writes is
-     * still in the stashed roster, with the same quorum. A removal
-     * shrinks the quorum: the stashed roster's larger one could then
-     * hold the reservation while the retry's final is acknowledged under
-     * the smaller, and an open from the stashed roster would mount the
-     * reservation under it. So the sync's remove and finish-evacuation
-     * refuse while the stash waits for its retry (sync_retry_pending),
-     * and a retry that finds a slot the stashed roster names removed
-     * some other way wedges, whether or not a device was added too. */
+     * the acknowledged one). A fail, rejoin or evacuation's start moves
+     * only state bytes, so every device the retry writes is still in the
+     * stashed roster, with the same quorum. A removal or an add changes
+     * the quorum: a retry acknowledged by the new roster's quorum need not
+     * hold a quorum of the stashed roster, whose own pick then takes the
+     * first attempt's reservation or orphan final, one gen below or at the
+     * acknowledged one, and an open from it claims over that. So the
+     * sync's remove, finish-evacuation and replace refuse while the stash
+     * waits for its retry (sync_retry_pending), and a retry that finds
+     * the pool's slots changed some other way (the pool primitives)
+     * writes nothing and wedges (sync_stash_roster_kept). */
     stm_uberblock     res_ub;
     uint64_t          res_ub_gen;
     bool              have_res_ub;
@@ -1675,15 +1675,15 @@ static bool sync_retry_pending(const stm_sync *s)
     return s->have_res_ub && s->res_ub_gen + 1u == s->current_gen;
 }
 
-/* Every slot the stashed reservation's roster names is removed now
- * exactly when it was then: no removal shrank the quorum that reservation
- * was written under (slots added since are not compared). Caller holds
- * the pool lock. */
-static bool sync_removed_set_kept(const stm_sync *s, const stm_uberblock *ub)
+/* The pool's slots are the stashed reservation's: none added since, and
+ * each removed now exactly when it was then, so the retry writes those
+ * bytes under the quorum they were written under. Caller holds the pool
+ * lock. */
+static bool sync_stash_roster_kept(const stm_sync *s, const stm_uberblock *ub)
 {
     uint16_t n = stm_load_le16(ub->ub_device_count);
     stm_pool_device dev[STM_POOL_DEVICES_MAX] = { 0 };
-    if (n > stm_pool_device_count(s->pool)) return false;
+    if (n != stm_pool_device_count(s->pool)) return false;
     if (stm_pool_roster_decode(ub->ub_roster, n, dev) != STM_OK) return false;
     for (uint16_t i = 0; i < n; i++) {
         const stm_pool_device *cur = stm_pool_device_info(s->pool, i);
@@ -2691,7 +2691,7 @@ static void sync_roster_map(const stm_pool_device dev[], size_t n,
  * reservation some devices hold and whose final none handed in does) can
  * both be, and whether the final was acknowledged, which no device handed
  * in shows, tells them apart: STM_EIO. (The retry of a failed commit
- * reuses its reservation's roster, so the sync refuses a removal until
+ * reuses its reservation's roster, so the sync refuses a roster change until
  * that retry is acknowledged: sync_retry_pending.) Any other refusal of a
  * roster's pick refuses the scan: the roster the pool acknowledged its
  * newest commit under may be the one an absent device makes unknown
@@ -3653,15 +3653,13 @@ stm_status stm_sync_commit(stm_sync *s)
                          /*merkle_root=*/       s->merkle_root,
                          &astats_res);
         if (s->have_res_ub && s->res_ub_gen == reservation_gen) {
-            if (!sync_removed_set_kept(s, &s->res_ub)) {
+            if (!sync_stash_roster_kept(s, &s->res_ub)) {
                 sync_wedge_locked(s);
                 pthread_mutex_unlock(&s->lock);
                 stm_pool_unlock_shared(s->pool);
                 return STM_EWEDGED;
             }
-            if (stm_load_le16(s->res_ub.ub_device_count) ==
-                stm_load_le16(res_prototype.ub_device_count))
-                res_prototype = s->res_ub;
+            res_prototype = s->res_ub;
         }
     }
 
@@ -4009,8 +4007,9 @@ stm_status stm_sync_commit(stm_sync *s)
      * FINALIZE — the flush of a clean engine kept its prior root triple
      * (engine.c: a no-op commit preserves root gen), so adoption is a
      * no-op; ABORT would drop the resident memtree (crash-equivalent),
-     * wrong for a no-op. A finalize failure wedges via the caller
-     * exactly as on the commit path.
+     * wrong for a no-op. A finalize failure wedges, as on the commit
+     * path: the failed engine stays pending and refuses every later
+     * flush.
      *
      * Not while a failed attempt waits for its retry: its reservation
      * (and maybe its final) is newer on disk than the last final this
@@ -4019,6 +4018,7 @@ stm_status stm_sync_commit(stm_sync *s)
     if (s->have_last_fin_ub && !sync_retry_pending(s) &&
         ub_content_equal_masked(&fin_prototype, &s->last_fin_ub)) {
         stm_status cfs = stm_dataset_index_commit_engines_finalize(s->dataset_idx);
+        if (cfs != STM_OK) sync_wedge_locked(s);
         out_rc = cfs;
         goto out_cancel;
     }
@@ -4119,9 +4119,10 @@ stm_status stm_sync_commit(stm_sync *s)
      * trees intact, superseded nodes merely leaked. */
     stm_status mfs = stm_dataset_index_commit_engines_finalize(s->dataset_idx);
     if (mfs != STM_OK) {
-        /* The final is durable but this session never publishes it: a
-         * later commit would retry at its gen and could write another
-         * content there. The sync wedges as the fs does. */
+        /* The final is durable but this session never publishes it, and
+         * the failed engine stays pending, refusing every later flush:
+         * the handle no longer agrees with the pool it wrote. The sync
+         * wedges as the fs does. */
         sync_wedge_locked(s);
         { out_rc = mfs; goto out_cancel; }
     }
@@ -5545,6 +5546,14 @@ stm_status stm_sync_replace_device_online(
      * claim is already held by another in-flight replace, refuse
      * STM_EBUSY and roll back the add. */
     stm_pool_lock_exclusive(s->pool);
+    pthread_mutex_lock(&s->lock);
+    bool retry_pending = sync_retry_pending(s);
+    pthread_mutex_unlock(&s->lock);
+    if (retry_pending) {
+        /* The add would change the stashed reservation's quorum (res_ub). */
+        stm_pool_unlock_exclusive(s->pool);
+        return STM_EBUSY;
+    }
     size_t count_before = stm_pool_device_count(s->pool);
     stm_status as = stm_pool_add_device_locked(s->pool, new_device);
     stm_status cls = STM_OK;
